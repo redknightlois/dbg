@@ -6,6 +6,7 @@ pub mod netcoredbg;
 pub mod perf;
 pub mod pdb;
 pub mod pprof;
+pub mod pstats;
 use std::collections::HashMap;
 
 /// Result of cleaning debugger output.
