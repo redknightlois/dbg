@@ -1,3 +1,4 @@
+pub mod delve;
 pub mod lldb;
 pub mod netcoredbg;
 pub mod pdb;

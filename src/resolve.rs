@@ -10,6 +10,8 @@ pub fn resolve(backend_type: &str, target: &str) -> Result<String> {
         "rust" | "c" | "cpp" | "zig" => resolve_native(target),
         "python" | "py" => resolve_python(target),
         "dotnet" | "csharp" | "fsharp" => resolve_dotnet(target),
+        "go" => resolve_go(target),
+        "java" | "kotlin" | "pprof" | "perf" | "callgrind" | "pyprofile" | "memcheck" | "valgrind" | "massif" | "dotnet-trace" => Ok(target.to_string()),
         _ => {
             // Unknown type — just check the file exists
             if Path::new(target).exists() {
@@ -142,4 +144,40 @@ fn find_dotnet_output(dir: &Path, name: &str) -> Result<String> {
         }
     }
     bail!("cannot find {name} in {}", debug_dir.display())
+}
+
+fn resolve_go(target: &str) -> Result<String> {
+    // Existing binary
+    if Path::new(target).is_file() {
+        return Ok(target.to_string());
+    }
+
+    // Directory — build it
+    let dir = Path::new(target);
+    if dir.is_dir() {
+        eprintln!("building {target}...");
+        let output_name = dir
+            .file_name()
+            .unwrap_or_default()
+            .to_str()
+            .unwrap_or("app");
+        let output_path = dir.join(output_name);
+        let status = Command::new("go")
+            .args([
+                "build",
+                "-gcflags=all=-N -l",
+                "-o",
+                output_path.to_str().unwrap(),
+                ".",
+            ])
+            .current_dir(dir)
+            .status()
+            .context("go not found")?;
+        if !status.success() {
+            bail!("go build failed");
+        }
+        return Ok(output_path.display().to_string());
+    }
+
+    bail!("not found: {target}")
 }
