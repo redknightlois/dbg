@@ -2,6 +2,7 @@ pub mod delve;
 pub mod dotnettrace;
 pub mod callgrind;
 pub mod jdb;
+pub mod jitdasm;
 pub mod lldb;
 pub mod netcoredbg;
 pub mod massif;
