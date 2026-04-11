@@ -37,6 +37,7 @@ fn main() -> Result<()> {
     registry.register(Box::new(backend::netcoredbg::NetCoreDbgBackend));
     registry.register(Box::new(backend::delve::DelveBackend));
     registry.register(Box::new(backend::jdb::JdbBackend));
+    registry.register(Box::new(backend::pprof::PprofBackend));
 
     // --init
     if let Some(target) = &cli.init {

@@ -3,6 +3,7 @@ pub mod jdb;
 pub mod lldb;
 pub mod netcoredbg;
 pub mod pdb;
+pub mod pprof;
 use std::collections::HashMap;
 
 /// Result of cleaning debugger output.
