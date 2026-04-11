@@ -40,6 +40,7 @@ fn main() -> Result<()> {
     registry.register(Box::new(backend::pprof::PprofBackend));
     registry.register(Box::new(backend::perf::PerfBackend));
     registry.register(Box::new(backend::callgrind::CallgrindBackend));
+    registry.register(Box::new(backend::pstats::PstatsBackend));
 
     // --init
     if let Some(target) = &cli.init {
