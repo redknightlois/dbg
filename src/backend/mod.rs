@@ -2,6 +2,7 @@ pub mod delve;
 pub mod jdb;
 pub mod lldb;
 pub mod netcoredbg;
+pub mod perf;
 pub mod pdb;
 pub mod pprof;
 use std::collections::HashMap;
@@ -76,6 +77,14 @@ pub trait Backend: Send + Sync {
 
     /// Dependencies this backend requires.
     fn dependencies(&self) -> Vec<Dependency>;
+
+    /// Runtime preflight check — called before fork/spawn. Use this
+    /// for conditions that aren't "is this binary installed?" but still
+    /// need to hold for the backend to work: kernel settings, perf
+    /// paranoia level, capabilities, writable cwd, etc. Default: ok.
+    fn preflight(&self) -> anyhow::Result<()> {
+        Ok(())
+    }
 
     /// Format a breakpoint spec for this debugger.
     fn format_breakpoint(&self, spec: &str) -> String;
