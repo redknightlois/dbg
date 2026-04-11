@@ -1,7 +1,5 @@
 <p align="center">
-  <img src="public/logo.png" alt="dbg" width="180">
-  <br>
-  <img src="public/toolkit.png" alt="Agent Debug Toolkit" width="180">
+  <img src="public/logo_t.png" alt="dbg" width="180">
   <br><br>
   <em>Give your agent eyes, not guesses.</em>
   <br>
@@ -12,24 +10,18 @@
 
 > **[Watch the 16-second demo](https://redknightlois.github.io/dbg/demo.html)** — start a session, hit a breakpoint, inspect state, find the bug.
 
-Every AI coding agent hits the same wall: it reads your source, guesses what's wrong, and rewrites code hoping the bug goes away. When the guess is wrong, it guesses again — burning tokens, time, and trust.
+The bottleneck for agentic engineering is not generation. It is diagnosis.
 
-dbg gives your agent a live debugger. One command starts a session. The agent sets breakpoints, steps through execution, inspects variables, and reads actual runtime state — not a guess, the ground truth. It works across Rust, C, C++, Python, Go, .NET, Java, and Kotlin through a single interface. The agent never learns a new tool; it learns one tool that speaks every debugger.
+Without dbg, the agent reads source code, builds a theory, rewrites something, and hopes. Wrong guess? It guesses again. Five cycles of guess-and-rebuild per bug. Tokens, time, and trust — burned.
 
-An agent that can observe is an agent that can reason. Instead of five cycles of guess-and-rebuild, it gets the answer on the first pass. Every language you add to your stack is already supported — and if it isn't, send a PR.
+With dbg, the agent sets a breakpoint, steps to the crash, inspects the variable, and reads the actual value. Root cause on the first pass. One cycle. Done.
+
+One CLI. Every debugger. The agent learns `dbg` once — it works across Rust, C, C++, Python, Go, .NET, Java, and Kotlin through a single interface.
 
 ## Install
 
-### From source (now)
-
 ```bash
-cargo install --git https://github.com/redknightlois/dbg
-```
-
-### From crates.io (soon)
-
-```bash
-cargo install dbg
+cargo install dbg-cli
 ```
 
 ## Setup

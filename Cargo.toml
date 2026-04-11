@@ -1,10 +1,13 @@
 [package]
-name = "dbg"
+name = "dbg-cli"
 version = "0.1.0"
 edition = "2024"
-description = "AI can read your code. Now it can live it."
+description = "A universal debugger CLI that lets AI agents observe runtime state instead of guessing from source code"
 license = "MIT"
 repository = "https://github.com/redknightlois/dbg"
+homepage = "https://redknightlois.github.io/dbg/"
+keywords = ["debugger", "ai", "agent", "lldb", "profiler"]
+categories = ["development-tools::debugging", "command-line-utilities"]
 
 [[bin]]
 name = "dbg"
