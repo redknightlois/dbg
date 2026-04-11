@@ -19,6 +19,7 @@ pub struct CleanResult {
 }
 
 /// How to verify a dependency is installed.
+#[allow(dead_code)]
 pub enum DependencyCheck {
     /// Check that a binary exists on PATH (optionally with minimum version).
     Binary {
