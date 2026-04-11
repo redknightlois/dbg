@@ -8,6 +8,7 @@
 
 | Requirement | Check | Fix |
 |-------------|-------|-----|
+| `dbg` | `which dbg` | `cargo install dbg-cli` — ensure `~/.cargo/bin` is in PATH |
 | `perf` | `which perf` | `sudo apt install linux-tools-$(uname -r)` |
 
 ## Recording Profiles

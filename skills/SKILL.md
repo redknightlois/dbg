@@ -65,7 +65,7 @@ Debugging requires process control (fork, ptrace, PTY). If you are running insid
 dbg start <type> <target> --break <spec> [--break <spec2>] [--args ...] [--run]
 ```
 
-Where `<type>` is `rust`, `python`, or `dotnet`. The daemon stays alive until `dbg kill`.
+Where `<type>` is `rust`, `python`, `dotnet`, `go`, `java`, etc. The `<target>` is language-specific — for Rust it's the **crate name** (not a file path), for Python it's a script path, for .NET it's an exe/dll/project dir. Check the adapter for details. The daemon stays alive until `dbg kill`.
 
 ### Investigate progressively
 

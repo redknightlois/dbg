@@ -27,6 +27,7 @@ Memcheck finds memory errors in **any native binary** (C, C++, Rust, Zig, Go). I
 
 | Requirement | Check | Fix |
 |-------------|-------|-----|
+| `dbg` | `which dbg` | `cargo install dbg-cli` — ensure `~/.cargo/bin` is in PATH |
 | `valgrind` | `which valgrind` | `sudo apt install valgrind` |
 
 Compile with `-g` for debug symbols and line numbers in error reports.

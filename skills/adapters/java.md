@@ -8,6 +8,7 @@
 
 | Requirement | Check | Fix |
 |-------------|-------|-----|
+| `dbg` | `which dbg` | `cargo install dbg-cli` — ensure `~/.cargo/bin` is in PATH |
 | `jdb` | `which jdb` | Included with JDK: `sudo apt install default-jdk` |
 
 Compile with debug info: `javac -g *.java`

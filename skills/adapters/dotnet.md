@@ -2,17 +2,15 @@
 
 ## CLI
 
-`$DBG` = `~/.claude/skills/debug/scripts/dbg`
-
-Start: `$DBG start dotnet <exe-or-dll-or-dir> [--break File.cs:line] [--args ...] [--run]`
+Start: `dbg start dotnet <exe-or-dll-or-dir> [--break File.cs:line] [--args ...] [--run]`
 
 ## Preconditions
 
 | Requirement | Check | Fix |
 |-------------|-------|-----|
+| `dbg` | `which dbg` | `cargo install dbg-cli` — ensure `~/.cargo/bin` is in PATH |
 | .NET SDK | `dotnet --version` | https://dot.net/install |
 | `netcoredbg` | `which netcoredbg` or `$NETCOREDBG` | See below |
-| `pexpect` | `python3 -c "import pexpect"` | `pip install pexpect` |
 
 Install netcoredbg:
 ```bash

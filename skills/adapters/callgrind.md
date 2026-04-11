@@ -16,6 +16,7 @@ Callgrind profiles **any native binary** — C, C++, Rust, Zig, Go, anything com
 
 | Requirement | Check | Fix |
 |-------------|-------|-----|
+| `dbg` | `which dbg` | `cargo install dbg-cli` — ensure `~/.cargo/bin` is in PATH |
 | `valgrind` | `which valgrind` | `sudo apt install valgrind` |
 
 Compile with `-g` for debug symbols. Do NOT use `-O0` — callgrind profiles instruction counts, and you want realistic optimization behavior.

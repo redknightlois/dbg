@@ -21,6 +21,7 @@ Massif is a **heap profiler** for native binaries (C, C++, Rust, Zig, Go). It tr
 
 | Requirement | Check | Fix |
 |-------------|-------|-----|
+| `dbg` | `which dbg` | `cargo install dbg-cli` — ensure `~/.cargo/bin` is in PATH |
 | `valgrind` | `which valgrind` | `sudo apt install valgrind` |
 
 Compile with `-g` for source-level allocation attribution.
