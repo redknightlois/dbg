@@ -1,2 +1,161 @@
-# ai-dbg
-AI can read your code. Now it can run it. dbg gives the LLM a live debugger. It sets breakpoints, inspects state, steps through execution, and reasons about what actually happens at runtime. Instead of hallucinating about variable values, it observes them. Any language, one interface.
+<p align="center">
+  <img src="public/logo.png" alt="dbg" width="180">
+  <br>
+  <img src="public/toolkit.png" alt="Agent Debug Toolkit" width="180">
+  <br><br>
+  <em>Give your agent eyes, not guesses.</em>
+  <br>
+  A universal debugger CLI that lets AI agents observe runtime state instead of guessing from source code.
+</p>
+
+---
+
+> **[Watch the 16-second demo](https://htmlpreview.github.io/?https://github.com/redknightlois/dbg/blob/main/public/demo.html)** — start a session, hit a breakpoint, inspect state, find the bug.
+
+Every AI coding agent hits the same wall: it reads your source, guesses what's wrong, and rewrites code hoping the bug goes away. When the guess is wrong, it guesses again — burning tokens, time, and trust.
+
+dbg gives your agent a live debugger. One command starts a session. The agent sets breakpoints, steps through execution, inspects variables, and reads actual runtime state — not a guess, the ground truth. It works across Rust, C, C++, Python, Go, .NET, Java, and Kotlin through a single interface. The agent never learns a new tool; it learns one tool that speaks every debugger.
+
+An agent that can observe is an agent that can reason. Instead of five cycles of guess-and-rebuild, it gets the answer on the first pass. Every language you add to your stack is already supported — and if it isn't, send a PR.
+
+## Install
+
+### From source (now)
+
+```bash
+cargo install --git https://github.com/redknightlois/dbg
+```
+
+### From crates.io (soon)
+
+```bash
+cargo install dbg
+```
+
+## Setup
+
+### For agents
+
+One command installs the skill and all language adapters into your agent's config:
+
+```bash
+dbg --init claude    # ~/.claude/skills/dbg/
+dbg --init codex     # ~/.codex/skills/dbg/
+```
+
+After this, the agent knows how to use `dbg` — no further configuration needed. It picks the right backend, sets breakpoints, and interprets debugger output on its own.
+
+### For humans
+
+There is no human setup. `dbg` is a CLI tool — run it directly or let your agent run it. Check which backends are ready:
+
+```bash
+dbg                    # shows all backends and their status
+dbg --backend rust     # check dependencies for a specific type
+```
+
+## Usage
+
+```
+dbg start <type> <target> [--break spec] [--args ...] [--run]
+dbg <any debugger command>
+dbg help              list available commands
+dbg help <command>    ask the debugger what a command does
+dbg kill
+```
+
+## Try it
+
+### Quick smoke test
+
+No project needed. This confirms dbg and your debugger are working:
+
+```bash
+# Python — debug a one-liner that crashes
+echo 'x = [1,2,3]; print(x[5])' > /tmp/crash.py
+dbg start python /tmp/crash.py
+# agent (or you) can now: run, backtrace, print x, kill
+```
+
+### Agent prompts
+
+Pick your language and paste the prompt into Claude or Codex:
+
+**Debug a crash (Rust, C, C++, Go, Python, .NET, Java)**
+
+> The function `process_batch` in `src/pipeline.rs` panics on empty input.
+> Use `dbg` to start a debug session, set a breakpoint at the function,
+> run with an empty list, and find the exact line and variable state that causes the panic.
+
+**Find a memory leak (C, C++)**
+
+> Run `dbg start memcheck ./myapp` to check for memory errors.
+> Report any leaks, use-after-free, or uninitialized reads.
+
+**Profile slow code (Go)**
+
+> I have a CPU profile at `cpu.prof`. Use `dbg start pprof cpu.prof` to open it,
+> run `top` to find the hottest functions, and `list` the top one to see which lines are expensive.
+
+**Profile a Python script**
+
+> Profile `scripts/etl.py` with cProfile, then use `dbg start pyprofile profile.prof`
+> to find the bottleneck. Use `callers` and `callees` to trace why it's slow.
+
+**Profile a .NET app**
+
+> Use `dbg start dotnet-trace ./MyApp` to collect a trace.
+> Then run `top`, `focus MyNamespace`, and `callers` to find what's burning CPU.
+
+## Backends
+
+### Debuggers
+
+| Backend | Types | Tool |
+|---------|-------|------|
+| lldb | rust, c, cpp, zig | LLDB |
+| pdb | python, py | Python debugger |
+| netcoredbg | dotnet, csharp, fsharp | NetCoreDbg |
+| delve | go | Delve |
+| jdb | java, kotlin | Java Debugger |
+
+### Profilers
+
+| Backend | Types | Tool |
+|---------|-------|------|
+| pprof | pprof | Go pprof (CPU/memory profiles) |
+| perf | perf | Linux perf (hardware counters, sampling) |
+| callgrind | callgrind | Valgrind callgrind (instruction-level cost) |
+| memcheck | memcheck, valgrind | Valgrind memcheck (memory errors, leaks) |
+| massif | massif | Valgrind massif (heap profiling) |
+| pstats | pyprofile | Python cProfile (function-level timing) |
+| dotnet-trace | dotnet-trace | .NET EventPipe (CPU, GC, contention) |
+
+Run `dbg` with no arguments to see which backends are ready on your machine.
+
+Run `dbg --backend <type>` to check dependencies and get install instructions for missing ones.
+
+## How it works
+
+dbg runs the debugger inside a persistent daemon. Instead of starting and stopping a debugger for every command, it spawns the process once in a PTY, keeps it alive behind a UNIX socket, and relays commands from the CLI. The agent talks to `dbg` like any other shell tool — no special protocol, no adapters.
+
+Why this matters:
+
+- **Daemon, not subprocess.** The debugger stays alive across commands. No startup cost per interaction, which is critical when an agent sends dozens of commands per session.
+- **PTY, not pipes.** The debugger thinks it's in a real terminal, so it behaves exactly as documented. No pipe-mode quirks, no missing output.
+- **Output cleaning.** Backends strip debugger noise — DWARF indexing, thread lifecycle, symbol loading — so the agent gets clean, token-efficient output instead of pages of chatter.
+- **One interface, every language.** A backend trait maps each debugger's commands to a common CLI. The agent learns `dbg break`, `dbg step`, `dbg print` once and it works everywhere.
+
+## What dbg is not
+
+- **Not a DAP server.** It's a CLI that agents call directly, not a protocol they implement.
+- **Not an IDE plugin.** It's agent-first. Humans can use it, but the design optimizes for non-interactive, command-driven workflows.
+- **Not a debugger.** It wraps LLDB, PDB, Delve, NetCoreDbg, JDB, and others under one interface. It doesn't replace them — it makes them agent-accessible.
+
+## Contributing
+
+Adding a new backend is writing a prompt. Each backend implements a trait that describes how to spawn the debugger, detect its prompt, format breakpoints, and clean output. See `src/backend/mod.rs` for the trait and any existing backend (e.g., `lldb.rs`, `delve.rs`) as a template.
+
+## License
+
+MIT

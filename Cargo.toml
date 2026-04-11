@@ -1,0 +1,23 @@
+[package]
+name = "dbg"
+version = "0.1.0"
+edition = "2024"
+description = "AI can read your code. Now it can live it."
+license = "MIT"
+repository = "https://github.com/redknightlois/dbg"
+
+[[bin]]
+name = "dbg"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+nix = { version = "0.29", features = ["term", "signal", "process", "fs", "poll"] }
+regex = "1"
+anyhow = "1"
+which = "7"
+ctrlc = "3"
+
+[profile.release]
+strip = true
+lto = true
