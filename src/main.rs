@@ -39,6 +39,7 @@ fn main() -> Result<()> {
     registry.register(Box::new(backend::jdb::JdbBackend));
     registry.register(Box::new(backend::pprof::PprofBackend));
     registry.register(Box::new(backend::perf::PerfBackend));
+    registry.register(Box::new(backend::callgrind::CallgrindBackend));
 
     // --init
     if let Some(target) = &cli.init {
