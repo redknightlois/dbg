@@ -37,6 +37,18 @@ fn check_dep(dep: Dependency) -> DepStatus {
                         install: dep.install,
                     };
                 }
+                // Also check common tool directories not on PATH
+                for dir in extra_tool_dirs() {
+                    let path = dir.join(name);
+                    if path.is_file() {
+                        return DepStatus {
+                            name: dep.name,
+                            ok: true,
+                            detail: path.display().to_string(),
+                            install: dep.install,
+                        };
+                    }
+                }
             }
             DepStatus {
                 name: dep.name,
@@ -78,6 +90,15 @@ fn check_dep(dep: Dependency) -> DepStatus {
             }
         }
     }
+}
+
+/// Extra directories to search for tool binaries not on PATH.
+fn extra_tool_dirs() -> Vec<std::path::PathBuf> {
+    let mut dirs = Vec::new();
+    if let Ok(home) = std::env::var("HOME") {
+        dirs.push(std::path::PathBuf::from(&home).join(".dotnet/tools"));
+    }
+    dirs
 }
 
 /// Format check results for display.
