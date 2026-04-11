@@ -1,4 +1,5 @@
 pub mod lldb;
+pub mod netcoredbg;
 pub mod pdb;
 use std::collections::HashMap;
 
