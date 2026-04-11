@@ -28,6 +28,25 @@ fn pid_path() -> PathBuf {
     runtime_dir().join("dbg.pid")
 }
 
+/// Session-scoped temp directory for profile data etc.
+/// Uses a random ID to avoid collisions between concurrent sessions.
+pub fn session_tmp(filename: &str) -> PathBuf {
+    use std::sync::OnceLock;
+    static SESSION_ID: OnceLock<String> = OnceLock::new();
+    let id = SESSION_ID.get_or_init(|| {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        use std::time::SystemTime;
+        let mut h = DefaultHasher::new();
+        SystemTime::now().hash(&mut h);
+        std::process::id().hash(&mut h);
+        format!("{:08x}", h.finish() as u32)
+    });
+    let dir = runtime_dir().join(format!("dbg-{id}"));
+    let _ = std::fs::create_dir_all(&dir);
+    dir.join(filename)
+}
+
 struct Session {
     proc: DebuggerProcess,
     events: VecDeque<String>,
@@ -67,6 +86,10 @@ pub fn run_daemon(backend: &dyn Backend, target: &str, args: &[String]) -> Resul
     let cleanup = || {
         let _ = std::fs::remove_file(&socket_path());
         let _ = std::fs::remove_file(&pid_path());
+        let session_dir = session_tmp("").parent().map(|p| p.to_path_buf());
+        if let Some(dir) = session_dir {
+            let _ = std::fs::remove_dir_all(&dir);
+        }
     };
 
     ctrlc::set_handler(move || {

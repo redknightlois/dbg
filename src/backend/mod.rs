@@ -1,4 +1,5 @@
 pub mod delve;
+pub mod callgrind;
 pub mod jdb;
 pub mod lldb;
 pub mod netcoredbg;
