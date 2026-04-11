@@ -8,7 +8,7 @@
 
 ---
 
-> **[Watch the 16-second demo](https://redknightlois.github.io/dbg/demo.html)** — start a session, hit a breakpoint, inspect state, find the bug.
+> **[Watch the demo](https://redknightlois.github.io/dbg/#demo)** — start a session, hit a breakpoint, inspect state, find the bug.
 
 The bottleneck for agentic engineering is not generation. It is diagnosis.
 
