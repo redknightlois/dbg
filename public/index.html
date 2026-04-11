@@ -432,7 +432,7 @@
   <div class="hero-glow" aria-hidden="true"></div>
   <img class="logo" src="logo_t.png" alt="dbg" width="120" height="120">
   <h1>Give your agent <em>eyes</em>,<br>not guesses.</h1>
-  <p class="sub">One CLI. Every debugger. Your AI agent stops guessing at runtime state and starts observing it.</p>
+  <p class="sub">One CLI. Many debuggers. Your AI agent stops guessing at runtime state and starts observing it.</p>
   <div class="actions">
     <a class="btn btn-g" href="https://github.com/redknightlois/dbg">View source</a>
     <a class="btn btn-o" href="#demo">Watch demo ↓</a>
@@ -483,7 +483,7 @@
         <div class="num">1</div>
         <div>
           <p><strong>Install</strong></p>
-          <pre>cargo install --git https://github.com/redknightlois/dbg</pre>
+          <pre>cargo install dbg-cli</pre>
         </div>
       </div>
       <div class="install-step">
@@ -501,7 +501,7 @@
 <!-- ═══ BACKENDS ═══ -->
 <section>
   <div class="wrap">
-    <div class="sec-title">Every language, one interface.</div>
+    <div class="sec-title">Many languages, one interface.</div>
     <p class="sec-desc">The agent learns <code style="background:var(--slab);padding:2px 7px;border-radius:3px;font-size:.85em;color:var(--trace)">dbg</code> once. It works everywhere.</p>
     <div class="lang-grid reveal">
       <div class="lang-divider">Debuggers</div>
@@ -532,7 +532,7 @@
       <div class="arch-item"><div><strong>Daemon, not subprocess.</strong><span>The debugger stays alive across commands. No startup cost per interaction, no lost state between steps.</span></div></div>
       <div class="arch-item"><div><strong>PTY, not pipes.</strong><span>The debugger thinks it's in a real terminal. No pipe-mode quirks, no missing output, no behavior differences from docs.</span></div></div>
       <div class="arch-item"><div><strong>Output cleaning.</strong><span>Backends strip DWARF indexing, thread lifecycle, symbol loading noise. The agent gets clean, token-efficient output.</span></div></div>
-      <div class="arch-item"><div><strong>One interface, every language.</strong><span>A backend trait maps each debugger's commands to a common CLI. The agent learns break, step, print once.</span></div></div>
+      <div class="arch-item"><div><strong>One interface, many languages.</strong><span>A backend trait maps each debugger's commands to a common CLI. The agent learns break, step, print once.</span></div></div>
     </div>
   </div>
 </section>

@@ -16,7 +16,7 @@ Without dbg, the agent reads source code, builds a theory, rewrites something, a
 
 With dbg, the agent sets a breakpoint, steps to the crash, inspects the variable, and reads the actual value. Root cause on the first pass. One cycle. Done.
 
-One CLI. Every debugger. The agent learns `dbg` once — it works across Rust, C, C++, Python, Go, .NET, Java, and Kotlin through a single interface.
+One CLI. Many debuggers. The agent learns `dbg` once — it works across Rust, C, C++, Python, Go, .NET, Java, and Kotlin through a single interface.
 
 ## Install
 
@@ -130,7 +130,7 @@ Why this matters:
 - **Daemon, not subprocess.** The debugger stays alive across commands. No startup cost per interaction, which is critical when an agent sends dozens of commands per session.
 - **PTY, not pipes.** The debugger thinks it's in a real terminal, so it behaves exactly as documented. No pipe-mode quirks, no missing output.
 - **Output cleaning.** Backends strip debugger noise — DWARF indexing, thread lifecycle, symbol loading — so the agent gets clean, token-efficient output instead of pages of chatter.
-- **One interface, every language.** A backend trait maps each debugger's commands to a common CLI. The agent learns `dbg break`, `dbg step`, `dbg print` once and it works everywhere.
+- **One interface, many languages.** A backend trait maps each debugger's commands to a common CLI. The agent learns `dbg break`, `dbg step`, `dbg print` once and it works everywhere.
 
 ## What dbg is not
 
