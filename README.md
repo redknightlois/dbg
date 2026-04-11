@@ -21,6 +21,12 @@ One CLI. Many debuggers. The agent learns `dbg` once — it works across Rust, C
 ## Install
 
 ```bash
+curl -sSf https://raw.githubusercontent.com/redknightlois/dbg/main/install.sh | sh
+```
+
+Or if you already have Rust:
+
+```bash
 cargo install dbg-cli
 ```
 
