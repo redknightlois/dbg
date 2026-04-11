@@ -2,6 +2,7 @@ mod backend;
 mod check;
 mod daemon;
 mod init;
+mod jitdasm;
 mod profile;
 mod pty;
 mod resolve;
@@ -25,6 +26,10 @@ struct Cli {
     #[arg(long, alias = "language")]
     backend: Option<String>,
 
+    /// Internal: run the JIT disassembly REPL on a captured .asm file
+    #[arg(long, hide = true)]
+    jitdasm_repl: Option<String>,
+
     /// All remaining arguments
     #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
     args: Vec<String>,
@@ -45,6 +50,12 @@ fn main() -> Result<()> {
     registry.register(Box::new(backend::memcheck::MemcheckBackend));
     registry.register(Box::new(backend::massif::MassifBackend));
     registry.register(Box::new(backend::dotnettrace::DotnetTraceBackend));
+    registry.register(Box::new(backend::jitdasm::JitDasmBackend));
+
+    // --jitdasm-repl (internal: launched by the jitdasm backend)
+    if let Some(asm_path) = &cli.jitdasm_repl {
+        return jitdasm::run_repl(asm_path).map_err(Into::into);
+    }
 
     // --init
     if let Some(target) = &cli.init {
