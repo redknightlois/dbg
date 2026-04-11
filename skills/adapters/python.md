@@ -2,16 +2,14 @@
 
 ## CLI
 
-`$DBG` = `~/.claude/skills/debug/scripts/dbg`
-
-Start: `$DBG start python <script.py> [--break file.py:line] [--args ...] [--run]`
+Start: `dbg start python <script.py> [--break file.py:line] [--args ...] [--run]`
 
 ## Preconditions
 
 | Requirement | Check | Fix |
 |-------------|-------|-----|
+| `dbg` | `which dbg` | `cargo install dbg-cli` — ensure `~/.cargo/bin` is in PATH |
 | Python 3.12+ | `python3 --version` | System package |
-| `pexpect` | `python3 -c "import pexpect"` | `pip install pexpect` |
 
 ## Build
 

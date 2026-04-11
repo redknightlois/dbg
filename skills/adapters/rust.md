@@ -2,18 +2,18 @@
 
 ## CLI
 
-`$DBG` = `~/.claude/skills/debug/scripts/dbg`
+Start: `dbg start rust <crate-name> [--break file.rs:line] [--run]`
 
-Start: `$DBG start rust <crate-or-binary> [--break file.rs:line] [--run]`
+The `<crate-name>` is the Cargo package name (e.g., `my-crate`), **not** a file path. Do not pass `./target/debug/...` — dbg builds and locates the binary automatically.
 
 ## Preconditions
 
 | Requirement | Check | Fix |
 |-------------|-------|-----|
-| `lldb` | `which lldb-20 \|\| which lldb` | `sudo apt install lldb-20` |
-| `pexpect` | `python3 -c "import pexpect"` | `pip install pexpect` |
+| `dbg` | `which dbg` | `cargo install dbg-cli` — ensure `~/.cargo/bin` is in PATH |
+| `lldb` | `which lldb-20 \|\| which lldb` | `sudo apt install lldb-20` or `brew install llvm` |
 
-Set `LLDB_BIN=lldb-20` if the default `lldb` is too old.
+If `sudo` is not available, check if lldb is already installed under a versioned name (`lldb-18`, `lldb-16`, etc.) with `which lldb-{20,18,16,15,14} 2>/dev/null`. Set `LLDB_BIN=lldb-<version>` if the default `lldb` is not the right one.
 
 ## Build
 

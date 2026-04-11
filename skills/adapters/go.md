@@ -8,6 +8,7 @@
 
 | Requirement | Check | Fix |
 |-------------|-------|-----|
+| `dbg` | `which dbg` | `cargo install dbg-cli` — ensure `~/.cargo/bin` is in PATH |
 | `dlv` (Delve) | `which dlv` | `go install github.com/go-delve/delve/cmd/dlv@latest` |
 
 Build with debug info: `go build -gcflags="all=-N -l"` (disables optimizations and inlining).

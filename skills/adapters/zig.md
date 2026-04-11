@@ -8,6 +8,7 @@
 
 | Requirement | Check | Fix |
 |-------------|-------|-----|
+| `dbg` | `which dbg` | `cargo install dbg-cli` — ensure `~/.cargo/bin` is in PATH |
 | `lldb` | `which lldb-20 \|\| which lldb` | `sudo apt install lldb-20` |
 
 Build with debug info: `zig build` (default Debug mode includes symbols).

@@ -12,6 +12,7 @@ Or just a profile file:
 
 | Requirement | Check | Fix |
 |-------------|-------|-----|
+| `dbg` | `which dbg` | `cargo install dbg-cli` — ensure `~/.cargo/bin` is in PATH |
 | `go` | `which go` | https://go.dev/dl/ |
 
 ## Generating Profiles

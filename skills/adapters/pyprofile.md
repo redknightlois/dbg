@@ -17,6 +17,7 @@ dbg start pyprofile existing.prof
 
 | Requirement | Check | Fix |
 |-------------|-------|-----|
+| `dbg` | `which dbg` | `cargo install dbg-cli` — ensure `~/.cargo/bin` is in PATH |
 | `python3` | `which python3` | `sudo apt install python3` |
 
 cProfile and pstats are stdlib — no pip install needed.

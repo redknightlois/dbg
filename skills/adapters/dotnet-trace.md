@@ -17,6 +17,7 @@ dotnet-trace is the official Microsoft .NET CLI profiler. It captures CPU sample
 
 | Requirement | Check | Fix |
 |-------------|-------|-----|
+| `dbg` | `which dbg` | `cargo install dbg-cli` — ensure `~/.cargo/bin` is in PATH |
 | `dotnet` | `which dotnet` | https://dot.net/install |
 | `dotnet-trace` | `which dotnet-trace` | `dotnet tool install -g dotnet-trace` |
 

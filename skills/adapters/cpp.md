@@ -8,6 +8,7 @@
 
 | Requirement | Check | Fix |
 |-------------|-------|-----|
+| `dbg` | `which dbg` | `cargo install dbg-cli` — ensure `~/.cargo/bin` is in PATH |
 | `lldb` | `which lldb-20 \|\| which lldb` | `sudo apt install lldb-20` |
 
 Compile with `-g` for debug symbols: `g++ -g -o myapp main.cpp`
