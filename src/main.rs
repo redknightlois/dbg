@@ -32,6 +32,7 @@ struct Cli {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let mut registry = Registry::new();
+    registry.register(Box::new(backend::lldb::LldbBackend));
 
     // --init
     if let Some(target) = &cli.init {
