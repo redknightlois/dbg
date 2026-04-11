@@ -2,6 +2,7 @@ pub mod delve;
 pub mod jdb;
 pub mod lldb;
 pub mod netcoredbg;
+pub mod perf;
 pub mod pdb;
 pub mod pprof;
 use std::collections::HashMap;
