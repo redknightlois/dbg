@@ -1,4 +1,5 @@
 pub mod lldb;
+pub mod pdb;
 use std::collections::HashMap;
 
 /// Result of cleaning debugger output.
