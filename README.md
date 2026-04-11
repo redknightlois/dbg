@@ -81,31 +81,25 @@ dbg start python /tmp/crash.py
 
 Pick your language and paste the prompt into Claude or Codex:
 
-**Debug a crash (Rust, C, C++, Go, Python, .NET, Java)**
+**Debug a crash**
 
-> The function `process_batch` in `src/pipeline.rs` panics on empty input.
-> Use `dbg` to start a debug session, set a breakpoint at the function,
-> run with an empty list, and find the exact line and variable state that causes the panic.
+> `process_batch` in `src/pipeline.rs` panics on empty input. Use dbg to find out why.
 
-**Find a memory leak (C, C++)**
+**Find a memory leak**
 
-> Run `dbg start memcheck ./myapp` to check for memory errors.
-> Report any leaks, use-after-free, or uninitialized reads.
+> `./myapp` leaks memory under load. Use dbg to find the source.
 
-**Profile slow code (Go)**
+**Profile slow code**
 
-> I have a CPU profile at `cpu.prof`. Use `dbg start pprof cpu.prof` to open it,
-> run `top` to find the hottest functions, and `list` the top one to see which lines are expensive.
+> I have a Go CPU profile at `cpu.prof`. Use dbg to find what's hot and why.
 
 **Profile a Python script**
 
-> Profile `scripts/etl.py` with cProfile, then use `dbg start pyprofile profile.prof`
-> to find the bottleneck. Use `callers` and `callees` to trace why it's slow.
+> `scripts/etl.py` takes 40 seconds. Use dbg to find where the time is going.
 
 **Profile a .NET app**
 
-> Use `dbg start dotnet-trace ./MyApp` to collect a trace.
-> Then run `top`, `focus MyNamespace`, and `callers` to find what's burning CPU.
+> `./MyApp` is burning CPU somewhere in `MyNamespace`. Use dbg to find the bottleneck.
 
 ## Backends
 
