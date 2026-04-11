@@ -10,7 +10,7 @@
 
 ---
 
-> **[Watch the 16-second demo](https://htmlpreview.github.io/?https://github.com/redknightlois/dbg/blob/main/public/demo.html)** — start a session, hit a breakpoint, inspect state, find the bug.
+> **[Watch the 16-second demo](https://redknightlois.github.io/dbg/demo.html)** — start a session, hit a breakpoint, inspect state, find the bug.
 
 Every AI coding agent hits the same wall: it reads your source, guesses what's wrong, and rewrites code hoping the bug goes away. When the guess is wrong, it guesses again — burning tokens, time, and trust.
 
