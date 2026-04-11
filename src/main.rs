@@ -42,6 +42,7 @@ fn main() -> Result<()> {
     registry.register(Box::new(backend::callgrind::CallgrindBackend));
     registry.register(Box::new(backend::pstats::PstatsBackend));
     registry.register(Box::new(backend::memcheck::MemcheckBackend));
+    registry.register(Box::new(backend::massif::MassifBackend));
 
     // --init
     if let Some(target) = &cli.init {
