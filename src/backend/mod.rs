@@ -3,6 +3,7 @@ pub mod callgrind;
 pub mod jdb;
 pub mod lldb;
 pub mod netcoredbg;
+pub mod memcheck;
 pub mod perf;
 pub mod pdb;
 pub mod pprof;
