@@ -1,4 +1,5 @@
 pub mod delve;
+pub mod dotnettrace;
 pub mod callgrind;
 pub mod jdb;
 pub mod lldb;
@@ -106,6 +107,11 @@ pub trait Backend: Send + Sync {
 
     /// Parse raw help output into compact command list.
     fn parse_help(&self, raw: &str) -> String;
+
+    /// Path to a Speedscope JSON file produced after init commands complete.
+    fn profile_output(&self) -> Option<String> {
+        None
+    }
 
     /// Clean noise from command output.
     fn clean(&self, cmd: &str, output: &str) -> CleanResult {

@@ -1,0 +1,67 @@
+# .NET Trace Adapter (dotnet-trace)
+
+## CLI
+
+`dbg start dotnet-trace <binary> [--args ...]`
+
+## What It Profiles
+
+dotnet-trace is the official Microsoft .NET CLI profiler. It captures CPU samples, GC events, thread contention, and custom EventPipe events from any .NET application. The trace is automatically collected, converted to Speedscope format, and loaded into an interactive profile REPL.
+
+- **CPU sampling** — which methods spend the most time on the callstack
+- **GC events** — allocation rates, collection pauses, heap sizes
+- **Thread contention** — lock waits and thread pool starvation
+- **Custom events** — any EventSource/EventPipe provider
+
+## Preconditions
+
+| Requirement | Check | Fix |
+|-------------|-------|-----|
+| `dotnet` | `which dotnet` | https://dot.net/install |
+| `dotnet-trace` | `which dotnet-trace` | `dotnet tool install -g dotnet-trace` |
+
+## Workflow
+
+1. Start: `dbg start dotnet-trace ./myapp`
+2. The app runs and trace collects automatically. Wait for completion.
+3. Profile data is loaded into memory. All subsequent `dbg` commands query the profile directly.
+
+## Key Commands
+
+After the trace completes, the session enters profile mode. All commands go through `dbg`:
+
+| Command | What it does |
+|---------|-------------|
+| `dbg top` | Top 20 functions by inclusive time |
+| `dbg top 50` | Top 50 functions |
+| `dbg callers <func>` | Who calls this function and how much time |
+| `dbg callees <func>` | What this function calls |
+| `dbg traces` | Top 20 distinct stack traces (text flamegraph) |
+| `dbg traces 50` | Top 50 stack traces |
+| `dbg tree` | Call tree from root frames |
+| `dbg hotpath` | Single hottest execution path |
+| `dbg threads` | Number of threads in profile |
+| `dbg stats` | Profile metadata (total time, frame count, stack count) |
+| `dbg search <pattern>` | Find functions matching a substring |
+| `dbg focus <pattern>` | Filter all output to stacks containing pattern |
+| `dbg ignore <pattern>` | Exclude stacks containing pattern |
+| `dbg reset` | Clear focus/ignore filters |
+
+## Investigation Strategy
+
+1. `top` — identify which functions dominate wall time
+2. `callers <hot-func>` — understand why the hot function is called
+3. `callees <hot-func>` — see where it spends its time internally
+4. `traces` — examine full call stacks for the costliest paths
+5. `focus <module>` — narrow to a specific area, re-run top/traces
+6. `hotpath` — get the single worst path for targeted optimization
+
+## Common Failures
+
+| Symptom | Fix |
+|---------|-----|
+| `dotnet-trace` not found | `dotnet tool install -g dotnet-trace` and add `~/.dotnet/tools` to PATH |
+| Runtime version mismatch | Set `DOTNET_ROLL_FORWARD=LatestMajor` (already set by dbg) |
+| No useful samples | App ran too briefly — use a longer workload |
+| Missing method names | Ensure debug symbols are available (build in Debug config) |
+| "no stacks recorded" | Trace collected but Speedscope conversion produced empty data |

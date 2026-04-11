@@ -2,6 +2,7 @@ mod backend;
 mod check;
 mod daemon;
 mod init;
+mod profile;
 mod pty;
 mod resolve;
 
@@ -43,6 +44,7 @@ fn main() -> Result<()> {
     registry.register(Box::new(backend::pstats::PstatsBackend));
     registry.register(Box::new(backend::memcheck::MemcheckBackend));
     registry.register(Box::new(backend::massif::MassifBackend));
+    registry.register(Box::new(backend::dotnettrace::DotnetTraceBackend));
 
     // --init
     if let Some(target) = &cli.init {

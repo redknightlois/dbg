@@ -8,6 +8,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 
 use crate::backend::Backend;
+use crate::profile::ProfileData;
 use crate::pty::DebuggerProcess;
 
 const CMD_TIMEOUT: Duration = Duration::from_secs(60);
@@ -50,6 +51,7 @@ pub fn session_tmp(filename: &str) -> PathBuf {
 struct Session {
     proc: DebuggerProcess,
     events: VecDeque<String>,
+    profile: Option<ProfileData>,
 }
 
 /// Start the daemon: spawn the debugger, listen on socket.
@@ -99,9 +101,14 @@ pub fn run_daemon(backend: &dyn Backend, target: &str, args: &[String]) -> Resul
     })
     .ok();
 
+    let profile = backend
+        .profile_output()
+        .and_then(|path| ProfileData::load(Path::new(&path)).ok());
+
     let session = Mutex::new(Session {
         proc,
         events: VecDeque::new(),
+        profile,
     });
 
     for stream in listener.incoming() {
@@ -147,6 +154,14 @@ fn handle_command(cmd: &str, backend: &dyn Backend, session: &Mutex<Session>) ->
         }
         let events: Vec<String> = guard.events.drain(..).collect();
         return events.join("\n");
+    }
+
+    // Profile mode: handle commands from in-memory profile data
+    {
+        let mut guard = session.lock().unwrap();
+        if let Some(ref mut profile) = guard.profile {
+            return profile.handle_command(cmd);
+        }
     }
 
     if cmd == "help" {
