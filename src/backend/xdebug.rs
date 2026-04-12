@@ -1,4 +1,4 @@
-use super::{Backend, CleanResult, Dependency, DependencyCheck, SpawnConfig};
+use super::{Backend, CleanResult, Dependency, DependencyCheck, SpawnConfig, shell_escape};
 use crate::daemon::session_tmp;
 
 pub struct XdebugProfileBackend;
@@ -20,11 +20,11 @@ impl Backend for XdebugProfileBackend {
 
         let mut php_cmd = format!(
             "mkdir -p {} && php -d xdebug.mode=profile -d xdebug.output_dir={} -d xdebug.profiler_output_name=cachegrind.out {}",
-            out_dir_str, out_dir_str, target
+            out_dir_str, out_dir_str, shell_escape(target)
         );
-        if !args.is_empty() {
+        for a in args {
             php_cmd.push(' ');
-            php_cmd.push_str(&args.join(" "));
+            php_cmd.push_str(&shell_escape(a));
         }
 
         // Find our own binary path for exec-ing into the REPL
@@ -68,7 +68,7 @@ impl Backend for XdebugProfileBackend {
                 name: "xdebug",
                 check: DependencyCheck::Command {
                     program: "php",
-                    args: &["-m"],
+                    args: &["-r", "if (!extension_loaded('xdebug')) exit(1);"],
                 },
                 install: "sudo apt install php-xdebug  # or: pecl install xdebug",
             },
@@ -137,5 +137,29 @@ mod tests {
     #[test]
     fn format_breakpoint_empty() {
         assert_eq!(XdebugProfileBackend.format_breakpoint("anything"), "");
+    }
+
+    #[test]
+    fn spawn_config_escapes_target_with_spaces() {
+        let cfg = XdebugProfileBackend
+            .spawn_config("./my script.php", &[])
+            .unwrap();
+        let cmd = &cfg.init_commands[0];
+        assert!(cmd.contains("'./my script.php'"), "target not escaped: {cmd}");
+    }
+
+    #[test]
+    fn dep_check_verifies_xdebug_loaded() {
+        let deps = XdebugProfileBackend.dependencies();
+        let xdebug_dep = deps.iter().find(|d| d.name == "xdebug").unwrap();
+        match &xdebug_dep.check {
+            DependencyCheck::Command { program, args } => {
+                assert_eq!(*program, "php");
+                // Must actually check for xdebug, not just run php -m
+                let args_str = args.join(" ");
+                assert!(args_str.contains("xdebug"), "dep check doesn't verify xdebug: {args_str}");
+            }
+            _ => panic!("xdebug dep should use Command check"),
+        }
     }
 }

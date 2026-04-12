@@ -1,4 +1,5 @@
-use super::{Backend, CleanResult, Dependency, DependencyCheck, SpawnConfig};
+use super::{Backend, CleanResult, Dependency, DependencyCheck, SpawnConfig, shell_escape};
+use crate::check::find_bin;
 use crate::daemon::session_tmp;
 
 pub struct DotnetTraceBackend;
@@ -18,16 +19,15 @@ impl Backend for DotnetTraceBackend {
         let trace_str = trace_file.display().to_string();
         let speedscope_str = speedscope_base.display().to_string();
 
-        let collect_cmd = if args.is_empty() {
-            format!("dotnet-trace collect --output {} -- {}", trace_str, target)
-        } else {
-            format!(
-                "dotnet-trace collect --output {} -- {} {}",
-                trace_str,
-                target,
-                args.join(" ")
-            )
-        };
+        let trace_bin = find_bin("dotnet-trace");
+        let mut collect_cmd = format!(
+            "{} collect --output {} -- {}",
+            shell_escape(&trace_bin), trace_str, shell_escape(target)
+        );
+        for a in args {
+            collect_cmd.push(' ');
+            collect_cmd.push_str(&shell_escape(a));
+        }
 
         Ok(SpawnConfig {
             bin: "bash".into(),
@@ -51,8 +51,8 @@ impl Backend for DotnetTraceBackend {
             init_commands: vec![
                 collect_cmd,
                 format!(
-                    "dotnet-trace convert --format Speedscope {} -o {}",
-                    trace_str, speedscope_str
+                    "{} convert --format Speedscope {} -o {}",
+                    shell_escape(&trace_bin), trace_str, speedscope_str
                 ),
                 "echo '--- trace data ready ---'".into(),
             ],
@@ -132,7 +132,7 @@ fn find_dotnet_root() -> Option<String> {
 fn dirs_home() -> std::path::PathBuf {
     std::env::var("HOME")
         .map(std::path::PathBuf::from)
-        .unwrap_or_else(|_| std::path::PathBuf::from("~"))
+        .unwrap_or_else(|_| std::path::PathBuf::from("/tmp"))
 }
 
 #[cfg(test)]
@@ -169,7 +169,18 @@ mod tests {
             .spawn_config("./myapp", &["--port".into(), "8080".into()])
             .unwrap();
         let cmd = &cfg.init_commands[0];
-        assert!(cmd.contains("./myapp --port 8080"));
+        assert!(cmd.contains("./myapp"));
+        assert!(cmd.contains("--port"));
+        assert!(cmd.contains("8080"));
+    }
+
+    #[test]
+    fn spawn_config_escapes_spaces() {
+        let cfg = DotnetTraceBackend
+            .spawn_config("./my app", &[])
+            .unwrap();
+        let cmd = &cfg.init_commands[0];
+        assert!(cmd.contains("'./my app'"), "target not escaped: {cmd}");
     }
 
     #[test]

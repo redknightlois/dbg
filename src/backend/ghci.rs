@@ -1,4 +1,5 @@
 use super::{Backend, CleanResult, Dependency, DependencyCheck, SpawnConfig};
+use crate::check::find_bin;
 
 pub struct GhciBackend;
 
@@ -21,7 +22,7 @@ impl Backend for GhciBackend {
         spawn_args.extend(args.iter().cloned());
 
         Ok(SpawnConfig {
-            bin: "ghci".into(),
+            bin: find_bin("ghci"),
             args: spawn_args,
             env: vec![],
             init_commands: vec![
@@ -208,7 +209,7 @@ mod tests {
     #[test]
     fn spawn_config_flags() {
         let cfg = GhciBackend.spawn_config("Main.hs", &[]).unwrap();
-        assert_eq!(cfg.bin, "ghci");
+        assert!(cfg.bin.contains("ghci"), "bin should contain ghci: {}", cfg.bin);
         assert!(cfg.args.contains(&"-v0".to_string()));
         assert!(cfg.args.contains(&"-fbreak-on-exception".to_string()));
         assert!(cfg.args.contains(&"Main.hs".to_string()));

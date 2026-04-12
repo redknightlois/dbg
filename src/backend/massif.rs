@@ -1,4 +1,4 @@
-use super::{Backend, CleanResult, Dependency, DependencyCheck, SpawnConfig};
+use super::{Backend, CleanResult, Dependency, DependencyCheck, SpawnConfig, shell_escape};
 use crate::daemon::session_tmp;
 
 pub struct MassifBackend;
@@ -16,17 +16,14 @@ impl Backend for MassifBackend {
         let out_file = session_tmp("massif.out");
         let out_str = out_file.display().to_string();
 
-        let valgrind_cmd = if args.is_empty() {
-            format!(
-                "valgrind --tool=massif --massif-out-file={} {}",
-                out_str, target
-            )
-        } else {
-            format!(
-                "valgrind --tool=massif --massif-out-file={} {} {}",
-                out_str, target, args.join(" ")
-            )
-        };
+        let mut valgrind_cmd = format!(
+            "valgrind --tool=massif --massif-out-file={} {}",
+            out_str, shell_escape(target)
+        );
+        for a in args {
+            valgrind_cmd.push(' ');
+            valgrind_cmd.push_str(&shell_escape(a));
+        }
 
         Ok(SpawnConfig {
             bin: "bash".into(),
@@ -139,6 +136,16 @@ mod tests {
         let cmd = &cfg.init_commands[0];
         assert!(cmd.contains("--tool=massif"));
         assert!(cmd.contains("./app"));
-        assert!(cmd.contains("--size 100"));
+        assert!(cmd.contains("--size"));
+        assert!(cmd.contains("100"));
+    }
+
+    #[test]
+    fn spawn_config_escapes_spaces() {
+        let cfg = MassifBackend
+            .spawn_config("./my app", &[])
+            .unwrap();
+        let cmd = &cfg.init_commands[0];
+        assert!(cmd.contains("'./my app'"), "target not escaped: {cmd}");
     }
 }

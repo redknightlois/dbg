@@ -1,4 +1,4 @@
-use super::{Backend, CleanResult, Dependency, DependencyCheck, SpawnConfig};
+use super::{Backend, CleanResult, Dependency, DependencyCheck, SpawnConfig, shell_escape};
 use crate::daemon::session_tmp;
 
 pub struct JitDasmBackend;
@@ -34,7 +34,8 @@ impl Backend for JitDasmBackend {
         let extra = if extra_args.is_empty() {
             String::new()
         } else {
-            format!(" {}", extra_args.join(" "))
+            let escaped: Vec<String> = extra_args.iter().map(|a| shell_escape(a)).collect();
+            format!(" {}", escaped.join(" "))
         };
 
         // Find our own binary path for exec-ing into the REPL
@@ -47,12 +48,12 @@ impl Backend for JitDasmBackend {
 
         let build_cmd = format!(
             "echo 'Building...' && dotnet build {} -c Release --nologo -v q 2>&1 | tail -1",
-            project
+            shell_escape(&project)
         );
 
         let run_cmd = format!(
             "echo 'Disassembling: {}' && DOTNET_TieredCompilation=0 DOTNET_JitDisasm='{}' DOTNET_JitDiffableDasm=1 dotnet run --project {} -c Release --no-build{} > {} 2>&1",
-            pattern, pattern, project, extra, out_file_str
+            pattern, pattern, shell_escape(&project), extra, out_file_str
         );
 
         // Replace the bash shell with our Rust REPL

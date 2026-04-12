@@ -129,6 +129,20 @@ pub trait Backend: Send + Sync {
     }
 }
 
+/// Escape a string for safe interpolation into a bash command.
+/// Wraps in single quotes and escapes embedded single quotes.
+pub fn shell_escape(s: &str) -> String {
+    if s.is_empty() {
+        return "''".to_string();
+    }
+    // If the string is simple (no special chars), return as-is
+    if s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'/' || b == b'-' || b == b'_' || b == b'=' || b == b':') {
+        return s.to_string();
+    }
+    // Wrap in single quotes, escaping existing single quotes as '\''
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
 /// Registry of all available backends.
 pub struct Registry {
     backends: Vec<Box<dyn Backend>>,
@@ -166,5 +180,46 @@ impl Registry {
 
     pub fn all_backends(&self) -> &[Box<dyn Backend>] {
         &self.backends
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shell_escape_simple_passthrough() {
+        assert_eq!(shell_escape("./myapp"), "./myapp");
+        assert_eq!(shell_escape("target/debug/foo"), "target/debug/foo");
+        assert_eq!(shell_escape("a-b_c.d"), "a-b_c.d");
+    }
+
+    #[test]
+    fn shell_escape_empty() {
+        assert_eq!(shell_escape(""), "''");
+    }
+
+    #[test]
+    fn shell_escape_spaces() {
+        assert_eq!(shell_escape("my app"), "'my app'");
+        assert_eq!(shell_escape("/path/to/my app"), "'/path/to/my app'");
+    }
+
+    #[test]
+    fn shell_escape_single_quotes() {
+        assert_eq!(shell_escape("it's"), "'it'\\''s'");
+    }
+
+    #[test]
+    fn shell_escape_special_chars() {
+        assert_eq!(shell_escape("$(rm -rf /)"), "'$(rm -rf /)'");
+        assert_eq!(shell_escape("foo;bar"), "'foo;bar'");
+        assert_eq!(shell_escape("a&b"), "'a&b'");
+        assert_eq!(shell_escape("a|b"), "'a|b'");
+    }
+
+    #[test]
+    fn shell_escape_backticks() {
+        assert_eq!(shell_escape("`whoami`"), "'`whoami`'");
     }
 }

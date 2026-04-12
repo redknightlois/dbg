@@ -1,4 +1,4 @@
-use super::{Backend, CleanResult, Dependency, DependencyCheck, SpawnConfig};
+use super::{Backend, CleanResult, Dependency, DependencyCheck, SpawnConfig, shell_escape};
 
 pub struct MemcheckBackend;
 
@@ -13,15 +13,12 @@ impl Backend for MemcheckBackend {
 
     fn spawn_config(&self, target: &str, args: &[String]) -> anyhow::Result<SpawnConfig> {
         let mut valgrind_cmd = format!(
-            "valgrind --tool=memcheck --leak-check=full --show-leak-kinds=all --track-origins=yes {} {}",
-            target,
-            args.join(" ")
+            "valgrind --tool=memcheck --leak-check=full --show-leak-kinds=all --track-origins=yes {}",
+            shell_escape(target)
         );
-        if args.is_empty() {
-            valgrind_cmd = format!(
-                "valgrind --tool=memcheck --leak-check=full --show-leak-kinds=all --track-origins=yes {}",
-                target
-            );
+        for a in args {
+            valgrind_cmd.push(' ');
+            valgrind_cmd.push_str(&shell_escape(a));
         }
 
         Ok(SpawnConfig {
@@ -132,6 +129,26 @@ mod tests {
             .spawn_config("./app", &["arg1".into()])
             .unwrap();
         let cmd = &cfg.init_commands[0];
-        assert!(cmd.contains("./app arg1"));
+        assert!(cmd.contains("./app"));
+        assert!(cmd.contains("arg1"));
+    }
+
+    #[test]
+    fn spawn_config_escapes_spaces() {
+        let cfg = MemcheckBackend
+            .spawn_config("./my app", &["--dir=/my path".into()])
+            .unwrap();
+        let cmd = &cfg.init_commands[0];
+        assert!(cmd.contains("'./my app'"), "target not escaped: {cmd}");
+        assert!(cmd.contains("'--dir=/my path'"), "arg not escaped: {cmd}");
+    }
+
+    #[test]
+    fn spawn_config_escapes_shell_metacharacters() {
+        let cfg = MemcheckBackend
+            .spawn_config("./app;rm -rf /", &[])
+            .unwrap();
+        let cmd = &cfg.init_commands[0];
+        assert!(cmd.contains("'./app;rm -rf /'"), "metachar not escaped: {cmd}");
     }
 }
