@@ -19,6 +19,8 @@ pub fn resolve(backend_type: &str, target: &str) -> Result<String> {
         "rust" | "c" | "cpp" | "zig" => resolve_native(target),
         "d" => resolve_d(target),
         "nim" => resolve_nim(target),
+        "node" | "nodejs" | "js" | "javascript" | "ts" | "typescript" | "bun" | "deno"
+            | "nodeprof" | "js-profile" => resolve_existing_file(target),
         "python" | "py" => resolve_existing_file(target),
         "php" | "php-profile" => resolve_existing_file(target),
         "ruby" | "rb" | "ruby-profile" => resolve_existing_file(target),

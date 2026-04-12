@@ -28,6 +28,8 @@ The backend type is NOT always a language name. Match the user's goal:
 | Debug .NET code | `dotnet` | |
 | Profile .NET code | `dotnet-trace` | `dotnet` |
 | .NET JIT disassembly | `jitdasm` | `dotnet` |
+| Debug JS/TS/Node.js | `node` | |
+| Profile JS/TS/Node.js | `nodeprof` | `node` |
 | Profile C/C++/Rust | `callgrind` or `perf` | `lldb` |
 | Memory errors | `memcheck` | `lldb` |
 | Heap profiling | `massif` | `lldb` |

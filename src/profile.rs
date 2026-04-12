@@ -65,10 +65,47 @@ struct Frame {
     name: String,
 }
 
+// --- V8 .cpuprofile format ---
+
+#[derive(Deserialize)]
+struct V8CpuProfile {
+    nodes: Vec<V8Node>,
+    samples: Vec<u64>,
+    #[serde(rename = "timeDeltas")]
+    time_deltas: Vec<f64>,
+}
+
+#[derive(Deserialize)]
+struct V8Node {
+    id: u64,
+    #[serde(rename = "callFrame")]
+    call_frame: V8CallFrame,
+    #[serde(default)]
+    children: Vec<u64>,
+}
+
+#[derive(Deserialize)]
+struct V8CallFrame {
+    #[serde(rename = "functionName")]
+    function_name: String,
+    #[serde(default)]
+    url: String,
+    #[serde(rename = "lineNumber", default)]
+    line_number: i64,
+}
+
 impl ProfileData {
     pub fn load(path: &Path) -> Result<Self> {
         let content = std::fs::read_to_string(path)
-            .context("failed to read speedscope file")?;
+            .context("failed to read profile file")?;
+
+        // Auto-detect: V8 cpuprofile has "nodes" + "samples" at top level
+        if path.extension().is_some_and(|e| e == "cpuprofile")
+            || (content.contains("\"nodes\"") && content.contains("\"timeDeltas\""))
+        {
+            return Self::load_v8_cpuprofile(&content);
+        }
+
         let file: SpeedscopeFile =
             serde_json::from_str(&content).context("failed to parse speedscope JSON")?;
 
@@ -160,6 +197,196 @@ impl ProfileData {
             stacks,
             total_time,
             thread_count,
+            focus: None,
+            ignore: None,
+        })
+    }
+
+    /// Load a V8 .cpuprofile and convert to Speedscope evented format in memory.
+    fn load_v8_cpuprofile(content: &str) -> Result<Self> {
+        let profile: V8CpuProfile =
+            serde_json::from_str(content).context("failed to parse V8 cpuprofile JSON")?;
+
+        // Build node-id → index map and parent map
+        let id_to_idx: HashMap<u64, usize> = profile
+            .nodes
+            .iter()
+            .enumerate()
+            .map(|(i, n)| (n.id, i))
+            .collect();
+        let mut parent_of: HashMap<u64, u64> = HashMap::new();
+        for node in &profile.nodes {
+            for &child_id in &node.children {
+                parent_of.insert(child_id, node.id);
+            }
+        }
+
+        // Build frame names, deduplicating nodes with the same identity.
+        // V8 creates separate nodes per recursion depth; we merge them.
+        let mut frames: Vec<Frame> = Vec::new();
+        let mut name_to_frame: HashMap<String, usize> = HashMap::new();
+        let mut node_to_frame: Vec<usize> = Vec::with_capacity(profile.nodes.len());
+
+        for node in &profile.nodes {
+            let name = if node.call_frame.url.is_empty() {
+                let fn_name = &node.call_frame.function_name;
+                if fn_name.is_empty() {
+                    "(anonymous)".to_string()
+                } else {
+                    fn_name.clone()
+                }
+            } else {
+                let fn_name = if node.call_frame.function_name.is_empty() {
+                    "(anonymous)"
+                } else {
+                    &node.call_frame.function_name
+                };
+                format!("{} ({}:{})", fn_name, node.call_frame.url, node.call_frame.line_number + 1)
+            };
+            let frame_idx = *name_to_frame.entry(name.clone()).or_insert_with(|| {
+                let idx = frames.len();
+                frames.push(Frame { name });
+                idx
+            });
+            node_to_frame.push(frame_idx);
+        }
+
+        // Walk parent chain to build a stack for a given node id.
+        // Collapse consecutive recursive calls to the same frame so that
+        // e.g. ackermann→ackermann→ackermann appears as a single frame
+        // in the stack rather than inflating inclusive time.
+        let build_stack = |node_id: u64| -> Vec<usize> {
+            let mut stack = Vec::new();
+            let mut id = node_id;
+            loop {
+                if let Some(&node_idx) = id_to_idx.get(&id) {
+                    let frame_idx = node_to_frame[node_idx];
+                    // Skip if same frame as the previous entry (recursion)
+                    if stack.last() != Some(&frame_idx) {
+                        stack.push(frame_idx);
+                    }
+                }
+                match parent_of.get(&id) {
+                    Some(&pid) => id = pid,
+                    None => break,
+                }
+            }
+            stack.reverse();
+            stack
+        };
+
+        // Convert samples + timeDeltas into Speedscope evented format
+        let mut events: Vec<SpeedscopeEvent> = Vec::new();
+        let mut time = 0.0f64;
+        let mut prev_stack: Vec<usize> = Vec::new();
+
+        for (i, &sample_id) in profile.samples.iter().enumerate() {
+            let stack = build_stack(sample_id);
+            let delta = profile.time_deltas[i] / 1000.0; // microseconds → ms
+
+            // Find common prefix length
+            let common = prev_stack
+                .iter()
+                .zip(stack.iter())
+                .take_while(|(a, b)| a == b)
+                .count();
+
+            // Close frames popped from previous stack
+            for j in (common..prev_stack.len()).rev() {
+                events.push(SpeedscopeEvent {
+                    event_type: "C".into(),
+                    at: time,
+                    frame: prev_stack[j],
+                });
+            }
+            // Open new frames pushed onto stack
+            for &frame_idx in &stack[common..] {
+                events.push(SpeedscopeEvent {
+                    event_type: "O".into(),
+                    at: time,
+                    frame: frame_idx,
+                });
+            }
+
+            time += delta;
+            prev_stack = stack;
+        }
+
+        // Close remaining frames
+        for j in (0..prev_stack.len()).rev() {
+            events.push(SpeedscopeEvent {
+                event_type: "C".into(),
+                at: time,
+                frame: prev_stack[j],
+            });
+        }
+
+        // Now process events the same way as Speedscope loading
+        let n = frames.len();
+        let mut inclusive = vec![0.0f64; n];
+        let mut exclusive = vec![0.0f64; n];
+        let mut children: HashMap<usize, Vec<(usize, f64)>> = HashMap::new();
+        let mut parents: HashMap<usize, Vec<(usize, f64)>> = HashMap::new();
+        let mut stacks: Vec<(Vec<usize>, f64)> = Vec::new();
+        let mut total_time = 0.0f64;
+
+        let mut stack: Vec<(usize, f64)> = Vec::new();
+        for event in &events {
+            let idx = event.frame;
+            if idx >= n {
+                continue;
+            }
+            match event.event_type.as_str() {
+                "O" => {
+                    stack.push((idx, event.at));
+                }
+                "C" => {
+                    if let Some((opened_idx, opened_at)) = stack.pop() {
+                        let duration = event.at - opened_at;
+                        if duration > 0.0 {
+                            inclusive[opened_idx] += duration;
+                            if let Some(&(parent_idx, _)) = stack.last() {
+                                children
+                                    .entry(parent_idx)
+                                    .or_default()
+                                    .push((opened_idx, duration));
+                                parents
+                                    .entry(opened_idx)
+                                    .or_default()
+                                    .push((parent_idx, duration));
+                            }
+                            let mut trace: Vec<usize> =
+                                stack.iter().map(|(idx, _)| *idx).collect();
+                            trace.push(opened_idx);
+                            stacks.push((trace, duration));
+                            if stack.is_empty() {
+                                total_time += duration;
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        // Compute exclusive = inclusive - sum(children inclusive)
+        for i in 0..n {
+            let child_time: f64 = children
+                .get(&i)
+                .map(|c| c.iter().map(|(_, t)| t).sum())
+                .unwrap_or(0.0);
+            exclusive[i] = (inclusive[i] - child_time).max(0.0);
+        }
+
+        Ok(Self {
+            frames,
+            inclusive,
+            exclusive,
+            children,
+            parents,
+            stacks,
+            total_time,
+            thread_count: 1,
             focus: None,
             ignore: None,
         })
@@ -839,5 +1066,177 @@ mod tests {
         // A should NOT appear twice (cycle broken)
         let a_count = out.matches("A").count();
         assert_eq!(a_count, 1, "A appeared {a_count} times — cycle not broken: {out}");
+    }
+
+    fn sample_v8_cpuprofile() -> String {
+        r#"{
+            "nodes": [
+                {"id": 1, "callFrame": {"functionName": "(root)", "scriptId": "0", "url": "", "lineNumber": -1, "columnNumber": -1}, "hitCount": 0, "children": [2]},
+                {"id": 2, "callFrame": {"functionName": "main", "scriptId": "1", "url": "app.js", "lineNumber": 0, "columnNumber": 0}, "hitCount": 0, "children": [3, 4]},
+                {"id": 3, "callFrame": {"functionName": "compute", "scriptId": "1", "url": "app.js", "lineNumber": 4, "columnNumber": 0}, "hitCount": 5, "children": []},
+                {"id": 4, "callFrame": {"functionName": "sort", "scriptId": "1", "url": "app.js", "lineNumber": 8, "columnNumber": 0}, "hitCount": 3, "children": []}
+            ],
+            "startTime": 0,
+            "endTime": 80000,
+            "samples": [3, 3, 3, 3, 3, 4, 4, 4],
+            "timeDeltas": [10000, 10000, 10000, 10000, 10000, 10000, 10000, 10000]
+        }"#
+        .to_string()
+    }
+
+    #[test]
+    fn load_v8_cpuprofile_parses_frames() {
+        let p = ProfileData::load_v8_cpuprofile(&sample_v8_cpuprofile()).unwrap();
+        assert_eq!(p.frames.len(), 4);
+        assert_eq!(p.frames[0].name, "(root)");
+        assert!(p.frames[1].name.contains("main"));
+        assert!(p.frames[1].name.contains("app.js:1"));
+        assert!(p.frames[2].name.contains("compute"));
+        assert!(p.frames[3].name.contains("sort"));
+    }
+
+    #[test]
+    fn load_v8_cpuprofile_has_time() {
+        let p = ProfileData::load_v8_cpuprofile(&sample_v8_cpuprofile()).unwrap();
+        assert!(p.total_time > 0.0);
+        // compute is sampled 5 times at 10ms each, sort 3 times at 10ms each
+        assert!(p.inclusive[2] > 0.0, "compute should have inclusive time");
+        assert!(p.inclusive[3] > 0.0, "sort should have inclusive time");
+    }
+
+    #[test]
+    fn load_v8_cpuprofile_commands_work() {
+        let mut p = ProfileData::load_v8_cpuprofile(&sample_v8_cpuprofile()).unwrap();
+        let top = p.handle_command("top");
+        assert!(top.contains("compute"), "top should list compute: {top}");
+        assert!(top.contains("sort"), "top should list sort: {top}");
+
+        let callers = p.handle_command("callers compute");
+        assert!(callers.contains("main"), "compute should be called by main: {callers}");
+
+        let stats = p.handle_command("stats");
+        assert!(stats.contains("frames: 4"));
+    }
+
+    /// V8 cpuprofile with recursive function: root → main → fib → fib → fib
+    /// Nodes 3, 4, 5 are all "fib" at the same location but different recursion depths.
+    fn sample_v8_recursive() -> String {
+        r#"{
+            "nodes": [
+                {"id": 1, "callFrame": {"functionName": "(root)", "scriptId": "0", "url": "", "lineNumber": -1, "columnNumber": -1}, "hitCount": 0, "children": [2]},
+                {"id": 2, "callFrame": {"functionName": "main", "scriptId": "1", "url": "app.js", "lineNumber": 0, "columnNumber": 0}, "hitCount": 0, "children": [3]},
+                {"id": 3, "callFrame": {"functionName": "fib", "scriptId": "1", "url": "app.js", "lineNumber": 4, "columnNumber": 0}, "hitCount": 1, "children": [4]},
+                {"id": 4, "callFrame": {"functionName": "fib", "scriptId": "1", "url": "app.js", "lineNumber": 4, "columnNumber": 0}, "hitCount": 2, "children": [5]},
+                {"id": 5, "callFrame": {"functionName": "fib", "scriptId": "1", "url": "app.js", "lineNumber": 4, "columnNumber": 0}, "hitCount": 3, "children": []}
+            ],
+            "startTime": 0,
+            "endTime": 60000,
+            "samples": [3, 4, 4, 5, 5, 5],
+            "timeDeltas": [10000, 10000, 10000, 10000, 10000, 10000]
+        }"#
+        .to_string()
+    }
+
+    #[test]
+    fn v8_recursive_deduplicates_frames() {
+        let p = ProfileData::load_v8_cpuprofile(&sample_v8_recursive()).unwrap();
+        // Nodes 3, 4, 5 are all "fib" — should be deduplicated to one frame
+        let fib_count = p.frames.iter().filter(|f| f.name.contains("fib")).count();
+        assert_eq!(fib_count, 1, "fib should appear once, got {fib_count}; frames: {:?}",
+            p.frames.iter().map(|f| &f.name).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn v8_recursive_inclusive_time_sane() {
+        let p = ProfileData::load_v8_cpuprofile(&sample_v8_recursive()).unwrap();
+        // No frame's inclusive time should exceed total_time
+        for (i, frame) in p.frames.iter().enumerate() {
+            assert!(
+                p.inclusive[i] <= p.total_time * 1.01, // 1% tolerance for float
+                "frame '{}' inclusive {:.2}ms exceeds total {:.2}ms",
+                frame.name, p.inclusive[i], p.total_time
+            );
+        }
+    }
+
+    #[test]
+    fn v8_recursive_search_finds_one() {
+        let mut p = ProfileData::load_v8_cpuprofile(&sample_v8_recursive()).unwrap();
+        let out = p.handle_command("search fib");
+        assert!(out.contains("1 matches"), "should find 1 match, got: {out}");
+    }
+
+    #[test]
+    fn v8_recursive_callers_no_self() {
+        let mut p = ProfileData::load_v8_cpuprofile(&sample_v8_recursive()).unwrap();
+        let out = p.handle_command("callers fib");
+        // fib should be called by main, but NOT by itself
+        assert!(out.contains("main"), "fib should be called by main: {out}");
+        // Check caller lines (skip "callers of ..." header) for self-calls
+        let caller_lines: Vec<&str> = out.lines()
+            .filter(|l| l.contains("ms") && !l.starts_with("callers of"))
+            .collect();
+        for line in &caller_lines {
+            assert!(!line.contains("fib"), "fib should not self-call after collapse: {line}");
+        }
+    }
+
+    #[test]
+    fn v8_recursive_callees_is_leaf() {
+        let mut p = ProfileData::load_v8_cpuprofile(&sample_v8_recursive()).unwrap();
+        let out = p.handle_command("callees fib");
+        // After recursion collapse, fib has no callees (only called itself)
+        assert!(out.contains("leaf") || !out.contains("fib ("),
+            "fib should be leaf or not self-callee: {out}");
+    }
+
+    /// V8 cpuprofile with mutual recursion: root → a → b → a → b
+    /// Tests that A→B→A doesn't collapse (they're different functions).
+    fn sample_v8_mutual_recursion() -> String {
+        r#"{
+            "nodes": [
+                {"id": 1, "callFrame": {"functionName": "(root)", "scriptId": "0", "url": "", "lineNumber": -1, "columnNumber": -1}, "hitCount": 0, "children": [2]},
+                {"id": 2, "callFrame": {"functionName": "isEven", "scriptId": "1", "url": "app.js", "lineNumber": 0, "columnNumber": 0}, "hitCount": 1, "children": [3]},
+                {"id": 3, "callFrame": {"functionName": "isOdd", "scriptId": "1", "url": "app.js", "lineNumber": 4, "columnNumber": 0}, "hitCount": 1, "children": [4]},
+                {"id": 4, "callFrame": {"functionName": "isEven", "scriptId": "1", "url": "app.js", "lineNumber": 0, "columnNumber": 0}, "hitCount": 1, "children": [5]},
+                {"id": 5, "callFrame": {"functionName": "isOdd", "scriptId": "1", "url": "app.js", "lineNumber": 4, "columnNumber": 0}, "hitCount": 1, "children": []}
+            ],
+            "startTime": 0,
+            "endTime": 40000,
+            "samples": [2, 3, 4, 5],
+            "timeDeltas": [10000, 10000, 10000, 10000]
+        }"#
+        .to_string()
+    }
+
+    #[test]
+    fn v8_mutual_recursion_preserves_both() {
+        let p = ProfileData::load_v8_cpuprofile(&sample_v8_mutual_recursion()).unwrap();
+        // isEven and isOdd are different functions — both should exist
+        let even = p.frames.iter().filter(|f| f.name.contains("isEven")).count();
+        let odd = p.frames.iter().filter(|f| f.name.contains("isOdd")).count();
+        assert_eq!(even, 1, "isEven should appear once");
+        assert_eq!(odd, 1, "isOdd should appear once");
+    }
+
+    #[test]
+    fn v8_mutual_recursion_callers_correct() {
+        let mut p = ProfileData::load_v8_cpuprofile(&sample_v8_mutual_recursion()).unwrap();
+        let callers = p.handle_command("callers isOdd");
+        assert!(callers.contains("isEven"), "isOdd should be called by isEven: {callers}");
+    }
+
+    #[test]
+    fn load_auto_detects_v8_format() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static COUNTER2: AtomicU32 = AtomicU32::new(0);
+        let id = COUNTER2.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("dbg-test-v8-{}", id));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("test.cpuprofile");
+        std::fs::write(&path, sample_v8_cpuprofile()).unwrap();
+        let p = ProfileData::load(&path).unwrap();
+        assert_eq!(p.frames.len(), 4);
+        assert!(p.frames[2].name.contains("compute"));
     }
 }

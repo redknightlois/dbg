@@ -9,6 +9,8 @@ pub mod lldb;
 pub mod netcoredbg;
 pub mod massif;
 pub mod memcheck;
+pub mod node_inspect;
+pub mod nodeprof;
 pub mod ocamldebug;
 pub mod perf;
 pub mod pdb;
