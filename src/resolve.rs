@@ -17,6 +17,7 @@ pub fn resolve(backend_type: &str, target: &str) -> Result<String> {
         "dotnet" | "csharp" | "fsharp" => resolve_dotnet(target),
         "go" => resolve_go(target),
         "haskell" | "hs" | "haskell-profile" | "hs-profile" => resolve_haskell(target),
+        "ocaml" | "ml" => resolve_ocaml(target),
         "java" | "kotlin" | "pprof" | "perf" | "callgrind" | "pyprofile" | "memcheck" | "valgrind" | "massif" | "dotnet-trace" => Ok(target.to_string()),
         _ => {
             // Unknown type — just check the file exists
@@ -221,6 +222,34 @@ fn resolve_php(target: &str) -> Result<String> {
     } else {
         bail!("file not found: {target}")
     }
+}
+
+fn resolve_ocaml(target: &str) -> Result<String> {
+    let path = Path::new(target);
+    if path.is_file() {
+        // If it's a source file, compile to bytecode with debug info
+        if target.ends_with(".ml") {
+            let stem = path.file_stem().unwrap().to_str().unwrap();
+            let output = path.parent().unwrap_or(Path::new(".")).join(stem);
+            eprintln!("building {target} (bytecode with -g)...");
+            let status = Command::new("ocamlfind")
+                .args(["ocamlc", "-g", "-o", output.to_str().unwrap(), target])
+                .status()
+                .or_else(|_| {
+                    Command::new("ocamlc")
+                        .args(["-g", "-o", output.to_str().unwrap(), target])
+                        .status()
+                })
+                .context("neither ocamlfind nor ocamlc found")?;
+            if !status.success() {
+                bail!("OCaml bytecode compilation failed for {target}");
+            }
+            return Ok(output.display().to_string());
+        }
+        // Already a bytecode binary
+        return Ok(target.to_string());
+    }
+    bail!("file not found: {target}")
 }
 
 fn resolve_haskell(target: &str) -> Result<String> {

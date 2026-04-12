@@ -16,7 +16,7 @@ Without dbg, the agent reads source code, builds a theory, rewrites something, a
 
 With dbg, the agent sets a breakpoint, steps to the crash, inspects the variable, and reads the actual value. Root cause on the first pass. One cycle. Done.
 
-One CLI. Many debuggers. The agent learns `dbg` once — it works across Rust, C, C++, Python, Go, .NET, Java, Kotlin, Ruby, PHP, Haskell, D, and Nim through a single interface.
+One CLI. Many debuggers. The agent learns `dbg` once — it works across Rust, C, C++, Python, Go, .NET, Java, Kotlin, Ruby, PHP, Haskell, OCaml, D, and Nim through a single interface.
 
 ## Install
 
@@ -129,6 +129,7 @@ Pick your language and paste the prompt into Claude or Codex:
 | rdbg | ruby, rb | rdbg (debug gem) |
 | phpdbg | php | phpdbg |
 | ghci | haskell, hs | GHCi (GHC interactive debugger) |
+| ocamldebug | ocaml, ml | ocamldebug (bytecode debugger with time-travel) |
 
 ### Profilers
 
@@ -164,7 +165,7 @@ Why this matters:
 
 - **Not a DAP server.** It's a CLI that agents call directly, not a protocol they implement.
 - **Not an IDE plugin.** It's agent-first. Humans can use it, but the design optimizes for non-interactive, command-driven workflows.
-- **Not a debugger.** It wraps LLDB, PDB, Delve, NetCoreDbg, JDB, rdbg, GHCi, and others under one interface. Pass a source file and it compiles with debug symbols automatically — D, Nim, Haskell, Rust, Go, and .NET projects build on the fly.
+- **Not a debugger.** It wraps LLDB, PDB, Delve, NetCoreDbg, JDB, rdbg, GHCi, ocamldebug, and others under one interface. Pass a source file and it compiles with debug symbols automatically — D, Nim, Haskell, OCaml, Rust, Go, and .NET projects build on the fly.
 
 ## Contributing
 
