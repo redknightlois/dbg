@@ -16,6 +16,7 @@ pub fn resolve(backend_type: &str, target: &str) -> Result<String> {
         "ruby" | "rb" | "ruby-profile" => resolve_ruby(target),
         "dotnet" | "csharp" | "fsharp" => resolve_dotnet(target),
         "go" => resolve_go(target),
+        "haskell" | "hs" | "haskell-profile" | "hs-profile" => resolve_haskell(target),
         "java" | "kotlin" | "pprof" | "perf" | "callgrind" | "pyprofile" | "memcheck" | "valgrind" | "massif" | "dotnet-trace" => Ok(target.to_string()),
         _ => {
             // Unknown type — just check the file exists
@@ -214,6 +215,15 @@ fn resolve_ruby(target: &str) -> Result<String> {
 }
 
 fn resolve_php(target: &str) -> Result<String> {
+    let path = Path::new(target);
+    if path.is_file() {
+        Ok(target.to_string())
+    } else {
+        bail!("file not found: {target}")
+    }
+}
+
+fn resolve_haskell(target: &str) -> Result<String> {
     let path = Path::new(target);
     if path.is_file() {
         Ok(target.to_string())

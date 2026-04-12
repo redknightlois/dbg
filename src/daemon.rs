@@ -168,16 +168,17 @@ fn handle_command(cmd: &str, backend: &dyn Backend, session: &Mutex<Session>) ->
         let guard = session.lock().unwrap();
         let raw = guard
             .proc
-            .send_and_wait("help", CMD_TIMEOUT)
+            .send_and_wait(backend.help_command(), CMD_TIMEOUT)
             .unwrap_or_default();
         return backend.parse_help(&raw);
     }
 
     if let Some(topic) = cmd.strip_prefix("help ") {
+        let help_cmd = backend.help_command();
         let guard = session.lock().unwrap();
         return guard
             .proc
-            .send_and_wait(&format!("help {topic}"), CMD_TIMEOUT)
+            .send_and_wait(&format!("{help_cmd} {topic}"), CMD_TIMEOUT)
             .unwrap_or_else(|e| format!("[error: {e}]"));
     }
 

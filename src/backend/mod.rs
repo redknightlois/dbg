@@ -1,6 +1,8 @@
 pub mod delve;
 pub mod dotnettrace;
 pub mod callgrind;
+pub mod ghci;
+pub mod ghcprof;
 pub mod jdb;
 pub mod jitdasm;
 pub mod lldb;
@@ -98,6 +100,11 @@ pub trait Backend: Send + Sync {
     /// The command to quit the debugger.
     fn quit_command(&self) -> &'static str {
         "quit"
+    }
+
+    /// The command to request help from the debugger.
+    fn help_command(&self) -> &'static str {
+        "help"
     }
 
     /// Adapter markdown files for AI skill integration.

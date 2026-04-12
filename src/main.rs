@@ -1,6 +1,7 @@
 mod backend;
 mod check;
 mod daemon;
+mod ghcprof;
 mod init;
 mod jitdasm;
 mod phpprofile;
@@ -35,6 +36,10 @@ struct Cli {
     #[arg(long, hide = true)]
     phpprofile_repl: Option<String>,
 
+    /// Internal: convert GHC .prof to callgrind format
+    #[arg(long, hide = true, num_args = 2, value_names = &["PROF", "OUT"])]
+    ghcprof_convert: Option<Vec<String>>,
+
     /// Internal: custom prompt for the profile REPL
     #[arg(long, hide = true, default_value = "php-profile> ")]
     profile_prompt: String,
@@ -64,6 +69,8 @@ fn main() -> Result<()> {
     registry.register(Box::new(backend::xdebug::XdebugProfileBackend));
     registry.register(Box::new(backend::rdbg::RdbgBackend));
     registry.register(Box::new(backend::stackprof::StackprofBackend));
+    registry.register(Box::new(backend::ghci::GhciBackend));
+    registry.register(Box::new(backend::ghcprof::GhcProfBackend));
 
     // --jitdasm-repl (internal: launched by the jitdasm backend)
     if let Some(asm_path) = &cli.jitdasm_repl {
@@ -73,6 +80,11 @@ fn main() -> Result<()> {
     // --phpprofile-repl (internal: launched by profile backends)
     if let Some(cg_path) = &cli.phpprofile_repl {
         return phpprofile::run_repl(cg_path, &cli.profile_prompt).map_err(Into::into);
+    }
+
+    // --ghcprof-convert (internal: convert GHC .prof to callgrind format)
+    if let Some(paths) = &cli.ghcprof_convert {
+        return ghcprof::convert(&paths[0], &paths[1]);
     }
 
     // --init
