@@ -71,6 +71,7 @@ fn main() -> Result<()> {
     registry.register(Box::new(backend::stackprof::StackprofBackend));
     registry.register(Box::new(backend::ghci::GhciBackend));
     registry.register(Box::new(backend::ghcprof::GhcProfBackend));
+    registry.register(Box::new(backend::ocamldebug::OcamlDebugBackend));
 
     // --jitdasm-repl (internal: launched by the jitdasm backend)
     if let Some(asm_path) = &cli.jitdasm_repl {
