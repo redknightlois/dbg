@@ -276,7 +276,7 @@ impl ProfileData {
             .map(|i| (i, self.inclusive[i], self.exclusive[i]))
             .collect();
 
-        entries.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+        entries.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         entries.truncate(n);
 
         let total = self.total_time.max(0.001);
@@ -311,7 +311,7 @@ impl ProfileData {
                     *aggregated.entry(parent_idx).or_default() += time;
                 }
                 let mut sorted: Vec<(usize, f64)> = aggregated.into_iter().collect();
-                sorted.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+                sorted.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
                 for (parent_idx, time) in sorted.iter().take(15) {
                     out.push_str(&format!(
                         "  {:>8.2}ms  {}\n",
@@ -341,7 +341,7 @@ impl ProfileData {
                     *aggregated.entry(child_idx).or_default() += time;
                 }
                 let mut sorted: Vec<(usize, f64)> = aggregated.into_iter().collect();
-                sorted.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+                sorted.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
                 for (child_idx, time) in sorted.iter().take(15) {
                     out.push_str(&format!(
                         "  {:>8.2}ms  {}\n",
@@ -370,7 +370,7 @@ impl ProfileData {
         }
 
         let mut sorted: Vec<(Vec<usize>, f64)> = aggregated.into_iter().collect();
-        sorted.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+        sorted.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         sorted.truncate(n);
 
         let mut out = String::new();
@@ -394,13 +394,14 @@ impl ProfileData {
             .filter(|&i| self.inclusive[i] > 0.0 && !self.parents.contains_key(&i))
             .map(|i| (i, self.inclusive[i]))
             .collect();
-        roots.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+        roots.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         roots.truncate(n);
 
         let total = self.total_time.max(0.001);
         let mut out = String::new();
+        let mut visited = std::collections::HashSet::new();
         for (idx, _) in &roots {
-            self.tree_recurse(*idx, 0, total, &mut out, 5);
+            self.tree_recurse(*idx, 0, total, &mut out, 5, &mut visited);
         }
         out
     }
@@ -412,13 +413,15 @@ impl ProfileData {
         total: f64,
         out: &mut String,
         max_depth: usize,
+        visited: &mut std::collections::HashSet<usize>,
     ) {
-        if depth > max_depth {
+        if depth > max_depth || !visited.insert(idx) {
             return;
         }
         let indent = "  ".repeat(depth);
         let pct = self.inclusive[idx] / total * 100.0;
         if pct < 0.5 {
+            visited.remove(&idx);
             return;
         }
         out.push_str(&format!(
@@ -434,11 +437,12 @@ impl ProfileData {
                 *aggregated.entry(child_idx).or_default() += time;
             }
             let mut sorted: Vec<(usize, f64)> = aggregated.into_iter().collect();
-            sorted.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+            sorted.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
             for (child_idx, _) in sorted {
-                self.tree_recurse(child_idx, depth + 1, total, out, max_depth);
+                self.tree_recurse(child_idx, depth + 1, total, out, max_depth, visited);
             }
         }
+        visited.remove(&idx);
     }
 
     fn cmd_hotpath(&self) -> String {
@@ -452,7 +456,7 @@ impl ProfileData {
             *aggregated.entry(stack.clone()).or_default() += time;
         }
 
-        let hottest = aggregated.iter().max_by(|a, b| a.1.partial_cmp(b.1).unwrap());
+        let hottest = aggregated.iter().max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal));
 
         match hottest {
             Some((stack, time)) => {
@@ -531,10 +535,17 @@ impl ProfileData {
 
 fn shorten(s: &str, max: usize) -> String {
     if s.len() <= max {
-        s.to_string()
-    } else {
-        format!("{}…", &s[..max - 1])
+        return s.to_string();
     }
+    // Find the last char boundary at or before max-1 to leave room for '…'
+    let mut truncate_at = 0;
+    for (i, _) in s.char_indices() {
+        if i >= max {
+            break;
+        }
+        truncate_at = i;
+    }
+    format!("{}…", &s[..truncate_at])
 }
 
 #[cfg(test)]
@@ -762,5 +773,71 @@ mod tests {
         let result = shorten("long function name here", 10);
         assert!(result.len() <= 12); // 9 chars + multi-byte …
         assert!(result.ends_with('…'));
+    }
+
+    #[test]
+    fn shorten_multibyte_utf8_no_panic() {
+        // CJK characters are 3 bytes each in UTF-8
+        let cjk = "函数名称很长的函数";
+        let result = shorten(cjk, 5);
+        assert!(result.ends_with('…'));
+        // Must not panic — the old code would slice mid-character
+    }
+
+    #[test]
+    fn shorten_emoji_no_panic() {
+        let emoji = "🔥🔥🔥🔥🔥main";
+        let result = shorten(emoji, 8);
+        assert!(result.ends_with('…'));
+    }
+
+    #[test]
+    fn shorten_boundary_exact() {
+        // Exactly at the limit — no truncation
+        assert_eq!(shorten("abcde", 5), "abcde");
+        // One over — truncated
+        let r = shorten("abcdef", 5);
+        assert!(r.ends_with('…'));
+        assert!(r.len() <= 8); // 4 ASCII + 3-byte …
+    }
+
+    #[test]
+    fn tree_with_recursive_profile_no_infinite_loop() {
+        // Build a profile with a cycle: A -> B -> A
+        // A is the root (no parents entry), B -> A creates the cycle
+        let frames = vec![
+            Frame { name: "A".into() },
+            Frame { name: "B".into() },
+        ];
+        let inclusive = vec![10.0, 8.0];
+        let exclusive = vec![2.0, 2.0];
+        let mut children = HashMap::new();
+        children.insert(0, vec![(1, 8.0)]); // A -> B
+        children.insert(1, vec![(0, 6.0)]); // B -> A (cycle!)
+        let mut parents = HashMap::new();
+        // Only B has a parent (A) — A is a root
+        parents.insert(1, vec![(0, 8.0)]);
+        let stacks = vec![
+            (vec![0, 1], 8.0),
+        ];
+        let mut p = ProfileData {
+            frames,
+            inclusive,
+            exclusive,
+            children,
+            parents,
+            stacks,
+            total_time: 10.0,
+            thread_count: 1,
+            focus: None,
+            ignore: None,
+        };
+        // This must not stack overflow — cycle detection prevents infinite recursion
+        let out = p.handle_command("tree");
+        assert!(out.contains("A"));
+        assert!(out.contains("B"));
+        // A should NOT appear twice (cycle broken)
+        let a_count = out.matches("A").count();
+        assert_eq!(a_count, 1, "A appeared {a_count} times — cycle not broken: {out}");
     }
 }

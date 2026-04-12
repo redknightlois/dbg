@@ -51,7 +51,13 @@ impl JitIndex {
             }
 
             if let Some(rest) = line.strip_prefix("; Total bytes of code") {
-                current_bytes = rest.trim().parse().unwrap_or(0);
+                // Format: "; Total bytes of code 42" or "; Total bytes of code = 42"
+                current_bytes = rest
+                    .trim()
+                    .trim_start_matches('=')
+                    .trim()
+                    .parse()
+                    .unwrap_or(0);
             }
 
             if current_name.is_some() {
@@ -601,5 +607,29 @@ mod tests {
         let calls = JitIndex::extract_calls(body);
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0], "Real:Call()");
+    }
+
+    #[test]
+    fn parse_code_bytes_with_equals_format() {
+        // Some .NET versions emit "; Total bytes of code = 42"
+        let asm = "; Assembly listing for method Foo:Bar()\n\
+                    ; Emitting BLENDED_CODE for X64\n\n\
+                    push rbp\n\
+                    ret\n\
+                    ; Total bytes of code = 42\n";
+        let idx = JitIndex::parse(asm);
+        assert_eq!(idx.methods.len(), 1);
+        assert_eq!(idx.methods[0].code_bytes, 42);
+    }
+
+    #[test]
+    fn parse_code_bytes_plain_format() {
+        // Standard format: "; Total bytes of code 250"
+        let asm = "; Assembly listing for method Foo:Baz()\n\n\
+                    nop\n\
+                    ; Total bytes of code 250\n";
+        let idx = JitIndex::parse(asm);
+        assert_eq!(idx.methods.len(), 1);
+        assert_eq!(idx.methods[0].code_bytes, 250);
     }
 }
