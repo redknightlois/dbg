@@ -63,3 +63,4 @@ Examples of things that **do NOT work** as targets:
 - Check preconditions from the adapter before starting.
 - Always `dbg kill` when done — leaked processes hold file locks.
 - Interpret output for the user — translate mangled names, summarize state.
+- **Never prepend env vars to every `dbg` command.** The daemon inherits its environment from `dbg start`. If a tool needs env vars (e.g. `DOTNET_ROOT`), tell the user to add them to their shell profile once.
