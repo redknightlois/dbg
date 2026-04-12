@@ -11,6 +11,7 @@ pub fn resolve(backend_type: &str, target: &str) -> Result<String> {
         "python" | "py" => resolve_python(target),
         "php" => resolve_php(target),
         "php-profile" => resolve_php(target),
+        "ruby" | "rb" | "ruby-profile" => resolve_ruby(target),
         "dotnet" | "csharp" | "fsharp" => resolve_dotnet(target),
         "go" => resolve_go(target),
         "java" | "kotlin" | "pprof" | "perf" | "callgrind" | "pyprofile" | "memcheck" | "valgrind" | "massif" | "dotnet-trace" => Ok(target.to_string()),
@@ -146,6 +147,15 @@ fn find_dotnet_output(dir: &Path, name: &str) -> Result<String> {
         }
     }
     bail!("cannot find {name} in {}", debug_dir.display())
+}
+
+fn resolve_ruby(target: &str) -> Result<String> {
+    let path = Path::new(target);
+    if path.is_file() {
+        Ok(target.to_string())
+    } else {
+        bail!("file not found: {target}")
+    }
 }
 
 fn resolve_php(target: &str) -> Result<String> {

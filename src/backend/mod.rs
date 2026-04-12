@@ -12,6 +12,8 @@ pub mod pdb;
 pub mod phpdbg;
 pub mod pprof;
 pub mod pstats;
+pub mod rdbg;
+pub mod stackprof;
 pub mod xdebug;
 use std::collections::HashMap;
 
