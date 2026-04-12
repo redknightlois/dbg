@@ -122,10 +122,16 @@ fn main() -> Result<()> {
 
         println!("backends:");
         for backend in registry.all_backends() {
-            let all_ok = check::check_backends(&registry, &[backend.name()])
+            let results = check::check_backends(&registry, &[backend.name()]);
+            let missing: Vec<&str> = results
                 .iter()
-                .all(|(_, statuses)| statuses.iter().all(|s| s.ok));
-            let status = if all_ok { "ready" } else { "missing deps" };
+                .flat_map(|(_, statuses)| statuses.iter().filter(|s| !s.ok).map(|s| s.name))
+                .collect();
+            let status = if missing.is_empty() {
+                "ready".to_string()
+            } else {
+                format!("missing: {}", missing.join(", "))
+            };
             println!("  {:<14} {} [{}]", backend.name(), backend.description(), status);
         }
         return Ok(());
