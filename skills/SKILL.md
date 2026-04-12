@@ -9,7 +9,9 @@ description: >
   "why is this slow", "where is it spending time", "find the memory leak",
   "check for memory errors", "show the disassembly", "JIT disassembly",
   "what instructions", "is it vectorized", "check codegen", "show assembly",
-  "SIMD", "bounds checks", "jitdasm".
+  "SIMD", "bounds checks", "jitdasm",
+  "GPU", "CUDA", "kernel", "training is slow", "optimize GPU", "roofline",
+  "occupancy", "memory bound", "compute bound", "kernel fusion".
   Also use when you would otherwise guess at runtime state — if you're about to
   add print statements, re-read the same function a third time, speculate about
   variable values, or rewrite code hoping the bug disappears, use dbg instead.
@@ -33,6 +35,15 @@ The backend type is NOT always a language name. Match the user's goal:
 | Profile C/C++/Rust | `callgrind` or `perf` | `lldb` |
 | Memory errors | `memcheck` | `lldb` |
 | Heap profiling | `massif` | `lldb` |
+| **GPU kernels / CUDA / PyTorch training / Triton** | **`gdbg`** | `dbg` |
+
+## GPU profiling — when to use `gdbg` instead of `dbg`
+
+If the target is a Python script that imports `torch`, `triton`, or uses CUDA, or if the user asks about GPU kernels, kernel fusion, memory bandwidth, SM occupancy, roofline, or training throughput — use `gdbg`, not `dbg`.
+
+**How to detect this:** Read the target file. If it imports `torch`, `triton`, `tensorflow`, `jax`, `cupy`, `mxnet`, or uses `.cuda()` / `.to('cuda')`, route to `gdbg`. If the user says "GPU", "kernel", "CUDA", "training is slow", or "optimize for GPU", route to `gdbg`.
+
+`gdbg` is a separate binary (installed alongside `dbg`). It is NOT a dbg backend — do not try `dbg start gdbg`. Load the `gdbg` adapter from `references/adapters/gdbg.md` instead.
 
 **Load the adapter** from `references/adapters/` matching the backend type. The adapter has preconditions, commands, and workflows. Follow the adapter.
 

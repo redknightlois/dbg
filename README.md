@@ -123,6 +123,10 @@ Pick your language and paste the prompt into Claude or Codex:
 
 > `app/Main.hs` allocates too much memory. Use dbg to find which functions are responsible.
 
+**Profile a training script**
+
+> `train.py` is slow. Use dbg to find where the time goes.
+
 ## Backends
 
 ### Debuggers
@@ -155,6 +159,22 @@ Pick your language and paste the prompt into Claude or Codex:
 | xdebug | php-profile, xdebug-profile | Xdebug (PHP function-level profiling) |
 | stackprof | ruby-profile | StackProf (Ruby CPU sampling) |
 | ghc-profile | haskell-profile, hs-profile | GHC cost-centre profiling |
+
+### GPU Profilers — `gdbg`
+
+| Backend | Types | Tools |
+|---------|-------|-------|
+| cuda | CUDA kernels | nsys + ncu |
+| pytorch | PyTorch models | nsys + ncu + torch.profiler |
+| triton | Triton kernels | nsys + ncu + proton |
+
+`gdbg` is a separate binary that auto-collects GPU profiling data in three phases (timeline, hardware metrics, op mapping), stores everything in a single SQLite session, and provides an interactive REPL with 30+ analysis commands — roofline classification, occupancy ranking, kernel fusion candidates, compute/memory boundedness, op-to-kernel drill-down, and more.
+
+```bash
+gdbg train.py          # collect + analyze
+gdbg --from baseline   # reload a saved session
+gdbg check             # verify nsys/ncu are installed
+```
 
 Run `dbg` with no arguments to see which backends are ready on your machine.
 
