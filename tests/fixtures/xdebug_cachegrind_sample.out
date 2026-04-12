@@ -1,0 +1,101 @@
+version: 1
+creator: xdebug 3.2.0 (PHP 8.3.6)
+cmd: /tmp/demo.php
+part: 1
+positions: line
+
+events: Time_(10ns) Memory_(bytes)
+
+fl=(1) php:internal
+fn=(1) php::array_fill
+1 500 2048
+
+fl=(2) /tmp/demo.php
+fn=(2) Matrix->__construct
+8 1200 0
+cfl=(1)
+cfn=(1)
+calls=2 0 0
+10 1000 4096
+
+fl=(2)
+fn=(3) Matrix->set
+16 28000 60000
+
+fl=(2)
+fn=(4) Matrix->get
+20 200 0
+
+fl=(2)
+fn=(5) Matrix->multiply
+23 175000 96
+cfl=(2)
+cfn=(2)
+calls=1 0 0
+24 141 1392
+cfl=(2)
+cfn=(3)
+calls=900 0 0
+30 9500 20000
+
+fl=(2)
+fn=(6) Matrix->trace
+36 265 0
+cfl=(1)
+cfn=(8) php::min
+calls=1 0 0
+38 53 0
+
+fl=(1)
+fn=(7) php::mt_rand
+1 7800 0
+
+fl=(2)
+fn=(9) buildRandom
+47 146000 192
+cfl=(2)
+cfn=(2)
+calls=2 0 0
+48 2374 2784
+cfl=(2)
+cfn=(3)
+calls=1800 0 0
+51 18762 40368
+cfl=(1)
+cfn=(7)
+calls=1800 0 0
+51 7800 0
+
+fl=(2)
+fn=(10) main
+56 64000 0
+cfl=(2)
+cfn=(9)
+calls=1 0 0
+57 101341 21672
+cfl=(2)
+cfn=(9)
+calls=1 0 0
+58 73583 21672
+cfl=(2)
+cfn=(5)
+calls=1 0 0
+59 185360 21672
+cfl=(2)
+cfn=(6)
+calls=1 0 0
+60 318 0
+
+fl=(2)
+fn=(11) {main}
+1 1104 0
+cfl=(2)
+cfn=(10)
+calls=1 0 0
+64 424595 32
+
+fl=(1)
+fn=(8) php::min
+1 53 0
+
+summary: 429023 480384
