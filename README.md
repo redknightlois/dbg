@@ -16,7 +16,7 @@ Without dbg, the agent reads source code, builds a theory, rewrites something, a
 
 With dbg, the agent sets a breakpoint, steps to the crash, inspects the variable, and reads the actual value. Root cause on the first pass. One cycle. Done.
 
-One CLI. Many debuggers. The agent learns `dbg` once — it works across Rust, C, C++, Python, Go, .NET, Java, Kotlin, Ruby, PHP, Haskell, OCaml, D, and Nim through a single interface.
+One CLI. Many debuggers. The agent learns `dbg` once — it works across Rust, C, C++, Python, Go, .NET, Java, Kotlin, JavaScript, TypeScript, Ruby, PHP, Haskell, OCaml, D, and Nim through a single interface.
 
 ## Install
 
@@ -95,6 +95,14 @@ Pick your language and paste the prompt into Claude or Codex:
 
 > `scripts/etl.py` takes 40 seconds. Use dbg to find where the time is going.
 
+**Debug a Node.js app**
+
+> `src/server.js` throws a TypeError on the `/api/users` route. Use dbg to find what's undefined and why.
+
+**Profile a Node.js script**
+
+> `scripts/build.js` takes 20 seconds. Use dbg to find where the time is going.
+
 **Profile a .NET app**
 
 > `./MyApp` is burning CPU somewhere in `MyNamespace`. Use dbg to find the bottleneck.
@@ -126,6 +134,7 @@ Pick your language and paste the prompt into Claude or Codex:
 | netcoredbg | dotnet, csharp, fsharp | NetCoreDbg |
 | delve | go | Delve |
 | jdb | java, kotlin | Java Debugger |
+| node-inspect | node, js, typescript, ts | Node.js inspector |
 | rdbg | ruby, rb | rdbg (debug gem) |
 | phpdbg | php | phpdbg |
 | ghci | haskell, hs | GHCi (GHC interactive debugger) |
@@ -142,6 +151,7 @@ Pick your language and paste the prompt into Claude or Codex:
 | massif | massif | Valgrind massif (heap profiling) |
 | pstats | pyprofile | Python cProfile (function-level timing) |
 | dotnet-trace | dotnet-trace | .NET EventPipe (CPU, GC, contention) |
+| nodeprof | nodeprof, js-profile | V8 CPU profiler (--cpu-prof) |
 | xdebug | php-profile, xdebug-profile | Xdebug (PHP function-level profiling) |
 | stackprof | ruby-profile | StackProf (Ruby CPU sampling) |
 | ghc-profile | haskell-profile, hs-profile | GHC cost-centre profiling |
