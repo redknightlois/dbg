@@ -19,7 +19,7 @@ curl -sL https://github.com/Samsung/netcoredbg/releases/latest/download/netcored
 export NETCOREDBG=~/.local/share/netcoredbg/netcoredbg/netcoredbg
 ```
 
-Set `DOTNET_ROOT` if auto-detection fails (homebrew, custom installs).
+If `DOTNET_ROOT` is needed (homebrew, custom installs), tell the user to add it to their shell profile (`~/.bashrc` or `~/.zshrc`) rather than setting it per-command. The daemon inherits the environment from `dbg start` — do NOT prepend env vars to every `dbg` command.
 
 ## Build
 
