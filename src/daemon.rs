@@ -16,11 +16,16 @@ const CMD_TIMEOUT: Duration = Duration::from_secs(60);
 fn cleanup_and_exit() -> ! {
     let _ = std::fs::remove_file(socket_path());
     let _ = std::fs::remove_file(pid_path());
-    let session_dir = session_tmp("").parent().map(|p| p.to_path_buf());
-    if let Some(dir) = session_dir {
-        let _ = std::fs::remove_dir_all(&dir);
-    }
+    let session_dir = session_tmp_dir();
+    let _ = std::fs::remove_dir_all(&session_dir);
     std::process::exit(0);
+}
+
+/// Return the session-scoped temp directory (without appending a filename).
+fn session_tmp_dir() -> PathBuf {
+    // session_tmp("x") gives <dir>/x — take the parent to get <dir>
+    let with_file = session_tmp("x");
+    with_file.parent().unwrap_or(&with_file).to_path_buf()
 }
 
 /// Pick the best directory for IPC files.
@@ -164,6 +169,12 @@ pub fn run_daemon(backend: &dyn Backend, target: &str, args: &[String]) -> Resul
     cleanup_and_exit();
 }
 
+/// Lock the session mutex, recovering from poisoning so the daemon
+/// stays responsive after a thread panic.
+fn lock_session(session: &Mutex<Session>) -> std::sync::MutexGuard<'_, Session> {
+    session.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 fn handle_command(cmd: &str, backend: &dyn Backend, session: &Mutex<Session>, cached_help: &str) -> String {
     // Serve help from cache — no lock needed, works even when the debugger is busy.
     if cmd == "help" {
@@ -180,7 +191,7 @@ fn handle_command(cmd: &str, backend: &dyn Backend, session: &Mutex<Session>, ca
     }
 
     if cmd == "events" {
-        let mut guard = session.lock().unwrap();
+        let mut guard = lock_session(session);
         if guard.events.is_empty() {
             return "none".to_string();
         }
@@ -190,7 +201,7 @@ fn handle_command(cmd: &str, backend: &dyn Backend, session: &Mutex<Session>, ca
 
     // Profile mode: handle commands from in-memory profile data
     {
-        let mut guard = session.lock().unwrap();
+        let mut guard = lock_session(session);
         if let Some(ref mut profile) = guard.profile {
             return profile.handle_command(cmd);
         }
@@ -208,7 +219,7 @@ fn handle_command(cmd: &str, backend: &dyn Backend, session: &Mutex<Session>, ca
             .unwrap_or_else(|e| format!("[error: {e}]"));
     }
 
-    let mut guard = session.lock().unwrap();
+    let mut guard = lock_session(session);
     match guard.proc.send_and_wait(cmd, CMD_TIMEOUT) {
         Ok(raw) => {
             let result = backend.clean(cmd, &raw);
