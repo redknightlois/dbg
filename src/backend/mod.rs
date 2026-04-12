@@ -22,50 +22,13 @@ pub mod stackprof;
 pub mod xdebug;
 use std::collections::HashMap;
 
+// Re-export dependency types from shared crate for backwards compatibility
+pub use dbg_cli::deps::{Dependency, DependencyCheck, DepStatus};
+
 /// Result of cleaning debugger output.
 pub struct CleanResult {
     pub output: String,
     pub events: Vec<String>,
-}
-
-/// How to verify a dependency is installed.
-#[allow(dead_code)]
-pub enum DependencyCheck {
-    /// Check that a binary exists on PATH (optionally with minimum version).
-    Binary {
-        name: &'static str,
-        /// Alternative names to try (e.g., "lldb-20", "lldb-18", "lldb").
-        alternatives: &'static [&'static str],
-        /// Command + args to get version string, e.g., ("lldb-20", &["--version"]).
-        /// If None, just checks existence.
-        version_cmd: Option<(&'static str, &'static [&'static str])>,
-    },
-    /// Check that a Python module can be imported.
-    PythonImport {
-        module: &'static str,
-    },
-    /// Run an arbitrary command; exit code 0 means installed.
-    Command {
-        program: &'static str,
-        args: &'static [&'static str],
-    },
-}
-
-/// A single dependency with its check and install instructions.
-pub struct Dependency {
-    pub name: &'static str,
-    pub check: DependencyCheck,
-    pub install: &'static str,
-}
-
-/// Result of checking a single dependency.
-pub struct DepStatus {
-    pub name: &'static str,
-    pub ok: bool,
-    /// The resolved path or version if found.
-    pub detail: String,
-    /// Install instructions if not found.
-    pub install: &'static str,
 }
 
 /// Configuration for spawning a debugger process.
