@@ -31,9 +31,13 @@ struct Cli {
     #[arg(long, hide = true)]
     jitdasm_repl: Option<String>,
 
-    /// Internal: run the PHP profile REPL on a captured cachegrind file
+    /// Internal: run the profile REPL on a captured cachegrind file
     #[arg(long, hide = true)]
     phpprofile_repl: Option<String>,
+
+    /// Internal: custom prompt for the profile REPL
+    #[arg(long, hide = true, default_value = "php-profile> ")]
+    profile_prompt: String,
 
     /// All remaining arguments
     #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
@@ -64,9 +68,9 @@ fn main() -> Result<()> {
         return jitdasm::run_repl(asm_path).map_err(Into::into);
     }
 
-    // --phpprofile-repl (internal: launched by the xdebug backend)
+    // --phpprofile-repl (internal: launched by profile backends)
     if let Some(cg_path) = &cli.phpprofile_repl {
-        return phpprofile::run_repl(cg_path).map_err(Into::into);
+        return phpprofile::run_repl(cg_path, &cli.profile_prompt).map_err(Into::into);
     }
 
     // --init

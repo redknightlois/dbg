@@ -78,6 +78,10 @@ impl ProfileIndex {
         let mut total_memory: i64 = 0;
         let mut command = String::new();
 
+        // Registry for bare-name callgrind format (e.g. stackprof output)
+        let mut bare_name_ids: HashMap<String, u32> = HashMap::new();
+        let mut next_bare_id: u32 = 500_000;
+
         for line in text.lines() {
             let line = line.trim();
             if line.is_empty() {
@@ -110,9 +114,9 @@ impl ProfileIndex {
                 continue;
             }
 
-            // fl=(id) [name]
+            // fl=(id) [name] or fl=bare_name
             if let Some(rest) = line.strip_prefix("fl=") {
-                if let Some((id_str, name)) = parse_id_assignment(rest) {
+                if let Some((id_str, name)) = parse_id_assignment(rest, &mut bare_name_ids, &mut next_bare_id) {
                     current_fl = id_str;
                     if !name.is_empty() {
                         file_names.insert(id_str, name.to_string());
@@ -121,9 +125,9 @@ impl ProfileIndex {
                 continue;
             }
 
-            // fn=(id) [name]
+            // fn=(id) [name] or fn=bare_name
             if let Some(rest) = line.strip_prefix("fn=") {
-                if let Some((id_str, name)) = parse_id_assignment(rest) {
+                if let Some((id_str, name)) = parse_id_assignment(rest, &mut bare_name_ids, &mut next_bare_id) {
                     current_fn = id_str;
                     if !name.is_empty() {
                         fn_names.insert(id_str, name.to_string());
@@ -136,9 +140,9 @@ impl ProfileIndex {
                 continue;
             }
 
-            // cfl=(id) [name]
+            // cfl=(id) [name] or cfl=bare_name
             if let Some(rest) = line.strip_prefix("cfl=") {
-                if let Some((id_str, name)) = parse_id_assignment(rest) {
+                if let Some((id_str, name)) = parse_id_assignment(rest, &mut bare_name_ids, &mut next_bare_id) {
                     _current_cfl = id_str;
                     if !name.is_empty() {
                         file_names.insert(id_str, name.to_string());
@@ -147,9 +151,9 @@ impl ProfileIndex {
                 continue;
             }
 
-            // cfn=(id) [name]
+            // cfn=(id) [name] or cfn=bare_name
             if let Some(rest) = line.strip_prefix("cfn=") {
-                if let Some((id_str, name)) = parse_id_assignment(rest) {
+                if let Some((id_str, name)) = parse_id_assignment(rest, &mut bare_name_ids, &mut next_bare_id) {
                     current_cfn = id_str;
                     if !name.is_empty() {
                         fn_names.insert(id_str, name.to_string());
@@ -175,8 +179,8 @@ impl ProfileIndex {
                     let memory: i64 = parts.get(2).and_then(|s| s.parse().ok()).unwrap_or(0);
 
                     if pending_call_count > 0 {
-                        // This is a callee cost line
-                        let callee_name = fn_names.get(&current_cfn).cloned().unwrap_or_else(|| format!("fn#{}", current_cfn));
+                        // This is a callee cost line — use ID placeholder, resolved after parsing
+                        let callee_name = format!("__id_{}__", current_cfn);
                         let calls = fn_calls.entry(current_fn).or_default();
                         // Merge with existing call to same target
                         if let Some(existing) = calls.iter_mut().find(|c| c.callee == callee_name) {
@@ -199,6 +203,36 @@ impl ProfileIndex {
                     }
                 }
             }
+        }
+
+        // Resolve callee ID placeholders now that all fn= names are known
+        for calls in fn_calls.values_mut() {
+            for call in calls.iter_mut() {
+                if let Some(rest) = call.callee.strip_prefix("__id_") {
+                    if let Some(id_str) = rest.strip_suffix("__") {
+                        if let Ok(id) = id_str.parse::<u32>() {
+                            if let Some(name) = fn_names.get(&id) {
+                                call.callee = name.clone();
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Merge calls that now share the same resolved callee name
+        for calls in fn_calls.values_mut() {
+            let mut merged: Vec<CallRecord> = Vec::new();
+            for call in calls.drain(..) {
+                if let Some(existing) = merged.iter_mut().find(|c| c.callee == call.callee) {
+                    existing.call_count += call.call_count;
+                    existing.time += call.time;
+                    existing.memory += call.memory;
+                } else {
+                    merged.push(call);
+                }
+            }
+            *calls = merged;
         }
 
         // Build function list
@@ -534,31 +568,41 @@ impl ProfileIndex {
 
     /// `tree [N]` — call tree from roots, top N branches by time.
     pub fn cmd_tree(&self, n: usize) -> String {
+        let filtered: Vec<&PhpFunction> = self.filter("");
         // Build callee map: function name → Vec<(callee PhpFunction ref, time)>
         // Start from functions that are not called by anyone (roots).
-        let called_names: std::collections::HashSet<&str> = self
-            .functions
+        let called_names: std::collections::HashSet<&str> = filtered
             .iter()
             .flat_map(|f| f.calls.iter().map(|c| c.callee.as_str()))
             .collect();
 
-        let mut roots: Vec<&PhpFunction> = self
-            .functions
+        let mut roots: Vec<&PhpFunction> = filtered
             .iter()
             .filter(|f| !called_names.contains(f.name.as_str()) && f.inclusive_time > 0)
+            .copied()
             .collect();
+        if roots.is_empty() {
+            // No uncalled root found (e.g. focus on mutually-recursive functions).
+            // Fall back to functions with the highest inclusive time.
+            roots = filtered
+                .iter()
+                .filter(|f| f.inclusive_time > 0)
+                .copied()
+                .collect();
+        }
         roots.sort_by(|a, b| b.inclusive_time.cmp(&a.inclusive_time));
         roots.truncate(n);
 
-        let fn_map: HashMap<&str, &PhpFunction> = self
-            .functions
+        let fn_map: HashMap<&str, &PhpFunction> = filtered
             .iter()
-            .map(|f| (f.name.as_str(), f))
+            .map(|f| (f.name.as_str(), *f))
             .collect();
 
         let mut out = String::new();
+        let mut visited = std::collections::HashSet::new();
         for root in &roots {
-            self.tree_recurse(root, 0, &fn_map, &mut out, 5);
+            self.tree_recurse(root, 0, &fn_map, &mut out, 5, &mut visited);
+            visited.clear();
         }
         if out.is_empty() {
             out.push_str("no call tree found\n");
@@ -566,13 +610,14 @@ impl ProfileIndex {
         out
     }
 
-    fn tree_recurse(
+    fn tree_recurse<'a>(
         &self,
-        func: &PhpFunction,
+        func: &'a PhpFunction,
         depth: usize,
-        fn_map: &HashMap<&str, &PhpFunction>,
+        fn_map: &HashMap<&str, &'a PhpFunction>,
         out: &mut String,
         max_depth: usize,
+        visited: &mut std::collections::HashSet<&'a str>,
     ) {
         if depth > max_depth {
             return;
@@ -586,6 +631,13 @@ impl ProfileIndex {
             return;
         }
         let indent = "  ".repeat(depth);
+        if !visited.insert(func.name.as_str()) {
+            out.push_str(&format!(
+                "{}{:>6.1}%  {}  (recursive)\n",
+                indent, pct, func.name,
+            ));
+            return;
+        }
         out.push_str(&format!(
             "{}{:>6.1}%  {}  ({}x)\n",
             indent, pct, func.name, func.call_count,
@@ -594,31 +646,35 @@ impl ProfileIndex {
         sorted.sort_by(|a, b| b.time.cmp(&a.time));
         for call in &sorted {
             if let Some(callee) = fn_map.get(call.callee.as_str()) {
-                self.tree_recurse(callee, depth + 1, fn_map, out, max_depth);
+                self.tree_recurse(callee, depth + 1, fn_map, out, max_depth, visited);
             }
         }
+        visited.remove(func.name.as_str());
     }
 
     /// `hotpath` — the single most expensive call chain.
     pub fn cmd_hotpath(&self) -> String {
-        let fn_map: HashMap<&str, &PhpFunction> = self
-            .functions
+        let filtered: Vec<&PhpFunction> = self.filter("");
+        let fn_map: HashMap<&str, &PhpFunction> = filtered
             .iter()
-            .map(|f| (f.name.as_str(), f))
+            .map(|f| (f.name.as_str(), *f))
             .collect();
 
-        // Find the root with the most inclusive time
-        let called_names: std::collections::HashSet<&str> = self
-            .functions
+        // Find the root with the most inclusive time (among filtered functions)
+        let called_names: std::collections::HashSet<&str> = filtered
             .iter()
             .flat_map(|f| f.calls.iter().map(|c| c.callee.as_str()))
             .collect();
 
-        let root = self
-            .functions
+        let root = filtered
             .iter()
             .filter(|f| !called_names.contains(f.name.as_str()) && f.inclusive_time > 0)
-            .max_by_key(|f| f.inclusive_time);
+            .max_by_key(|f| f.inclusive_time)
+            .or_else(|| {
+                // No uncalled root found (e.g. focus on mutually-recursive functions).
+                // Fall back to the function with the highest inclusive time.
+                filtered.iter().filter(|f| f.inclusive_time > 0).max_by_key(|f| f.inclusive_time)
+            });
 
         let Some(root) = root else {
             return "no call data\n".to_string();
@@ -628,8 +684,9 @@ impl ProfileIndex {
             "hottest path ({}):\n",
             Self::format_time(root.inclusive_time)
         );
-        let mut current = root;
+        let mut current = *root;
         let mut depth = 0;
+        let mut visited = std::collections::HashSet::new();
         loop {
             let indent = "  ".repeat(depth);
             out.push_str(&format!(
@@ -639,14 +696,19 @@ impl ProfileIndex {
                 Self::format_time(current.self_time),
                 current.call_count,
             ));
-            // Follow the callee with the highest time
-            if let Some(hottest_call) = current.calls.iter().max_by_key(|c| c.time) {
-                if let Some(callee) = fn_map.get(hottest_call.callee.as_str()) {
-                    current = callee;
-                    depth += 1;
-                } else {
-                    break;
-                }
+            if !visited.insert(current.name.as_str()) {
+                out.push_str(&format!("{}  (recursive)\n", indent));
+                break;
+            }
+            // Follow the callee with the highest time (among filtered functions)
+            let hottest_call = current
+                .calls
+                .iter()
+                .filter(|c| fn_map.contains_key(c.callee.as_str()))
+                .max_by_key(|c| c.time);
+            if let Some(hottest_call) = hottest_call {
+                current = fn_map[hottest_call.callee.as_str()];
+                depth += 1;
             } else {
                 break;
             }
@@ -655,20 +717,34 @@ impl ProfileIndex {
     }
 }
 
-fn parse_id_assignment(s: &str) -> Option<(u32, &str)> {
-    // Parse "(123) name" or "(123)"
+fn parse_id_assignment<'a>(
+    s: &'a str,
+    bare_name_ids: &mut HashMap<String, u32>,
+    next_bare_id: &mut u32,
+) -> Option<(u32, &'a str)> {
     let s = s.trim();
-    if !s.starts_with('(') {
+    if s.is_empty() {
         return None;
     }
-    let end_paren = s.find(')')?;
-    let id: u32 = s[1..end_paren].parse().ok()?;
-    let rest = s[end_paren + 1..].trim();
-    Some((id, rest))
+    // Standard callgrind format: "(123) name" or "(123)"
+    if s.starts_with('(') {
+        let end_paren = s.find(')')?;
+        let id: u32 = s[1..end_paren].parse().ok()?;
+        let rest = s[end_paren + 1..].trim();
+        return Some((id, rest));
+    }
+    // Bare name format (e.g. stackprof --callgrind): "Object#fibonacci"
+    let name = s;
+    let id = *bare_name_ids.entry(name.to_string()).or_insert_with(|| {
+        let id = *next_bare_id;
+        *next_bare_id += 1;
+        id
+    });
+    Some((id, name))
 }
 
 /// Run the interactive REPL. Reads commands from stdin, writes results to stdout.
-pub fn run_repl(cachegrind_path: &str) -> io::Result<()> {
+pub fn run_repl(cachegrind_path: &str, prompt: &str) -> io::Result<()> {
     let text = std::fs::read_to_string(cachegrind_path)?;
     let mut index = ProfileIndex::parse(&text);
 
@@ -682,7 +758,7 @@ pub fn run_repl(cachegrind_path: &str) -> io::Result<()> {
     let mut stdout = io::stdout();
 
     loop {
-        print!("php-profile> ");
+        print!("{prompt}");
         stdout.flush()?;
 
         let mut line = String::new();
@@ -982,16 +1058,35 @@ mod tests {
 
     #[test]
     fn parse_id_assignment_with_name() {
-        let (id, name) = parse_id_assignment("(2) /tmp/demo.php").unwrap();
+        let mut bare = HashMap::new();
+        let mut next = 500_000;
+        let (id, name) = parse_id_assignment("(2) /tmp/demo.php", &mut bare, &mut next).unwrap();
         assert_eq!(id, 2);
         assert_eq!(name, "/tmp/demo.php");
     }
 
     #[test]
     fn parse_id_assignment_without_name() {
-        let (id, name) = parse_id_assignment("(2)").unwrap();
+        let mut bare = HashMap::new();
+        let mut next = 500_000;
+        let (id, name) = parse_id_assignment("(2)", &mut bare, &mut next).unwrap();
         assert_eq!(id, 2);
         assert_eq!(name, "");
+    }
+
+    #[test]
+    fn parse_id_assignment_bare_name() {
+        let mut bare = HashMap::new();
+        let mut next = 500_000;
+        let (id, name) = parse_id_assignment("Object#fibonacci", &mut bare, &mut next).unwrap();
+        assert_eq!(id, 500_000);
+        assert_eq!(name, "Object#fibonacci");
+        // Same name should return same id
+        let (id2, _) = parse_id_assignment("Object#fibonacci", &mut bare, &mut next).unwrap();
+        assert_eq!(id2, 500_000);
+        // Different name gets next id
+        let (id3, _) = parse_id_assignment("Object#compute", &mut bare, &mut next).unwrap();
+        assert_eq!(id3, 500_001);
     }
 
     #[test]
@@ -1036,6 +1131,57 @@ mod tests {
     }
 
     #[test]
+    fn cmd_hotpath_terminates_on_recursion() {
+        let cg = "\
+events: Time Memory
+summary: 1000 0
+
+fl=(1) test.rb
+fn=(1) main
+1 100 0
+cfn=(2)
+calls=1 1
+1 900 0
+
+fn=(2) fib
+1 500 0
+cfn=(2)
+calls=100 1
+1 400 0
+";
+        let idx = ProfileIndex::parse(cg);
+        let out = idx.cmd_hotpath();
+        assert!(out.contains("recursive"), "output: {}", out);
+        // Must terminate, not infinite loop
+        assert!(out.lines().count() < 10);
+    }
+
+    #[test]
+    fn cmd_tree_terminates_on_recursion() {
+        let cg = "\
+events: Time Memory
+summary: 1000 0
+
+fl=(1) test.rb
+fn=(1) main
+1 100 0
+cfn=(2)
+calls=1 1
+1 900 0
+
+fn=(2) fib
+1 500 0
+cfn=(2)
+calls=100 1
+1 400 0
+";
+        let idx = ProfileIndex::parse(cg);
+        let out = idx.cmd_tree(5);
+        assert!(out.contains("recursive"));
+        assert!(out.lines().count() < 10);
+    }
+
+    #[test]
     fn focus_filters_hotspots() {
         let mut idx = ProfileIndex::parse(SAMPLE);
         idx.focus = Some("Matrix".to_string());
@@ -1075,5 +1221,571 @@ mod tests {
         let out = idx.cmd_hotspots(20, "");
         assert!(out.contains("buildRandom"));
         assert!(out.contains("Matrix->multiply"));
+    }
+
+    #[test]
+    fn focus_filters_hotpath() {
+        let mut idx = ProfileIndex::parse(SAMPLE);
+        idx.focus = Some("Matrix".to_string());
+        let out = idx.cmd_hotpath();
+        // Should only follow Matrix-prefixed functions
+        for line in out.lines().skip(1) {
+            // Each "→ name" line should be a Matrix function
+            if let Some(name_part) = line.trim().strip_prefix("→ ") {
+                let name = name_part.split("  ").next().unwrap_or("");
+                assert!(name.contains("Matrix"), "unexpected function in focused hotpath: {}", name);
+            }
+        }
+        assert!(!out.contains("buildRandom"));
+        assert!(!out.contains("{main}"));
+    }
+
+    #[test]
+    fn focus_filters_tree() {
+        let mut idx = ProfileIndex::parse(SAMPLE);
+        idx.focus = Some("Matrix".to_string());
+        let out = idx.cmd_tree(5);
+        assert!(!out.contains("buildRandom"), "tree output: {}", out);
+        assert!(!out.contains("{main}"), "tree output: {}", out);
+        assert!(!out.contains("php::"), "tree output: {}", out);
+        // Should contain Matrix functions
+        assert!(out.contains("Matrix"), "tree output: {}", out);
+    }
+
+    #[test]
+    fn ignore_filters_hotpath() {
+        let mut idx = ProfileIndex::parse(SAMPLE);
+        idx.ignore = Some("multiply".to_string());
+        let out = idx.cmd_hotpath();
+        assert!(!out.contains("multiply"), "hotpath output: {}", out);
+    }
+
+    #[test]
+    fn ignore_filters_tree() {
+        let mut idx = ProfileIndex::parse(SAMPLE);
+        idx.ignore = Some("multiply".to_string());
+        let out = idx.cmd_tree(5);
+        assert!(!out.contains("multiply"), "tree output: {}", out);
+    }
+
+    // =========================================================================
+    // StackProf / Ruby profiler (bare-name callgrind format)
+    // =========================================================================
+    mod stackprof {
+        use super::*;
+
+        const SAMPLE: &str = include_str!("../tests/fixtures/stackprof_callgrind_sample.out");
+
+        #[test]
+        fn parse_finds_all_functions() {
+            let idx = ProfileIndex::parse(SAMPLE);
+            // Set#add, Object#fibonacci, block in <top (required)>,
+            // <top (required)>, Benchmark.measure, Kernel#load, Set#include?
+            assert_eq!(idx.functions.len(), 7);
+        }
+
+        #[test]
+        fn parse_totals() {
+            let idx = ProfileIndex::parse(SAMPLE);
+            assert_eq!(idx.total_time, 313470);
+        }
+
+        #[test]
+        fn parse_bare_name_self_time() {
+            let idx = ProfileIndex::parse(SAMPLE);
+            let fib = idx.functions.iter().find(|f| f.name == "Object#fibonacci").unwrap();
+            assert_eq!(fib.self_time, 16200);
+        }
+
+        #[test]
+        fn parse_bare_name_calls() {
+            let idx = ProfileIndex::parse(SAMPLE);
+            let fib = idx.functions.iter().find(|f| f.name == "Object#fibonacci").unwrap();
+            assert_eq!(fib.calls.len(), 1);
+            let self_call = &fib.calls[0];
+            assert_eq!(self_call.callee, "Object#fibonacci");
+            assert_eq!(self_call.call_count, 2624);
+        }
+
+        #[test]
+        fn parse_inclusive_time() {
+            let idx = ProfileIndex::parse(SAMPLE);
+            let fib = idx.functions.iter().find(|f| f.name == "Object#fibonacci").unwrap();
+            // self 16200 + recursive call 262400
+            assert_eq!(fib.inclusive_time, 16200 + 262400);
+        }
+
+        #[test]
+        fn cmd_hotspots() {
+            let idx = ProfileIndex::parse(SAMPLE);
+            let out = idx.cmd_hotspots(5, "");
+            assert!(out.contains("Object#fibonacci"));
+        }
+
+        #[test]
+        fn cmd_flat() {
+            let idx = ProfileIndex::parse(SAMPLE);
+            let out = idx.cmd_flat(5, "");
+            // fibonacci has highest self time
+            let lines: Vec<&str> = out.lines().collect();
+            assert!(lines[2].contains("Object#fibonacci"));
+        }
+
+        #[test]
+        fn cmd_calls() {
+            let idx = ProfileIndex::parse(SAMPLE);
+            let out = idx.cmd_calls("fibonacci");
+            assert!(out.contains("Object#fibonacci"));
+            assert!(out.contains("2624x"));
+        }
+
+        #[test]
+        fn cmd_callers() {
+            let idx = ProfileIndex::parse(SAMPLE);
+            let out = idx.cmd_callers("fibonacci");
+            assert!(out.contains("block in <top (required)>"));
+            assert!(out.contains("Object#fibonacci"));
+        }
+
+        #[test]
+        fn cmd_inspect() {
+            let idx = ProfileIndex::parse(SAMPLE);
+            let out = idx.cmd_inspect("fibonacci");
+            assert!(out.contains("Object#fibonacci"));
+            assert!(out.contains("Self:"));
+            assert!(out.contains("Inclusive:"));
+        }
+
+        #[test]
+        fn cmd_search() {
+            let idx = ProfileIndex::parse(SAMPLE);
+            let out = idx.cmd_search("Object");
+            assert!(out.contains("Object#fibonacci"));
+        }
+
+        #[test]
+        fn cmd_stats() {
+            let idx = ProfileIndex::parse(SAMPLE);
+            let out = idx.cmd_stats("");
+            assert!(out.contains("Functions:      7"));
+        }
+
+        #[test]
+        fn cmd_hotpath_terminates_on_recursion() {
+            let idx = ProfileIndex::parse(SAMPLE);
+            let out = idx.cmd_hotpath();
+            assert!(out.contains("hottest path"), "output: {}", out);
+            // fibonacci is recursive — must not infinite loop
+            assert!(out.lines().count() < 20, "output: {}", out);
+            // If the hotpath reaches fibonacci→fibonacci, it should mark recursion
+            if out.contains("Object#fibonacci") {
+                let fib_count = out.matches("Object#fibonacci").count();
+                // Should appear at most twice (enter + recursive marker)
+                assert!(fib_count <= 2, "fibonacci appears {} times: {}", fib_count, out);
+            }
+        }
+
+        #[test]
+        fn cmd_tree_terminates_on_recursion() {
+            let idx = ProfileIndex::parse(SAMPLE);
+            let out = idx.cmd_tree(5);
+            assert!(out.lines().count() < 30, "output: {}", out);
+        }
+    }
+
+    // =========================================================================
+    // Callgrind / native profiler (valgrind numeric-ID format)
+    // =========================================================================
+    mod callgrind_native {
+        use super::*;
+
+        const SAMPLE: &str = include_str!("../tests/fixtures/callgrind_native_sample.out");
+
+        #[test]
+        fn parse_finds_all_functions() {
+            let idx = ProfileIndex::parse(SAMPLE);
+            // main, matrix_set, matrix_multiply, build_random, matrix_trace,
+            // qsort_compare, do_sort
+            assert_eq!(idx.functions.len(), 7);
+        }
+
+        #[test]
+        fn parse_totals() {
+            let idx = ProfileIndex::parse(SAMPLE);
+            assert_eq!(idx.total_time, 2473500);
+        }
+
+        #[test]
+        fn parse_self_time() {
+            let idx = ProfileIndex::parse(SAMPLE);
+            let mul = idx.functions.iter().find(|f| f.name == "matrix_multiply").unwrap();
+            assert_eq!(mul.self_time, 175000);
+        }
+
+        #[test]
+        fn parse_forward_ref_callee() {
+            let idx = ProfileIndex::parse(SAMPLE);
+            // main calls build_random (cfn=(4) appears before fn=(4) is defined)
+            let main = idx.functions.iter().find(|f| f.name == "main").unwrap();
+            let br = main.calls.iter().find(|c| c.callee == "build_random").unwrap();
+            assert_eq!(br.call_count, 2);
+        }
+
+        #[test]
+        fn parse_back_ref_callee() {
+            let idx = ProfileIndex::parse(SAMPLE);
+            // matrix_multiply calls matrix_set (cfn=(2) after fn=(2) defined)
+            let mul = idx.functions.iter().find(|f| f.name == "matrix_multiply").unwrap();
+            let set = mul.calls.iter().find(|c| c.callee == "matrix_set").unwrap();
+            assert_eq!(set.call_count, 900);
+        }
+
+        #[test]
+        fn parse_recursive_calls() {
+            let idx = ProfileIndex::parse(SAMPLE);
+            let qsort = idx.functions.iter().find(|f| f.name == "qsort_compare").unwrap();
+            assert_eq!(qsort.calls.len(), 1);
+            assert_eq!(qsort.calls[0].callee, "qsort_compare");
+            assert_eq!(qsort.calls[0].call_count, 3100);
+        }
+
+        #[test]
+        fn cmd_hotspots() {
+            let idx = ProfileIndex::parse(SAMPLE);
+            let out = idx.cmd_hotspots(5, "");
+            assert!(out.contains("main"));
+            assert!(out.contains("qsort_compare"));
+        }
+
+        #[test]
+        fn cmd_flat() {
+            let idx = ProfileIndex::parse(SAMPLE);
+            let out = idx.cmd_flat(5, "");
+            assert!(out.contains("matrix_multiply"));
+        }
+
+        #[test]
+        fn cmd_calls() {
+            let idx = ProfileIndex::parse(SAMPLE);
+            let out = idx.cmd_calls("main");
+            assert!(out.contains("build_random"));
+            assert!(out.contains("matrix_multiply"));
+            assert!(out.contains("matrix_trace"));
+        }
+
+        #[test]
+        fn cmd_callers() {
+            let idx = ProfileIndex::parse(SAMPLE);
+            let out = idx.cmd_callers("matrix_set");
+            assert!(out.contains("matrix_multiply"));
+            assert!(out.contains("build_random"));
+        }
+
+        #[test]
+        fn cmd_inspect() {
+            let idx = ProfileIndex::parse(SAMPLE);
+            let out = idx.cmd_inspect("qsort_compare");
+            assert!(out.contains("Self:"));
+            assert!(out.contains("Callees:"));
+            assert!(out.contains("qsort_compare"));
+        }
+
+        #[test]
+        fn cmd_search() {
+            let idx = ProfileIndex::parse(SAMPLE);
+            let out = idx.cmd_search("matrix");
+            assert!(out.contains("matrix_multiply"));
+            assert!(out.contains("matrix_set"));
+            assert!(out.contains("matrix_trace"));
+        }
+
+        #[test]
+        fn cmd_stats() {
+            let idx = ProfileIndex::parse(SAMPLE);
+            let out = idx.cmd_stats("");
+            assert!(out.contains("Functions:      7"));
+        }
+
+        #[test]
+        fn cmd_hotpath_terminates_on_recursion() {
+            let idx = ProfileIndex::parse(SAMPLE);
+            let out = idx.cmd_hotpath();
+            assert!(out.contains("hottest path"), "output: {}", out);
+            // qsort_compare is recursive — must not infinite loop
+            assert!(out.lines().count() < 20, "output: {}", out);
+            if out.contains("qsort_compare") {
+                let count = out.matches("qsort_compare").count();
+                assert!(count <= 2, "qsort_compare appears {} times: {}", count, out);
+            }
+        }
+
+        #[test]
+        fn cmd_tree_terminates_on_recursion() {
+            let idx = ProfileIndex::parse(SAMPLE);
+            let out = idx.cmd_tree(5);
+            assert!(out.lines().count() < 30, "output: {}", out);
+            // Recursive functions should be marked
+            if out.contains("qsort_compare") {
+                // Should appear but not blow up
+                let count = out.matches("qsort_compare").count();
+                assert!(count <= 3, "qsort_compare appears {} times: {}", count, out);
+            }
+        }
+
+        #[test]
+        fn cmd_hotpath_follows_through_forward_refs() {
+            let idx = ProfileIndex::parse(SAMPLE);
+            let out = idx.cmd_hotpath();
+            // main→build_random or main→matrix_multiply should be reachable
+            // (not broken by forward-ref callee resolution)
+            assert!(out.contains("main"), "output: {}", out);
+            let lines = out.lines().count();
+            // Should follow at least 2 levels deep
+            assert!(lines >= 3, "hotpath too shallow ({}): {}", lines, out);
+        }
+    }
+
+    // =========================================================================
+    // Xdebug / PHP profiler — recursion-specific tests
+    // (basic parsing already covered by top-level tests using SAMPLE)
+    // =========================================================================
+    mod xdebug_recursion {
+        use super::*;
+
+        /// PHP-style recursive function (e.g. recursive directory scan)
+        const RECURSIVE_PHP: &str = "\
+events: Time_(10ns) Memory_(bytes)
+
+fl=(1) /app/scan.php
+fn=(1) {main}
+1 500 0
+cfl=(1)
+cfn=(2)
+calls=1 5
+1 90000 40000
+
+fl=(1)
+fn=(2) scan_dir
+5 3000 1000
+cfl=(1)
+cfn=(2)
+calls=50 5
+6 85000 38000
+cfl=(1)
+cfn=(3)
+calls=200 20
+10 2000 1000
+
+fl=(1)
+fn=(3) process_file
+20 2000 1000
+
+summary: 182500 80000
+";
+
+        #[test]
+        fn parse_finds_all_functions() {
+            let idx = ProfileIndex::parse(RECURSIVE_PHP);
+            assert_eq!(idx.functions.len(), 3);
+        }
+
+        #[test]
+        fn parse_recursive_self_call() {
+            let idx = ProfileIndex::parse(RECURSIVE_PHP);
+            let scan = idx.functions.iter().find(|f| f.name == "scan_dir").unwrap();
+            let self_call = scan.calls.iter().find(|c| c.callee == "scan_dir").unwrap();
+            assert_eq!(self_call.call_count, 50);
+        }
+
+        #[test]
+        fn cmd_hotpath_terminates() {
+            let idx = ProfileIndex::parse(RECURSIVE_PHP);
+            let out = idx.cmd_hotpath();
+            assert!(out.contains("hottest path"), "output: {}", out);
+            assert!(out.contains("recursive"), "output: {}", out);
+            assert!(out.lines().count() < 10, "output: {}", out);
+        }
+
+        #[test]
+        fn cmd_tree_terminates() {
+            let idx = ProfileIndex::parse(RECURSIVE_PHP);
+            let out = idx.cmd_tree(5);
+            assert!(out.contains("recursive"), "output: {}", out);
+            assert!(out.lines().count() < 15, "output: {}", out);
+        }
+
+        #[test]
+        fn cmd_hotspots() {
+            let idx = ProfileIndex::parse(RECURSIVE_PHP);
+            let out = idx.cmd_hotspots(5, "");
+            assert!(out.contains("scan_dir"));
+        }
+
+        #[test]
+        fn cmd_calls() {
+            let idx = ProfileIndex::parse(RECURSIVE_PHP);
+            let out = idx.cmd_calls("scan_dir");
+            assert!(out.contains("scan_dir"));
+            assert!(out.contains("50x"));
+            assert!(out.contains("process_file"));
+        }
+
+        #[test]
+        fn cmd_callers() {
+            let idx = ProfileIndex::parse(RECURSIVE_PHP);
+            let out = idx.cmd_callers("scan_dir");
+            assert!(out.contains("{main}"));
+            assert!(out.contains("scan_dir")); // recursive caller
+        }
+
+        #[test]
+        fn cmd_inspect() {
+            let idx = ProfileIndex::parse(RECURSIVE_PHP);
+            let out = idx.cmd_inspect("scan_dir");
+            assert!(out.contains("Self:"));
+            assert!(out.contains("Inclusive:"));
+            assert!(out.contains("Callees:"));
+        }
+
+        #[test]
+        fn cmd_stats() {
+            let idx = ProfileIndex::parse(RECURSIVE_PHP);
+            let out = idx.cmd_stats("");
+            assert!(out.contains("Functions:      3"));
+        }
+
+        #[test]
+        fn focus_on_recursive_fn_shows_hotpath() {
+            let mut idx = ProfileIndex::parse(RECURSIVE_PHP);
+            idx.focus = Some("scan_dir".to_string());
+            let out = idx.cmd_hotpath();
+            assert!(out.contains("scan_dir"), "output: {}", out);
+            assert!(out.contains("recursive"), "output: {}", out);
+        }
+
+        #[test]
+        fn focus_on_recursive_fn_shows_tree() {
+            let mut idx = ProfileIndex::parse(RECURSIVE_PHP);
+            idx.focus = Some("scan_dir".to_string());
+            let out = idx.cmd_tree(5);
+            assert!(out.contains("scan_dir"), "output: {}", out);
+            assert!(!out.contains("{main}"), "output: {}", out);
+            assert!(!out.contains("process_file"), "output: {}", out);
+        }
+    }
+
+    // =========================================================================
+    // Cross-recursion with focus/ignore filters
+    // =========================================================================
+    mod cross_recursion_filters {
+        use super::*;
+
+        /// mutual_a ↔ mutual_b cross-recursion, plus fibonacci (self-recursive)
+        const CROSS_RECURSIVE: &str = "\
+events: Time_(10ns) Memory_(bytes)
+
+fl=(1) /app/test.php
+fn=(1) {main}
+1 500 0
+cfn=(2)
+calls=10 5
+1 30000 0
+cfn=(4)
+calls=5 20
+1 50000 0
+
+fl=(1)
+fn=(2) mutual_a
+5 2000 0
+cfn=(3)
+calls=20000 10
+6 15000 0
+cfn=(2)
+calls=20000 10
+6 13000 0
+
+fl=(1)
+fn=(3) mutual_b
+10 1500 0
+cfn=(2)
+calls=20000 5
+11 14000 0
+
+fl=(1)
+fn=(4) fibonacci
+20 25000 0
+cfn=(4)
+calls=5000000 20
+20 25000 0
+
+summary: 176000 0
+";
+
+        #[test]
+        fn parse_cross_recursion() {
+            let idx = ProfileIndex::parse(CROSS_RECURSIVE);
+            let a = idx.functions.iter().find(|f| f.name == "mutual_a").unwrap();
+            let b_call = a.calls.iter().find(|c| c.callee == "mutual_b").unwrap();
+            assert_eq!(b_call.call_count, 20000);
+            let b = idx.functions.iter().find(|f| f.name == "mutual_b").unwrap();
+            let a_call = b.calls.iter().find(|c| c.callee == "mutual_a").unwrap();
+            assert_eq!(a_call.call_count, 20000);
+        }
+
+        #[test]
+        fn hotpath_terminates_with_cross_recursion() {
+            let idx = ProfileIndex::parse(CROSS_RECURSIVE);
+            let out = idx.cmd_hotpath();
+            assert!(out.lines().count() < 15, "output: {}", out);
+        }
+
+        #[test]
+        fn tree_terminates_with_cross_recursion() {
+            let idx = ProfileIndex::parse(CROSS_RECURSIVE);
+            let out = idx.cmd_tree(5);
+            assert!(out.lines().count() < 20, "output: {}", out);
+        }
+
+        #[test]
+        fn focus_mutual_shows_cross_recursive_hotpath() {
+            let mut idx = ProfileIndex::parse(CROSS_RECURSIVE);
+            idx.focus = Some("mutual".to_string());
+            let out = idx.cmd_hotpath();
+            // Should find mutual_a as root (highest inclusive time among mutual_*)
+            assert!(out.contains("mutual_a"), "output: {}", out);
+            assert!(out.contains("mutual_b"), "output: {}", out);
+            assert!(out.contains("recursive"), "output: {}", out);
+            assert!(!out.contains("fibonacci"), "output: {}", out);
+            assert!(!out.contains("{main}"), "output: {}", out);
+        }
+
+        #[test]
+        fn focus_mutual_shows_cross_recursive_tree() {
+            let mut idx = ProfileIndex::parse(CROSS_RECURSIVE);
+            idx.focus = Some("mutual".to_string());
+            let out = idx.cmd_tree(5);
+            assert!(out.contains("mutual_a"), "output: {}", out);
+            assert!(out.contains("mutual_b"), "output: {}", out);
+            assert!(!out.contains("fibonacci"), "output: {}", out);
+            assert!(!out.contains("{main}"), "output: {}", out);
+        }
+
+        #[test]
+        fn ignore_fibonacci_keeps_mutual() {
+            let mut idx = ProfileIndex::parse(CROSS_RECURSIVE);
+            idx.ignore = Some("fibonacci".to_string());
+            let out = idx.cmd_tree(5);
+            assert!(out.contains("mutual_a"), "output: {}", out);
+            assert!(!out.contains("fibonacci"), "output: {}", out);
+        }
+
+        #[test]
+        fn ignore_mutual_keeps_fibonacci() {
+            let mut idx = ProfileIndex::parse(CROSS_RECURSIVE);
+            idx.ignore = Some("mutual".to_string());
+            let out = idx.cmd_hotpath();
+            assert!(!out.contains("mutual"), "output: {}", out);
+            assert!(out.contains("fibonacci"), "output: {}", out);
+        }
     }
 }

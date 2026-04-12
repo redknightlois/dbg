@@ -1,0 +1,59 @@
+version: 1
+creator: callgrind-3.22.0
+pid: 12345
+cmd: ./matrix_bench
+part: 1
+positions: line
+
+events: Ir
+
+fl=(1) /tmp/matrix_bench.c
+fn=(1) main
+56 15000
+cfn=(4) build_random
+calls=2 47
+57 320000
+cfn=(3) matrix_multiply
+calls=1 23
+59 580000
+cfn=(5) matrix_trace
+calls=1 36
+60 8500
+
+fl=(1)
+fn=(2) matrix_set
+16 95000
+
+fl=(1)
+fn=(3) matrix_multiply
+23 175000
+cfn=(2)
+calls=900 16
+30 85500
+
+fl=(1)
+fn=(4) build_random
+47 146000
+cfn=(2)
+calls=1800 16
+51 171000
+
+fl=(1)
+fn=(5) matrix_trace
+36 8500
+
+fl=(1)
+fn=(6) qsort_compare
+70 42000
+cfn=(6)
+calls=3100 70
+70 390000
+
+fl=(1)
+fn=(7) do_sort
+80 5000
+cfn=(6)
+calls=1 70
+80 432000
+
+summary: 2473500

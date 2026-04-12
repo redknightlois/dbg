@@ -1,0 +1,49 @@
+events: Time_(10ns)
+
+fl=/usr/lib/ruby/3.2.0/set.rb
+fn=Set#add
+1 300
+
+fl=/tmp/app.rb
+fn=Object#fibonacci
+5 16200
+cfn=Object#fibonacci
+calls=2624 5
+5 262400
+
+fl=/tmp/app.rb
+fn=block in <top (required)>
+10 50
+cfn=Object#fibonacci
+calls=160 5
+10 16000
+
+fl=/tmp/app.rb
+fn=<top (required)>
+1 1660
+cfn=block in <top (required)>
+calls=1 10
+1 16050
+cfn=Kernel#load
+calls=1 1
+1 200
+
+fl=/usr/lib/ruby/3.2.0/benchmark.rb
+fn=Benchmark.measure
+20 500
+cfn=block in <top (required)>
+calls=1 10
+20 16050
+
+fl=/tmp/app.rb
+fn=Kernel#load
+1 200
+cfn=<top (required)>
+calls=1 1
+1 17710
+
+fl=/usr/lib/ruby/3.2.0/set.rb
+fn=Set#include?
+1 100
+
+summary: 313470
