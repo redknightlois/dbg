@@ -1,0 +1,13 @@
+# Normalize all text files to LF in the repo
+* text=auto eol=lf
+*.rs text eol=lf
+*.toml text eol=lf
+*.md text eol=lf
+*.json text eol=lf
+*.yaml text eol=lf
+*.yml text eol=lf
+*.lock text eol=lf
+*.sh text eol=lf
+*.png binary
+*.jpg binary
+*.ico binary
