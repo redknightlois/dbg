@@ -82,7 +82,7 @@ The .NET JIT uses **single colon** `Class:Method` notation, NOT C++ double-colon
 
 | Symptom | Fix |
 |---------|-----|
-| No methods captured | Method must execute at runtime — ensure the code path is hit |
+| No methods captured | The target must be an **executable** project (has a `Main`), not a library. Use a test project, benchmark, or console app that calls the code. |
 | `Class::Method` not found | Use single colon: `Class:Method` (JIT convention) |
 | Too much output | Use a specific pattern: `--args "Class:Method"` |
 | App exits immediately | The app needs to run long enough for JIT compilation |

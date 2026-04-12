@@ -17,69 +17,39 @@ description: >
 
 # dbg
 
-Persistent CLI for debugging, profiling, and JIT disassembly. Keeps the backend alive across commands via a UNIX socket daemon.
+Persistent CLI for debugging, profiling, and JIT disassembly. Run `dbg` with no arguments to see all available backends.
 
-## When to Use
+## Pick the right backend
 
-- **Debugging** — understand runtime state: variable values, execution flow, thread state
-- **Profiling** — find bottlenecks, memory leaks, time spent (pprof, perf, callgrind, memcheck, massif, cProfile, dotnet-trace, stackprof, xdebug, GHC profiling)
-- **JIT disassembly** — inspect generated machine code: SIMD vectorization, bounds checks, register allocation, codegen quality (`dbg start jitdasm`)
+The backend type is NOT always a language name. Match the user's goal:
 
-## When Not to Use
+| Goal | Backend type | NOT |
+|------|-------------|-----|
+| Debug .NET code | `dotnet` | |
+| Profile .NET code | `dotnet-trace` | `dotnet` |
+| .NET JIT disassembly | `jitdasm` | `dotnet` |
+| Profile C/C++/Rust | `callgrind` or `perf` | `lldb` |
+| Memory errors | `memcheck` | `lldb` |
+| Heap profiling | `massif` | `lldb` |
 
-- Pure logic bugs obvious from reading the code
-- Observing patterns across many execution points simultaneously where setting that many breakpoints is impractical — use logging instead
+**Load the adapter** from `references/adapters/` matching the backend type. The adapter has preconditions, commands, and workflows. Follow the adapter.
 
-## Sandbox Warning
-
-Debugging requires process control (fork, ptrace, PTY). If running inside a sandbox (e.g., Codex with bubblewrap), `dbg start` will fail. Run dbg commands without sandboxing.
-
----
-
-## Getting Started
-
-1. **Run `dbg` with no arguments** to see all backends and their status.
-
-2. **Pick the right backend.** Match the user's goal to a backend type — this is not always a language name. JIT disassembly uses `jitdasm`, not `dotnet`. Profiling uses `callgrind`, `perf`, `pyprofile`, etc.
-
-3. **Load the adapter** from `references/adapters/` matching the backend. The adapter defines preconditions, commands, and workflows. If no adapter exists, ask the user what tool they use.
-
-4. **Check preconditions** from the adapter. If any fail, report the failure and the adapter's fix. On any subsequent failure, re-check preconditions before retrying.
-
-## Starting a Session
+## Usage
 
 ```
 dbg start <type> <target> [--break <spec>] [--args ...] [--run]
+dbg <command>              # send command to running session
+dbg help                   # list commands the backend supports
+dbg kill                   # stop session (always do this when done)
 ```
 
-The `<type>` comes from the backend list. The `<target>` is backend-specific — check the adapter. The daemon stays alive until `dbg kill`.
+## Sandbox Warning
 
-## Debugging Commands
-
-```
-dbg run                    # hit the breakpoint
-dbg bt                     # backtrace
-dbg locals                 # local variables
-dbg print <expr>           # evaluate expression
-dbg next                   # step over
-dbg step                   # step into
-dbg finish                 # step out
-dbg continue               # run to next breakpoint
-dbg break <spec>           # add breakpoint
-dbg help                   # list available commands
-```
-
-Keep investigating — do not ask "should I continue?" — until the goal is met or you need user input on an ambiguity.
-
-## When Done
-
-1. `dbg kill` — always stop the session. Leaked debugger processes hold file locks.
-2. Report: root cause (or what was ruled out), file:line, observed state, suggested fix.
-3. If the user wants a fix, implement it directly.
+Requires process control (fork, ptrace, PTY). Will fail inside sandboxes. Use unsandboxed execution.
 
 ## Rules
 
-- Load the adapter first. Everything backend-specific lives there, not here.
-- Check preconditions on first failure before retrying anything.
-- Never modify the dbg CLI or its daemons. They are tested infrastructure.
-- Interpret debugger output — translate mangled names, explain type layouts, summarize state. Raw output is noisy; your value is synthesis.
+- Load the adapter first. Everything backend-specific lives there.
+- Check preconditions from the adapter before starting.
+- Always `dbg kill` when done — leaked processes hold file locks.
+- Interpret output for the user — translate mangled names, summarize state.

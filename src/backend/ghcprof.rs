@@ -9,6 +9,10 @@ impl Backend for GhcProfBackend {
         "ghc-profile"
     }
 
+    fn description(&self) -> &'static str {
+        "Haskell profiler (GHC)"
+    }
+
     fn types(&self) -> &'static [&'static str] {
         &["haskell-profile", "hs-profile"]
     }

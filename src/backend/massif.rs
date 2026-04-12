@@ -8,6 +8,10 @@ impl Backend for MassifBackend {
         "massif"
     }
 
+    fn description(&self) -> &'static str {
+        "heap profiler (valgrind)"
+    }
+
     fn types(&self) -> &'static [&'static str] {
         &["massif"]
     }

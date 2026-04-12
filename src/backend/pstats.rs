@@ -8,6 +8,10 @@ impl Backend for PstatsBackend {
         "pstats"
     }
 
+    fn description(&self) -> &'static str {
+        "Python cProfile profiler"
+    }
+
     fn types(&self) -> &'static [&'static str] {
         &["pyprofile"]
     }

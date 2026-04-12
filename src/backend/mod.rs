@@ -80,6 +80,9 @@ pub trait Backend: Send + Sync {
     /// Human-readable name for this backend.
     fn name(&self) -> &'static str;
 
+    /// Short description shown in backend listing.
+    fn description(&self) -> &'static str;
+
     /// The type names this backend handles.
     fn types(&self) -> &'static [&'static str];
 

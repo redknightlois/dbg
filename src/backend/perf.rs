@@ -7,6 +7,10 @@ impl Backend for PerfBackend {
         "perf"
     }
 
+    fn description(&self) -> &'static str {
+        "Linux performance profiler"
+    }
+
     fn types(&self) -> &'static [&'static str] {
         &["perf"]
     }

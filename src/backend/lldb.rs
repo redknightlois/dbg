@@ -9,6 +9,10 @@ impl Backend for LldbBackend {
         "lldb"
     }
 
+    fn description(&self) -> &'static str {
+        "native debugger for Rust, C, C++, Zig, D, Nim"
+    }
+
     fn types(&self) -> &'static [&'static str] {
         &["rust", "c", "cpp", "zig", "d", "nim"]
     }

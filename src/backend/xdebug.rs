@@ -8,6 +8,10 @@ impl Backend for XdebugProfileBackend {
         "xdebug-profile"
     }
 
+    fn description(&self) -> &'static str {
+        "PHP profiler (Xdebug)"
+    }
+
     fn types(&self) -> &'static [&'static str] {
         &["php-profile"]
     }

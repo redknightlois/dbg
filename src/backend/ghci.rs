@@ -8,6 +8,10 @@ impl Backend for GhciBackend {
         "ghci"
     }
 
+    fn description(&self) -> &'static str {
+        "Haskell debugger (GHCi)"
+    }
+
     fn types(&self) -> &'static [&'static str] {
         &["haskell", "hs"]
     }

@@ -9,6 +9,10 @@ impl Backend for NetCoreDbgBackend {
         "netcoredbg"
     }
 
+    fn description(&self) -> &'static str {
+        ".NET debugger (C#, F#)"
+    }
+
     fn types(&self) -> &'static [&'static str] {
         &["dotnet", "csharp", "fsharp"]
     }

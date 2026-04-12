@@ -7,6 +7,10 @@ impl Backend for PhpdbgBackend {
         "phpdbg"
     }
 
+    fn description(&self) -> &'static str {
+        "PHP debugger"
+    }
+
     fn types(&self) -> &'static [&'static str] {
         &["php"]
     }

@@ -8,6 +8,10 @@ impl Backend for StackprofBackend {
         "stackprof"
     }
 
+    fn description(&self) -> &'static str {
+        "Ruby CPU profiler"
+    }
+
     fn types(&self) -> &'static [&'static str] {
         &["ruby-profile"]
     }

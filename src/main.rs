@@ -121,8 +121,7 @@ fn main() -> Result<()> {
                 .iter()
                 .all(|(_, statuses)| statuses.iter().all(|s| s.ok));
             let status = if all_ok { "ready" } else { "missing deps" };
-            let types = backend.types().join(", ");
-            println!("  {} ({}) — {}", backend.name(), types, status);
+            println!("  {:<14} {} [{}]", backend.name(), backend.description(), status);
         }
         return Ok(());
     }
