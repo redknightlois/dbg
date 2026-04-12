@@ -50,7 +50,7 @@ impl Backend for GhcProfBackend {
         }
         // GHC writes .prof next to the binary or in cwd — rename to known location
         let rename_cmd = format!(
-            "mv {}/*.prof {} 2>/dev/null || true",
+            "mv {}/*.prof {}",
             out_dir_str, prof_str
         );
 
