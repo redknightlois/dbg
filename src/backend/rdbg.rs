@@ -116,7 +116,7 @@ impl Backend for RdbgBackend {
                 continue;
             }
 
-            // Filter internal debug gem frames from backktrace
+            // Filter internal debug gem frames from backtrace
             if (trimmed == "bt" || trimmed == "backtrace")
                 && (l.contains("/debug/") || l.contains("<internal:"))
             {

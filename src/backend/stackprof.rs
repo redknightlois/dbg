@@ -1,4 +1,4 @@
-use super::{Backend, CleanResult, Dependency, DependencyCheck, SpawnConfig, shell_escape};
+use super::{Backend, Dependency, DependencyCheck, SpawnConfig, shell_escape};
 use crate::daemon::session_tmp;
 
 pub struct StackprofBackend;
@@ -50,13 +50,7 @@ impl Backend for StackprofBackend {
             shell_escape(&dump_str), shell_escape(&cg_str), shell_escape(&cg_str)
         );
 
-        // Find our own binary for exec-ing into the REPL
-        let dbg_bin = std::env::current_exe()
-            .unwrap_or_else(|_| "dbg".into())
-            .display()
-            .to_string();
-
-        // Replace the bash shell with the profile REPL
+        let dbg_bin = super::self_exe();
         let exec_repl = format!(
             "exec {} --phpprofile-repl {} --profile-prompt 'ruby-profile> '",
             dbg_bin, cg_str
@@ -102,10 +96,6 @@ impl Backend for StackprofBackend {
         ]
     }
 
-    fn format_breakpoint(&self, _spec: &str) -> String {
-        String::new()
-    }
-
     fn run_command(&self) -> &'static str {
         "hotspots"
     }
@@ -122,13 +112,6 @@ impl Backend for StackprofBackend {
         vec![("ruby-profile.md", include_str!("../../skills/adapters/ruby-profile.md"))]
     }
 
-    fn clean(&self, _cmd: &str, output: &str) -> CleanResult {
-        // The REPL returns clean output — minimal cleaning needed
-        CleanResult {
-            output: output.to_string(),
-            events: vec![],
-        }
-    }
 }
 
 #[cfg(test)]

@@ -101,7 +101,10 @@ pub trait Backend: Send + Sync {
     }
 
     /// Format a breakpoint spec for this debugger.
-    fn format_breakpoint(&self, spec: &str) -> String;
+    /// Profiler backends that don't support breakpoints return empty by default.
+    fn format_breakpoint(&self, _spec: &str) -> String {
+        String::new()
+    }
 
     /// The command to start/continue execution.
     fn run_command(&self) -> &'static str;
@@ -135,6 +138,14 @@ pub trait Backend: Send + Sync {
             events: vec![],
         }
     }
+}
+
+/// Path to the current dbg binary, for exec-ing into sub-REPLs.
+pub fn self_exe() -> String {
+    std::env::current_exe()
+        .unwrap_or_else(|_| "dbg".into())
+        .display()
+        .to_string()
 }
 
 /// Escape a string for safe interpolation into a bash command.

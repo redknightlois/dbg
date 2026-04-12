@@ -1,4 +1,4 @@
-use super::{Backend, CleanResult, Dependency, DependencyCheck, SpawnConfig, shell_escape};
+use super::{Backend, Dependency, DependencyCheck, SpawnConfig, shell_escape};
 use crate::daemon::session_tmp;
 
 pub struct JitDasmBackend;
@@ -97,11 +97,7 @@ impl Backend for JitDasmBackend {
             format!(" {}", escaped.join(" "))
         };
 
-        // Find our own binary path for exec-ing into the REPL
-        let dbg_bin = std::env::current_exe()
-            .unwrap_or_else(|_| "dbg".into())
-            .display()
-            .to_string();
+        let dbg_bin = super::self_exe();
 
         let mkdir_cmd = format!("mkdir -p {}", out_dir_str);
 
@@ -142,10 +138,6 @@ impl Backend for JitDasmBackend {
         }]
     }
 
-    fn format_breakpoint(&self, _spec: &str) -> String {
-        String::new()
-    }
-
     fn run_command(&self) -> &'static str {
         "stats"
     }
@@ -156,14 +148,6 @@ impl Backend for JitDasmBackend {
 
     fn parse_help(&self, _raw: &str) -> String {
         "jitdasm: methods, disasm <pattern>, search <instr>, stats, hotspots [N], simd, help".to_string()
-    }
-
-    fn clean(&self, _cmd: &str, output: &str) -> CleanResult {
-        // The REPL returns clean output — minimal cleaning needed
-        CleanResult {
-            output: output.to_string(),
-            events: vec![],
-        }
     }
 
     fn adapters(&self) -> Vec<(&'static str, &'static str)> {

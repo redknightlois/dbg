@@ -73,10 +73,6 @@ impl Backend for PstatsBackend {
         }]
     }
 
-    fn format_breakpoint(&self, _spec: &str) -> String {
-        String::new()
-    }
-
     fn run_command(&self) -> &'static str {
         "sort cumulative\nstats 20"
     }

@@ -66,10 +66,6 @@ impl Backend for PerfBackend {
         }]
     }
 
-    fn format_breakpoint(&self, _spec: &str) -> String {
-        String::new()
-    }
-
     fn run_command(&self) -> &'static str {
         ""
     }
@@ -102,8 +98,7 @@ impl Backend for PerfBackend {
         "exit"
     }
 
-    fn parse_help(&self, raw: &str) -> String {
-        let _ = raw;
+    fn parse_help(&self, _raw: &str) -> String {
         "perf: record, report, stat, annotate, script, top".to_string()
     }
 

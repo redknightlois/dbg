@@ -48,10 +48,6 @@ impl Backend for MemcheckBackend {
         }]
     }
 
-    fn format_breakpoint(&self, _spec: &str) -> String {
-        String::new()
-    }
-
     fn run_command(&self) -> &'static str {
         ""
     }

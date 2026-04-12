@@ -1,4 +1,4 @@
-use super::{Backend, CleanResult, Dependency, DependencyCheck, SpawnConfig, shell_escape};
+use super::{Backend, Dependency, DependencyCheck, SpawnConfig, shell_escape};
 use crate::check::find_bin;
 use crate::daemon::session_tmp;
 
@@ -54,11 +54,7 @@ impl Backend for GhcProfBackend {
             out_dir_str, prof_str
         );
 
-        // Step 3: Convert to callgrind format
-        let dbg_bin = std::env::current_exe()
-            .unwrap_or_else(|_| "dbg".into())
-            .display()
-            .to_string();
+        let dbg_bin = super::self_exe();
 
         let convert_cmd = format!(
             "{} --ghcprof-convert {} {}",
@@ -104,10 +100,6 @@ impl Backend for GhcProfBackend {
         }]
     }
 
-    fn format_breakpoint(&self, _spec: &str) -> String {
-        String::new()
-    }
-
     fn run_command(&self) -> &'static str {
         "hotspots"
     }
@@ -124,12 +116,6 @@ impl Backend for GhcProfBackend {
         vec![("haskell-profile.md", include_str!("../../skills/adapters/haskell-profile.md"))]
     }
 
-    fn clean(&self, _cmd: &str, output: &str) -> CleanResult {
-        CleanResult {
-            output: output.to_string(),
-            events: vec![],
-        }
-    }
 }
 
 #[cfg(test)]

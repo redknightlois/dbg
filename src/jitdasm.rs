@@ -341,39 +341,19 @@ pub fn run_repl(asm_path: &str) -> io::Result<()> {
         let arg1 = parts.get(1).copied().unwrap_or("");
         let arg2 = parts.get(2).copied().unwrap_or("");
 
+        let pat = if arg2.is_empty() { arg1.to_string() } else { format!("{arg1} {arg2}") };
+
         let result = match cmd {
             "methods" => index.cmd_methods(arg1),
-            "disasm" => {
-                if arg1.is_empty() {
-                    "usage: disasm <pattern>\n".into()
-                } else {
-                    // Rejoin all args for patterns with spaces
-                    let pat = if arg2.is_empty() { arg1.to_string() } else { format!("{} {}", arg1, arg2) };
-                    index.cmd_disasm(&pat)
-                }
-            }
-            "search" => {
-                if arg1.is_empty() {
-                    "usage: search <instruction>\n".into()
-                } else {
-                    index.cmd_search(arg1)
-                }
-            }
+            "disasm" if arg1.is_empty() => "usage: disasm <pattern>\n".into(),
+            "disasm" => index.cmd_disasm(&pat),
+            "search" if arg1.is_empty() => "usage: search <instruction>\n".into(),
+            "search" => index.cmd_search(arg1),
             "stats" => index.cmd_stats(arg1),
-            "calls" => {
-                if arg1.is_empty() {
-                    "usage: calls <pattern>\n".into()
-                } else {
-                    index.cmd_calls(arg1)
-                }
-            }
-            "callers" => {
-                if arg1.is_empty() {
-                    "usage: callers <pattern>\n".into()
-                } else {
-                    index.cmd_callers(arg1)
-                }
-            }
+            "calls" if arg1.is_empty() => "usage: calls <pattern>\n".into(),
+            "calls" => index.cmd_calls(arg1),
+            "callers" if arg1.is_empty() => "usage: callers <pattern>\n".into(),
+            "callers" => index.cmd_callers(arg1),
             "hotspots" => {
                 let n: usize = arg1.parse().unwrap_or(10);
                 index.cmd_hotspots(n, arg2)

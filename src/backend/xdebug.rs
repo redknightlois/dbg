@@ -1,4 +1,4 @@
-use super::{Backend, CleanResult, Dependency, DependencyCheck, SpawnConfig, shell_escape};
+use super::{Backend, Dependency, DependencyCheck, SpawnConfig, shell_escape};
 use crate::daemon::session_tmp;
 
 pub struct XdebugProfileBackend;
@@ -27,13 +27,7 @@ impl Backend for XdebugProfileBackend {
             php_cmd.push_str(&shell_escape(a));
         }
 
-        // Find our own binary path for exec-ing into the REPL
-        let dbg_bin = std::env::current_exe()
-            .unwrap_or_else(|_| "dbg".into())
-            .display()
-            .to_string();
-
-        // Replace the bash shell with our Rust REPL
+        let dbg_bin = super::self_exe();
         let exec_repl = format!("exec {} --phpprofile-repl {}", dbg_bin, out_file_str);
 
         Ok(SpawnConfig {
@@ -75,10 +69,6 @@ impl Backend for XdebugProfileBackend {
         ]
     }
 
-    fn format_breakpoint(&self, _spec: &str) -> String {
-        String::new()
-    }
-
     fn run_command(&self) -> &'static str {
         "stats"
     }
@@ -95,13 +85,6 @@ impl Backend for XdebugProfileBackend {
         vec![("php-profile.md", include_str!("../../skills/adapters/php-profile.md"))]
     }
 
-    fn clean(&self, _cmd: &str, output: &str) -> CleanResult {
-        // The REPL returns clean output — minimal cleaning needed
-        CleanResult {
-            output: output.to_string(),
-            events: vec![],
-        }
-    }
 }
 
 #[cfg(test)]

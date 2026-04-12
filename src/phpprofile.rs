@@ -775,6 +775,9 @@ pub fn run_repl(cachegrind_path: &str, prompt: &str) -> io::Result<()> {
         let arg1 = parts.get(1).copied().unwrap_or("");
         let arg2 = parts.get(2).copied().unwrap_or("");
 
+        // Join arg1 and arg2 into a single pattern string
+        let pat = if arg2.is_empty() { arg1.to_string() } else { format!("{arg1} {arg2}") };
+
         let result = match cmd {
             "hotspots" => {
                 let n: usize = arg1.parse().unwrap_or(10);
@@ -784,89 +787,33 @@ pub fn run_repl(cachegrind_path: &str, prompt: &str) -> io::Result<()> {
                 let n: usize = arg1.parse().unwrap_or(20);
                 index.cmd_flat(n, arg2)
             }
-            "calls" => {
-                if arg1.is_empty() {
-                    "usage: calls <pattern>\n".into()
-                } else {
-                    let pat = if arg2.is_empty() {
-                        arg1.to_string()
-                    } else {
-                        format!("{} {}", arg1, arg2)
-                    };
-                    index.cmd_calls(&pat)
-                }
-            }
-            "callers" => {
-                if arg1.is_empty() {
-                    "usage: callers <pattern>\n".into()
-                } else {
-                    let pat = if arg2.is_empty() {
-                        arg1.to_string()
-                    } else {
-                        format!("{} {}", arg1, arg2)
-                    };
-                    index.cmd_callers(&pat)
-                }
-            }
-            "inspect" => {
-                if arg1.is_empty() {
-                    "usage: inspect <pattern>\n".into()
-                } else {
-                    let pat = if arg2.is_empty() {
-                        arg1.to_string()
-                    } else {
-                        format!("{} {}", arg1, arg2)
-                    };
-                    index.cmd_inspect(&pat)
-                }
-            }
+            "calls" if arg1.is_empty() => "usage: calls <pattern>\n".into(),
+            "calls" => index.cmd_calls(&pat),
+            "callers" if arg1.is_empty() => "usage: callers <pattern>\n".into(),
+            "callers" => index.cmd_callers(&pat),
+            "inspect" if arg1.is_empty() => "usage: inspect <pattern>\n".into(),
+            "inspect" => index.cmd_inspect(&pat),
             "stats" => index.cmd_stats(arg1),
             "memory" => {
                 let n: usize = arg1.parse().unwrap_or(10);
                 index.cmd_memory(n, arg2)
             }
-            "search" => {
-                if arg1.is_empty() {
-                    "usage: search <pattern>\n".into()
-                } else {
-                    let pat = if arg2.is_empty() {
-                        arg1.to_string()
-                    } else {
-                        format!("{} {}", arg1, arg2)
-                    };
-                    index.cmd_search(&pat)
-                }
-            }
+            "search" if arg1.is_empty() => "usage: search <pattern>\n".into(),
+            "search" => index.cmd_search(&pat),
             "tree" => {
                 let n: usize = arg1.parse().unwrap_or(10);
                 index.cmd_tree(n)
             }
             "hotpath" => index.cmd_hotpath(),
+            "focus" if arg1.is_empty() => "usage: focus <pattern>\n".into(),
             "focus" => {
-                if arg1.is_empty() {
-                    "usage: focus <pattern>\n".into()
-                } else {
-                    let pat = if arg2.is_empty() {
-                        arg1.to_string()
-                    } else {
-                        format!("{} {}", arg1, arg2)
-                    };
-                    index.focus = Some(pat.clone());
-                    format!("focus set: {}\n", pat)
-                }
+                index.focus = Some(pat.clone());
+                format!("focus set: {}\n", pat)
             }
+            "ignore" if arg1.is_empty() => "usage: ignore <pattern>\n".into(),
             "ignore" => {
-                if arg1.is_empty() {
-                    "usage: ignore <pattern>\n".into()
-                } else {
-                    let pat = if arg2.is_empty() {
-                        arg1.to_string()
-                    } else {
-                        format!("{} {}", arg1, arg2)
-                    };
-                    index.ignore = Some(pat.clone());
-                    format!("ignore set: {}\n", pat)
-                }
+                index.ignore = Some(pat.clone());
+                format!("ignore set: {}\n", pat)
             }
             "reset" => {
                 index.focus = None;

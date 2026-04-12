@@ -1,4 +1,4 @@
-use super::{Backend, CleanResult, Dependency, DependencyCheck, SpawnConfig};
+use super::{Backend, Dependency, DependencyCheck, SpawnConfig};
 
 pub struct PprofBackend;
 
@@ -45,10 +45,6 @@ impl Backend for PprofBackend {
         }]
     }
 
-    fn format_breakpoint(&self, _spec: &str) -> String {
-        String::new()
-    }
-
     fn run_command(&self) -> &'static str {
         "top"
     }
@@ -72,13 +68,6 @@ impl Backend for PprofBackend {
         }
         cmds.dedup();
         format!("pprof: {}", cmds.join(", "))
-    }
-
-    fn clean(&self, _cmd: &str, output: &str) -> CleanResult {
-        CleanResult {
-            output: output.to_string(),
-            events: vec![],
-        }
     }
 
     fn adapters(&self) -> Vec<(&'static str, &'static str)> {
