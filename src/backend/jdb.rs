@@ -7,6 +7,10 @@ impl Backend for JdbBackend {
         "jdb"
     }
 
+    fn description(&self) -> &'static str {
+        "Java/Kotlin debugger"
+    }
+
     fn types(&self) -> &'static [&'static str] {
         &["java", "kotlin"]
     }

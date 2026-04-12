@@ -7,6 +7,10 @@ impl Backend for PprofBackend {
         "pprof"
     }
 
+    fn description(&self) -> &'static str {
+        "Go CPU/memory profiler"
+    }
+
     fn types(&self) -> &'static [&'static str] {
         &["pprof"]
     }

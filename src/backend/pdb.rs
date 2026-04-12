@@ -7,6 +7,10 @@ impl Backend for PdbBackend {
         "pdb"
     }
 
+    fn description(&self) -> &'static str {
+        "Python debugger"
+    }
+
     fn types(&self) -> &'static [&'static str] {
         &["python", "py"]
     }

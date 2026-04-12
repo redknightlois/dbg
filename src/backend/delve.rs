@@ -7,6 +7,10 @@ impl Backend for DelveBackend {
         "delve"
     }
 
+    fn description(&self) -> &'static str {
+        "Go debugger"
+    }
+
     fn types(&self) -> &'static [&'static str] {
         &["go"]
     }

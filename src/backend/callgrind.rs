@@ -8,6 +8,10 @@ impl Backend for CallgrindBackend {
         "callgrind"
     }
 
+    fn description(&self) -> &'static str {
+        "call-graph profiler (valgrind)"
+    }
+
     fn types(&self) -> &'static [&'static str] {
         &["callgrind"]
     }

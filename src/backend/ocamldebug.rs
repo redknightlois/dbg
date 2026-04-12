@@ -7,6 +7,10 @@ impl Backend for OcamlDebugBackend {
         "ocamldebug"
     }
 
+    fn description(&self) -> &'static str {
+        "OCaml bytecode debugger"
+    }
+
     fn types(&self) -> &'static [&'static str] {
         &["ocaml", "ml"]
     }

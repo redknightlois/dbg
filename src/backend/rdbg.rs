@@ -7,6 +7,10 @@ impl Backend for RdbgBackend {
         "rdbg"
     }
 
+    fn description(&self) -> &'static str {
+        "Ruby debugger"
+    }
+
     fn types(&self) -> &'static [&'static str] {
         &["ruby", "rb"]
     }

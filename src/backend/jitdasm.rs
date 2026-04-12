@@ -59,6 +59,10 @@ impl Backend for JitDasmBackend {
         "jitdasm"
     }
 
+    fn description(&self) -> &'static str {
+        ".NET JIT disassembly analyzer"
+    }
+
     fn types(&self) -> &'static [&'static str] {
         &["jitdasm"]
     }

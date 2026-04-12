@@ -9,6 +9,10 @@ impl Backend for DotnetTraceBackend {
         "dotnet-trace"
     }
 
+    fn description(&self) -> &'static str {
+        ".NET performance profiler"
+    }
+
     fn types(&self) -> &'static [&'static str] {
         &["dotnet-trace"]
     }

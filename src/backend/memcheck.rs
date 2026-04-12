@@ -7,6 +7,10 @@ impl Backend for MemcheckBackend {
         "memcheck"
     }
 
+    fn description(&self) -> &'static str {
+        "memory error detector (valgrind)"
+    }
+
     fn types(&self) -> &'static [&'static str] {
         &["memcheck", "valgrind"]
     }
