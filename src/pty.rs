@@ -1,5 +1,6 @@
-use std::io::{Read, Write};
+use std::io::Read;
 use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
+use std::sync::LazyLock;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
@@ -8,6 +9,9 @@ use nix::pty::{OpenptyResult, openpty};
 use nix::sys::signal::Signal;
 use nix::unistd::{ForkResult, Pid, close, dup2, execvpe, fork, setsid};
 use regex::Regex;
+
+static ANSI_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\x1b\[[0-9;]*[A-Za-z]|\x1b\[K|\x1b\[2K").unwrap());
 
 /// A debugger process running in a PTY.
 pub struct DebuggerProcess {
@@ -85,6 +89,31 @@ impl DebuggerProcess {
         }
     }
 
+    /// Write bytes to the master fd without creating a File (which would
+    /// close the fd on drop or panic).
+    fn write_master(&self, data: &[u8]) -> Result<()> {
+        let fd = self.master.as_raw_fd();
+        let mut written = 0;
+        while written < data.len() {
+            match nix::unistd::write(unsafe { std::os::fd::BorrowedFd::borrow_raw(fd) }, &data[written..]) {
+                Ok(n) => written += n,
+                Err(nix::errno::Errno::EINTR) => continue,
+                Err(e) => return Err(e.into()),
+            }
+        }
+        Ok(())
+    }
+
+    /// Read bytes from the master fd without creating a File.
+    fn read_master(&self, buf: &mut [u8]) -> usize {
+        let mut master_file = unsafe {
+            std::fs::File::from_raw_fd(self.master.as_raw_fd())
+        };
+        let n = master_file.read(buf).unwrap_or(0);
+        std::mem::forget(master_file);
+        n
+    }
+
     /// Wait for the initial prompt after spawn.
     pub fn wait_for_prompt(&self, timeout: Duration) -> Result<String> {
         self.read_until_prompt(timeout)
@@ -94,12 +123,7 @@ impl DebuggerProcess {
     /// the echoed command and the next prompt.
     pub fn send_and_wait(&self, cmd: &str, timeout: Duration) -> Result<String> {
         // Write command
-        let mut master_file = unsafe {
-            std::fs::File::from_raw_fd(self.master.as_raw_fd())
-        };
-        write!(master_file, "{cmd}\n")?;
-        // Don't drop — that would close the fd
-        std::mem::forget(master_file);
+        self.write_master(format!("{cmd}\n").as_bytes())?;
 
         // Read until prompt
         let raw = self.read_until_prompt(timeout)?;
@@ -137,9 +161,7 @@ impl DebuggerProcess {
     /// Send quit command and wait for exit.
     pub fn quit(&self, quit_cmd: &str) {
         if self.is_alive() {
-            let mut f = unsafe { std::fs::File::from_raw_fd(self.master.as_raw_fd()) };
-            let _ = write!(f, "{quit_cmd}\n");
-            std::mem::forget(f);
+            let _ = self.write_master(format!("{quit_cmd}\n").as_bytes());
 
             // Give it a moment
             std::thread::sleep(Duration::from_millis(500));
@@ -167,18 +189,15 @@ impl DebuggerProcess {
             let n = poll(&mut [fd], ms)?;
 
             if n == 0 {
-                // Timeout — check if we have a prompt in what we accumulated
+                // Poll timed out (possibly due to u16 cap) — check prompt
                 if self.prompt_re.is_match(&strip_ansi(&accumulated)) {
                     break;
                 }
-                bail!("timeout waiting for prompt");
+                // Real timeout is checked at loop top; continue to re-check
+                continue;
             }
 
-            let mut master_file = unsafe {
-                std::fs::File::from_raw_fd(self.master.as_raw_fd())
-            };
-            let bytes_read = master_file.read(&mut buf).unwrap_or(0);
-            std::mem::forget(master_file);
+            let bytes_read = self.read_master(&mut buf);
 
             if bytes_read == 0 {
                 break;
@@ -192,17 +211,13 @@ impl DebuggerProcess {
                 // Small extra wait to ensure no more output is coming
                 std::thread::sleep(Duration::from_millis(20));
 
-                let mut master_file = unsafe {
-                    std::fs::File::from_raw_fd(self.master.as_raw_fd())
-                };
                 let extra_fd = PollFd::new(self.master.as_fd(), PollFlags::POLLIN);
                 if poll(&mut [extra_fd], 30u16).unwrap_or(0) > 0 {
-                    let extra = master_file.read(&mut buf).unwrap_or(0);
+                    let extra = self.read_master(&mut buf);
                     if extra > 0 {
                         accumulated.push_str(&String::from_utf8_lossy(&buf[..extra]));
                     }
                 }
-                std::mem::forget(master_file);
                 break;
             }
         }
@@ -213,11 +228,10 @@ impl DebuggerProcess {
 
 fn strip_ansi(s: &str) -> String {
     // Fast path: no escape char means no ANSI
-    if !s.contains('\x1b') && !s.contains("[K") {
+    if !s.contains('\x1b') {
         return s.to_string();
     }
-    let re = Regex::new(r"\x1b\[[0-9;]*[A-Za-z]|\[K|\[2K").unwrap();
-    re.replace_all(s, "").to_string()
+    ANSI_RE.replace_all(s, "").to_string()
 }
 
 impl Drop for DebuggerProcess {
