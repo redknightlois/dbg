@@ -16,7 +16,7 @@ Without dbg, the agent reads source code, builds a theory, rewrites something, a
 
 With dbg, the agent sets a breakpoint, steps to the crash, inspects the variable, and reads the actual value. Root cause on the first pass. One cycle. Done.
 
-One CLI. Many debuggers. The agent learns `dbg` once — it works across Rust, C, C++, Python, Go, .NET, Java, Kotlin, Ruby, and PHP through a single interface.
+One CLI. Many debuggers. The agent learns `dbg` once — it works across Rust, C, C++, Python, Go, .NET, Java, Kotlin, Ruby, PHP, D, and Nim through a single interface.
 
 ## Install
 
@@ -113,7 +113,7 @@ Pick your language and paste the prompt into Claude or Codex:
 
 | Backend | Types | Tool |
 |---------|-------|------|
-| lldb | rust, c, cpp, zig | LLDB |
+| lldb | rust, c, cpp, zig, d, nim | LLDB |
 | pdb | python, py | Python debugger |
 | netcoredbg | dotnet, csharp, fsharp | NetCoreDbg |
 | delve | go | Delve |
@@ -154,7 +154,7 @@ Why this matters:
 
 - **Not a DAP server.** It's a CLI that agents call directly, not a protocol they implement.
 - **Not an IDE plugin.** It's agent-first. Humans can use it, but the design optimizes for non-interactive, command-driven workflows.
-- **Not a debugger.** It wraps LLDB, PDB, Delve, NetCoreDbg, JDB, rdbg, and others under one interface. It doesn't replace them — it makes them agent-accessible.
+- **Not a debugger.** It wraps LLDB, PDB, Delve, NetCoreDbg, JDB, rdbg, and others under one interface. Pass a source file and it compiles with debug symbols automatically — D, Nim, Rust, Go, and .NET projects build on the fly.
 
 ## Contributing
 

@@ -25,23 +25,31 @@ impl Backend for CallgrindBackend {
             valgrind_cmd.push_str(&args.join(" "));
         }
 
-        // Export path so the user can reference it without knowing the session dir
+        let dbg_bin = std::env::current_exe()
+            .unwrap_or_else(|_| "dbg".into())
+            .display()
+            .to_string();
+
+        let exec_repl = format!(
+            "exec {} --phpprofile-repl {} --profile-prompt 'callgrind> '",
+            dbg_bin, out_str
+        );
+
         Ok(SpawnConfig {
             bin: "bash".into(),
             args: vec!["--norc".into(), "--noprofile".into()],
             env: vec![
-                ("PS1".into(), "$ ".into()),
-                ("CALLGRIND_OUT".into(), out_str),
+                ("PS1".into(), "callgrind> ".into()),
             ],
             init_commands: vec![
                 valgrind_cmd,
-                "echo '--- callgrind data ready ---'".into(),
+                exec_repl,
             ],
         })
     }
 
     fn prompt_pattern(&self) -> &str {
-        r"\$ $"
+        r"callgrind> $"
     }
 
     fn dependencies(&self) -> Vec<Dependency> {
@@ -55,15 +63,6 @@ impl Backend for CallgrindBackend {
                 },
                 install: "sudo apt install valgrind  # or: brew install valgrind",
             },
-            Dependency {
-                name: "callgrind_annotate",
-                check: DependencyCheck::Binary {
-                    name: "callgrind_annotate",
-                    alternatives: &["callgrind_annotate"],
-                    version_cmd: None,
-                },
-                install: "sudo apt install valgrind  # included with valgrind",
-            },
         ]
     }
 
@@ -72,7 +71,7 @@ impl Backend for CallgrindBackend {
     }
 
     fn run_command(&self) -> &'static str {
-        "callgrind_annotate $CALLGRIND_OUT"
+        "stats"
     }
 
     fn quit_command(&self) -> &'static str {
@@ -80,23 +79,13 @@ impl Backend for CallgrindBackend {
     }
 
     fn parse_help(&self, _raw: &str) -> String {
-        "callgrind: callgrind_annotate [--auto=yes] [--tree=both] [--threshold=N] $CALLGRIND_OUT".to_string()
+        "callgrind: hotspots, flat, calls, callers, inspect, stats, memory, search, tree, hotpath, focus, ignore, reset, help".to_string()
     }
 
     fn clean(&self, _cmd: &str, output: &str) -> CleanResult {
-        let mut events = Vec::new();
-        let mut lines = Vec::new();
-        for line in output.lines() {
-            let trimmed = line.trim();
-            if trimmed.starts_with("==") && trimmed.ends_with("==") {
-                events.push(trimmed.to_string());
-                continue;
-            }
-            lines.push(line);
-        }
         CleanResult {
-            output: lines.join("\n"),
-            events,
+            output: output.to_string(),
+            events: vec![],
         }
     }
 
@@ -110,37 +99,29 @@ mod tests {
     use super::*;
 
     #[test]
-    fn clean_separates_valgrind_lines_as_events() {
-        let input = "==12345== Callgrind info==\n==12345== Using Valgrind==\nactual output\nmore output";
-        let r = CallgrindBackend.clean("callgrind_annotate", input);
-        assert_eq!(r.output, "actual output\nmore output");
-        assert_eq!(r.events.len(), 2);
-    }
-
-    #[test]
-    fn clean_keeps_incomplete_prefix() {
-        let input = "==12345== no trailing equals\nkept";
-        let r = CallgrindBackend.clean("echo", input);
-        assert!(r.output.contains("no trailing equals"));
-        assert!(r.output.contains("kept"));
-        assert!(r.events.is_empty());
-    }
-
-    #[test]
-    fn spawn_config_sets_env() {
+    fn spawn_config_execs_repl() {
         let cfg = CallgrindBackend.spawn_config("./app", &[]).unwrap();
-        assert!(cfg.env.iter().any(|(k, _)| k == "CALLGRIND_OUT"));
-        assert!(cfg.env.iter().any(|(k, v)| k == "PS1" && v == "$ "));
+        assert_eq!(cfg.bin, "bash");
+        assert!(cfg.init_commands[0].contains("valgrind --tool=callgrind"));
+        assert!(cfg.init_commands[0].contains("./app"));
+        assert!(cfg.init_commands[1].contains("--phpprofile-repl"));
+        assert!(cfg.init_commands[1].contains("exec"));
     }
 
     #[test]
-    fn spawn_config_includes_args_in_valgrind_cmd() {
+    fn spawn_config_includes_args() {
         let cfg = CallgrindBackend
             .spawn_config("./app", &["--flag".into()])
             .unwrap();
         let cmd = &cfg.init_commands[0];
         assert!(cmd.contains("./app"));
         assert!(cmd.contains("--flag"));
+    }
+
+    #[test]
+    fn prompt_pattern_matches() {
+        let re = regex::Regex::new(CallgrindBackend.prompt_pattern()).unwrap();
+        assert!(re.is_match("callgrind> "));
     }
 
     #[test]
