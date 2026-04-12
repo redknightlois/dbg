@@ -1,5 +1,3 @@
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
@@ -7,6 +5,7 @@ use anyhow::{Context, Result, bail};
 use crate::backend::Registry;
 
 const SKILL_MD: &str = include_str!("../../skills/SKILL.md");
+const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 pub fn run_init(target: &str, registry: &Registry) -> Result<()> {
     match target {
@@ -27,14 +26,13 @@ fn init_agent(registry: &Registry, config_dir: &str, agent_name: &str) -> Result
         .flat_map(|b| b.adapters())
         .collect();
 
-    let hash = content_hash(SKILL_MD, &adapters);
-    let hash_file = skill_dir.join(".hash");
+    let version_file = skill_dir.join(".version");
 
     #[cfg(not(debug_assertions))]
-    if hash_file.exists() {
-        if let Ok(existing) = std::fs::read_to_string(&hash_file) {
-            if existing.trim() == hash {
-                eprintln!("skill already up to date");
+    if version_file.exists() {
+        if let Ok(existing) = std::fs::read_to_string(&version_file) {
+            if existing.trim() == VERSION {
+                eprintln!("dbg v{VERSION} skill already up to date");
                 match ensure_on_path()? {
                     Some(path) => eprintln!("installed: {}", path.display()),
                     None => eprintln!("dbg already on PATH"),
@@ -43,6 +41,9 @@ fn init_agent(registry: &Registry, config_dir: &str, agent_name: &str) -> Result
             }
         }
     }
+
+    // Remove stale .hash file from older versions
+    let _ = std::fs::remove_file(skill_dir.join(".hash"));
 
     std::fs::create_dir_all(&adapters_dir)
         .context("failed to create skill directory")?;
@@ -53,9 +54,9 @@ fn init_agent(registry: &Registry, config_dir: &str, agent_name: &str) -> Result
         std::fs::write(adapters_dir.join(filename), content)?;
     }
 
-    std::fs::write(&hash_file, &hash)?;
+    std::fs::write(&version_file, VERSION)?;
 
-    eprintln!("skill installed: {}", skill_dir.display());
+    eprintln!("dbg v{VERSION} skill installed: {}", skill_dir.display());
 
     match ensure_on_path()? {
         Some(path) => eprintln!("installed: {}", path.display()),
@@ -64,16 +65,6 @@ fn init_agent(registry: &Registry, config_dir: &str, agent_name: &str) -> Result
 
     eprintln!("done — restart {agent_name} to activate");
     Ok(())
-}
-
-fn content_hash(skill: &str, adapters: &[(&str, &str)]) -> String {
-    let mut h = DefaultHasher::new();
-    skill.hash(&mut h);
-    for (name, content) in adapters {
-        name.hash(&mut h);
-        content.hash(&mut h);
-    }
-    format!("{:08x}", h.finish() as u32)
 }
 
 /// Ensure dbg is on PATH by copying to ~/.local/bin/
