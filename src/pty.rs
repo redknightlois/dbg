@@ -1,5 +1,4 @@
-use std::io::Read;
-use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd, OwnedFd};
 use std::sync::LazyLock;
 use std::time::{Duration, Instant};
 
@@ -106,12 +105,7 @@ impl DebuggerProcess {
 
     /// Read bytes from the master fd without creating a File.
     fn read_master(&self, buf: &mut [u8]) -> usize {
-        let mut master_file = unsafe {
-            std::fs::File::from_raw_fd(self.master.as_raw_fd())
-        };
-        let n = master_file.read(buf).unwrap_or(0);
-        std::mem::forget(master_file);
-        n
+        nix::unistd::read(self.master.as_raw_fd(), buf).unwrap_or(0)
     }
 
     /// Wait for the initial prompt after spawn.
