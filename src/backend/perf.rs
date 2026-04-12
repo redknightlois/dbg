@@ -1,4 +1,4 @@
-use super::{Backend, CleanResult, Dependency, DependencyCheck, SpawnConfig};
+use super::{Backend, CleanResult, Dependency, DependencyCheck, SpawnConfig, shell_escape};
 
 pub struct PerfBackend;
 
@@ -18,42 +18,40 @@ impl Backend for PerfBackend {
         let path = std::path::Path::new(target);
 
         if path.is_file() && (target.contains("perf") || target.ends_with(".data")) {
-            // Existing perf data — go straight to report
+            // Existing perf data — go straight to report in bash
             Ok(SpawnConfig {
-                bin: "perf".into(),
-                args: vec![
-                    "report".into(),
-                    "--stdio".into(),
-                    "-i".into(),
-                    target.into(),
+                bin: "bash".into(),
+                args: vec!["--norc".into(), "--noprofile".into()],
+                env: vec![("PS1".into(), "perf> ".into())],
+                init_commands: vec![
+                    format!("perf report --stdio -i {}", shell_escape(target)),
                 ],
-                env: vec![],
-                init_commands: vec![],
             })
         } else {
-            // Record then report — use init_commands to record first
-            let mut record_args = vec![
-                "record".into(),
-                "-g".into(),
-                "--".into(),
-                target.into(),
-            ];
-            record_args.extend(args.iter().cloned());
+            // Record then report
+            let mut record_cmd = format!(
+                "perf record -g -- {}",
+                shell_escape(target)
+            );
+            for a in args {
+                record_cmd.push(' ');
+                record_cmd.push_str(&shell_escape(a));
+            }
 
             Ok(SpawnConfig {
-                bin: "perf".into(),
-                args: vec!["report".into(), "--tui".into()],
-                env: vec![],
-                init_commands: vec![],
+                bin: "bash".into(),
+                args: vec!["--norc".into(), "--noprofile".into()],
+                env: vec![("PS1".into(), "perf> ".into())],
+                init_commands: vec![
+                    record_cmd,
+                    "perf report --stdio".into(),
+                ],
             })
         }
     }
 
     fn prompt_pattern(&self) -> &str {
-        // perf report --tui doesn't have a traditional prompt.
-        // We use --stdio mode which outputs and exits.
-        // For interactive use, perf script piped to flamegraph is better.
-        r"#"
+        r"perf> $"
     }
 
     fn dependencies(&self) -> Vec<Dependency> {
@@ -101,7 +99,7 @@ impl Backend for PerfBackend {
     }
 
     fn quit_command(&self) -> &'static str {
-        "q"
+        "exit"
     }
 
     fn parse_help(&self, raw: &str) -> String {
@@ -160,21 +158,62 @@ mod tests {
         let cfg = PerfBackend
             .spawn_config(tmp.to_str().unwrap(), &[])
             .unwrap();
-        assert_eq!(cfg.bin, "perf");
-        assert!(cfg.args.contains(&"report".to_string()));
-        assert!(cfg.args.contains(&"--stdio".to_string()));
+        assert_eq!(cfg.bin, "bash");
+        assert!(cfg.init_commands[0].contains("perf report --stdio"));
         let _ = std::fs::remove_file(&tmp);
     }
 
     #[test]
     fn spawn_config_binary_target() {
         let cfg = PerfBackend.spawn_config("./myapp", &[]).unwrap();
-        assert_eq!(cfg.bin, "perf");
-        assert!(cfg.args.contains(&"report".to_string()));
+        assert_eq!(cfg.bin, "bash");
+        assert!(cfg.init_commands[0].contains("perf record -g"));
+        assert!(cfg.init_commands[0].contains("./myapp"));
+        assert!(cfg.init_commands[1].contains("perf report --stdio"));
+    }
+
+    #[test]
+    fn spawn_config_binary_with_args() {
+        let cfg = PerfBackend
+            .spawn_config("./myapp", &["--port".into(), "8080".into()])
+            .unwrap();
+        let cmd = &cfg.init_commands[0];
+        assert!(cmd.contains("./myapp"));
+        assert!(cmd.contains("--port"));
+        assert!(cmd.contains("8080"));
     }
 
     #[test]
     fn format_breakpoint_empty() {
         assert_eq!(PerfBackend.format_breakpoint("anything"), "");
+    }
+
+    #[test]
+    fn spawn_config_record_has_separator() {
+        let cfg = PerfBackend.spawn_config("./myapp", &[]).unwrap();
+        let cmd = &cfg.init_commands[0];
+        // perf record must have -- separator before the target
+        assert!(cmd.contains("-- "), "missing -- separator: {cmd}");
+    }
+
+    #[test]
+    fn spawn_config_escapes_target_with_spaces() {
+        let cfg = PerfBackend
+            .spawn_config("./my app", &[])
+            .unwrap();
+        let cmd = &cfg.init_commands[0];
+        assert!(cmd.contains("'./my app'"), "target not escaped: {cmd}");
+    }
+
+    #[test]
+    fn spawn_config_uses_bash_with_perf_prompt() {
+        let cfg = PerfBackend.spawn_config("./myapp", &[]).unwrap();
+        assert_eq!(cfg.bin, "bash");
+        assert!(cfg.env.iter().any(|(k, v)| k == "PS1" && v == "perf> "));
+    }
+
+    #[test]
+    fn quit_command_exits_bash() {
+        assert_eq!(PerfBackend.quit_command(), "exit");
     }
 }
