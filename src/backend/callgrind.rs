@@ -1,4 +1,4 @@
-use super::{Backend, CleanResult, Dependency, DependencyCheck, SpawnConfig};
+use super::{Backend, CleanResult, Dependency, DependencyCheck, SpawnConfig, shell_escape};
 use crate::daemon::session_tmp;
 
 pub struct CallgrindBackend;
@@ -18,11 +18,11 @@ impl Backend for CallgrindBackend {
 
         let mut valgrind_cmd = format!(
             "valgrind --tool=callgrind --callgrind-out-file={} {}",
-            out_str, target
+            out_str, shell_escape(target)
         );
-        if !args.is_empty() {
+        for a in args {
             valgrind_cmd.push(' ');
-            valgrind_cmd.push_str(&args.join(" "));
+            valgrind_cmd.push_str(&shell_escape(a));
         }
 
         let dbg_bin = std::env::current_exe()
@@ -127,5 +127,32 @@ mod tests {
     #[test]
     fn format_breakpoint_empty() {
         assert_eq!(CallgrindBackend.format_breakpoint("anything"), "");
+    }
+
+    #[test]
+    fn spawn_config_escapes_spaces_in_target() {
+        let cfg = CallgrindBackend
+            .spawn_config("./my app", &[])
+            .unwrap();
+        let cmd = &cfg.init_commands[0];
+        assert!(cmd.contains("'./my app'"), "target with space not escaped: {cmd}");
+    }
+
+    #[test]
+    fn spawn_config_escapes_args_with_spaces() {
+        let cfg = CallgrindBackend
+            .spawn_config("./app", &["--dir=/my path".into()])
+            .unwrap();
+        let cmd = &cfg.init_commands[0];
+        assert!(cmd.contains("'--dir=/my path'"), "arg with space not escaped: {cmd}");
+    }
+
+    #[test]
+    fn spawn_config_escapes_shell_metacharacters() {
+        let cfg = CallgrindBackend
+            .spawn_config("./app$(evil)", &[])
+            .unwrap();
+        let cmd = &cfg.init_commands[0];
+        assert!(cmd.contains("'./app$(evil)'"), "shell metacharacter not escaped: {cmd}");
     }
 }

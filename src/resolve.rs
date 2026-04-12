@@ -2,6 +2,15 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{Context, Result, bail};
+use crate::check::find_bin;
+
+fn path_stem_str(p: &Path) -> Result<String> {
+    let stem = p.file_stem()
+        .context("path has no file stem")?
+        .to_str()
+        .context("path contains non-UTF8 characters")?;
+    Ok(stem.to_string())
+}
 
 /// Resolve a target for a given backend type.
 /// Builds if needed, returns the path to the binary/script.
@@ -80,8 +89,7 @@ fn resolve_dotnet(target: &str) -> Result<String> {
 
     // Existing file — prefer apphost over DLL
     if path.is_file() {
-        if target.ends_with(".dll") {
-            let apphost = target.strip_suffix(".dll").unwrap();
+        if let Some(apphost) = target.strip_suffix(".dll") {
             let apphost_path = Path::new(apphost);
             if apphost_path.is_file() {
                 return Ok(apphost.to_string());
@@ -93,16 +101,12 @@ fn resolve_dotnet(target: &str) -> Result<String> {
     // Directory with .csproj
     if path.is_dir() {
         let csproj = find_csproj(path)?;
-        let name = csproj
-            .file_stem()
-            .unwrap()
-            .to_str()
-            .unwrap()
-            .to_string();
+        let name = path_stem_str(&csproj)?;
+        let csproj_str = csproj.to_str().context("csproj path contains non-UTF8 characters")?;
 
         eprintln!("building {name}...");
         let status = Command::new("dotnet")
-            .args(["build", csproj.to_str().unwrap(), "-c", "Debug"])
+            .args(["build", csproj_str, "-c", "Debug"])
             .status()
             .context("dotnet not found")?;
 
@@ -158,15 +162,16 @@ fn resolve_d(target: &str) -> Result<String> {
     if path.is_file() {
         // If it's a source file, compile it
         if target.ends_with(".d") {
-            let stem = path.file_stem().unwrap().to_str().unwrap();
-            let output = path.parent().unwrap_or(Path::new(".")).join(stem);
+            let stem = path_stem_str(path)?;
+            let output = path.parent().unwrap_or(Path::new(".")).join(&stem);
             eprintln!("building {target}...");
             // Try ldc2 first (better DWARF), fall back to dmd
-            let status = Command::new("ldc2")
-                .args(["-g", "-of", output.to_str().unwrap(), target])
+            let output_str = output.to_str().context("output path contains non-UTF8 characters")?;
+            let status = Command::new(find_bin("ldc2"))
+                .args(["-g", "-of", output_str, target])
                 .status()
                 .or_else(|_| {
-                    Command::new("dmd")
+                    Command::new(find_bin("dmd"))
                         .args(["-g", &format!("-of={}", output.display()), target])
                         .status()
                 })
@@ -187,10 +192,10 @@ fn resolve_nim(target: &str) -> Result<String> {
     if path.is_file() {
         // If it's a source file, compile it
         if target.ends_with(".nim") {
-            let stem = path.file_stem().unwrap().to_str().unwrap();
-            let output = path.parent().unwrap_or(Path::new(".")).join(stem);
+            let stem = path_stem_str(path)?;
+            let output = path.parent().unwrap_or(Path::new(".")).join(&stem);
             eprintln!("building {target}...");
-            let status = Command::new("nim")
+            let status = Command::new(find_bin("nim"))
                 .args(["compile", "--debugger:native", "--opt:none",
                        &format!("--out:{}", output.display()), target])
                 .status()
@@ -229,15 +234,16 @@ fn resolve_ocaml(target: &str) -> Result<String> {
     if path.is_file() {
         // If it's a source file, compile to bytecode with debug info
         if target.ends_with(".ml") {
-            let stem = path.file_stem().unwrap().to_str().unwrap();
-            let output = path.parent().unwrap_or(Path::new(".")).join(stem);
+            let stem = path_stem_str(path)?;
+            let output = path.parent().unwrap_or(Path::new(".")).join(&stem);
             eprintln!("building {target} (bytecode with -g)...");
-            let status = Command::new("ocamlfind")
-                .args(["ocamlc", "-g", "-o", output.to_str().unwrap(), target])
+            let output_str = output.to_str().context("output path contains non-UTF8 characters")?;
+            let status = Command::new(find_bin("ocamlfind"))
+                .args(["ocamlc", "-g", "-o", output_str, target])
                 .status()
                 .or_else(|_| {
-                    Command::new("ocamlc")
-                        .args(["-g", "-o", output.to_str().unwrap(), target])
+                    Command::new(find_bin("ocamlc"))
+                        .args(["-g", "-o", output_str, target])
                         .status()
                 })
                 .context("neither ocamlfind nor ocamlc found")?;
@@ -277,12 +283,13 @@ fn resolve_go(target: &str) -> Result<String> {
             .to_str()
             .unwrap_or("app");
         let output_path = dir.join(output_name);
+        let output_str = output_path.to_str().context("output path contains non-UTF8 characters")?;
         let status = Command::new("go")
             .args([
                 "build",
                 "-gcflags=all=-N -l",
                 "-o",
-                output_path.to_str().unwrap(),
+                output_str,
                 ".",
             ])
             .current_dir(dir)

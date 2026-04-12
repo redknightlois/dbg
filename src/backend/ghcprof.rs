@@ -1,4 +1,5 @@
-use super::{Backend, CleanResult, Dependency, DependencyCheck, SpawnConfig};
+use super::{Backend, CleanResult, Dependency, DependencyCheck, SpawnConfig, shell_escape};
+use crate::check::find_bin;
 use crate::daemon::session_tmp;
 
 pub struct GhcProfBackend;
@@ -24,9 +25,10 @@ impl Backend for GhcProfBackend {
         let (binary, compile_cmd) = if target.ends_with(".hs") {
             let bin = out_dir.join("profiled");
             let bin_str = bin.display().to_string();
+            let ghc_bin = find_bin("ghc");
             let cmd = format!(
-                "mkdir -p {} && ghc -prof -fprof-late -rtsopts -o {} {}",
-                out_dir_str, bin_str, target
+                "mkdir -p {} && {} -prof -fprof-late -rtsopts -o {} {}",
+                out_dir_str, shell_escape(&ghc_bin), bin_str, shell_escape(target)
             );
             (bin_str, Some(cmd))
         } else {
@@ -37,13 +39,13 @@ impl Backend for GhcProfBackend {
         // Step 2: Run with profiling RTS flags
         let mut run_cmd = format!(
             "cd {} && {} +RTS -p -RTS",
-            out_dir_str, binary
+            out_dir_str, shell_escape(&binary)
         );
         if !args.is_empty() {
-            // Insert program args before +RTS
+            let escaped_args: Vec<String> = args.iter().map(|a| shell_escape(a)).collect();
             run_cmd = format!(
                 "cd {} && {} {} +RTS -p -RTS",
-                out_dir_str, binary, args.join(" ")
+                out_dir_str, shell_escape(&binary), escaped_args.join(" ")
             );
         }
         // GHC writes .prof next to the binary or in cwd — rename to known location

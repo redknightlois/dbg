@@ -92,11 +92,30 @@ fn check_dep(dep: Dependency) -> DepStatus {
     }
 }
 
+/// Resolve a binary name to its full path, checking PATH and extra tool dirs.
+/// Returns the full path if found, or the original name as fallback.
+pub fn find_bin(name: &str) -> String {
+    if let Ok(path) = which::which(name) {
+        return path.display().to_string();
+    }
+    for dir in extra_tool_dirs() {
+        let path = dir.join(name);
+        if path.is_file() {
+            return path.display().to_string();
+        }
+    }
+    name.to_string()
+}
+
 /// Extra directories to search for tool binaries not on PATH.
 fn extra_tool_dirs() -> Vec<std::path::PathBuf> {
     let mut dirs = Vec::new();
     if let Ok(home) = std::env::var("HOME") {
-        dirs.push(std::path::PathBuf::from(&home).join(".dotnet/tools"));
+        let home = std::path::PathBuf::from(&home);
+        dirs.push(home.join(".dotnet/tools"));
+        dirs.push(home.join(".ghcup/bin"));
+        dirs.push(home.join(".cargo/bin"));
+        dirs.push(home.join(".local/bin"));
     }
     dirs
 }

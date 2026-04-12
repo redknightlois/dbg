@@ -117,15 +117,9 @@ fn main() -> Result<()> {
 
         println!("backends:");
         for backend in registry.all_backends() {
-            let deps = backend.dependencies();
-            let all_ok = deps.iter().all(|d| {
-                match &d.check {
-                    crate::backend::DependencyCheck::Binary { alternatives, .. } => {
-                        alternatives.iter().any(|name| which::which(name).is_ok())
-                    }
-                    _ => true,
-                }
-            });
+            let all_ok = check::check_backends(&registry, &[backend.name()])
+                .iter()
+                .all(|(_, statuses)| statuses.iter().all(|s| s.ok));
             let status = if all_ok { "ready" } else { "missing deps" };
             let types = backend.types().join(", ");
             println!("  {} ({}) — {}", backend.name(), types, status);

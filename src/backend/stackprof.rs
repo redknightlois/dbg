@@ -20,20 +20,25 @@ impl Backend for StackprofBackend {
         let cg_str = cg_file.display().to_string();
         let out_dir_str = out_dir.display().to_string();
 
-        let mut ruby_cmd = format!(
-            "mkdir -p {} && ruby -e \"require 'stackprof'; StackProf.run(mode: :cpu, out: '{}', raw: true) {{ load '{}' }}\"",
-            out_dir_str, dump_str, target
-        );
-        if !args.is_empty() {
-            let escaped_args: Vec<String> = args.iter().map(|a| format!("'{}'", a)).collect();
-            ruby_cmd = format!(
+        let escaped_target = target.replace('\\', "\\\\").replace('\'', "\\'");
+        let ruby_cmd = if args.is_empty() {
+            format!(
+                "mkdir -p {} && ruby -e \"require 'stackprof'; StackProf.run(mode: :cpu, out: '{}', raw: true) {{ load '{}' }}\"",
+                out_dir_str, dump_str, escaped_target
+            )
+        } else {
+            let escaped_args: Vec<String> = args.iter().map(|a| {
+                let escaped = a.replace('\\', "\\\\").replace('\'', "\\'");
+                format!("'{}'", escaped)
+            }).collect();
+            format!(
                 "mkdir -p {} && ruby -e \"ARGV.replace([{}]); require 'stackprof'; StackProf.run(mode: :cpu, out: '{}', raw: true) {{ load '{}' }}\"",
                 out_dir_str,
                 escaped_args.join(", "),
                 dump_str,
-                target
-            );
-        }
+                escaped_target
+            )
+        };
 
         // Convert stackprof dump to callgrind format
         let convert_cmd = format!(
@@ -159,5 +164,24 @@ mod tests {
     #[test]
     fn format_breakpoint_empty() {
         assert_eq!(StackprofBackend.format_breakpoint("anything"), "");
+    }
+
+    #[test]
+    fn spawn_config_escapes_single_quotes_in_target() {
+        let cfg = StackprofBackend
+            .spawn_config("it's_a_test.rb", &[])
+            .unwrap();
+        let cmd = &cfg.init_commands[0];
+        // Single quote in target must be escaped for Ruby string
+        assert!(cmd.contains("it\\'s_a_test.rb"), "single quote not escaped in target: {cmd}");
+    }
+
+    #[test]
+    fn spawn_config_escapes_single_quotes_in_args() {
+        let cfg = StackprofBackend
+            .spawn_config("test.rb", &["it's".into()])
+            .unwrap();
+        let cmd = &cfg.init_commands[0];
+        assert!(cmd.contains("it\\'s"), "single quote not escaped in args: {cmd}");
     }
 }
