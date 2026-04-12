@@ -209,6 +209,25 @@ fn cmd_start(registry: &Registry, args: &[String]) -> Result<()> {
     let backend_type = &args[0];
     let target_raw = &args[1];
 
+    // Intercept GPU-related types — the agent should use gdbg, not dbg
+    match backend_type.as_str() {
+        "gdbg" | "gpu" | "cuda" | "pytorch" | "triton"
+        | "tensorflow" | "tf" | "jax" | "mxnet" | "cupy" => {
+            eprintln!("GPU profiling uses gdbg, not dbg.");
+            eprintln!();
+            eprintln!("  gdbg {target_raw}          # collect + analyze");
+            eprintln!("  gdbg --from <name>        # reload saved session");
+            eprintln!("  gdbg check                # verify nsys/ncu installed");
+            eprintln!();
+            eprintln!("gdbg auto-detects the target type (CUDA, PyTorch, Triton).");
+            eprintln!("It collects GPU timeline (nsys), hardware metrics (ncu),");
+            eprintln!("and op mapping (torch.profiler) into a single session,");
+            eprintln!("then opens an interactive REPL with 30+ analysis commands.");
+            bail!("use gdbg instead of dbg for GPU profiling");
+        }
+        _ => {}
+    }
+
     let backend = registry
         .get(backend_type)
         .ok_or_else(|| {
