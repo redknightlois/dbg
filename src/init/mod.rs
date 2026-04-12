@@ -7,6 +7,28 @@ use crate::backend::Registry;
 const SKILL_MD: &str = include_str!("../../skills/SKILL.md");
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// Silently update any installed skills whose version doesn't match the binary.
+pub fn auto_update(registry: &Registry) {
+    let home = match std::env::var("HOME") {
+        Ok(h) => h,
+        Err(_) => return,
+    };
+    for config_dir in [".claude", ".codex"] {
+        let skill_dir = PathBuf::from(&home).join(config_dir).join("skills/dbg");
+        let version_file = skill_dir.join(".version");
+        if !version_file.exists() {
+            continue;
+        }
+        let installed = std::fs::read_to_string(&version_file).unwrap_or_default();
+        if installed.trim() == VERSION {
+            continue;
+        }
+        // Version mismatch — update silently
+        let agent_name = if config_dir == ".claude" { "Claude Code" } else { "Codex" };
+        let _ = init_agent(registry, config_dir, agent_name);
+    }
+}
+
 pub fn run_init(target: &str, registry: &Registry) -> Result<()> {
     match target {
         "claude" => init_agent(registry, ".claude", "Claude Code"),

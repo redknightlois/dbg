@@ -1,6 +1,6 @@
 [package]
 name = "dbg-cli"
-version = "0.1.8"
+version = "0.1.9"
 edition = "2024"
 description = "A universal debugger CLI that lets AI agents observe runtime state instead of guessing from source code"
 license = "MIT"
