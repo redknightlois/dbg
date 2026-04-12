@@ -113,6 +113,7 @@ impl Backend for RdbgBackend {
             // Extract stop events (breakpoint hits, catchpoints)
             if l.starts_with("Stop by ") || l.starts_with("Catch ") {
                 events.push(l.to_string());
+                continue;
             }
 
             // Filter internal debug gem frames from backktrace
@@ -159,7 +160,7 @@ mod tests {
         let input = "Stop by #0 BP - Line /path/test.rb:10\nlocal_var = 42";
         let r = RdbgBackend.clean("continue", input);
         assert!(r.events.iter().any(|e| e.contains("Stop by")));
-        assert!(r.output.contains("Stop by"));
+        assert!(!r.output.contains("Stop by"), "stop event should not be duplicated in output");
         assert!(r.output.contains("local_var = 42"));
     }
 

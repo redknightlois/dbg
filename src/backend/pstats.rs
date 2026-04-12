@@ -1,4 +1,4 @@
-use super::{Backend, CleanResult, Dependency, DependencyCheck, SpawnConfig};
+use super::{Backend, CleanResult, Dependency, DependencyCheck, SpawnConfig, shell_escape};
 use crate::daemon::session_tmp;
 
 pub struct PstatsBackend;
@@ -12,10 +12,10 @@ impl Backend for PstatsBackend {
         &["pyprofile"]
     }
 
-    fn spawn_config(&self, target: &str, _args: &[String]) -> anyhow::Result<SpawnConfig> {
+    fn spawn_config(&self, target: &str, args: &[String]) -> anyhow::Result<SpawnConfig> {
         // Two modes:
         // 1. Existing .prof file → open pstats directly
-        // 2. Python script → profile it, save to temp, open pstats
+        // 2. Python script → profile it with cProfile, save to temp, open pstats
         let path = std::path::Path::new(target);
 
         if path.extension().is_some_and(|e| e == "prof" || e == "pstats") {
@@ -28,11 +28,31 @@ impl Backend for PstatsBackend {
             })
         } else {
             // Python script — profile it first, then open pstats
+            let prof_path = session_tmp("profile.prof");
+            let prof_str = prof_path.display().to_string();
+            let escaped_target = shell_escape(target);
+            let mut profile_cmd = format!(
+                "python3 -m cProfile -o {} {}",
+                shell_escape(&prof_str), escaped_target
+            );
+            for a in args {
+                profile_cmd.push(' ');
+                profile_cmd.push_str(&shell_escape(a));
+            }
+
+            let exec_repl = format!(
+                "exec python3 -m pstats {}",
+                shell_escape(&prof_str)
+            );
+
             Ok(SpawnConfig {
-                bin: "python3".into(),
-                args: vec!["-m".into(), "pstats".into(), session_tmp("profile.prof").display().to_string()],
-                env: vec![],
-                init_commands: vec![],
+                bin: "bash".into(),
+                args: vec!["--norc".into(), "--noprofile".into()],
+                env: vec![("PS1".into(), "% ".into())],
+                init_commands: vec![
+                    profile_cmd,
+                    exec_repl,
+                ],
             })
         }
     }
@@ -124,5 +144,23 @@ mod tests {
     fn spawn_config_pstats_extension() {
         let cfg = PstatsBackend.spawn_config("output.pstats", &[]).unwrap();
         assert!(cfg.args.contains(&"output.pstats".to_string()));
+    }
+
+    #[test]
+    fn spawn_config_python_script_profiles_first() {
+        let cfg = PstatsBackend.spawn_config("app.py", &[]).unwrap();
+        assert_eq!(cfg.bin, "bash");
+        assert!(cfg.init_commands[0].contains("cProfile"));
+        assert!(cfg.init_commands[0].contains("app.py"));
+        assert!(cfg.init_commands[1].contains("pstats"));
+    }
+
+    #[test]
+    fn spawn_config_python_script_with_args() {
+        let cfg = PstatsBackend.spawn_config("app.py", &["--port".into(), "8080".into()]).unwrap();
+        let cmd = &cfg.init_commands[0];
+        assert!(cmd.contains("app.py"));
+        assert!(cmd.contains("--port"));
+        assert!(cmd.contains("8080"));
     }
 }
