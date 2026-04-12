@@ -13,6 +13,16 @@ use crate::pty::DebuggerProcess;
 
 const CMD_TIMEOUT: Duration = Duration::from_secs(60);
 
+fn cleanup_and_exit() -> ! {
+    let _ = std::fs::remove_file(socket_path());
+    let _ = std::fs::remove_file(pid_path());
+    let session_dir = session_tmp("").parent().map(|p| p.to_path_buf());
+    if let Some(dir) = session_dir {
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    std::process::exit(0);
+}
+
 /// Pick the best directory for IPC files.
 /// Prefers $XDG_RUNTIME_DIR (per-user, tmpfs), falls back to /tmp.
 fn runtime_dir() -> PathBuf {
@@ -85,21 +95,18 @@ pub fn run_daemon(backend: &dyn Backend, target: &str, args: &[String]) -> Resul
     // Bind socket
     let listener = UnixListener::bind(&socket_path()).context("failed to bind socket")?;
 
-    let cleanup = || {
-        let _ = std::fs::remove_file(&socket_path());
-        let _ = std::fs::remove_file(&pid_path());
-        let session_dir = session_tmp("").parent().map(|p| p.to_path_buf());
-        if let Some(dir) = session_dir {
-            let _ = std::fs::remove_dir_all(&dir);
-        }
-    };
-
     ctrlc::set_handler(move || {
-        let _ = std::fs::remove_file(&socket_path());
-        let _ = std::fs::remove_file(&pid_path());
-        std::process::exit(0);
+        cleanup_and_exit();
     })
     .ok();
+
+    // Cache help output now while the debugger is idle and responsive.
+    // Stored outside the session mutex so it can be served even when
+    // the debugger is busy running a command.
+    let cached_help = proc
+        .send_and_wait(backend.help_command(), CMD_TIMEOUT)
+        .map(|raw| backend.parse_help(&raw))
+        .unwrap_or_default();
 
     let profile = backend
         .profile_output()
@@ -111,39 +118,64 @@ pub fn run_daemon(backend: &dyn Backend, target: &str, args: &[String]) -> Resul
         profile,
     });
 
-    for stream in listener.incoming() {
-        let mut stream = match stream {
-            Ok(s) => s,
-            Err(_) => continue,
-        };
+    // Non-blocking accept so threads can handle connections concurrently.
+    listener.set_nonblocking(true)?;
 
-        let mut data = vec![0u8; 4096];
-        let n = stream.read(&mut data).unwrap_or(0);
-        let cmd = String::from_utf8_lossy(&data[..n]).trim().to_string();
+    std::thread::scope(|scope| {
+        loop {
+            let stream = match listener.accept() {
+                Ok((s, _)) => s,
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(10));
+                    continue;
+                }
+                Err(_) => continue,
+            };
 
-        if cmd.is_empty() {
-            continue;
+            let session = &session;
+            let cached_help = &cached_help;
+
+            scope.spawn(move || {
+                let mut stream = stream;
+                // Accepted sockets inherit non-blocking from the listener; reset to blocking
+                let _ = stream.set_nonblocking(false);
+                let mut data = String::new();
+                let _ = stream.read_to_string(&mut data);
+                let cmd = data.trim().to_string();
+
+                if cmd.is_empty() {
+                    return;
+                }
+
+                if cmd == "quit" {
+                    let response = handle_command(&cmd, backend, session, cached_help);
+                    let _ = stream.write_all(response.as_bytes());
+                    // Exit immediately — scoped threads would otherwise wait
+                    // for any blocked command (e.g. `continue`) to finish.
+                    cleanup_and_exit();
+                }
+
+                let response = handle_command(&cmd, backend, session, cached_help);
+                let _ = stream.write_all(response.as_bytes());
+            });
         }
+    });
 
-        let response = handle_command(&cmd, backend, &session);
-
-        if cmd == "quit" {
-            let _ = stream.write_all(response.as_bytes());
-            cleanup();
-            std::process::exit(0);
-        }
-
-        let _ = stream.write_all(response.as_bytes());
-    }
-
-    cleanup();
-    Ok(())
+    cleanup_and_exit();
 }
 
-fn handle_command(cmd: &str, backend: &dyn Backend, session: &Mutex<Session>) -> String {
+fn handle_command(cmd: &str, backend: &dyn Backend, session: &Mutex<Session>, cached_help: &str) -> String {
+    // Serve help from cache — no lock needed, works even when the debugger is busy.
+    if cmd == "help" {
+        return cached_help.to_string();
+    }
+
     if cmd == "quit" {
-        let guard = session.lock().unwrap();
-        guard.proc.quit(backend.quit_command());
+        if let Ok(guard) = session.try_lock() {
+            guard.proc.quit(backend.quit_command());
+        }
+        // If the lock is held (debugger busy), process::exit in the event
+        // loop will handle cleanup via DebuggerProcess::Drop.
         return "stopped".to_string();
     }
 
@@ -164,18 +196,12 @@ fn handle_command(cmd: &str, backend: &dyn Backend, session: &Mutex<Session>) ->
         }
     }
 
-    if cmd == "help" {
-        let guard = session.lock().unwrap();
-        let raw = guard
-            .proc
-            .send_and_wait(backend.help_command(), CMD_TIMEOUT)
-            .unwrap_or_default();
-        return backend.parse_help(&raw);
-    }
-
     if let Some(topic) = cmd.strip_prefix("help ") {
         let help_cmd = backend.help_command();
-        let guard = session.lock().unwrap();
+        let guard = match session.try_lock() {
+            Ok(g) => g,
+            Err(_) => return "[busy] debugger is running a command — try again".to_string(),
+        };
         return guard
             .proc
             .send_and_wait(&format!("{help_cmd} {topic}"), CMD_TIMEOUT)
