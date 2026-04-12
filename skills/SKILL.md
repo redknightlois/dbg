@@ -47,6 +47,16 @@ dbg kill                   # stop session (always do this when done)
 
 Requires process control (fork, ptrace, PTY). Will fail inside sandboxes. Use unsandboxed execution.
 
+## Invalid targets
+
+dbg instruments the process it launches directly. Frameworks that spawn their own child processes **will not work** because the child processes don't inherit the instrumentation. Write a small standalone program instead.
+
+Examples of things that **do NOT work** as targets:
+- **BenchmarkDotNet** projects — spawns isolated child processes per benchmark
+- **Test runners with process isolation** (xunit with `parallelizeAssembly`, NUnit with process-level isolation)
+- **Docker-wrapped** executables
+- Any launcher that `fork+exec`s the real workload
+
 ## Rules
 
 - Load the adapter first. Everything backend-specific lives there.
