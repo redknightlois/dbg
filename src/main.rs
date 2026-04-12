@@ -73,6 +73,9 @@ fn main() -> Result<()> {
     registry.register(Box::new(backend::ghcprof::GhcProfBackend));
     registry.register(Box::new(backend::ocamldebug::OcamlDebugBackend));
 
+    // Auto-update installed skills if binary version changed
+    init::auto_update(&registry);
+
     // --jitdasm-repl (internal: launched by the jitdasm backend)
     if let Some(asm_path) = &cli.jitdasm_repl {
         return jitdasm::run_repl(asm_path).map_err(Into::into);
