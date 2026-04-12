@@ -10,7 +10,7 @@ impl Backend for LldbBackend {
     }
 
     fn types(&self) -> &'static [&'static str] {
-        &["rust", "c", "cpp", "zig"]
+        &["rust", "c", "cpp", "zig", "d", "nim"]
     }
 
     fn spawn_config(&self, target: &str, args: &[String]) -> anyhow::Result<SpawnConfig> {

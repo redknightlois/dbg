@@ -8,6 +8,8 @@ use anyhow::{Context, Result, bail};
 pub fn resolve(backend_type: &str, target: &str) -> Result<String> {
     match backend_type {
         "rust" | "c" | "cpp" | "zig" => resolve_native(target),
+        "d" => resolve_d(target),
+        "nim" => resolve_nim(target),
         "python" | "py" => resolve_python(target),
         "php" => resolve_php(target),
         "php-profile" => resolve_php(target),
@@ -147,6 +149,59 @@ fn find_dotnet_output(dir: &Path, name: &str) -> Result<String> {
         }
     }
     bail!("cannot find {name} in {}", debug_dir.display())
+}
+
+fn resolve_d(target: &str) -> Result<String> {
+    let path = Path::new(target);
+    if path.is_file() {
+        // If it's a source file, compile it
+        if target.ends_with(".d") {
+            let stem = path.file_stem().unwrap().to_str().unwrap();
+            let output = path.parent().unwrap_or(Path::new(".")).join(stem);
+            eprintln!("building {target}...");
+            // Try ldc2 first (better DWARF), fall back to dmd
+            let status = Command::new("ldc2")
+                .args(["-g", "-of", output.to_str().unwrap(), target])
+                .status()
+                .or_else(|_| {
+                    Command::new("dmd")
+                        .args(["-g", &format!("-of={}", output.display()), target])
+                        .status()
+                })
+                .context("neither ldc2 nor dmd found")?;
+            if !status.success() {
+                bail!("D compilation failed for {target}");
+            }
+            return Ok(output.display().to_string());
+        }
+        // Already a binary
+        return Ok(target.to_string());
+    }
+    bail!("file not found: {target}")
+}
+
+fn resolve_nim(target: &str) -> Result<String> {
+    let path = Path::new(target);
+    if path.is_file() {
+        // If it's a source file, compile it
+        if target.ends_with(".nim") {
+            let stem = path.file_stem().unwrap().to_str().unwrap();
+            let output = path.parent().unwrap_or(Path::new(".")).join(stem);
+            eprintln!("building {target}...");
+            let status = Command::new("nim")
+                .args(["compile", "--debugger:native", "--opt:none",
+                       &format!("--out:{}", output.display()), target])
+                .status()
+                .context("nim not found")?;
+            if !status.success() {
+                bail!("nim compile failed for {target}");
+            }
+            return Ok(output.display().to_string());
+        }
+        // Already a binary
+        return Ok(target.to_string());
+    }
+    bail!("file not found: {target}")
 }
 
 fn resolve_ruby(target: &str) -> Result<String> {
