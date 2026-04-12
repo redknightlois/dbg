@@ -61,8 +61,8 @@ ghc -prof -fprof-late -rtsopts -o myapp Main.hs
 2. Wait for compilation + profiled run to finish
 3. Overview: `dbg hotspots` — find hot functions
 4. Allocation: `dbg memory` — find allocation-heavy functions
-5. Drill in: `dbg "inspect Main.fib"` — self vs inclusive cost
-6. Call graph: `dbg "calls Main.main"` and `dbg "callers Main.fib"`
+5. Drill in: `dbg inspect Main.fib` — self vs inclusive cost
+6. Call graph: `dbg calls Main.main` and `dbg callers Main.fib`
 7. Hot path: `dbg hotpath` — most expensive call chain
 
 ## Common Failures

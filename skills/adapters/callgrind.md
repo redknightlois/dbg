@@ -47,10 +47,10 @@ Callgrind runs the binary under Valgrind's instrumentation. After the program fi
 1. Start session: `dbg start callgrind ./binary`
 2. Wait for valgrind to finish (can take minutes for large programs)
 3. Overview: `dbg hotspots` — find hot functions
-4. Drill in: `dbg "inspect <function>"` — self vs inclusive time, callees
-5. Call graph: `dbg "calls <function>"` and `dbg "callers <function>"`
+4. Drill in: `dbg inspect <function>` — self vs inclusive time, callees
+5. Call graph: `dbg calls <function>` and `dbg callers <function>`
 6. Hot path: `dbg hotpath` — most expensive call chain
-7. Focus: `dbg "focus <pattern>"` — zoom into a subsystem
+7. Focus: `dbg focus <pattern>` — zoom into a subsystem
 
 ## Common Failures
 
