@@ -3,6 +3,7 @@ mod check;
 mod daemon;
 mod init;
 mod jitdasm;
+mod phpprofile;
 mod profile;
 mod pty;
 mod resolve;
@@ -30,6 +31,10 @@ struct Cli {
     #[arg(long, hide = true)]
     jitdasm_repl: Option<String>,
 
+    /// Internal: run the PHP profile REPL on a captured cachegrind file
+    #[arg(long, hide = true)]
+    phpprofile_repl: Option<String>,
+
     /// All remaining arguments
     #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
     args: Vec<String>,
@@ -51,10 +56,17 @@ fn main() -> Result<()> {
     registry.register(Box::new(backend::massif::MassifBackend));
     registry.register(Box::new(backend::dotnettrace::DotnetTraceBackend));
     registry.register(Box::new(backend::jitdasm::JitDasmBackend));
+    registry.register(Box::new(backend::phpdbg::PhpdbgBackend));
+    registry.register(Box::new(backend::xdebug::XdebugProfileBackend));
 
     // --jitdasm-repl (internal: launched by the jitdasm backend)
     if let Some(asm_path) = &cli.jitdasm_repl {
         return jitdasm::run_repl(asm_path).map_err(Into::into);
+    }
+
+    // --phpprofile-repl (internal: launched by the xdebug backend)
+    if let Some(cg_path) = &cli.phpprofile_repl {
+        return phpprofile::run_repl(cg_path).map_err(Into::into);
     }
 
     // --init

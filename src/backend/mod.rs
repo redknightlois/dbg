@@ -9,8 +9,10 @@ pub mod massif;
 pub mod memcheck;
 pub mod perf;
 pub mod pdb;
+pub mod phpdbg;
 pub mod pprof;
 pub mod pstats;
+pub mod xdebug;
 use std::collections::HashMap;
 
 /// Result of cleaning debugger output.
