@@ -62,6 +62,8 @@ fn main() -> Result<()> {
     registry.register(Box::new(backend::jitdasm::JitDasmBackend));
     registry.register(Box::new(backend::phpdbg::PhpdbgBackend));
     registry.register(Box::new(backend::xdebug::XdebugProfileBackend));
+    registry.register(Box::new(backend::rdbg::RdbgBackend));
+    registry.register(Box::new(backend::stackprof::StackprofBackend));
 
     // --jitdasm-repl (internal: launched by the jitdasm backend)
     if let Some(asm_path) = &cli.jitdasm_repl {
