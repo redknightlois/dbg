@@ -56,13 +56,13 @@ The .NET JIT uses **single colon** `Class:Method` notation, NOT C++ double-colon
 
 3. **Inspect specific methods**:
    ```
-   dbg "disasm SimdOps:DotProduct"
+   dbg disasm SimdOps:DotProduct
    ```
 
 4. **Search for instructions**:
    ```
-   dbg "search vfmadd"        # find FMA usage
-   dbg "search RNGCHKFAIL"    # find bounds checks
+   dbg search vfmadd        # find FMA usage
+   dbg search RNGCHKFAIL    # find bounds checks
    dbg simd                   # find all SIMD methods
    ```
 
