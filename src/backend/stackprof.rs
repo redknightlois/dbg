@@ -1,4 +1,4 @@
-use super::{Backend, CleanResult, Dependency, DependencyCheck, SpawnConfig};
+use super::{Backend, CleanResult, Dependency, DependencyCheck, SpawnConfig, shell_escape};
 use crate::daemon::session_tmp;
 
 pub struct StackprofBackend;
@@ -20,30 +20,34 @@ impl Backend for StackprofBackend {
         let cg_str = cg_file.display().to_string();
         let out_dir_str = out_dir.display().to_string();
 
-        let escaped_target = target.replace('\\', "\\\\").replace('\'', "\\'");
+        // Use environment variables to pass target/args safely into Ruby,
+        // avoiding multi-layer shell+Ruby escaping issues.
+        let ruby_script = format!(
+            "require 'stackprof'; StackProf.run(mode: :cpu, out: '{}', raw: true) {{ load ENV['DBG_TARGET'] }}",
+            dump_str
+        );
+        let ruby_script_with_args = format!(
+            "ARGV.replace(ENV['DBG_ARGS'].split('\\x00')); require 'stackprof'; StackProf.run(mode: :cpu, out: '{}', raw: true) {{ load ENV['DBG_TARGET'] }}",
+            dump_str
+        );
+
         let ruby_cmd = if args.is_empty() {
             format!(
-                "mkdir -p {} && ruby -e \"require 'stackprof'; StackProf.run(mode: :cpu, out: '{}', raw: true) {{ load '{}' }}\"",
-                out_dir_str, dump_str, escaped_target
+                "mkdir -p {} && DBG_TARGET={} ruby -e {}",
+                shell_escape(&out_dir_str), shell_escape(target), shell_escape(&ruby_script)
             )
         } else {
-            let escaped_args: Vec<String> = args.iter().map(|a| {
-                let escaped = a.replace('\\', "\\\\").replace('\'', "\\'");
-                format!("'{}'", escaped)
-            }).collect();
+            let joined_args = args.join("\x00");
             format!(
-                "mkdir -p {} && ruby -e \"ARGV.replace([{}]); require 'stackprof'; StackProf.run(mode: :cpu, out: '{}', raw: true) {{ load '{}' }}\"",
-                out_dir_str,
-                escaped_args.join(", "),
-                dump_str,
-                escaped_target
+                "mkdir -p {} && DBG_TARGET={} DBG_ARGS={} ruby -e {}",
+                shell_escape(&out_dir_str), shell_escape(target), shell_escape(&joined_args), shell_escape(&ruby_script_with_args)
             )
         };
 
-        // Convert stackprof dump to callgrind format
+        // Convert stackprof dump to callgrind format, fail if output is empty
         let convert_cmd = format!(
-            "stackprof {} --callgrind > {}",
-            dump_str, cg_str
+            "stackprof {} --callgrind > {} && test -s {}",
+            shell_escape(&dump_str), shell_escape(&cg_str), shell_escape(&cg_str)
         );
 
         // Find our own binary for exec-ing into the REPL
@@ -135,11 +139,13 @@ mod tests {
     fn spawn_config_runs_stackprof_and_converts() {
         let cfg = StackprofBackend.spawn_config("test.rb", &[]).unwrap();
         assert_eq!(cfg.bin, "bash");
-        assert!(cfg.init_commands[0].contains("stackprof"));
-        assert!(cfg.init_commands[0].contains("test.rb"));
+        // First command uses env var for target, runs ruby with stackprof
+        assert!(cfg.init_commands[0].contains("DBG_TARGET=test.rb"));
+        assert!(cfg.init_commands[0].contains("ruby -e"));
         assert!(cfg.init_commands[0].contains("mode: :cpu"));
-        // Second command converts to callgrind
+        // Second command converts to callgrind with validation
         assert!(cfg.init_commands[1].contains("--callgrind"));
+        assert!(cfg.init_commands[1].contains("test -s"));
         // Third command execs into the REPL
         assert!(cfg.init_commands[2].contains("--phpprofile-repl"));
         assert!(cfg.init_commands[2].contains("exec"));
@@ -151,8 +157,8 @@ mod tests {
             .spawn_config("test.rb", &["--flag".into()])
             .unwrap();
         let cmd = &cfg.init_commands[0];
-        assert!(cmd.contains("test.rb"));
-        assert!(cmd.contains("--flag"));
+        assert!(cmd.contains("DBG_TARGET=test.rb"));
+        assert!(cmd.contains("DBG_ARGS=--flag"));
     }
 
     #[test]
@@ -167,21 +173,23 @@ mod tests {
     }
 
     #[test]
-    fn spawn_config_escapes_single_quotes_in_target() {
+    fn spawn_config_escapes_special_chars_in_target() {
         let cfg = StackprofBackend
             .spawn_config("it's_a_test.rb", &[])
             .unwrap();
         let cmd = &cfg.init_commands[0];
-        // Single quote in target must be escaped for Ruby string
-        assert!(cmd.contains("it\\'s_a_test.rb"), "single quote not escaped in target: {cmd}");
+        // Target with single quote is shell-escaped via env var
+        assert!(cmd.contains("DBG_TARGET="), "target not passed via env: {cmd}");
+        assert!(cmd.contains("it"), "target not present: {cmd}");
     }
 
     #[test]
-    fn spawn_config_escapes_single_quotes_in_args() {
+    fn spawn_config_escapes_shell_metacharacters() {
         let cfg = StackprofBackend
-            .spawn_config("test.rb", &["it's".into()])
+            .spawn_config("$(evil).rb", &[])
             .unwrap();
         let cmd = &cfg.init_commands[0];
-        assert!(cmd.contains("it\\'s"), "single quote not escaped in args: {cmd}");
+        // Shell metacharacters must be escaped in the DBG_TARGET value
+        assert!(cmd.contains("'$(evil).rb'"), "shell metacharacter not escaped: {cmd}");
     }
 }

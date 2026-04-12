@@ -17,9 +17,14 @@ impl Backend for LldbBackend {
         let lldb_bin =
             std::env::var("LLDB_BIN").unwrap_or_else(|_| find_lldb().unwrap_or("lldb".into()));
 
-        let mut init_commands = vec![format!("file {target}")];
+        let escaped_target = target.replace('\\', "\\\\").replace('"', "\\\"");
+        let mut init_commands = vec![format!("file \"{escaped_target}\"")];
         if !args.is_empty() {
-            init_commands.push(format!("settings set target.run-args {}", args.join(" ")));
+            let escaped_args: Vec<String> = args.iter().map(|a| {
+                let e = a.replace('\\', "\\\\").replace('"', "\\\"");
+                format!("\"{e}\"")
+            }).collect();
+            init_commands.push(format!("settings set target.run-args {}", escaped_args.join(" ")));
         }
 
         Ok(SpawnConfig {
@@ -228,15 +233,27 @@ mod tests {
             .spawn_config("./test", &["arg1".into(), "arg2".into()])
             .unwrap();
         assert_eq!(cfg.init_commands.len(), 2);
-        assert_eq!(cfg.init_commands[0], "file ./test");
-        assert!(cfg.init_commands[1].contains("arg1 arg2"));
+        assert_eq!(cfg.init_commands[0], "file \"./test\"");
+        assert!(cfg.init_commands[1].contains("\"arg1\" \"arg2\""));
     }
 
     #[test]
     fn spawn_config_no_args() {
         let cfg = LldbBackend.spawn_config("./test", &[]).unwrap();
         assert_eq!(cfg.init_commands.len(), 1);
-        assert_eq!(cfg.init_commands[0], "file ./test");
+        assert_eq!(cfg.init_commands[0], "file \"./test\"");
+    }
+
+    #[test]
+    fn spawn_config_escapes_spaces_in_target() {
+        let cfg = LldbBackend.spawn_config("./my app", &[]).unwrap();
+        assert_eq!(cfg.init_commands[0], "file \"./my app\"");
+    }
+
+    #[test]
+    fn spawn_config_escapes_quotes_in_target() {
+        let cfg = LldbBackend.spawn_config("./te\"st", &[]).unwrap();
+        assert_eq!(cfg.init_commands[0], "file \"./te\\\"st\"");
     }
 
     #[test]
