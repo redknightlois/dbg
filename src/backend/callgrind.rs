@@ -1,4 +1,4 @@
-use super::{Backend, CleanResult, Dependency, DependencyCheck, SpawnConfig, shell_escape};
+use super::{Backend, Dependency, DependencyCheck, SpawnConfig, shell_escape};
 use crate::daemon::session_tmp;
 
 pub struct CallgrindBackend;
@@ -25,10 +25,7 @@ impl Backend for CallgrindBackend {
             valgrind_cmd.push_str(&shell_escape(a));
         }
 
-        let dbg_bin = std::env::current_exe()
-            .unwrap_or_else(|_| "dbg".into())
-            .display()
-            .to_string();
+        let dbg_bin = super::self_exe();
 
         let exec_repl = format!(
             "exec {} --phpprofile-repl {} --profile-prompt 'callgrind> '",
@@ -66,10 +63,6 @@ impl Backend for CallgrindBackend {
         ]
     }
 
-    fn format_breakpoint(&self, _spec: &str) -> String {
-        String::new()
-    }
-
     fn run_command(&self) -> &'static str {
         "stats"
     }
@@ -80,13 +73,6 @@ impl Backend for CallgrindBackend {
 
     fn parse_help(&self, _raw: &str) -> String {
         "callgrind: hotspots, flat, calls, callers, inspect, stats, memory, search, tree, hotpath, focus, ignore, reset, help".to_string()
-    }
-
-    fn clean(&self, _cmd: &str, output: &str) -> CleanResult {
-        CleanResult {
-            output: output.to_string(),
-            events: vec![],
-        }
     }
 
     fn adapters(&self) -> Vec<(&'static str, &'static str)> {

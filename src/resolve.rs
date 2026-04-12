@@ -19,13 +19,12 @@ pub fn resolve(backend_type: &str, target: &str) -> Result<String> {
         "rust" | "c" | "cpp" | "zig" => resolve_native(target),
         "d" => resolve_d(target),
         "nim" => resolve_nim(target),
-        "python" | "py" => resolve_python(target),
-        "php" => resolve_php(target),
-        "php-profile" => resolve_php(target),
-        "ruby" | "rb" | "ruby-profile" => resolve_ruby(target),
+        "python" | "py" => resolve_existing_file(target),
+        "php" | "php-profile" => resolve_existing_file(target),
+        "ruby" | "rb" | "ruby-profile" => resolve_existing_file(target),
         "dotnet" | "csharp" | "fsharp" => resolve_dotnet(target),
         "go" => resolve_go(target),
-        "haskell" | "hs" | "haskell-profile" | "hs-profile" => resolve_haskell(target),
+        "haskell" | "hs" | "haskell-profile" | "hs-profile" => resolve_existing_file(target),
         "ocaml" | "ml" => resolve_ocaml(target),
         "java" | "kotlin" | "pprof" | "perf" | "callgrind" | "pyprofile" | "memcheck" | "valgrind" | "massif" | "dotnet-trace" => Ok(target.to_string()),
         _ => {
@@ -76,7 +75,7 @@ fn resolve_native(target: &str) -> Result<String> {
     bail!("cannot find binary for {target} after build")
 }
 
-fn resolve_python(target: &str) -> Result<String> {
+fn resolve_existing_file(target: &str) -> Result<String> {
     if Path::new(target).is_file() {
         Ok(target.to_string())
     } else {
@@ -211,23 +210,6 @@ fn resolve_nim(target: &str) -> Result<String> {
     bail!("file not found: {target}")
 }
 
-fn resolve_ruby(target: &str) -> Result<String> {
-    let path = Path::new(target);
-    if path.is_file() {
-        Ok(target.to_string())
-    } else {
-        bail!("file not found: {target}")
-    }
-}
-
-fn resolve_php(target: &str) -> Result<String> {
-    let path = Path::new(target);
-    if path.is_file() {
-        Ok(target.to_string())
-    } else {
-        bail!("file not found: {target}")
-    }
-}
 
 fn resolve_ocaml(target: &str) -> Result<String> {
     let path = Path::new(target);
@@ -256,15 +238,6 @@ fn resolve_ocaml(target: &str) -> Result<String> {
         return Ok(target.to_string());
     }
     bail!("file not found: {target}")
-}
-
-fn resolve_haskell(target: &str) -> Result<String> {
-    let path = Path::new(target);
-    if path.is_file() {
-        Ok(target.to_string())
-    } else {
-        bail!("file not found: {target}")
-    }
 }
 
 fn resolve_go(target: &str) -> Result<String> {

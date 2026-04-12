@@ -66,10 +66,6 @@ impl Backend for MassifBackend {
         ]
     }
 
-    fn format_breakpoint(&self, _spec: &str) -> String {
-        String::new()
-    }
-
     fn run_command(&self) -> &'static str {
         "ms_print $MASSIF_OUT"
     }

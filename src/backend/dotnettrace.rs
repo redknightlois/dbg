@@ -1,4 +1,4 @@
-use super::{Backend, CleanResult, Dependency, DependencyCheck, SpawnConfig, shell_escape};
+use super::{Backend, Dependency, DependencyCheck, SpawnConfig, shell_escape};
 use crate::check::find_bin;
 use crate::daemon::session_tmp;
 
@@ -86,10 +86,6 @@ impl Backend for DotnetTraceBackend {
         ]
     }
 
-    fn format_breakpoint(&self, _spec: &str) -> String {
-        String::new()
-    }
-
     fn run_command(&self) -> &'static str {
         "top"
     }
@@ -100,13 +96,6 @@ impl Backend for DotnetTraceBackend {
 
     fn parse_help(&self, _raw: &str) -> String {
         "commands: top [N], callers <func>, callees <func>, traces [N], tree [N], hotpath, threads, stats, search <pattern>, focus <func>, ignore <func>, reset".to_string()
-    }
-
-    fn clean(&self, _cmd: &str, output: &str) -> CleanResult {
-        CleanResult {
-            output: output.to_string(),
-            events: vec![],
-        }
     }
 
     fn profile_output(&self) -> Option<String> {
