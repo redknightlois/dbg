@@ -1253,6 +1253,12 @@ pub fn cmd_diff(db: &GpuDb, args: &[&str]) {
         GpuDb::session_dir().join(format!("{name}.gpu.db"))
     };
 
+    // SQLite's ATTACH creates an empty DB at missing paths; guard first so
+    // we fail loudly instead of silently creating junk at the target path.
+    if !other_path.exists() {
+        println!("cannot load '{name}': no such session at {}", other_path.display());
+        return;
+    }
     if let Err(e) = db.attach(other_path.to_str().unwrap_or(""), "other") {
         println!("cannot load '{name}': {e}");
         return;
