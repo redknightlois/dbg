@@ -2175,4 +2175,50 @@ pub fn cmd_outliers(db: &GpuDb, args: &[&str]) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// source — show which ops/files launched a kernel (needs torch/proton layer)
+// ---------------------------------------------------------------------------
+
+pub fn cmd_source(db: &GpuDb, args: &[&str]) {
+    let pattern = match args.first() {
+        Some(p) => *p,
+        None => { println!("usage: source <kernel_pattern>"); return; }
+    };
+
+    if !db.has_layer("torch") && !db.has_layer("proton") {
+        println!("no op-to-kernel mapping — need torch.profiler or proton layer");
+        println!("(run 'suggest' for how to collect it)");
+        return;
+    }
+
+    // Match kernel → ops via op_kernel_map. Aggregate by (op name, module_path).
+    let sql = r"SELECT o.name, COALESCE(o.module_path, '') AS mp,
+                       COUNT(DISTINCT o.id) AS op_hits,
+                       SUM(COALESCE(o.gpu_time_us, 0)) AS gpu_us
+                FROM op_kernel_map m
+                JOIN ops o ON o.id = m.op_id
+                WHERE m.kernel_name LIKE ?1 ESCAPE '\'
+                GROUP BY o.name, mp
+                ORDER BY gpu_us DESC
+                LIMIT 20";
+    let rows: Vec<(String, String, i64, f64)> = db.query_vec(
+        sql, [like_param(pattern)],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+    );
+
+    if rows.is_empty() {
+        println!("no op mapping found for pattern '{pattern}'");
+        return;
+    }
+
+    println!("  Launch sites for kernels matching '{pattern}':\n");
+    println!("  Op                                       Hits  GPU Time    Source");
+    println!("  ──────────────────────────────────────── ───── ─────────── ──────────────────────────────");
+    for (name, mp, hits, gpu_us) in &rows {
+        let src = if mp.is_empty() { "—".to_string() } else { trunc(mp, 40) };
+        println!("  {:<40} {:>5} {:>11} {}",
+            trunc(name, 40), hits, fmt_us(*gpu_us), src);
+    }
+}
+
 use std::path::PathBuf;
