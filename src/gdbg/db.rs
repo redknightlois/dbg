@@ -275,9 +275,17 @@ impl GpuDb {
     }
 
     /// SQL fragment to filter launches to the best timeline layer.
+    /// Uses `launches.layer_id` to be safe in JOIN contexts where the launches
+    /// table is not aliased.  Use `timeline_filter_for("alias")` when the
+    /// launches table has a different alias.
     pub fn timeline_filter(&self) -> String {
+        self.timeline_filter_for("launches")
+    }
+
+    /// Like `timeline_filter`, but with a custom table alias.
+    pub fn timeline_filter_for(&self, alias: &str) -> String {
         match self.timeline_layer_id() {
-            Some(id) => format!("layer_id = {id}"),
+            Some(id) => format!("{alias}.layer_id = {id}"),
             None => "1=1".to_string(),
         }
     }
@@ -303,6 +311,51 @@ impl GpuDb {
     }
 
     // -----------------------------------------------------------------------
+    // Op GPU time recomputation
+    // -----------------------------------------------------------------------
+
+    /// Re-compute `ops.gpu_time_us` against the best timeline layer.
+    ///
+    /// During import, `ops.gpu_time_us` is computed from the torch/proton
+    /// layer's kernel launches.  When an nsys layer is also present, its
+    /// kernel durations are more accurate (lower profiler overhead).  This
+    /// method re-correlates every op's GPU time against whichever layer
+    /// `timeline_filter` selects, so that `top-ops`, `compare-ops`, and
+    /// `hotpath` stay consistent with `breakdown` and `kernels`.
+    pub fn recompute_op_gpu_times(&self) {
+        let Some(tl_id) = self.timeline_layer_id() else { return };
+
+        // Check whether the timeline layer is already the op layer —
+        // if so, nothing to fix.
+        let op_layers: Vec<String> = self.query_vec(
+            "SELECT DISTINCT source FROM layers WHERE id IN (SELECT DISTINCT layer_id FROM ops)",
+            [],
+            |row| row.get(0),
+        );
+        let tl_source: String = self.conn.query_row(
+            "SELECT source FROM layers WHERE id = ?1",
+            params![tl_id],
+            |row| row.get(0),
+        ).unwrap_or_default();
+
+        // If the only op layer is also the timeline layer, no recomputation needed.
+        if op_layers.len() == 1 && op_layers[0] == tl_source {
+            return;
+        }
+
+        // Re-correlate: for each op, sum kernel durations from the timeline layer.
+        let _ = self.conn.execute(
+            "UPDATE ops SET gpu_time_us = (
+                SELECT COALESCE(SUM(l.duration_us), 0)
+                FROM op_kernel_map okm
+                JOIN launches l ON l.kernel_name = okm.kernel_name AND l.layer_id = ?1
+                WHERE okm.op_id = ops.id
+            )",
+            params![tl_id],
+        );
+    }
+
+    // -----------------------------------------------------------------------
     // Scalar query helpers
     // -----------------------------------------------------------------------
 
@@ -325,15 +378,18 @@ impl GpuDb {
     // -----------------------------------------------------------------------
 
     pub fn unique_kernel_count(&self) -> usize {
-        self.count("SELECT COUNT(DISTINCT kernel_name) FROM launches")
+        let tl = self.timeline_filter();
+        self.count(&format!("SELECT COUNT(DISTINCT kernel_name) FROM launches WHERE {tl}"))
     }
 
     pub fn total_launch_count(&self) -> usize {
-        self.count("SELECT COUNT(*) FROM launches")
+        let tl = self.timeline_filter();
+        self.count(&format!("SELECT COUNT(*) FROM launches WHERE {tl}"))
     }
 
     pub fn total_gpu_time_us(&self) -> f64 {
-        self.scalar_f64("SELECT COALESCE(SUM(duration_us), 0) FROM launches")
+        let tl = self.timeline_filter();
+        self.scalar_f64(&format!("SELECT COALESCE(SUM(duration_us), 0) FROM launches WHERE {tl}"))
     }
 
     pub fn transfer_count(&self) -> usize {
@@ -341,7 +397,8 @@ impl GpuDb {
     }
 
     pub fn stream_count(&self) -> usize {
-        self.count("SELECT COUNT(DISTINCT stream_id) FROM launches WHERE stream_id IS NOT NULL")
+        let tl = self.timeline_filter();
+        self.count(&format!("SELECT COUNT(DISTINCT stream_id) FROM launches WHERE stream_id IS NOT NULL AND {tl}"))
     }
 
     pub fn kernels_with_metrics(&self) -> usize {
