@@ -101,7 +101,14 @@ fn main() -> Result<()> {
     // --backend
     if let Some(types_str) = &cli.backend {
         let types: Vec<&str> = types_str.split(',').map(|s| s.trim()).collect();
-        let results = check::check_backends(&registry, &types);
+        let (results, unknown) = check::check_backends(&registry, &types);
+        if !unknown.is_empty() {
+            bail!(
+                "unknown type(s): {} (available: {})",
+                unknown.join(", "),
+                registry.available_types().join(", ")
+            );
+        }
         print!("{}", check::format_results(&results));
 
         let all_ok = results.iter().all(|(_, deps)| deps.iter().all(|d| d.ok));
@@ -122,7 +129,7 @@ fn main() -> Result<()> {
 
         println!("backends:");
         for backend in registry.all_backends() {
-            let results = check::check_backends(&registry, &[backend.name()]);
+            let (results, _) = check::check_backends(&registry, &[backend.name()]);
             let missing: Vec<&str> = results
                 .iter()
                 .flat_map(|(_, statuses)| statuses.iter().filter(|s| !s.ok).map(|s| s.name))
@@ -212,7 +219,7 @@ fn cmd_start(registry: &Registry, args: &[String]) -> Result<()> {
         })?;
 
     // Check dependencies before attempting to spawn
-    let results = check::check_backends(registry, &[backend_type]);
+    let (results, _) = check::check_backends(registry, &[backend_type]);
     let missing: Vec<_> = results
         .iter()
         .flat_map(|(_, deps)| deps.iter().filter(|d| !d.ok))
