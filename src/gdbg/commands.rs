@@ -58,18 +58,26 @@ pub(crate) fn escape_regex(s: &str) -> String {
     out
 }
 
-/// Compute true GPU idle gaps by merging overlapping launch intervals across streams.
+/// Compute true GPU idle gaps by merging kernel and transfer intervals.
+/// A gap is time when the GPU has no kernel running AND no DMA in flight.
 /// Returns (gap_start, gap_duration) pairs sorted by start time.
-fn compute_gpu_gaps(db: &GpuDb) -> Vec<(f64, f64)> {
+pub(crate) fn compute_gpu_gaps(db: &GpuDb) -> Vec<(f64, f64)> {
     let tl = db.timeline_filter();
-    let sql = format!(
+    let kernel_sql = format!(
         "SELECT start_us, start_us + duration_us AS end_us
-         FROM launches WHERE start_us IS NOT NULL AND {tl}
-         ORDER BY start_us"
+         FROM launches WHERE start_us IS NOT NULL AND {tl}"
     );
-    let intervals: Vec<(f64, f64)> = db.query_vec(&sql, [], |row| {
+    let mut intervals: Vec<(f64, f64)> = db.query_vec(&kernel_sql, [], |row| {
         Ok((row.get::<_,f64>(0)?, row.get::<_,f64>(1)?))
     });
+
+    let xfer_intervals: Vec<(f64, f64)> = db.query_vec(
+        "SELECT start_us, start_us + duration_us FROM transfers WHERE start_us IS NOT NULL",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    );
+    intervals.extend(xfer_intervals);
+    intervals.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
 
     let mut gaps = Vec::new();
     if let Some(&(_, mut cur_end)) = intervals.first() {
@@ -108,13 +116,17 @@ pub fn cmd_stats(db: &GpuDb) {
     let device = db.meta("device");
     let wall_us: f64 = db.meta("wall_time_us").parse().unwrap_or(0.0);
     let gpu_us = db.total_gpu_time_us();
+    let xfer_us: f64 = db.scalar_f64("SELECT COALESCE(SUM(duration_us),0) FROM transfers");
 
     println!("GPU Profile Summary");
     println!("  Target:       {target}");
     if !device.is_empty() { println!("  Device:       {device}"); }
     println!("  Wall time:    {}", fmt_us(wall_us));
-    println!("  GPU active:   {} ({:.1}%)", fmt_us(gpu_us),
-        if wall_us > 0.0 { gpu_us / wall_us * 100.0 } else { 0.0 });
+    let pct = |v: f64| if wall_us > 0.0 { v / wall_us * 100.0 } else { 0.0 };
+    println!("  Kernel time:  {} ({:.1}% of wall)", fmt_us(gpu_us), pct(gpu_us));
+    if xfer_us > 0.0 {
+        println!("  Transfer time: {} ({:.1}% of wall)", fmt_us(xfer_us), pct(xfer_us));
+    }
     println!("  Kernels:      {} launches, {} unique",
         db.total_launch_count(), db.unique_kernel_count());
     println!("  Transfers:    {}", db.transfer_count());
@@ -176,7 +188,7 @@ pub fn cmd_kernels(db: &GpuDb, args: &[&str]) {
     let tl = db.timeline_filter();
 
     let pattern_clause = pattern
-        .map(|p| format!("AND launches.kernel_name LIKE '%{}%'", escape_sql_like(p)))
+        .map(|p| format!(r"AND launches.kernel_name LIKE '%{}%' ESCAPE '\'", escape_sql_like(p)))
         .unwrap_or_default();
 
     let sql = format!(
@@ -234,7 +246,7 @@ pub fn cmd_ops(db: &GpuDb, args: &[&str]) {
     let n = parse_count(args);
     let pattern = parse_pattern(args);
     let pattern_clause = pattern
-        .map(|p| format!("AND name LIKE '%{}%'", escape_sql_like(p)))
+        .map(|p| format!(r"AND name LIKE '%{}%' ESCAPE '\'", escape_sql_like(p)))
         .unwrap_or_default();
 
     let sql = format!(
@@ -276,9 +288,9 @@ pub fn cmd_inspect(db: &GpuDb, args: &[&str]) {
 
     // Get kernel aggregate (restrict to timeline layer to avoid double-counting)
     let tl = db.timeline_filter();
-    let sql = format!("SELECT kernel_name, COUNT(*), SUM(duration_us), AVG(duration_us),
+    let sql = format!(r"SELECT kernel_name, COUNT(*), SUM(duration_us), AVG(duration_us),
                       MIN(duration_us), MAX(duration_us)
-               FROM launches WHERE kernel_name LIKE ?1 AND {tl}
+               FROM launches WHERE kernel_name LIKE ?1 ESCAPE '\' AND {tl}
                GROUP BY kernel_name");
     let mut stmt = db.conn.prepare(&sql).unwrap();
     let mut rows = stmt.query_map([like_param(pattern)], |row| {
@@ -398,7 +410,7 @@ pub fn cmd_bound(db: &GpuDb, args: &[&str]) {
                       m.compute_throughput_pct, m.memory_throughput_pct,
                       m.l2_hit_rate_pct, m.achieved_bandwidth_gb_s, m.peak_bandwidth_gb_s,
                       m.occupancy_pct
-               FROM metrics m WHERE m.kernel_name LIKE ?1";
+               FROM metrics m WHERE m.kernel_name LIKE ?1 ESCAPE '\'";
     let mut stmt = db.conn.prepare(sql).unwrap();
     let rows: Vec<_> = stmt.query_map([like_param(pattern)], |row| {
         Ok((
@@ -449,7 +461,7 @@ pub fn cmd_roofline(db: &GpuDb, args: &[&str]) {
 
     let sql = "SELECT kernel_name, boundedness, compute_throughput_pct,
                       memory_throughput_pct, occupancy_pct
-               FROM metrics WHERE kernel_name LIKE ?1
+               FROM metrics WHERE kernel_name LIKE ?1 ESCAPE '\'
                ORDER BY kernel_name";
     let mut stmt = db.conn.prepare(sql).unwrap();
     let rows: Vec<_> = stmt.query_map([&pat], |row| {
@@ -513,14 +525,71 @@ pub fn cmd_transfers(db: &GpuDb, args: &[&str]) {
     }
     let n = parse_count(args);
 
-    // Summary
+    // --- Overall totals ---
     let (total_bytes, total_time): (i64, f64) = db.conn.query_row(
         "SELECT COALESCE(SUM(bytes),0), COALESCE(SUM(duration_us),0) FROM transfers",
         [], |row| Ok((row.get(0)?, row.get(1)?))
     ).unwrap();
-    println!("  Total: {} transfers, {}, {}\n",
-        db.transfer_count(), fmt_bytes(total_bytes), fmt_us(total_time));
+    let kernel_time = db.total_gpu_time_us();
+    let wall_us: f64 = db.meta("wall_time_us").parse().unwrap_or(0.0);
 
+    println!("  Total: {} transfers, {}, {}",
+        db.transfer_count(), fmt_bytes(total_bytes), fmt_us(total_time));
+    if wall_us > 0.0 {
+        println!("  {:.1}% of wall time spent on transfers", total_time / wall_us * 100.0);
+    }
+
+    // Transfer vs compute ratio — indicates bandwidth-bound workload
+    if kernel_time > 0.0 {
+        let ratio = total_time / kernel_time;
+        let verdict = if ratio > 5.0 { "BANDWIDTH-BOUND — PCIe dominates" }
+            else if ratio > 1.5 { "transfer-heavy — consider async transfers or larger batches" }
+            else if ratio > 0.5 { "mixed compute/transfer" }
+            else { "compute-dominated" };
+        println!("  Transfer:compute ratio = {ratio:.2}:1  ({verdict})");
+    }
+    println!();
+
+    // --- Breakdown by kind ---
+    let kind_sql = "SELECT kind, COUNT(*), SUM(bytes), SUM(duration_us),
+                           MIN(bytes), MAX(bytes)
+                    FROM transfers GROUP BY kind ORDER BY SUM(duration_us) DESC";
+    let mut stmt = db.conn.prepare(kind_sql).unwrap();
+    let kinds: Vec<_> = stmt.query_map([], |row| {
+        Ok((row.get::<_,String>(0)?, row.get::<_,i64>(1)?,
+            row.get::<_,i64>(2)?, row.get::<_,f64>(3)?,
+            row.get::<_,i64>(4)?, row.get::<_,i64>(5)?))
+    }).unwrap().filter_map(|r| r.ok()).collect();
+
+    println!("  By Direction:");
+    println!("  Kind  Count    Total         Time        Avg BW       Size range");
+    println!("  ───── ──────── ───────────── ─────────── ──────────── ────────────");
+    for (kind, cnt, bytes, dur, min_b, max_b) in &kinds {
+        let bw = if *dur > 0.0 { format!("{:.1} GB/s", *bytes as f64 / dur / 1000.0) }
+            else { "?".into() };
+        let range = if min_b == max_b { fmt_bytes(*min_b) }
+            else { format!("{}-{}", fmt_bytes(*min_b), fmt_bytes(*max_b)) };
+        println!("  {:<5} {:>8} {:>13} {:>11} {:>12} {}",
+            kind, cnt, fmt_bytes(*bytes), fmt_us(*dur), bw, range);
+    }
+    println!();
+
+    // --- Size distribution — flag small/large outliers ---
+    let (small_cnt, small_bytes, small_time): (i64, i64, f64) = db.conn.query_row(
+        "SELECT COUNT(*), COALESCE(SUM(bytes),0), COALESCE(SUM(duration_us),0)
+         FROM transfers WHERE bytes < 1048576", // < 1 MB
+        [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+    ).unwrap();
+    if small_cnt > 0 {
+        let pct = if total_time > 0.0 { small_time / total_time * 100.0 } else { 0.0 };
+        println!("  Small transfers: {} (<1 MB), {} total, {} time ({pct:.1}% of transfer time)",
+            small_cnt, fmt_bytes(small_bytes), fmt_us(small_time));
+        if small_cnt > 10 {
+            println!("    → many small transfers — coalesce into fewer batched copies");
+        }
+    }
+
+    // --- Top N by duration ---
     let sql = "SELECT kind, bytes, duration_us, stream_id
                FROM transfers ORDER BY duration_us DESC LIMIT ?1";
     let mut stmt = db.conn.prepare(sql).unwrap();
@@ -529,14 +598,24 @@ pub fn cmd_transfers(db: &GpuDb, args: &[&str]) {
             row.get::<_,f64>(2)?, row.get::<_,Option<u32>>(3)?))
     }).unwrap().filter_map(|r| r.ok()).collect();
 
-    println!("  #  Kind  Size        Duration    BW          Stream");
-    println!("  ── ───── ────────── ────────── ──────────── ──────");
+    println!("\n  Top {} by Duration:", rows.len());
+    println!("  #  Kind  Size        Duration    BW          Stream  Notes");
+    println!("  ── ───── ────────── ────────── ──────────── ─────── ────────");
     for (i, (kind, bytes, dur, sid)) in rows.iter().enumerate() {
-        let bw = if *dur > 0.0 { format!("{:.1} GB/s", *bytes as f64 / dur / 1000.0) }
-            else { "?".into() };
-        println!("  {:<2} {:<5} {:>10} {:>10} {:>11} {:>6}",
-            i+1, kind, fmt_bytes(*bytes), fmt_us(*dur), bw,
-            sid.map(|s| s.to_string()).unwrap_or_else(|| "?".into()));
+        let bw_num = if *dur > 0.0 { *bytes as f64 / dur / 1000.0 } else { 0.0 };
+        let bw_str = if *dur > 0.0 { format!("{:.1} GB/s", bw_num) } else { "?".into() };
+        // PCIe 4.0 x16 peak ≈ 31.5 GB/s, PCIe 3.0 x16 ≈ 15.75 GB/s.
+        // A BW much lower than those for H2D/D2H on > 16 MB suggests non-pinned memory.
+        let notes = if *bytes >= 16 * 1024 * 1024 && (kind == "H2D" || kind == "D2H") && bw_num < 6.0 {
+            "pageable? consider cudaMallocHost"
+        } else if *bytes < 4096 {
+            "tiny — overhead-dominated"
+        } else {
+            ""
+        };
+        println!("  {:<2} {:<5} {:>10} {:>10} {:>11} {:>6}  {}",
+            i+1, kind, fmt_bytes(*bytes), fmt_us(*dur), bw_str,
+            sid.map(|s| s.to_string()).unwrap_or_else(|| "?".into()), notes);
     }
 }
 
@@ -552,13 +631,22 @@ pub fn cmd_gaps(db: &GpuDb, args: &[&str]) {
     let n = parse_count(args);
 
     let mut rows = compute_gpu_gaps(db);
-    rows.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
-    rows.truncate(n);
-
     if rows.is_empty() { println!("no GPU idle gaps detected"); return; }
 
+    // Sum across ALL gaps first, then sort and truncate for display.
     let total_gap: f64 = rows.iter().map(|r| r.1).sum();
-    println!("  Top {n} GPU idle gaps (total idle: {})\n", fmt_us(total_gap));
+    let total_count = rows.len();
+
+    rows.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+    let shown = rows.len().min(n);
+    rows.truncate(n);
+
+    println!("  {} GPU idle gaps (total idle: {})", total_count, fmt_us(total_gap));
+    if shown < total_count {
+        println!("  Showing top {shown} by duration:\n");
+    } else {
+        println!();
+    }
     println!("  #  Start        Duration");
     println!("  ── ──────────── ────────────");
     for (i, (start, dur)) in rows.iter().enumerate() {
@@ -579,12 +667,75 @@ pub fn cmd_overlap(db: &GpuDb) {
         "SELECT COALESCE(SUM(duration_us),0) FROM transfers", [], |row| row.get(0)
     ).unwrap();
 
+    // Compute actual overlap: how much transfer time runs concurrently with kernels.
+    let overlap_us = compute_xfer_kernel_overlap(db);
+
     println!("  Compute/Transfer Overlap:");
     println!("    GPU kernel time:   {}", fmt_us(gpu_us));
     println!("    Transfer time:     {}", fmt_us(xfer_time));
+    if xfer_time > 0.0 && overlap_us > 0.0 {
+        println!("    Concurrent:        {} ({:.1}% of transfers overlapped with compute)",
+            fmt_us(overlap_us), overlap_us / xfer_time * 100.0);
+    } else if xfer_time > 0.0 {
+        println!("    Concurrent:        none (transfers and compute are serialized)");
+    }
     if wall_us > 0.0 {
         println!("    GPU utilization:   {:.1}%", gpu_us / wall_us * 100.0);
     }
+}
+
+/// Compute how much transfer time overlaps with kernel execution.
+/// Merges kernel intervals, then checks each transfer against the merged set.
+pub(crate) fn compute_xfer_kernel_overlap(db: &GpuDb) -> f64 {
+    let tl = db.timeline_filter();
+
+    // Collect and merge kernel intervals
+    let k_sql = format!(
+        "SELECT start_us, start_us + duration_us AS end_us
+         FROM launches WHERE start_us IS NOT NULL AND {tl}
+         ORDER BY start_us"
+    );
+    let k_intervals: Vec<(f64, f64)> = db.query_vec(&k_sql, [], |row| {
+        Ok((row.get(0)?, row.get(1)?))
+    });
+    let merged = merge_intervals(&k_intervals);
+
+    // Collect transfer intervals
+    let t_intervals: Vec<(f64, f64)> = db.query_vec(
+        "SELECT start_us, start_us + duration_us FROM transfers WHERE start_us IS NOT NULL ORDER BY start_us",
+        [], |row| Ok((row.get(0)?, row.get(1)?))
+    );
+
+    // For each transfer, compute how much of it overlaps with any merged kernel interval
+    let mut total_overlap = 0.0;
+    for &(ts, te) in &t_intervals {
+        for &(ks, ke) in &merged {
+            let overlap_start = ts.max(ks);
+            let overlap_end = te.min(ke);
+            if overlap_start < overlap_end {
+                total_overlap += overlap_end - overlap_start;
+            }
+        }
+    }
+    total_overlap
+}
+
+/// Merge overlapping or adjacent intervals into non-overlapping sorted intervals.
+fn merge_intervals(intervals: &[(f64, f64)]) -> Vec<(f64, f64)> {
+    if intervals.is_empty() { return Vec::new(); }
+    let mut merged: Vec<(f64, f64)> = Vec::new();
+    let (mut cur_s, mut cur_e) = intervals[0];
+    for &(s, e) in &intervals[1..] {
+        if s <= cur_e {
+            if e > cur_e { cur_e = e; }
+        } else {
+            merged.push((cur_s, cur_e));
+            cur_s = s;
+            cur_e = e;
+        }
+    }
+    merged.push((cur_s, cur_e));
+    merged
 }
 
 // ---------------------------------------------------------------------------
@@ -647,8 +798,8 @@ pub fn cmd_trace(db: &GpuDb, args: &[&str]) {
     };
     if !require_op_layer(db) { return; }
 
-    let sql = "SELECT id, name, module_path, cpu_time_us, input_shapes
-               FROM ops WHERE name LIKE ?1";
+    let sql = r"SELECT id, name, module_path, cpu_time_us, input_shapes
+               FROM ops WHERE name LIKE ?1 ESCAPE '\'";
     let mut stmt = db.conn.prepare(sql).unwrap();
     let ops: Vec<_> = stmt.query_map([like_param(pattern)], |row| {
         Ok((row.get::<_,i64>(0)?, row.get::<_,String>(1)?,
@@ -685,9 +836,9 @@ pub fn cmd_callers(db: &GpuDb, args: &[&str]) {
     };
     if !require_op_layer(db) { return; }
 
-    let sql = "SELECT DISTINCT o.name, o.module_path
+    let sql = r"SELECT DISTINCT o.name, o.module_path
                FROM op_kernel_map okm JOIN ops o ON o.id = okm.op_id
-               WHERE okm.kernel_name LIKE ?1";
+               WHERE okm.kernel_name LIKE ?1 ESCAPE '\'";
     let mut stmt = db.conn.prepare(sql).unwrap();
     let rows: Vec<_> = stmt.query_map([like_param(pattern)], |row| {
         Ok((row.get::<_,String>(0)?, row.get::<_,Option<String>>(1)?))
@@ -956,10 +1107,10 @@ pub fn cmd_variance(db: &GpuDb, args: &[&str]) {
     };
 
     let tl = db.timeline_filter();
-    let sql = format!("SELECT kernel_name, COUNT(*), AVG(duration_us),
+    let sql = format!(r"SELECT kernel_name, COUNT(*), AVG(duration_us),
                       MIN(duration_us), MAX(duration_us),
                       AVG(duration_us * duration_us) - AVG(duration_us) * AVG(duration_us)
-               FROM launches WHERE kernel_name LIKE ?1 AND {tl}
+               FROM launches WHERE kernel_name LIKE ?1 ESCAPE '\' AND {tl}
                GROUP BY kernel_name");
     let mut stmt = db.conn.prepare(&sql).unwrap();
     let rows: Vec<_> = stmt.query_map([like_param(pattern)], |row| {
@@ -986,62 +1137,96 @@ pub fn cmd_variance(db: &GpuDb, args: &[&str]) {
 // warmup — detect warmup launches before timing stabilizes
 // ---------------------------------------------------------------------------
 
+/// Detect the number of warmup launches for a single kernel's duration series.
+///
+/// Returns the number of leading launches whose duration exceeds the
+/// steady-state median (from the back half) by more than 20%.  Returns 0
+/// when no meaningful warmup is detected.
+pub(crate) fn detect_warmup_count(durations: &[f64]) -> usize {
+    if durations.len() < 5 { return 0; }
+    let half = durations.len() / 2;
+    let mut tail: Vec<f64> = durations[half..].to_vec();
+    tail.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let steady_median = tail[tail.len() / 2];
+    if steady_median <= 0.0 { return 0; }
+
+    let threshold = steady_median * 1.2;
+    for (i, &d) in durations.iter().enumerate() {
+        if d <= threshold { return i; }
+    }
+    0
+}
+
 pub fn cmd_warmup(db: &GpuDb) {
     let tl = db.timeline_filter();
-    let sql = format!("SELECT start_us, duration_us, kernel_name
-               FROM launches WHERE start_us IS NOT NULL AND {tl}
-               ORDER BY start_us LIMIT 200");
-    let mut stmt = db.conn.prepare(&sql).unwrap();
-    let rows: Vec<_> = stmt.query_map([], |row| {
-        Ok((row.get::<_,f64>(0)?, row.get::<_,f64>(1)?, row.get::<_,String>(2)?))
+
+    // Detect warmup per-kernel: only kernels with enough launches to analyze.
+    let kernel_sql = format!(
+        "SELECT kernel_name, COUNT(*) as cnt
+         FROM launches WHERE start_us IS NOT NULL AND {tl}
+         GROUP BY kernel_name HAVING cnt >= 5
+         ORDER BY SUM(duration_us) DESC"
+    );
+    let mut k_stmt = db.conn.prepare(&kernel_sql).unwrap();
+    let kernels: Vec<(String, i64)> = k_stmt.query_map([], |row| {
+        Ok((row.get(0)?, row.get(1)?))
     }).unwrap().filter_map(|r| r.ok()).collect();
 
-    if rows.len() < 5 {
-        println!("not enough launches to detect warmup");
+    if kernels.is_empty() {
+        println!("not enough launches to detect warmup (need ≥5 of the same kernel)");
         return;
     }
 
-    // Compute rolling median over a window to detect stabilization
-    let window = 5;
-    let mut warmup_end = 0;
-    let mut steady_durations: Vec<f64> = Vec::new();
-
-    // First pass: find where things stabilize
-    // A launch is "warm" when its duration is within 3x of the median of the next window
-    for i in window..rows.len() {
-        let mut window_durs: Vec<f64> = rows[i..rows.len().min(i + window)]
-            .iter().map(|r| r.1).collect();
-        window_durs.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        let median = window_durs[window_durs.len() / 2];
-
-        if rows[i].1 <= median * 3.0 {
-            if warmup_end == 0 {
-                warmup_end = i;
-            }
-            steady_durations.push(rows[i].1);
-        }
-    }
-
-    if warmup_end == 0 { warmup_end = 1; }
-
-    let warmup_total: f64 = rows[..warmup_end].iter().map(|r| r.1).sum();
-    let steady_avg = if steady_durations.is_empty() { 0.0 }
-        else { steady_durations.iter().sum::<f64>() / steady_durations.len() as f64 };
-
     let wall_us: f64 = db.meta("wall_time_us").parse().unwrap_or(0.0);
-    let warmup_pct = if wall_us > 0.0 { warmup_total / wall_us * 100.0 } else { 0.0 };
+    let mut found_warmup = false;
 
-    println!("  Warmup Detection:\n");
-    println!("  Launch   Duration    Cumulative");
-    let mut cumulative = 0.0;
-    for (i, (_, dur, _)) in rows.iter().take(warmup_end + 3).enumerate() {
-        cumulative += dur;
-        let marker = if i < warmup_end { "  ← warmup" } else if i == warmup_end { "  ← stabilized" } else { "" };
-        println!("  {:<6}   {:>10}  {:>10}{marker}", i + 1, fmt_us(*dur), fmt_us(cumulative));
+    for (kernel_name, _cnt) in &kernels {
+        let launch_sql = format!(
+            "SELECT start_us, duration_us
+             FROM launches WHERE kernel_name = ?1 AND start_us IS NOT NULL AND {tl}
+             ORDER BY start_us LIMIT 200"
+        );
+        let mut stmt = db.conn.prepare(&launch_sql).unwrap();
+        let launches: Vec<(f64, f64)> = stmt.query_map([kernel_name], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        }).unwrap().filter_map(|r| r.ok()).collect();
+
+        if launches.len() < 5 { continue; }
+
+        let durs: Vec<f64> = launches.iter().map(|r| r.1).collect();
+        let steady_median = {
+            let half = durs.len() / 2;
+            let mut tail = durs[half..].to_vec();
+            tail.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            tail[tail.len() / 2]
+        };
+        let warmup_end = detect_warmup_count(&durs);
+        if warmup_end == 0 { continue; }
+
+        found_warmup = true;
+        let warmup_total: f64 = launches[..warmup_end].iter().map(|r| r.1).sum();
+        let steady_avg = if launches.len() > warmup_end {
+            launches[warmup_end..].iter().map(|r| r.1).sum::<f64>() / (launches.len() - warmup_end) as f64
+        } else { 0.0 };
+        let warmup_pct = if wall_us > 0.0 { warmup_total / wall_us * 100.0 } else { 0.0 };
+
+        println!("  Warmup: {} ({})\n", trunc(kernel_name, 50), fmt_us(steady_median));
+        println!("  Launch   Duration    Cumulative");
+        let mut cumulative = 0.0;
+        let show = (warmup_end + 3).min(launches.len());
+        for (i, (_, dur)) in launches.iter().take(show).enumerate() {
+            cumulative += dur;
+            let marker = if i < warmup_end { "  ← warmup" } else if i == warmup_end { "  ← stabilized" } else { "" };
+            println!("  {:<6}   {:>10}  {:>10}{marker}", i + 1, fmt_us(*dur), fmt_us(cumulative));
+        }
+
+        println!("\n  Warmup:       {} launches ({}, {warmup_pct:.1}% of wall time)", warmup_end, fmt_us(warmup_total));
+        println!("  Steady state: {} avg/launch (excluding warmup)\n", fmt_us(steady_avg));
     }
 
-    println!("\n  Warmup:       {} launches ({}, {warmup_pct:.1}% of wall time)", warmup_end, fmt_us(warmup_total));
-    println!("  Steady state: {} avg/launch (excluding warmup)", fmt_us(steady_avg));
+    if !found_warmup {
+        println!("no warmup detected (all kernels stable from first launch)");
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1148,16 +1333,18 @@ pub fn cmd_fuse(db: &GpuDb, args: &[&str]) {
 
     let total_gap: f64 = rows.iter().map(|r| r.2).sum();
 
-    println!("  Fusion Candidates (sequential kernels, < 5us gap):\n");
-    println!("  #  Kernel A → Kernel B                              Count  Avg Gap");
-    println!("  ── ──────────────────────────────────────────────── ────── ────────");
+    println!("  Sequential Launch Candidates (same stream, < 5us gap):\n");
+    println!("  #  Kernel A → Kernel B                              Count  Avg Gap  Type");
+    println!("  ── ──────────────────────────────────────────────── ────── ──────── ─────────");
     for (i, ((a, b), (gap_sum, _, count))) in sorted.iter().enumerate() {
         let avg_gap = gap_sum / *count as f64;
-        println!("  {:<2} {} → {}  {:>5}  {:>7}",
-            i + 1, trunc(a, 24), trunc(b, 24), count, fmt_us(avg_gap));
+        let kind = if a == b { "batch" } else { "fuse" };
+        println!("  {:<2} {} → {}  {:>5}  {:>7}  {}",
+            i + 1, trunc(a, 24), trunc(b, 24), count, fmt_us(avg_gap), kind);
     }
-    println!("\n  Total fusable gap: {} across {} pairs", fmt_us(total_gap), rows.len());
-    println!("  Tip: torch.compile() or manual kernel fusion can eliminate launch gaps");
+    println!("\n  Total reclaimable gap: {} across {} pairs", fmt_us(total_gap), rows.len());
+    println!("  'batch' = same kernel, use CUDA graphs or larger batch sizes");
+    println!("  'fuse'  = different kernels, use torch.compile() or manual fusion");
 }
 
 // ---------------------------------------------------------------------------
@@ -1324,7 +1511,7 @@ pub fn cmd_top_ops(db: &GpuDb, args: &[&str]) {
     let n = parse_count(args);
     let pattern = parse_pattern(args);
     let pat_clause = pattern
-        .map(|p| format!("AND o.name LIKE '%{}%'", escape_sql_like(p)))
+        .map(|p| format!(r"AND o.name LIKE '%{}%' ESCAPE '\'", escape_sql_like(p)))
         .unwrap_or_default();
 
     let sql = format!(
@@ -1371,7 +1558,7 @@ pub fn cmd_breakdown(db: &GpuDb, args: &[&str]) {
     if !require_op_layer(db) { return; }
 
     // Find matching ops
-    let op_sql = "SELECT id, name, cpu_time_us, gpu_time_us FROM ops WHERE name LIKE ?1";
+    let op_sql = r"SELECT id, name, cpu_time_us, gpu_time_us FROM ops WHERE name LIKE ?1 ESCAPE '\'";
     let mut stmt = db.conn.prepare(op_sql).unwrap();
     let ops: Vec<_> = stmt.query_map([like_param(pattern)], |row| {
         Ok((row.get::<_,i64>(0)?, row.get::<_,String>(1)?,
@@ -1450,16 +1637,16 @@ pub fn cmd_idle_between(db: &GpuDb, args: &[&str]) {
     // Find kernel launches correlated to each op, compute gaps.
 
     // Get kernels belonging to op A
-    let ka_sql = "SELECT DISTINCT kernel_name FROM op_kernel_map okm
+    let ka_sql = r"SELECT DISTINCT kernel_name FROM op_kernel_map okm
                   JOIN ops o ON o.id = okm.op_id
-                  WHERE o.name LIKE ?1";
+                  WHERE o.name LIKE ?1 ESCAPE '\'";
     let mut stmt = db.conn.prepare(ka_sql).unwrap();
     let kernels_a: Vec<String> = stmt.query_map([like_param(pat_a)], |row| row.get(0))
         .unwrap().filter_map(|r| r.ok()).collect();
 
-    let kb_sql = "SELECT DISTINCT kernel_name FROM op_kernel_map okm
+    let kb_sql = r"SELECT DISTINCT kernel_name FROM op_kernel_map okm
                   JOIN ops o ON o.id = okm.op_id
-                  WHERE o.name LIKE ?1";
+                  WHERE o.name LIKE ?1 ESCAPE '\'";
     let mut stmt = db.conn.prepare(kb_sql).unwrap();
     let kernels_b: Vec<String> = stmt.query_map([like_param(pat_b)], |row| row.get(0))
         .unwrap().filter_map(|r| r.ok()).collect();
