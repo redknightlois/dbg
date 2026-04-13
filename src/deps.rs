@@ -42,6 +42,8 @@ pub struct DepStatus {
     pub detail: String,
     /// Install instructions if not found.
     pub install: &'static str,
+    /// Optional warning (tool found but degraded).
+    pub warning: Option<String>,
 }
 
 /// Check a single dependency.
@@ -58,6 +60,7 @@ pub fn check_dep(dep: Dependency) -> DepStatus {
                         ok: true,
                         detail: path.display().to_string(),
                         install: dep.install,
+                        warning: None,
                     };
                 }
                 for dir in extra_tool_dirs() {
@@ -68,6 +71,7 @@ pub fn check_dep(dep: Dependency) -> DepStatus {
                             ok: true,
                             detail: path.display().to_string(),
                             install: dep.install,
+                            warning: None,
                         };
                     }
                 }
@@ -77,6 +81,7 @@ pub fn check_dep(dep: Dependency) -> DepStatus {
                 ok: false,
                 detail: "not found".into(),
                 install: dep.install,
+                warning: None,
             }
         }
         DependencyCheck::PythonImport { module } => {
@@ -95,6 +100,7 @@ pub fn check_dep(dep: Dependency) -> DepStatus {
                     format!("{module} not found")
                 },
                 install: dep.install,
+                warning: None,
             }
         }
         DependencyCheck::Command { program, args } => {
@@ -109,6 +115,7 @@ pub fn check_dep(dep: Dependency) -> DepStatus {
                 ok,
                 detail: if ok { "ok".into() } else { "failed".into() },
                 install: dep.install,
+                warning: None,
             }
         }
     }
@@ -152,6 +159,9 @@ pub fn format_results(results: &[(&str, Vec<DepStatus>)]) -> String {
             out.push_str(&format!("  {}: {} ({})\n", s.name, icon, s.detail));
             if !s.ok {
                 out.push_str(&format!("    install: {}\n", s.install));
+            }
+            if let Some(warn) = &s.warning {
+                out.push_str(&format!("    WARNING: {warn}\n"));
             }
         }
     }
