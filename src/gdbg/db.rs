@@ -416,17 +416,17 @@ impl GpuDb {
     pub fn kernel_filter(&self) -> String {
         let mut clauses = Vec::new();
         if let Some(ref f) = self.focus {
-            clauses.push(format!("launches.kernel_name LIKE '%{}%'", escape_sql_like(f)));
+            clauses.push(format!(r"launches.kernel_name LIKE '%{}%' ESCAPE '\'", escape_sql_like(f)));
         }
         if let Some(ref ig) = self.ignore {
-            clauses.push(format!("launches.kernel_name NOT LIKE '%{}%'", escape_sql_like(ig)));
+            clauses.push(format!(r"launches.kernel_name NOT LIKE '%{}%' ESCAPE '\'", escape_sql_like(ig)));
         }
         if let Some(ref r) = self.region_filter {
             // Only include launches whose start_us falls within a matching region.
             clauses.push(format!(
-                "start_us IS NOT NULL AND EXISTS (
+                r"start_us IS NOT NULL AND EXISTS (
                    SELECT 1 FROM regions
-                   WHERE name LIKE '%{}%'
+                   WHERE name LIKE '%{}%' ESCAPE '\'
                      AND launches.start_us >= regions.start_us
                      AND launches.start_us <= regions.start_us + regions.duration_us
                  )",
@@ -585,10 +585,18 @@ fn find_project_root() -> PathBuf {
 
 /// Escape a value for safe interpolation into a SQL LIKE pattern.
 /// Doubles single quotes and escapes LIKE wildcards.
+/// Escape a user pattern for use in SQL LIKE.
+///
+/// - Quotes are doubled for SQL string safety.
+/// - `%` is escaped with backslash (the wildcard meaning is reserved internally).
+/// - `_` is NOT escaped: kernel names contain many underscores and users
+///   typing "vector_add" expect a literal match, not a wildcard.  Allowing
+///   `_` as a single-char wildcard is harmless in practice.
+///
+/// Callers using this helper must append `ESCAPE '\'` to their LIKE clause
+/// so the backslash-escaped `%` is recognized.
 pub fn escape_sql_like(s: &str) -> String {
-    s.replace('\'', "''")
-        .replace('%', "\\%")
-        .replace('_', "\\_")
+    s.replace('\'', "''").replace('%', "\\%")
 }
 
 // ---------------------------------------------------------------------------
