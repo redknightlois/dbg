@@ -41,14 +41,35 @@ fn import_kernels(dest: &Connection, src: &Connection, layer_id: i64) -> Result<
         Err(_) => return Ok(false),
     };
 
-    let mut read = src.prepare(&format!(
-        "SELECT demangledName, start, end,
-                gridX, gridY, gridZ,
-                blockX, blockY, blockZ,
-                streamId, correlationId
-         FROM {table}
-         ORDER BY start"
-    ))?;
+    // Newer nsys versions (2025+) store demangledName as an INTEGER foreign
+    // key into the StringIds table, while older versions store it as TEXT.
+    // Detect which format we have and build the query accordingly.
+    let has_string_ids = find_table(src, &["StringIds"]).is_ok();
+    let name_is_integer = is_column_integer(src, &table, "demangledName");
+    let use_join = has_string_ids && name_is_integer;
+
+    let sql = if use_join {
+        format!(
+            "SELECT s.value, k.start, k.end,
+                    k.gridX, k.gridY, k.gridZ,
+                    k.blockX, k.blockY, k.blockZ,
+                    k.streamId, k.correlationId
+             FROM {table} k
+             JOIN StringIds s ON s.id = k.demangledName
+             ORDER BY k.start"
+        )
+    } else {
+        format!(
+            "SELECT demangledName, start, end,
+                    gridX, gridY, gridZ,
+                    blockX, blockY, blockZ,
+                    streamId, correlationId
+             FROM {table}
+             ORDER BY start"
+        )
+    };
+
+    let mut read = src.prepare(&sql)?;
 
     let mut write = dest.prepare(
         "INSERT INTO launches
@@ -278,14 +299,21 @@ fn import_device_info(dest: &Connection, src: &Connection) -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------
-// Wall time — computed from launch span
+// Wall time — computed from launch + transfer span
 // ---------------------------------------------------------------------------
 
-fn import_wall_time(dest: &Connection) -> Result<()> {
+pub(crate) fn import_wall_time(dest: &Connection) -> Result<()> {
+    // Span covers both kernel launches and memory transfers — whichever
+    // starts earliest to whichever ends latest.
     let wall: f64 = dest
         .query_row(
-            "SELECT COALESCE(MAX(start_us + duration_us) - MIN(start_us), 0) FROM launches
-             WHERE start_us IS NOT NULL",
+            "SELECT COALESCE(MAX(end_us) - MIN(start_us), 0) FROM (
+                 SELECT start_us, start_us + duration_us AS end_us
+                 FROM launches WHERE start_us IS NOT NULL
+                 UNION ALL
+                 SELECT start_us, start_us + duration_us AS end_us
+                 FROM transfers WHERE start_us IS NOT NULL
+             )",
             [],
             |row| row.get(0),
         )
@@ -318,6 +346,33 @@ fn find_table(conn: &Connection, candidates: &[&str]) -> Result<String> {
         }
     }
     bail!("no matching table (tried: {})", candidates.join(", "))
+}
+
+/// Check whether a column is declared as INTEGER in the table schema.
+/// Used to detect nsys schema changes (e.g. demangledName: TEXT vs INTEGER FK).
+fn is_column_integer(conn: &Connection, table: &str, column: &str) -> bool {
+    let sql = format!("PRAGMA table_info({table})");
+    let mut stmt = match conn.prepare(&sql) {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+    let rows = stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(1)?,  // name
+            row.get::<_, String>(2)?,  // type
+        ))
+    });
+    match rows {
+        Ok(rows) => {
+            for row in rows.flatten() {
+                if row.0.eq_ignore_ascii_case(column) {
+                    return row.1.eq_ignore_ascii_case("INTEGER");
+                }
+            }
+            false
+        }
+        Err(_) => false,
+    }
 }
 
 #[cfg(test)]
