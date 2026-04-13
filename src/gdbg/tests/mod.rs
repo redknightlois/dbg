@@ -7,4 +7,5 @@
 mod fixtures;
 mod invariants;
 mod parsers;
+mod regressions;
 mod smoke;

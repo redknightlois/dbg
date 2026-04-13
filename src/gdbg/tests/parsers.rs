@@ -370,12 +370,13 @@ fn sql_like_wildcard_escaping() {
 
     // % in pattern should be escaped
     assert_eq!(escape_sql_like("100%"), r"100\%");
-    // _ should be escaped
-    assert_eq!(escape_sql_like("a_b"), r"a\_b");
+    // _ is NOT escaped: kernel names contain underscores and users typing
+    // "vector_add" expect a literal match, not a failed pattern.
+    assert_eq!(escape_sql_like("a_b"), "a_b");
     // ' should be doubled
     assert_eq!(escape_sql_like("it's"), "it''s");
     // Combined
-    assert_eq!(escape_sql_like("50% of it's_done"), r"50\% of it''s\_done");
+    assert_eq!(escape_sql_like("50% of it's_done"), r"50\% of it''s_done");
 }
 
 // -----------------------------------------------------------------------
