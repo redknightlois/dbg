@@ -2,7 +2,7 @@
 //! CUDA kernels.  Each test calls the actual production function that was
 //! fixed, so reverting the fix will break the test.
 
-use crate::commands::{compute_gpu_gaps, compute_xfer_kernel_overlap, detect_warmup_count};
+use crate::commands::{compute_gpu_gaps, compute_xfer_kernel_overlap, detect_warmup_count, find_hottest_window};
 use crate::db::{GpuDb, escape_sql_like};
 use crate::parsers::nsys::import_wall_time;
 use rusqlite::params;
@@ -290,4 +290,44 @@ fn gaps_total_across_all_gaps() {
         (total - 1000.0).abs() < 0.01,
         "sum of all gaps = 100+200+300+400 = 1000us, got {total}"
     );
+}
+
+// =======================================================================
+// Bug 6: hotspot must evaluate both {sᵢ} and {eᵢ − W} candidate windows
+// =======================================================================
+//
+// The busy function f(w) is piecewise linear with breakpoints at every
+// launch start AND every launch-end-minus-window-width.  A start-only sweep
+// misses the peak when concurrent launches overlap mid-way between starts.
+
+#[test]
+fn hotspot_handles_overlapping_streams() {
+    // Two launches on different streams:
+    //   A: [0, 100]
+    //   B: [80, 120]
+    // Window W = 50.
+    //   w=0:  busy = 50  (A only)
+    //   w=80: busy = 60  (A[80..100]=20  +  B[80..120]=40)
+    //   w=50: busy = 70  (A[50..100]=50  +  B[80..100]=20)  ← TRUE MAX
+    // w=50 is exactly e_A − W = 100 − 50, a breakpoint the start-only sweep misses.
+    let intervals = vec![(0.0, 100.0), (80.0, 40.0)];
+    let (busy, w_start, _, _) = find_hottest_window(&intervals, 50.0);
+    assert!((busy - 70.0).abs() < 0.01, "expected busy=70 at w=50, got busy={busy} at w={w_start}");
+    assert!((w_start - 50.0).abs() < 0.01, "expected w_start=50, got {w_start}");
+}
+
+#[test]
+fn hotspot_empty_and_degenerate() {
+    // Empty input → zeros.
+    let (b, w, lo, hi) = find_hottest_window(&[], 100.0);
+    assert_eq!((b, w, lo, hi), (0.0, 0.0, 0, 0));
+
+    // Single launch, window wider than it → captures full duration.
+    let intervals = vec![(10.0, 40.0)];
+    let (b, _, _, _) = find_hottest_window(&intervals, 100.0);
+    assert!((b - 40.0).abs() < 0.01, "single launch fully inside → busy == its duration");
+
+    // Zero/negative window → zeros (defensive).
+    let (b, _, _, _) = find_hottest_window(&intervals, 0.0);
+    assert_eq!(b, 0.0);
 }

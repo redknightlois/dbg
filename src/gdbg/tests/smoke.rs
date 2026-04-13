@@ -76,6 +76,26 @@ fn smoke_all_commands() {
     commands::cmd_reset(&mut db);
     commands::cmd_kernels(&db, &[]);  // back to all
 
+    // New high-value commands
+    commands::cmd_bandwidth(&db, &[]);
+    commands::cmd_bandwidth(&db, &["3"]);
+    commands::cmd_bandwidth(&db, &["5", "sgemm"]);
+    commands::cmd_critical_path(&db, &[]);
+    commands::cmd_critical_path(&db, &["50"]);
+    commands::cmd_stream_graph(&db, &[]);
+    commands::cmd_stream_graph(&db, &["60"]);
+    commands::cmd_hotspot(&db, &[]);            // missing arg
+    commands::cmd_hotspot(&db, &["10000"]);
+    commands::cmd_hotspot(&db, &["500"]);       // very small window
+    commands::cmd_launches(&db, &[]);           // missing arg
+    commands::cmd_launches(&db, &["sgemm"]);
+    commands::cmd_launches(&db, &["cutlass", "3"]);
+    commands::cmd_launches(&db, &["nonexistent_kernel_xyz"]);
+    commands::cmd_compare(&db, &["sgemm"]);     // missing second
+    commands::cmd_compare(&db, &["sgemm", "cutlass"]);
+    commands::cmd_compare(&db, &["sgemm", "nonexistent_xyz"]);
+    commands::cmd_regressions(&db, &[]);        // missing arg
+
     // No-data edge cases (commands on missing layers)
     commands::cmd_inspect(&db, &["nonexistent_kernel_xyz"]);
     commands::cmd_bound(&db, &["nonexistent_kernel_xyz"]);
