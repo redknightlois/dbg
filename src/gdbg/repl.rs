@@ -64,6 +64,7 @@ pub fn run(db: &mut GpuDb) -> Result<()> {
             "top-ops" | "top" => commands::cmd_top_ops(db, args),
             "breakdown" | "br" => commands::cmd_breakdown(db, args),
             "idle-between" | "idle" => commands::cmd_idle_between(db, args),
+            "outliers" => commands::cmd_outliers(db, args),
             _ => {
                 println!("unknown command: {cmd}");
                 println!("type 'help' for available commands");
@@ -86,6 +87,7 @@ fn cmd_help(args: &[&str]) {
         println!("    bound <kernel>          Detailed boundedness diagnosis");
         println!("    occupancy [N]           SM occupancy ranking");
         println!("    variance <kernel>       Launch-to-launch timing variance");
+        println!("    outliers <kernel>       Slowest launches, timeline position, clustering");
         println!("    warmup                  Detect warmup launches before steady state");
         println!("    small [N]               Kernels where launch overhead > compute");
         println!("    fuse [N]                Sequential kernels that could be fused");

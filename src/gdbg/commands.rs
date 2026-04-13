@@ -2067,4 +2067,112 @@ pub fn cmd_idle_between(db: &GpuDb, args: &[&str]) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// outliers — slowest launches of a kernel with timeline position
+// ---------------------------------------------------------------------------
+
+pub fn cmd_outliers(db: &GpuDb, args: &[&str]) {
+    let pattern = match args.first() {
+        Some(p) => *p,
+        None => { println!("usage: outliers <kernel_pattern>"); return; }
+    };
+    let tl = db.timeline_filter();
+
+    // Resolve pattern to a single kernel_name (most common) to keep the report focused.
+    let resolve_sql = format!(
+        r"SELECT kernel_name, COUNT(*) FROM launches
+          WHERE kernel_name LIKE ?1 ESCAPE '\' AND {tl}
+          GROUP BY kernel_name ORDER BY COUNT(*) DESC LIMIT 1"
+    );
+    let kernel = match db.conn.query_row(
+        &resolve_sql, [like_param(pattern)],
+        |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+    ) {
+        Ok(x) => x,
+        Err(_) => { println!("no kernel matching '{pattern}'"); return; }
+    };
+    let (name, total_cnt) = kernel;
+
+    // Pull all launches ordered by launch-order (start_us) so we can assign a launch index.
+    let all_sql = format!(
+        "SELECT start_us, duration_us FROM launches
+         WHERE kernel_name = ?1 AND start_us IS NOT NULL AND {tl}
+         ORDER BY start_us"
+    );
+    let launches: Vec<(f64, f64)> = db.query_vec(&all_sql, [&name], |row| {
+        Ok((row.get(0)?, row.get(1)?))
+    });
+    if launches.len() < 4 {
+        println!("{name}: only {} launches — need ≥4 for outlier analysis", launches.len());
+        return;
+    }
+
+    let cnt = launches.len();
+    let mut sorted: Vec<f64> = launches.iter().map(|(_, d)| *d).collect();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    // Nearest-rank percentile: index = ceil(p * n) - 1, clamped to [0, n-1].
+    // Formula preserves p50 == median and avoids reporting max() as p90 on
+    // tiny samples (e.g. cnt=10 would otherwise make p90 == max).
+    let pct_idx = |p: f64| -> usize {
+        let k = (p * cnt as f64).ceil() as isize - 1;
+        k.clamp(0, cnt as isize - 1) as usize
+    };
+    let median = sorted[pct_idx(0.50)];
+    let p90 = sorted[pct_idx(0.90)];
+    let p99 = sorted[pct_idx(0.99)];
+
+    // Top-10% of launches by duration with their original launch index.
+    let mut indexed: Vec<(usize, f64, f64)> = launches.iter().enumerate()
+        .map(|(i, (s, d))| (i, *s, *d)).collect();
+    indexed.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap());
+    let top_n = (cnt / 10).max(3).min(cnt);
+    let outliers = &indexed[..top_n];
+
+    // Early/late clustering: count how many outliers fall in the first/last third.
+    let third = cnt / 3;
+    let mut early = 0;
+    let mut late = 0;
+    for &(idx, _, _) in outliers {
+        if idx < third { early += 1; }
+        else if idx >= cnt - third { late += 1; }
+    }
+
+    let t_min = launches.first().map(|(s, _)| *s).unwrap_or(0.0);
+    let t_max = launches.last().map(|(s, d)| *s + *d).unwrap_or(0.0);
+    let span = t_max - t_min;
+
+    println!("  Outliers: {} ({} launches)\n", trunc(&name, 60), total_cnt);
+    println!("  Distribution:");
+    println!("    median: {}   p90: {}   p99: {}   max: {}",
+        fmt_us(median), fmt_us(p90), fmt_us(p99), fmt_us(sorted[cnt - 1]));
+    println!("    worst is {:.1}x median\n", sorted[cnt - 1] / median.max(1e-9));
+
+    println!("  Worst {} launches (top {:.0}%):", top_n, top_n as f64 / cnt as f64 * 100.0);
+    println!("  #   Idx   Timeline     Start        Duration    vs median");
+    println!("  ─── ───── ──────────── ──────────── ─────────── ─────────");
+    for (i, &(idx, start, dur)) in outliers.iter().enumerate() {
+        let tpos = if span > 0.0 { (start - t_min) / span * 100.0 } else { 0.0 };
+        let ratio = dur / median.max(1e-9);
+        println!("  {:<3} {:>5} {:>11.1}% {:>12} {:>11} {:>7.1}x",
+            i + 1, idx, tpos, fmt_us(start), fmt_us(dur), ratio);
+    }
+
+    println!();
+    // Suppress the clustering verdict when the data can't support one:
+    //  - too few launches for statistical signal
+    //  - worst barely exceeds median (essentially uniform distribution)
+    let worst_ratio = sorted[cnt - 1] / median.max(1e-9);
+    if cnt < 20 {
+        println!("  → {cnt} launches — too few to distinguish clustering from noise");
+    } else if worst_ratio < 1.5 {
+        println!("  → launches are uniform (worst {:.2}x median) — no meaningful outliers", worst_ratio);
+    } else if early > 2 * late && early >= top_n / 2 {
+        println!("  → clusters EARLY ({}/{} outliers in first third) — likely warmup / JIT / cache cold", early, top_n);
+    } else if late > 2 * early && late >= top_n / 2 {
+        println!("  → clusters LATE ({}/{} outliers in last third) — thermal throttling, memory fragmentation, or contention", late, top_n);
+    } else {
+        println!("  → outliers spread across the timeline — likely data-dependent work or scheduler jitter");
+    }
+}
+
 use std::path::PathBuf;
