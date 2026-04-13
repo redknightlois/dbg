@@ -139,7 +139,7 @@ pub fn import_ncu_csv(dest: &Connection, csv_path: &Path, layer_id: i64) -> Resu
     Ok(())
 }
 
-fn classify_boundedness(compute: Option<f64>, memory: Option<f64>) -> Option<String> {
+pub fn classify_boundedness(compute: Option<f64>, memory: Option<f64>) -> Option<String> {
     let (c, m) = match (compute, memory) {
         (Some(c), Some(m)) => (c, m),
         _ => return None,
