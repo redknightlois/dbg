@@ -172,6 +172,8 @@ fn collect_nsys(
     cmd.args(["profile", "-o"]);
     cmd.arg(&trace_base);
     cmd.arg("--force-overwrite=true");
+    // Enable GPU memory allocation tracking — needed for the `memory` command.
+    cmd.arg("--cuda-memory-usage=true");
 
     match kind {
         TargetKind::Python | TargetKind::PythonTorch | TargetKind::PythonTriton => {

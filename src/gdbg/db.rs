@@ -538,6 +538,19 @@ fn init_schema(conn: &Connection) -> Result<()> {
             PRIMARY KEY (op_id, kernel_name)
         );
 
+        CREATE TABLE IF NOT EXISTS allocations (
+            id        INTEGER PRIMARY KEY,
+            op        TEXT NOT NULL,        -- 'alloc' or 'free'
+            address   INTEGER NOT NULL,
+            bytes     INTEGER NOT NULL,     -- 0 for frees when size unknown
+            start_us  REAL,
+            stream_id INTEGER,
+            layer_id  INTEGER REFERENCES layers(id)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_alloc_addr ON allocations(address);
+        CREATE INDEX IF NOT EXISTS idx_alloc_time ON allocations(start_us);
+
         CREATE TABLE IF NOT EXISTS regions (
             id          INTEGER PRIMARY KEY,
             name        TEXT NOT NULL,
