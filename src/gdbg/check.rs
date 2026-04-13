@@ -44,8 +44,36 @@ fn dependencies() -> Vec<Dependency> {
 
 /// Check all dependencies. Returns (name, Vec<DepStatus>) for consistent formatting.
 pub fn check_all() -> Vec<(&'static str, Vec<DepStatus>)> {
-    let statuses: Vec<DepStatus> = dependencies().into_iter().map(deps::check_dep).collect();
+    let mut statuses: Vec<DepStatus> = dependencies().into_iter().map(deps::check_dep).collect();
+
+    // If ncu is installed, check whether GPU performance counters are accessible.
+    if let Some(ncu) = statuses.iter_mut().find(|s| s.name == "ncu" && s.ok) {
+        if gpu_profiling_restricted() {
+            ncu.warning = Some(
+                "GPU performance counters restricted to admin. ncu will fail.\n\
+                 \x20   fix: sudo modprobe nvidia NVreg_RestrictProfilingToAdminUsers=0\n\
+                 \x20   persist: echo 'options nvidia NVreg_RestrictProfilingToAdminUsers=0' \
+                 | sudo tee /etc/modprobe.d/nvidia-perf.conf"
+                    .into(),
+            );
+        }
+    }
+
     vec![("gdbg", statuses)]
+}
+
+/// Check whether the NVIDIA driver restricts GPU profiling to admin users.
+/// Reads `/proc/driver/nvidia/params` looking for `RmProfilingAdminOnly: 1`.
+fn gpu_profiling_restricted() -> bool {
+    let Ok(params) = std::fs::read_to_string("/proc/driver/nvidia/params") else {
+        return false; // Can't determine — assume ok
+    };
+    for line in params.lines() {
+        if let Some(rest) = line.strip_prefix("RmProfilingAdminOnly:") {
+            return rest.trim() == "1";
+        }
+    }
+    false
 }
 
 /// Check that at least nsys is available (minimum for gdbg to be useful).
