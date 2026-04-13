@@ -46,6 +46,18 @@ fn like_param(pattern: &str) -> String {
     format!("%{}%", escape_sql_like(pattern))
 }
 
+/// Escape regex metacharacters in a kernel name for use in ncu `--kernel-name "regex:..."`.
+pub(crate) fn escape_regex(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 8);
+    for ch in s.chars() {
+        if "\\^$.|?*+()[]{}".contains(ch) {
+            out.push('\\');
+        }
+        out.push(ch);
+    }
+    out
+}
+
 /// Compute true GPU idle gaps by merging overlapping launch intervals across streams.
 /// Returns (gap_start, gap_duration) pairs sorted by start time.
 fn compute_gpu_gaps(db: &GpuDb) -> Vec<(f64, f64)> {
@@ -161,6 +173,7 @@ pub fn cmd_kernels(db: &GpuDb, args: &[&str]) {
     let n = parse_count(args);
     let pattern = parse_pattern(args);
     let filter = db.kernel_filter();
+    let tl = db.timeline_filter();
 
     let pattern_clause = pattern
         .map(|p| format!("AND launches.kernel_name LIKE '%{}%'", escape_sql_like(p)))
@@ -175,7 +188,7 @@ pub fn cmd_kernels(db: &GpuDb, args: &[&str]) {
                 m.memory_throughput_pct
          FROM launches
          LEFT JOIN metrics m ON m.kernel_name = launches.kernel_name
-         WHERE {filter} {pattern_clause}
+         WHERE {filter} AND {tl} {pattern_clause}
          GROUP BY launches.kernel_name
          ORDER BY total DESC
          LIMIT ?1"
@@ -261,12 +274,13 @@ pub fn cmd_inspect(db: &GpuDb, args: &[&str]) {
         None => { println!("usage: inspect <kernel_pattern>"); return; }
     };
 
-    // Get kernel aggregate
-    let sql = "SELECT kernel_name, COUNT(*), SUM(duration_us), AVG(duration_us),
+    // Get kernel aggregate (restrict to timeline layer to avoid double-counting)
+    let tl = db.timeline_filter();
+    let sql = format!("SELECT kernel_name, COUNT(*), SUM(duration_us), AVG(duration_us),
                       MIN(duration_us), MAX(duration_us)
-               FROM launches WHERE kernel_name LIKE ?1
-               GROUP BY kernel_name";
-    let mut stmt = db.conn.prepare(sql).unwrap();
+               FROM launches WHERE kernel_name LIKE ?1 AND {tl}
+               GROUP BY kernel_name");
+    let mut stmt = db.conn.prepare(&sql).unwrap();
     let mut rows = stmt.query_map([like_param(pattern)], |row| {
         Ok((
             row.get::<_, String>(0)?,
@@ -300,13 +314,13 @@ pub fn cmd_inspect(db: &GpuDb, args: &[&str]) {
     if cnt > 1 { println!("  Min:      {}", fmt_us(min)); println!("  Max:      {}", fmt_us(max)); }
 
     // Launch config — most common
-    let config_sql = "SELECT grid_x, grid_y, grid_z, block_x, block_y, block_z,
+    let config_sql = format!("SELECT grid_x, grid_y, grid_z, block_x, block_y, block_z,
                              COUNT(*) as cnt
                       FROM launches WHERE kernel_name = ?1
-                      AND grid_x IS NOT NULL
+                      AND grid_x IS NOT NULL AND {tl}
                       GROUP BY grid_x, grid_y, grid_z, block_x, block_y, block_z
-                      ORDER BY cnt DESC LIMIT 5";
-    let mut stmt = db.conn.prepare(config_sql).unwrap();
+                      ORDER BY cnt DESC LIMIT 5");
+    let mut stmt = db.conn.prepare(&config_sql).unwrap();
     let configs: Vec<_> = stmt.query_map([&name], |row| {
         Ok((row.get::<_,u32>(0)?, row.get::<_,u32>(1)?, row.get::<_,u32>(2)?,
             row.get::<_,u32>(3)?, row.get::<_,u32>(4)?, row.get::<_,u32>(5)?,
@@ -578,10 +592,11 @@ pub fn cmd_overlap(db: &GpuDb) {
 // ---------------------------------------------------------------------------
 
 pub fn cmd_streams(db: &GpuDb) {
-    let sql = "SELECT stream_id, COUNT(*) as cnt, SUM(duration_us) as total
-               FROM launches WHERE stream_id IS NOT NULL
-               GROUP BY stream_id ORDER BY total DESC";
-    let mut stmt = db.conn.prepare(sql).unwrap();
+    let tl = db.timeline_filter();
+    let sql = format!("SELECT stream_id, COUNT(*) as cnt, SUM(duration_us) as total
+               FROM launches WHERE stream_id IS NOT NULL AND {tl}
+               GROUP BY stream_id ORDER BY total DESC");
+    let mut stmt = db.conn.prepare(&sql).unwrap();
     let rows: Vec<_> = stmt.query_map([], |row| {
         Ok((row.get::<_,u32>(0)?, row.get::<_,i64>(1)?, row.get::<_,f64>(2)?))
     }).unwrap().filter_map(|r| r.ok()).collect();
@@ -753,9 +768,10 @@ pub fn cmd_suggest(db: &GpuDb) {
 
     if !has_ncu {
         // Show which kernels would benefit
-        let top_sql = "SELECT kernel_name, SUM(duration_us) as total
-                       FROM launches GROUP BY kernel_name ORDER BY total DESC LIMIT 5";
-        let mut stmt = db.conn.prepare(top_sql).unwrap();
+        let tl = db.timeline_filter();
+        let top_sql = format!("SELECT kernel_name, SUM(duration_us) as total
+                       FROM launches WHERE {tl} GROUP BY kernel_name ORDER BY total DESC LIMIT 5");
+        let mut stmt = db.conn.prepare(&top_sql).unwrap();
         let top: Vec<(String, f64)> = stmt.query_map([], |row| {
             Ok((row.get(0)?, row.get(1)?))
         }).unwrap().filter_map(|r| r.ok()).collect();
@@ -763,7 +779,7 @@ pub fn cmd_suggest(db: &GpuDb) {
         if !top.is_empty() {
             let gpu_total = db.total_gpu_time_us();
             let pct: f64 = top.iter().map(|t| if gpu_total > 0.0 { t.1 / gpu_total * 100.0 } else { 0.0 }).sum();
-            let regex = top.iter().map(|t| t.0.as_str()).collect::<Vec<_>>().join("|");
+            let regex = top.iter().map(|t| escape_regex(&t.0)).collect::<Vec<_>>().join("|");
             println!("  {n}. Top {} kernels ({pct:.0}% of GPU) lack hardware metrics.", top.len());
             println!("     Collect: ncu --set full --kernel-name \"regex:{regex}\" {target}\n");
             n += 1;
@@ -777,12 +793,13 @@ pub fn cmd_suggest(db: &GpuDb) {
     }
 
     // High variance detection
-    let var_sql = "SELECT kernel_name, COUNT(*) as cnt, AVG(duration_us) as avg,
+    let tl2 = db.timeline_filter();
+    let var_sql = format!("SELECT kernel_name, COUNT(*) as cnt, AVG(duration_us) as avg,
                    AVG(duration_us * duration_us) - AVG(duration_us) * AVG(duration_us) as var
-                   FROM launches GROUP BY kernel_name
+                   FROM launches WHERE {tl2} GROUP BY kernel_name
                    HAVING cnt > 5 AND var > 0
-                   ORDER BY SUM(duration_us) DESC LIMIT 5";
-    let mut stmt = db.conn.prepare(var_sql).unwrap();
+                   ORDER BY SUM(duration_us) DESC LIMIT 5");
+    let mut stmt = db.conn.prepare(&var_sql).unwrap();
     let vars: Vec<_> = stmt.query_map([], |row| {
         Ok((row.get::<_,String>(0)?, row.get::<_,f64>(2)?, row.get::<_,f64>(3)?))
     }).unwrap().filter_map(|r| r.ok()).collect();
@@ -938,12 +955,13 @@ pub fn cmd_variance(db: &GpuDb, args: &[&str]) {
         None => { println!("usage: variance <kernel_pattern>"); return; }
     };
 
-    let sql = "SELECT kernel_name, COUNT(*), AVG(duration_us),
+    let tl = db.timeline_filter();
+    let sql = format!("SELECT kernel_name, COUNT(*), AVG(duration_us),
                       MIN(duration_us), MAX(duration_us),
                       AVG(duration_us * duration_us) - AVG(duration_us) * AVG(duration_us)
-               FROM launches WHERE kernel_name LIKE ?1
-               GROUP BY kernel_name";
-    let mut stmt = db.conn.prepare(sql).unwrap();
+               FROM launches WHERE kernel_name LIKE ?1 AND {tl}
+               GROUP BY kernel_name");
+    let mut stmt = db.conn.prepare(&sql).unwrap();
     let rows: Vec<_> = stmt.query_map([like_param(pattern)], |row| {
         Ok((row.get::<_,String>(0)?, row.get::<_,i64>(1)?,
             row.get::<_,f64>(2)?, row.get::<_,f64>(3)?,
@@ -1033,12 +1051,13 @@ pub fn cmd_warmup(db: &GpuDb) {
 pub fn cmd_small(db: &GpuDb, args: &[&str]) {
     let n = parse_count(args);
     let threshold_us = 10.0; // typical cudaLaunchKernel overhead
+    let tl = db.timeline_filter();
 
     let sql = format!(
         "SELECT kernel_name, COUNT(*) as cnt, AVG(duration_us) as avg,
                 SUM(duration_us) as total
          FROM launches
-         WHERE {} GROUP BY kernel_name
+         WHERE {} AND {tl} GROUP BY kernel_name
          HAVING avg < ?1
          ORDER BY cnt DESC LIMIT ?2",
         db.kernel_filter()
@@ -1154,10 +1173,11 @@ pub fn cmd_concurrency(db: &GpuDb) {
     }
 
     // Per-stream breakdown
-    let sql = "SELECT stream_id, COUNT(*) as cnt, SUM(duration_us) as total
-               FROM launches WHERE stream_id IS NOT NULL
-               GROUP BY stream_id ORDER BY total DESC";
-    let mut stmt = db.conn.prepare(sql).unwrap();
+    let tl = db.timeline_filter();
+    let sql = format!("SELECT stream_id, COUNT(*) as cnt, SUM(duration_us) as total
+               FROM launches WHERE stream_id IS NOT NULL AND {tl}
+               GROUP BY stream_id ORDER BY total DESC");
+    let mut stmt = db.conn.prepare(&sql).unwrap();
     let streams: Vec<_> = stmt.query_map([], |row| {
         Ok((row.get::<_,u32>(0)?, row.get::<_,i64>(1)?, row.get::<_,f64>(2)?))
     }).unwrap().filter_map(|r| r.ok()).collect();
@@ -1366,14 +1386,14 @@ pub fn cmd_breakdown(db: &GpuDb, args: &[&str]) {
 
         // Find kernels this op launches.
         // Restrict to timeline layer to avoid double-counting across nsys+torch.
-        let tl = db.timeline_filter();
+        let tl_l = db.timeline_filter_for("l");
         let k_sql = format!(
             "SELECT okm.kernel_name,
                     COUNT(*) as launches,
                     SUM(l.duration_us) as total_us,
                     AVG(l.duration_us) as avg_us
              FROM op_kernel_map okm
-             JOIN launches l ON l.kernel_name = okm.kernel_name AND {tl}
+             JOIN launches l ON l.kernel_name = okm.kernel_name AND {tl_l}
              WHERE okm.op_id = ?1
              GROUP BY okm.kernel_name
              ORDER BY total_us DESC"
@@ -1423,7 +1443,7 @@ pub fn cmd_idle_between(db: &GpuDb, args: &[&str]) {
         [], |row| row.get::<_, i64>(0),
     );
     let tl = match torch_layer {
-        Ok(id) => format!("layer_id = {id}"),
+        Ok(id) => format!("launches.layer_id = {id}"),
         Err(_) => db.timeline_filter(),
     };
 
