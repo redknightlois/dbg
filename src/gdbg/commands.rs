@@ -2221,4 +2221,108 @@ pub fn cmd_source(db: &GpuDb, args: &[&str]) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// memory — GPU memory allocation tracking (needs --cuda-memory-usage in nsys)
+// ---------------------------------------------------------------------------
+
+pub fn cmd_memory(db: &GpuDb, args: &[&str]) {
+    // Gate: allocations table may be empty either because memory tracking
+    // wasn't enabled or the run didn't allocate anything.
+    let total: i64 = db.scalar_f64("SELECT COUNT(*) FROM allocations") as i64;
+    if total == 0 {
+        println!("no allocation data");
+        println!("(re-profile to capture it — memory tracking is enabled by default in this build)");
+        return;
+    }
+    let n = parse_count(args);
+
+    // Totals.
+    let (n_alloc, n_free, sum_alloc): (i64, i64, i64) = db.conn.query_row(
+        "SELECT SUM(CASE WHEN op = 'alloc' THEN 1 ELSE 0 END),
+                SUM(CASE WHEN op = 'free'  THEN 1 ELSE 0 END),
+                COALESCE(SUM(CASE WHEN op = 'alloc' THEN bytes ELSE 0 END), 0)
+         FROM allocations",
+        [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+    ).unwrap_or((0, 0, 0));
+
+    // Walk events chronologically to find peak live bytes and leaks.
+    // Pair allocs and frees by address — last-writer-wins if an address
+    // is reallocated before its previous free.
+    let events: Vec<(f64, String, i64, i64)> = db.query_vec(
+        "SELECT start_us, op, address, bytes FROM allocations ORDER BY start_us",
+        [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+    );
+    let mut live: std::collections::HashMap<i64, i64> = std::collections::HashMap::new();
+    let mut live_bytes: i64 = 0;
+    let mut peak: i64 = 0;
+    let mut peak_time: f64 = 0.0;
+    let mut alloc_lifetimes: Vec<(i64, f64)> = Vec::new();
+    let mut pending_start: std::collections::HashMap<i64, f64> = std::collections::HashMap::new();
+    for (t, op, addr, bytes) in &events {
+        if op == "alloc" {
+            live.insert(*addr, *bytes);
+            pending_start.insert(*addr, *t);
+            live_bytes += *bytes;
+            if live_bytes > peak { peak = live_bytes; peak_time = *t; }
+        } else if op == "free" {
+            if let Some(b) = live.remove(addr) {
+                live_bytes -= b;
+                if let Some(s) = pending_start.remove(addr) {
+                    alloc_lifetimes.push((b, *t - s));
+                }
+            }
+        }
+    }
+    let leaked: i64 = live.values().sum();
+    let leak_count = live.len();
+
+    println!("  GPU Memory Summary\n");
+    println!("  Events:    {n_alloc} allocs, {n_free} frees");
+    println!("  Total:     {} allocated across {n_alloc} events", fmt_bytes(sum_alloc));
+    println!("  Peak live: {} at t={}", fmt_bytes(peak), fmt_us(peak_time));
+    if leak_count > 0 {
+        println!("  Leaked:    {} across {leak_count} allocations (not freed by exit)", fmt_bytes(leaked));
+    } else {
+        println!("  Leaked:    none");
+    }
+    println!();
+
+    // Largest single allocations.
+    let big_sql = "SELECT address, bytes, start_us FROM allocations
+                   WHERE op = 'alloc' ORDER BY bytes DESC LIMIT ?1";
+    let bigs: Vec<(i64, i64, f64)> = db.query_vec(big_sql, [n as i64], |row| {
+        Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+    });
+    if !bigs.is_empty() {
+        println!("  Largest Allocations:");
+        println!("  #  Size         Start        Lifetime");
+        println!("  ── ──────────── ──────────── ──────────────");
+        for (i, (addr, bytes, start)) in bigs.iter().enumerate() {
+            // Find this allocation's free event, if any.
+            let lifetime = db.conn.query_row(
+                "SELECT start_us FROM allocations
+                 WHERE op = 'free' AND address = ?1 AND start_us > ?2
+                 ORDER BY start_us LIMIT 1",
+                rusqlite::params![addr, start],
+                |row| row.get::<_, f64>(0)
+            ).ok().map(|fr| fmt_us(fr - *start)).unwrap_or_else(|| "leaked".into());
+            println!("  {:<2} {:>12} {:>12} {}",
+                i + 1, fmt_bytes(*bytes), fmt_us(*start), lifetime);
+        }
+    }
+
+    // Lifetime stats — short-lived allocations are churn signals.
+    if !alloc_lifetimes.is_empty() {
+        let short_threshold = 100.0; // us
+        let short_cnt = alloc_lifetimes.iter().filter(|(_, lt)| *lt < short_threshold).count();
+        if short_cnt > 10 {
+            let bytes_churned: i64 = alloc_lifetimes.iter()
+                .filter(|(_, lt)| *lt < short_threshold)
+                .map(|(b, _)| *b).sum();
+            println!("\n  Churn: {short_cnt} allocations lived < 100us ({} total) — consider a pool allocator",
+                fmt_bytes(bytes_churned));
+        }
+    }
+}
+
 use std::path::PathBuf;

@@ -13,6 +13,7 @@ pub fn import_nsys_rep(dest: &Connection, nsys_path: &Path, layer_id: i64) -> Re
 
     let has_kernels = import_kernels(dest, &src, layer_id)?;
     import_transfers(dest, &src, layer_id)?;
+    import_allocations(dest, &src, layer_id)?;
     import_nvtx_regions(dest, &src, layer_id)?;
     import_device_info(dest, &src)?;
 
@@ -156,6 +157,63 @@ fn import_transfers(dest: &Connection, src: &Connection, layer_id: i64) -> Resul
         ])?;
     }
 
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// GPU memory allocations
+// ---------------------------------------------------------------------------
+
+/// Import CUDA device memory alloc/free events.  Requires nsys to have been
+/// run with `--cuda-memory-usage=true`; otherwise the source table is absent
+/// and we skip silently.
+///
+/// `memoryOperationType` in the nsys schema: 0 = Allocation, 1 = Deallocation.
+/// Our `allocations.bytes` is always positive — the `op` column distinguishes.
+fn import_allocations(dest: &Connection, src: &Connection, layer_id: i64) -> Result<()> {
+    let table = match find_table(src, &["CUDA_GPU_MEMORY_USAGE_EVENTS"]) {
+        Ok(t) => t,
+        Err(_) => return Ok(()),
+    };
+
+    let mut read = src.prepare(&format!(
+        "SELECT start, memoryOperationType, address, bytes, streamId FROM {table} ORDER BY start"
+    ))?;
+
+    let mut write = dest.prepare(
+        "INSERT INTO allocations (op, address, bytes, start_us, stream_id, layer_id)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)"
+    )?;
+
+    let rows = read.query_map([], |row| {
+        Ok((
+            row.get::<_, i64>(0)?,           // start_ns
+            row.get::<_, i32>(1)?,           // oper type
+            row.get::<_, i64>(2)?,           // address
+            row.get::<_, i64>(3)?,           // bytes
+            row.get::<_, Option<u32>>(4)?,   // streamId
+        ))
+    })?;
+
+    for row in rows {
+        let (start_ns, oper, addr, bytes, sid) = row?;
+        // nsys: 0 = Allocation, 1 = Deallocation. Skip any future oper types
+        // rather than silently misclassifying them as frees and corrupting
+        // peak/leak analysis.
+        let op = match oper {
+            0 => "alloc",
+            1 => "free",
+            _ => continue,
+        };
+        write.execute(params![
+            op,
+            addr,
+            bytes,
+            start_ns as f64 / 1000.0,
+            sid,
+            layer_id
+        ])?;
+    }
     Ok(())
 }
 
