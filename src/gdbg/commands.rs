@@ -2326,3 +2326,683 @@ pub fn cmd_memory(db: &GpuDb, args: &[&str]) {
 }
 
 use std::path::PathBuf;
+
+// ---------------------------------------------------------------------------
+// bandwidth — per-kernel achieved memory bandwidth (requires ncu)
+// ---------------------------------------------------------------------------
+
+pub fn cmd_bandwidth(db: &GpuDb, args: &[&str]) {
+    if !db.has_layer("ncu") {
+        println!("no bandwidth data — need ncu layer (achieved_bandwidth_gb_s)");
+        return;
+    }
+    let n = parse_count(args);
+    let pattern = parse_pattern(args);
+    let pat_clause = pattern
+        .map(|p| format!(r"AND kernel_name LIKE '%{}%' ESCAPE '\'", escape_sql_like(p)))
+        .unwrap_or_default();
+
+    // Pull achieved & peak per kernel. Kernels without an achieved value are skipped.
+    let sql = format!(
+        "SELECT kernel_name, achieved_bandwidth_gb_s, peak_bandwidth_gb_s, boundedness
+         FROM metrics
+         WHERE achieved_bandwidth_gb_s IS NOT NULL {pat_clause}
+         ORDER BY achieved_bandwidth_gb_s DESC"
+    );
+    let rows: Vec<(String, f64, Option<f64>, Option<String>)> = db.query_vec(
+        &sql, [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+    );
+    if rows.is_empty() {
+        println!("no kernels have bandwidth metrics");
+        return;
+    }
+
+    // Join with per-kernel total GPU time from the timeline layer, so the rank
+    // column reflects how much the kernel actually cost.
+    let tl = db.timeline_filter();
+    let time_sql = format!(
+        "SELECT kernel_name, SUM(duration_us) FROM launches WHERE {tl} GROUP BY kernel_name"
+    );
+    let time_rows: Vec<(String, f64)> = db.query_vec(&time_sql, [], |row| {
+        Ok((row.get(0)?, row.get(1)?))
+    });
+    let time_of: std::collections::HashMap<String, f64> = time_rows.into_iter().collect();
+
+    println!("  Per-kernel Memory Bandwidth:\n");
+    println!("  #  Kernel                            Achieved     Peak       % peak  Bound    GPU Time");
+    println!("  ── ────────────────────────────────── ──────────── ────────── ─────── ──────── ──────────");
+    let shown = rows.iter().take(n);
+    let mut flagged = 0usize;
+    for (i, (name, ach, peak, bound)) in shown.enumerate() {
+        let pct = peak.filter(|&p| p > 0.0).map(|p| ach / p * 100.0);
+        let pct_str = pct.map(|v| format!("{v:.1}%")).unwrap_or_else(|| "?".into());
+        let peak_str = peak.map(|v| format!("{v:.1}")).unwrap_or_else(|| "?".into());
+        let gpu_us = time_of.get(name).copied().unwrap_or(0.0);
+        let flag = match pct {
+            Some(v) if v < 50.0 => { flagged += 1; " ←low" }
+            _ => "",
+        };
+        println!("  {:<2} {:<34} {:>9.1} GB/s {:>6} GB/s {:>6}  {:<8} {:>10}{flag}",
+            i + 1, trunc(name, 34), ach, peak_str, pct_str,
+            bound.as_deref().unwrap_or("?"), fmt_us(gpu_us));
+    }
+    if flagged > 0 {
+        println!("\n  {flagged} kernel(s) under 50% of peak bandwidth — likely memory-access bound");
+        println!("  (poor coalescing, low L2 hit rate, or uncoalesced strided loads)");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// critical-path — longest same-stream kernel chain (sequential dependency)
+// ---------------------------------------------------------------------------
+
+pub fn cmd_critical_path(db: &GpuDb, args: &[&str]) {
+    if !db.has_layer("nsys") && !db.has_layer("torch") {
+        println!("no timeline data — need nsys or torch layer");
+        return;
+    }
+    // Optional first arg: gap threshold in us (default 100us).
+    let gap_thresh: f64 = args.first()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(100.0);
+
+    let tl = db.timeline_filter();
+    let sql = format!(
+        "SELECT kernel_name, start_us, duration_us, stream_id
+         FROM launches
+         WHERE start_us IS NOT NULL AND stream_id IS NOT NULL AND {tl}
+         ORDER BY stream_id, start_us"
+    );
+    let rows: Vec<(String, f64, f64, u32)> = db.query_vec(&sql, [], |row| {
+        Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+    });
+    if rows.is_empty() {
+        println!("no stream-tagged launches available");
+        return;
+    }
+
+    // Build chains per stream: split whenever gap-to-previous > threshold.
+    struct Chain {
+        stream: u32,
+        start: f64,
+        end: f64,
+        kernel_time: f64,
+        kernels: Vec<(String, f64)>, // (name, duration_us)
+    }
+    let mut chains: Vec<Chain> = Vec::new();
+    let mut cur: Option<Chain> = None;
+    for (name, start, dur, stream) in &rows {
+        let end = start + dur;
+        let extend = cur.as_ref().is_some_and(|c| {
+            c.stream == *stream && start - c.end <= gap_thresh
+        });
+        if !extend {
+            if let Some(c) = cur.take() { chains.push(c); }
+            cur = Some(Chain {
+                stream: *stream, start: *start, end,
+                kernel_time: *dur, kernels: vec![(name.clone(), *dur)],
+            });
+        } else if let Some(c) = cur.as_mut() {
+            c.end = end;
+            c.kernel_time += dur;
+            c.kernels.push((name.clone(), *dur));
+        }
+    }
+    if let Some(c) = cur.take() { chains.push(c); }
+
+    // Rank by span (end - start): that is the critical-path wall time this chain
+    // occupies on its stream.  Tie-break on kernel_time (active work).
+    chains.sort_by(|a, b| {
+        let sa = a.end - a.start;
+        let sb = b.end - b.start;
+        sb.partial_cmp(&sa).unwrap()
+            .then_with(|| b.kernel_time.partial_cmp(&a.kernel_time).unwrap())
+    });
+
+    println!("  Critical path chains (same stream, gap ≤ {}):\n", fmt_us(gap_thresh));
+    // Defensive: rows.is_empty() returns early above, so chains has ≥1 entry.
+    // Guard anyway to decouple from that invariant.
+    let Some(best) = chains.first() else {
+        println!("  (no chains to report)");
+        return;
+    };
+    let best_span = best.end - best.start;
+    let utilization = if best_span > 0.0 { best.kernel_time / best_span * 100.0 } else { 0.0 };
+    println!("  Longest chain: stream {}  span {}  active {} ({utilization:.0}%)  {} kernel(s)",
+        best.stream, fmt_us(best_span), fmt_us(best.kernel_time), best.kernels.len());
+
+    // Aggregate kernels within the best chain by name.
+    let mut agg: std::collections::HashMap<&str, (usize, f64)> = std::collections::HashMap::new();
+    for (name, dur) in &best.kernels {
+        let e = agg.entry(name.as_str()).or_insert((0, 0.0));
+        e.0 += 1;
+        e.1 += dur;
+    }
+    let mut ranked: Vec<_> = agg.into_iter().collect();
+    ranked.sort_by(|a, b| b.1.1.partial_cmp(&a.1.1).unwrap());
+    println!("\n  Top kernels on chain:");
+    println!("  Kernel                                     Launches  Time       % chain");
+    println!("  ────────────────────────────────────────── ──────── ────────── ────────");
+    for (name, (cnt, total)) in ranked.iter().take(8) {
+        let pct = if best.kernel_time > 0.0 { total / best.kernel_time * 100.0 } else { 0.0 };
+        println!("  {:<42} {:>8} {:>10} {:>6.1}%",
+            trunc(name, 42), cnt, fmt_us(*total), pct);
+    }
+
+    // Report next few chains for contrast.
+    if chains.len() > 1 {
+        println!("\n  Other long chains:");
+        println!("  #  Stream  Span        Active      Util   Kernels");
+        println!("  ── ─────── ─────────── ─────────── ────── ────────");
+        for (i, c) in chains.iter().skip(1).take(5).enumerate() {
+            let span = c.end - c.start;
+            let util = if span > 0.0 { c.kernel_time / span * 100.0 } else { 0.0 };
+            println!("  {:<2} {:>7} {:>11} {:>11} {:>5.0}% {:>7}",
+                i + 2, c.stream, fmt_us(span), fmt_us(c.kernel_time), util, c.kernels.len());
+        }
+    }
+
+    let wall_us: f64 = db.meta("wall_time_us").parse().unwrap_or(0.0);
+    if wall_us > 0.0 {
+        println!("\n  Chain wall fraction: {:.1}% of wall time ({})",
+            best_span / wall_us * 100.0, fmt_us(wall_us));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// stream-graph — ASCII timeline with streams as rows
+// ---------------------------------------------------------------------------
+
+pub fn cmd_stream_graph(db: &GpuDb, args: &[&str]) {
+    let width: usize = args.first()
+        .and_then(|s| s.parse().ok())
+        .filter(|&w: &usize| w >= 20 && w <= 500)
+        .unwrap_or(100);
+
+    let tl = db.timeline_filter();
+    let sql = format!(
+        "SELECT kernel_name, start_us, duration_us, stream_id
+         FROM launches
+         WHERE start_us IS NOT NULL AND stream_id IS NOT NULL AND {tl}
+         ORDER BY stream_id, start_us"
+    );
+    let rows: Vec<(String, f64, f64, u32)> = db.query_vec(&sql, [], |row| {
+        Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+    });
+    if rows.is_empty() {
+        println!("no timeline data");
+        return;
+    }
+
+    let t_min = rows.iter().map(|r| r.1).fold(f64::INFINITY, f64::min);
+    let t_max = rows.iter().map(|r| r.1 + r.2).fold(f64::NEG_INFINITY, f64::max);
+    let span = t_max - t_min;
+    if span <= 0.0 { println!("timeline has zero span"); return; }
+
+    // Group by stream. Order streams by their first-launch time so reading
+    // the graph top-to-bottom matches chronological launch order.
+    use std::collections::BTreeMap;
+    let mut by_stream: BTreeMap<u32, Vec<(String, f64, f64)>> = BTreeMap::new();
+    for (name, start, dur, stream) in &rows {
+        by_stream.entry(*stream).or_default().push((name.clone(), *start, *dur));
+    }
+
+    // Intern kernels to single-char glyphs, ordered by total time (highest gets 'A').
+    let mut kernel_time: std::collections::HashMap<String, f64> = std::collections::HashMap::new();
+    for (name, _, dur, _) in &rows {
+        *kernel_time.entry(name.clone()).or_insert(0.0) += dur;
+    }
+    let mut kernel_rank: Vec<(String, f64)> = kernel_time.into_iter().collect();
+    kernel_rank.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+    // Glyphs: A-Z, then a-z, then digits. After that, reuse '*' for the tail.
+    let glyphs: Vec<char> = ('A'..='Z').chain('a'..='z').chain('0'..='9').collect();
+    let glyph_of: std::collections::HashMap<String, char> = kernel_rank.iter().enumerate()
+        .map(|(i, (name, _))| {
+            let g = if i < glyphs.len() { glyphs[i] } else { '*' };
+            (name.clone(), g)
+        })
+        .collect();
+
+    println!("  Stream Graph ({} → {}, span {})\n",
+        fmt_us(t_min), fmt_us(t_max), fmt_us(span));
+
+    for (stream, launches) in &by_stream {
+        let mut line = vec![' '; width];
+        for (name, start, dur) in launches {
+            let s = ((*start - t_min) / span * width as f64).floor() as usize;
+            let e_raw = ((*start + *dur - t_min) / span * width as f64).ceil() as usize;
+            let s = s.min(width - 1);
+            let e = e_raw.clamp(s + 1, width);
+            let g = glyph_of.get(name).copied().unwrap_or('?');
+            for cell in line.iter_mut().take(e).skip(s) {
+                *cell = g;
+            }
+        }
+        let row: String = line.into_iter().collect();
+        println!("  s{:<4} │{row}│", stream);
+    }
+    // Time axis underline.
+    let axis: String = "─".repeat(width);
+    println!("        └{axis}┘");
+
+    // Legend (top-N most time-consuming kernels).
+    println!("\n  Legend:");
+    for (i, (name, total)) in kernel_rank.iter().take(glyphs.len().min(20)).enumerate() {
+        let g = glyphs.get(i).copied().unwrap_or('*');
+        println!("    {g}  {:<50} {}", trunc(name, 50), fmt_us(*total));
+    }
+    if kernel_rank.len() > 20 {
+        println!("    ({} more kernels not shown)", kernel_rank.len() - 20);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// hotspot — hottest N-microsecond window in the timeline
+// ---------------------------------------------------------------------------
+
+/// Find the window of width `window_us` that maximizes total busy kernel-time.
+///
+/// `intervals` are `(start_us, duration_us)` pairs pre-sorted by `start_us`.
+/// Busy time sums contributions across all streams, so a 100us window with two
+/// fully-overlapping launches reports 200us of busy time.
+///
+/// The busy function f(w) = Σ max(0, min(eᵢ, w+W) − max(sᵢ, w)) is piecewise
+/// linear; its breakpoints lie at {sᵢ} and {eᵢ − W}. We evaluate f at every
+/// breakpoint and return the best. A start-only sweep would miss the peak when
+/// overlapping launches on different streams align mid-way between starts.
+///
+/// Returns `(busy_us, window_start_us, lo_idx, hi_idx)`: indices bracket the
+/// launches that intersect the best window (`intervals[lo..hi]`).
+pub(crate) fn find_hottest_window(
+    intervals: &[(f64, f64)],
+    window_us: f64,
+) -> (f64, f64, usize, usize) {
+    let n = intervals.len();
+    if n == 0 || window_us <= 0.0 { return (0.0, 0.0, 0, 0); }
+
+    let mut candidates: Vec<f64> = Vec::with_capacity(2 * n);
+    for &(s, d) in intervals {
+        candidates.push(s);
+        candidates.push(s + d - window_us);
+    }
+    candidates.sort_by(|a, b| a.partial_cmp(b).unwrap());
+
+    let mut best = (0.0_f64, 0.0_f64, 0usize, 0usize);
+    let mut lo = 0usize;
+    for &w_start in &candidates {
+        let w_end = w_start + window_us;
+        while lo < n && intervals[lo].0 + intervals[lo].1 <= w_start { lo += 1; }
+        let mut busy = 0.0_f64;
+        let mut hi_scan = lo;
+        while hi_scan < n && intervals[hi_scan].0 < w_end {
+            let (s, d) = intervals[hi_scan];
+            let e = s + d;
+            let os = s.max(w_start);
+            let oe = e.min(w_end);
+            if os < oe { busy += oe - os; }
+            hi_scan += 1;
+        }
+        if busy > best.0 {
+            best = (busy, w_start, lo, hi_scan);
+        }
+    }
+    best
+}
+
+pub fn cmd_hotspot(db: &GpuDb, args: &[&str]) {
+    let window_us: f64 = match args.first().and_then(|s| s.parse::<f64>().ok()) {
+        Some(v) if v > 0.0 => v,
+        _ => { println!("usage: hotspot <window_us>  (e.g. 10000 for 10ms)"); return; }
+    };
+    let tl = db.timeline_filter();
+    let sql = format!(
+        "SELECT kernel_name, start_us, duration_us
+         FROM launches
+         WHERE start_us IS NOT NULL AND {tl}
+         ORDER BY start_us"
+    );
+    let rows: Vec<(String, f64, f64)> = db.query_vec(&sql, [], |row| {
+        Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+    });
+    if rows.is_empty() { println!("no timeline data"); return; }
+
+    let intervals: Vec<(f64, f64)> = rows.iter().map(|(_, s, d)| (*s, *d)).collect();
+    let (busy_best, w_start_best, lo, hi_end) = find_hottest_window(&intervals, window_us);
+    let best = (busy_best, w_start_best, lo, hi_end);
+
+    if best.0 == 0.0 {
+        println!("no activity found in any window");
+        return;
+    }
+    let (busy, w_start, lo, hi_end) = best;
+    let w_end = w_start + window_us;
+    let util = busy / window_us * 100.0;
+    println!("  Hottest {} window:\n", fmt_us(window_us));
+    println!("  Window:     {} → {}", fmt_us(w_start), fmt_us(w_end));
+    println!("  Busy time:  {}  ({util:.1}% of window)", fmt_us(busy));
+    println!("  Launches:   {}", hi_end - lo);
+
+    // Aggregate kernels intersecting the best window by name.
+    let mut agg: std::collections::HashMap<&str, (usize, f64)> = std::collections::HashMap::new();
+    for (name, s, d) in rows.iter().take(hi_end).skip(lo) {
+        let end = s + d;
+        let os = s.max(w_start);
+        let oe = end.min(w_end);
+        if os < oe {
+            let e = agg.entry(name.as_str()).or_insert((0, 0.0));
+            e.0 += 1;
+            e.1 += oe - os;
+        }
+    }
+    let mut ranked: Vec<_> = agg.into_iter().collect();
+    ranked.sort_by(|a, b| b.1.1.partial_cmp(&a.1.1).unwrap());
+
+    println!("\n  Kernel                                     Launches  Time in window  % busy");
+    println!("  ────────────────────────────────────────── ──────── ─────────────── ───────");
+    for (name, (cnt, t)) in ranked.iter().take(15) {
+        let pct = if busy > 0.0 { t / busy * 100.0 } else { 0.0 };
+        println!("  {:<42} {:>8} {:>15} {:>6.1}%",
+            trunc(name, 42), cnt, fmt_us(*t), pct);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// launches — every launch of one kernel with timestamps + gap-to-previous
+// ---------------------------------------------------------------------------
+
+pub fn cmd_launches(db: &GpuDb, args: &[&str]) {
+    let pattern = match args.first() {
+        Some(p) => *p,
+        None => { println!("usage: launches <kernel_pattern> [limit]"); return; }
+    };
+    let limit: usize = args.get(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(50);
+
+    let tl = db.timeline_filter();
+    // Resolve pattern to the single best kernel match (most launches).
+    let resolve_sql = format!(
+        r"SELECT kernel_name, COUNT(*) FROM launches
+          WHERE kernel_name LIKE ?1 ESCAPE '\' AND {tl}
+          GROUP BY kernel_name ORDER BY COUNT(*) DESC LIMIT 1"
+    );
+    let kernel = match db.conn.query_row(
+        &resolve_sql, [like_param(pattern)],
+        |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+    ) {
+        Ok(x) => x,
+        Err(_) => { println!("no kernel matching '{pattern}'"); return; }
+    };
+    let (name, cnt) = kernel;
+
+    let sql = format!(
+        "SELECT start_us, duration_us, grid_x, grid_y, grid_z,
+                block_x, block_y, block_z, stream_id
+         FROM launches
+         WHERE kernel_name = ?1 AND start_us IS NOT NULL AND {tl}
+         ORDER BY start_us LIMIT ?2"
+    );
+    let rows: Vec<(f64, f64, Option<u32>, Option<u32>, Option<u32>,
+                   Option<u32>, Option<u32>, Option<u32>, Option<u32>)> = db.query_vec(
+        &sql, rusqlite::params![name, limit as i64],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?,
+                  row.get(5)?, row.get(6)?, row.get(7)?, row.get(8)?)),
+    );
+
+    println!("  Launches of {} ({} total, showing {})\n",
+        trunc(&name, 70), cnt, rows.len());
+    println!("  #    Start         Duration    Gap        Stream  Grid            Block");
+    println!("  ──── ───────────── ─────────── ────────── ─────── ─────────────── ───────────────");
+    let mut prev_end: Option<f64> = None;
+    for (i, (start, dur, gx, gy, gz, bx, by, bz, sid)) in rows.iter().enumerate() {
+        let gap = prev_end.map(|e| start - e);
+        let gap_s = gap.map(|g| if g >= 0.0 { fmt_us(g) } else { format!("-{}", fmt_us(-g)) })
+            .unwrap_or_else(|| "—".into());
+        let grid = match (gx, gy, gz) {
+            (Some(x), Some(y), Some(z)) => format!("({x},{y},{z})"),
+            _ => "—".into(),
+        };
+        let block = match (bx, by, bz) {
+            (Some(x), Some(y), Some(z)) => format!("({x},{y},{z})"),
+            _ => "—".into(),
+        };
+        let sid_s = sid.map(|s| s.to_string()).unwrap_or_else(|| "?".into());
+        println!("  {:<4} {:>13} {:>11} {:>10} {:>7} {:<15} {:<15}",
+            i + 1, fmt_us(*start), fmt_us(*dur), gap_s, sid_s,
+            trunc(&grid, 15), trunc(&block, 15));
+        prev_end = Some(start + dur);
+    }
+
+    // Summary stats across the fetched launches.
+    if rows.len() >= 2 {
+        let gaps: Vec<f64> = rows.windows(2)
+            .map(|w| w[1].0 - (w[0].0 + w[0].1))
+            .filter(|g| *g >= 0.0)
+            .collect();
+        if !gaps.is_empty() {
+            let mean = gaps.iter().sum::<f64>() / gaps.len() as f64;
+            let min = gaps.iter().cloned().fold(f64::INFINITY, f64::min);
+            let max = gaps.iter().cloned().fold(0.0_f64, f64::max);
+            println!("\n  Gap between consecutive launches: mean {}, min {}, max {}",
+                fmt_us(mean), fmt_us(min), fmt_us(max));
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// compare — side-by-side stats for two kernels
+// ---------------------------------------------------------------------------
+
+pub fn cmd_compare(db: &GpuDb, args: &[&str]) {
+    if args.len() < 2 {
+        println!("usage: compare <kernel_a> <kernel_b>");
+        return;
+    }
+    let tl = db.timeline_filter();
+
+    let resolve = |pattern: &str| -> Option<(String, i64, f64, f64, f64, f64, f64)> {
+        let sql = format!(
+            r"SELECT kernel_name,
+                     COUNT(*),
+                     AVG(duration_us),
+                     MIN(duration_us),
+                     MAX(duration_us),
+                     SUM(duration_us),
+                     AVG(duration_us * duration_us) - AVG(duration_us) * AVG(duration_us)
+              FROM launches
+              WHERE kernel_name LIKE ?1 ESCAPE '\' AND {tl}
+              GROUP BY kernel_name
+              ORDER BY SUM(duration_us) DESC LIMIT 1"
+        );
+        db.conn.query_row(&sql, [like_param(pattern)], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?,
+                row.get(4)?, row.get(5)?, row.get(6)?))
+        }).ok()
+    };
+    let a = match resolve(args[0]) {
+        Some(v) => v,
+        None => { println!("no kernel matching '{}'", args[0]); return; }
+    };
+    let b = match resolve(args[1]) {
+        Some(v) => v,
+        None => { println!("no kernel matching '{}'", args[1]); return; }
+    };
+    if a.0 == b.0 {
+        println!("both patterns resolved to the same kernel: {}", a.0);
+        return;
+    }
+
+    // Optional ncu metrics per kernel.
+    let metrics_of = |name: &str| -> Option<(Option<f64>, Option<f64>, Option<f64>, Option<f64>, Option<String>)> {
+        db.conn.query_row(
+            "SELECT occupancy_pct, compute_throughput_pct, memory_throughput_pct,
+                    achieved_bandwidth_gb_s, boundedness
+             FROM metrics WHERE kernel_name = ?1",
+            [name],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+        ).ok()
+    };
+    let ma = metrics_of(&a.0);
+    let mb = metrics_of(&b.0);
+
+    let stddev = |var: f64| var.max(0.0).sqrt();
+    let cv = |mean: f64, var: f64| if mean > 0.0 { stddev(var) / mean } else { 0.0 };
+
+    println!("  Kernel A: {}", trunc(&a.0, 70));
+    println!("  Kernel B: {}\n", trunc(&b.0, 70));
+    println!("  Metric            A                 B                 Ratio B/A");
+    println!("  ────────────────  ────────────────  ────────────────  ──────────");
+    let row = |label: &str, va: String, vb: String, ratio: Option<f64>| {
+        let r = ratio.map(|r| format!("{r:.2}x")).unwrap_or_else(|| "—".into());
+        println!("  {:<16}  {:<16}  {:<16}  {r}", label, va, vb);
+    };
+    row("Launches", a.1.to_string(), b.1.to_string(),
+        if a.1 > 0 { Some(b.1 as f64 / a.1 as f64) } else { None });
+    row("Total time", fmt_us(a.5), fmt_us(b.5),
+        if a.5 > 0.0 { Some(b.5 / a.5) } else { None });
+    row("Mean", fmt_us(a.2), fmt_us(b.2),
+        if a.2 > 0.0 { Some(b.2 / a.2) } else { None });
+    row("Min", fmt_us(a.3), fmt_us(b.3), None);
+    row("Max", fmt_us(a.4), fmt_us(b.4), None);
+    row("Stddev",
+        fmt_us(stddev(a.6)), fmt_us(stddev(b.6)), None);
+    row("CV",
+        format!("{:.3}", cv(a.2, a.6)),
+        format!("{:.3}", cv(b.2, b.6)), None);
+
+    if ma.is_some() || mb.is_some() {
+        println!("\n  Hardware metrics (ncu):");
+        let fmt_opt_pct = |v: Option<f64>| v.map(|x| format!("{x:.1}%")).unwrap_or_else(|| "?".into());
+        let fmt_opt_bw = |v: Option<f64>| v.map(|x| format!("{x:.1} GB/s")).unwrap_or_else(|| "?".into());
+        let fmt_opt_s = |v: Option<String>| v.unwrap_or_else(|| "?".into());
+        let (oa, ca, mma, ba, bda) = ma.unwrap_or((None, None, None, None, None));
+        let (ob, cb, mmb, bb, bdb) = mb.unwrap_or((None, None, None, None, None));
+        println!("  Occupancy        {:<16}  {:<16}", fmt_opt_pct(oa), fmt_opt_pct(ob));
+        println!("  Compute tput     {:<16}  {:<16}", fmt_opt_pct(ca), fmt_opt_pct(cb));
+        println!("  Memory tput      {:<16}  {:<16}", fmt_opt_pct(mma), fmt_opt_pct(mmb));
+        println!("  Bandwidth        {:<16}  {:<16}", fmt_opt_bw(ba), fmt_opt_bw(bb));
+        println!("  Boundedness      {:<16}  {:<16}", fmt_opt_s(bda), fmt_opt_s(bdb));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// regressions — like diff, but filtered by noise threshold
+// ---------------------------------------------------------------------------
+
+pub fn cmd_regressions(db: &GpuDb, args: &[&str]) {
+    let name = match args.first() {
+        Some(n) => *n,
+        None => { println!("usage: regressions <saved_session> [pct=5] [min_us=10]"); return; }
+    };
+    let pct_thresh: f64 = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(5.0);
+    let abs_thresh_us: f64 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(10.0);
+
+    let other_path = if name.ends_with(".gpu.db") || name.contains('/') {
+        PathBuf::from(name)
+    } else {
+        GpuDb::session_dir().join(format!("{name}.gpu.db"))
+    };
+    // SQLite's ATTACH creates an empty DB at missing paths; guard first so
+    // we fail loudly instead of silently creating junk and reporting a
+    // spurious all-new-kernels diff.
+    if !other_path.exists() {
+        println!("cannot load '{name}': no such session at {}", other_path.display());
+        return;
+    }
+    if let Err(e) = db.attach(other_path.to_str().unwrap_or(""), "other") {
+        println!("cannot load '{name}': {e}");
+        return;
+    }
+
+    // Pull per-kernel totals from both sides, joined by name.
+    let sql = "SELECT COALESCE(c.kernel_name, o.kernel_name),
+                      COALESCE(o.total, 0), COALESCE(c.total, 0),
+                      COALESCE(o.cnt,   0), COALESCE(c.cnt,   0)
+               FROM
+                 (SELECT kernel_name, SUM(duration_us) AS total, COUNT(*) AS cnt
+                  FROM launches GROUP BY kernel_name) c
+               FULL OUTER JOIN
+                 (SELECT kernel_name, SUM(duration_us) AS total, COUNT(*) AS cnt
+                  FROM other.launches GROUP BY kernel_name) o
+               ON c.kernel_name = o.kernel_name";
+    let all: Vec<(String, f64, f64, i64, i64)> = db.query_vec(sql, [], |row| {
+        Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?))
+    });
+
+    // Partition into regressions (slower now), improvements (faster), new, gone.
+    struct Change { name: String, before: f64, after: f64, delta_us: f64, delta_pct: f64, before_cnt: i64, after_cnt: i64 }
+    let mut regressions: Vec<Change> = Vec::new();
+    let mut improvements: Vec<Change> = Vec::new();
+    let mut new_kernels: Vec<(String, f64, i64)> = Vec::new();
+    let mut gone_kernels: Vec<(String, f64, i64)> = Vec::new();
+
+    for (kname, before, after, bc, ac) in all {
+        if before <= 0.0 && after > 0.0 {
+            new_kernels.push((kname, after, ac));
+            continue;
+        }
+        if after <= 0.0 && before > 0.0 {
+            gone_kernels.push((kname, before, bc));
+            continue;
+        }
+        let delta = after - before;
+        if delta.abs() < abs_thresh_us { continue; }
+        let pct = if before > 0.0 { delta / before * 100.0 } else { 0.0 };
+        if pct.abs() < pct_thresh { continue; }
+        let ch = Change {
+            name: kname, before, after,
+            delta_us: delta, delta_pct: pct,
+            before_cnt: bc, after_cnt: ac,
+        };
+        if delta > 0.0 { regressions.push(ch); } else { improvements.push(ch); }
+    }
+    regressions.sort_by(|a, b| b.delta_us.partial_cmp(&a.delta_us).unwrap());
+    improvements.sort_by(|a, b| a.delta_us.partial_cmp(&b.delta_us).unwrap());
+
+    println!("  Regressions vs {name}   (threshold: ≥{pct_thresh}% AND ≥{abs_thresh_us}us)\n");
+    let print_changes = |label: &str, v: &[Change]| {
+        if v.is_empty() { return; }
+        println!("  {label} ({})", v.len());
+        println!("  Kernel                                     Before      After       Delta        %       Launches");
+        println!("  ────────────────────────────────────────── ─────────── ─────────── ──────────── ──────── ─────────");
+        for c in v.iter().take(15) {
+            let sign = if c.delta_us >= 0.0 { "+" } else { "" };
+            let launches = if c.before_cnt == c.after_cnt {
+                format!("{}", c.after_cnt)
+            } else {
+                format!("{}→{}", c.before_cnt, c.after_cnt)
+            };
+            println!("  {:<42} {:>11} {:>11} {:>11} {sign}{:>6.1}% {:>9}",
+                trunc(&c.name, 42), fmt_us(c.before), fmt_us(c.after),
+                fmt_us(c.delta_us.abs()), c.delta_pct, launches);
+        }
+        println!();
+    };
+    print_changes("SLOWER", &regressions);
+    print_changes("FASTER", &improvements);
+
+    if !new_kernels.is_empty() {
+        println!("  NEW kernels in current run ({}):", new_kernels.len());
+        new_kernels.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+        for (n, t, c) in new_kernels.iter().take(10) {
+            println!("    + {:<50} {} ({} launches)", trunc(n, 50), fmt_us(*t), c);
+        }
+        println!();
+    }
+    if !gone_kernels.is_empty() {
+        println!("  GONE from current run ({}):", gone_kernels.len());
+        gone_kernels.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+        for (n, t, c) in gone_kernels.iter().take(10) {
+            println!("    - {:<50} {} ({} launches)", trunc(n, 50), fmt_us(*t), c);
+        }
+        println!();
+    }
+
+    let net_delta: f64 = regressions.iter().map(|c| c.delta_us).sum::<f64>()
+        + improvements.iter().map(|c| c.delta_us).sum::<f64>();
+    let sign = if net_delta >= 0.0 { "+" } else { "-" };
+    println!("  Net change on filtered kernels: {sign}{} ({} regressions, {} improvements)",
+        fmt_us(net_delta.abs()), regressions.len(), improvements.len());
+
+    let _ = db.detach("other");
+}

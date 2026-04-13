@@ -67,6 +67,13 @@ pub fn run(db: &mut GpuDb) -> Result<()> {
             "outliers" => commands::cmd_outliers(db, args),
             "source" | "src" => commands::cmd_source(db, args),
             "memory" | "mem" => commands::cmd_memory(db, args),
+            "bandwidth" | "bw" => commands::cmd_bandwidth(db, args),
+            "critical-path" | "cp" => commands::cmd_critical_path(db, args),
+            "stream-graph" | "sg" => commands::cmd_stream_graph(db, args),
+            "hotspot" => commands::cmd_hotspot(db, args),
+            "launches" => commands::cmd_launches(db, args),
+            "compare" | "cmp-k" => commands::cmd_compare(db, args),
+            "regressions" | "regr" => commands::cmd_regressions(db, args),
             _ => {
                 println!("unknown command: {cmd}");
                 println!("type 'help' for available commands");
@@ -92,6 +99,13 @@ fn cmd_help(args: &[&str]) {
         println!("    outliers <kernel>       Slowest launches, timeline position, clustering");
         println!("    source <kernel>         Op/file that launched this kernel (needs torch/proton)");
         println!("    memory [N]              GPU allocations: peak, leaks, largest, churn");
+        println!("    bandwidth [N] [pat]     Per-kernel achieved memory bandwidth (needs ncu)");
+        println!("    critical-path [gap_us]  Longest same-stream kernel chain");
+        println!("    stream-graph [width]    ASCII timeline with streams as rows");
+        println!("    hotspot <window_us>     Hottest N-us window and what ran in it");
+        println!("    launches <kernel> [N]   Every launch: time, grid/block, stream, gap");
+        println!("    compare <ka> <kb>       Side-by-side stats for two kernels");
+        println!("    regressions <s> [%] [us] Diff filtered by % and absolute thresholds");
         println!("    warmup                  Detect warmup launches before steady state");
         println!("    small [N]               Kernels where launch overhead > compute");
         println!("    fuse [N]                Sequential kernels that could be fused");
