@@ -27,3 +27,8 @@ target
 .netcoredbg_hist
 
 .playwright-mcp/
+
+# gdbg/dbg session storage (saved profiles, breakpoints, etc.)
+.dbg/
+
+test-kernels/
