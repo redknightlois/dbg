@@ -65,6 +65,7 @@ pub fn run(db: &mut GpuDb) -> Result<()> {
             "breakdown" | "br" => commands::cmd_breakdown(db, args),
             "idle-between" | "idle" => commands::cmd_idle_between(db, args),
             "outliers" => commands::cmd_outliers(db, args),
+            "source" | "src" => commands::cmd_source(db, args),
             _ => {
                 println!("unknown command: {cmd}");
                 println!("type 'help' for available commands");
@@ -88,6 +89,7 @@ fn cmd_help(args: &[&str]) {
         println!("    occupancy [N]           SM occupancy ranking");
         println!("    variance <kernel>       Launch-to-launch timing variance");
         println!("    outliers <kernel>       Slowest launches, timeline position, clustering");
+        println!("    source <kernel>         Op/file that launched this kernel (needs torch/proton)");
         println!("    warmup                  Detect warmup launches before steady state");
         println!("    small [N]               Kernels where launch overhead > compute");
         println!("    fuse [N]                Sequential kernels that could be fused");
