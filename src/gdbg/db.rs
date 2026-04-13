@@ -6,7 +6,7 @@ use rusqlite::{Connection, params};
 /// A GPU profiling session backed by a SQLite database.
 pub struct GpuDb {
     pub conn: Connection,
-    pub path: PathBuf,
+    pub _path: PathBuf,
     /// Active focus filter (kernel name substring).
     pub focus: Option<String>,
     /// Active ignore filter (kernel name substring).
@@ -27,7 +27,7 @@ impl GpuDb {
         init_schema(&conn)?;
         Ok(Self {
             conn,
-            path: path.to_path_buf(),
+            _path: path.to_path_buf(),
             focus: None,
             ignore: None,
             region_filter: None,
@@ -43,7 +43,7 @@ impl GpuDb {
             .with_context(|| format!("cannot open {}", path.display()))?;
         Ok(Self {
             conn,
-            path: path.to_path_buf(),
+            _path: path.to_path_buf(),
             focus: None,
             ignore: None,
             region_filter: None,
@@ -102,10 +102,10 @@ impl GpuDb {
                         .to_string();
                     sessions.push(SavedSession {
                         name,
-                        target: db.meta("target"),
+                        _target: db.meta("target"),
                         device: db.meta("device"),
                         kernel_count: db.unique_kernel_count(),
-                        launch_count: db.total_launch_count(),
+                        _launch_count: db.total_launch_count(),
                         layers: db.layer_names(),
                         created: db.meta("created"),
                     });
@@ -619,10 +619,10 @@ pub fn escape_sql_like(s: &str) -> String {
 #[derive(Debug)]
 pub struct SavedSession {
     pub name: String,
-    pub target: String,
+    pub _target: String,
     pub device: String,
     pub kernel_count: usize,
-    pub launch_count: usize,
+    pub _launch_count: usize,
     pub layers: Vec<String>,
     pub created: String,
 }

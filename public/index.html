@@ -75,6 +75,28 @@
   a{color:var(--probe);text-decoration:none;transition:color .2s}
   a:hover{color:var(--trace)}
 
+  /* ─── TOP NAV ─── */
+  .top-nav{
+    display:flex;
+    justify-content:center;
+    gap:4px;
+    padding:16px 24px 0;
+  }
+  .top-nav a{
+    font-size:.75rem;
+    font-weight:500;
+    letter-spacing:.06em;
+    padding:6px 16px;
+    border-radius:4px;
+    color:var(--mute);
+    transition:all .2s;
+  }
+  .top-nav a:hover{color:var(--read)}
+  .top-nav a.active{
+    color:var(--trace);
+    background:rgba(61,255,160,.06);
+  }
+
   /* ─── HERO ─── */
   .hero{
     position:relative;
@@ -82,7 +104,7 @@
     flex-direction:column;
     align-items:center;
     text-align:center;
-    padding:80px 24px 40px;
+    padding:48px 24px 40px;
     max-width:800px;
     margin:0 auto;
   }
@@ -427,15 +449,20 @@
 
 <div class="grid-bg" aria-hidden="true"></div>
 
+<nav class="top-nav">
+  <a href="index.html" class="active">dbg</a>
+  <a href="gdbg.html">gdbg</a>
+</nav>
+
 <!-- ═══ HERO ═══ -->
 <header class="hero">
   <div class="hero-glow" aria-hidden="true"></div>
   <img class="logo" src="logo_t.png" alt="dbg" width="120" height="120">
-  <h1>Give your agent <em>eyes</em>,<br>not guesses.</h1>
+  <h1>Give your agent <em>eyes</em>, not guesses.</h1>
   <p class="sub">One CLI. Many debuggers. Your AI agent stops guessing at runtime state and starts observing it.</p>
   <div class="actions">
     <a class="btn btn-g" href="https://github.com/redknightlois/dbg">View source</a>
-    <a class="btn btn-o" href="#demo">Watch demo ↓</a>
+    <a class="btn btn-o" href="#demo">Watch demo &darr;</a>
   </div>
 </header>
 
@@ -538,7 +565,7 @@ cargo install dbg-cli</pre>
       <div class="lang-item"><div class="name">PHP</div><div class="tool">Xdebug</div></div>
       <div class="lang-item"><div class="name">Ruby</div><div class="tool">StackProf</div></div>
       <div class="lang-item"><div class="name">Haskell</div><div class="tool">GHC profiler</div></div>
-      <div class="lang-divider">GPU Profilers &mdash; <code style="font-size:.65rem;color:var(--probe)">gdbg</code></div>
+      <div class="lang-divider">GPU Profilers &mdash; <a href="gdbg.html" style="color:var(--probe);text-decoration:none"><code style="font-size:.65rem;color:var(--probe)">gdbg</code></a></div>
       <div class="lang-item"><div class="name">CUDA</div><div class="tool">nsys + ncu</div></div>
       <div class="lang-item"><div class="name">PyTorch</div><div class="tool">torch.profiler</div></div>
       <div class="lang-item"><div class="name">Triton</div><div class="tool">nsys + proton</div></div>
@@ -560,7 +587,7 @@ cargo install dbg-cli</pre>
 </section>
 
 <footer>
-  <p><a href="https://github.com/redknightlois/dbg">GitHub</a> &ensp;&middot;&ensp; MIT License &ensp;&middot;&ensp; Built by <a href="https://github.com/redknightlois">Federico Lois</a></p>
+  <p><a href="index.html">dbg</a> &ensp;&middot;&ensp; <a href="gdbg.html">gdbg</a> &ensp;&middot;&ensp; <a href="https://github.com/redknightlois/dbg">GitHub</a> &ensp;&middot;&ensp; MIT License &ensp;&middot;&ensp; Built by <a href="https://github.com/redknightlois">Federico Lois</a></p>
   <div class="sig">dbg &mdash; agent debug toolkit</div>
 </footer>
 

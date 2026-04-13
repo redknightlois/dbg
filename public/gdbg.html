@@ -1,0 +1,857 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>gdbg — GPU Profiler for AI Agents</title>
+<meta name="description" content="GPU profiling for AI agents. Three collection phases, one REPL, 30+ analysis commands. Your agent stops guessing at GPU performance and starts measuring it.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=DM+Mono:ital,wght@0,300;0,400;0,500;1,400&family=Instrument+Serif:ital@0;1&display=swap" rel="stylesheet">
+<style>
+  *{margin:0;padding:0;box-sizing:border-box}
+
+  :root{
+    --void:#06080c;
+    --ink:#0b0e14;
+    --slab:#111620;
+    --rule:#1a2233;
+    --mute:#4a5568;
+    --read:#94a3b8;
+    --lit:#d1dce8;
+    --white:#f1f5f9;
+    --trace:#3dffa0;
+    --probe:#5eead4;
+    --signal:#38bdf8;
+    --fault:#ff5c5c;
+    --warn:#fbbf24;
+    --gpu:#c084fc;
+    --glow:rgba(61,255,160,.06);
+    --mono:"DM Mono",ui-monospace,"Cascadia Code","Fira Code",Menlo,Consolas,monospace;
+    --serif:"Instrument Serif",Georgia,"Times New Roman",serif;
+  }
+
+  html{scroll-behavior:smooth}
+
+  body{
+    background:var(--void);
+    color:var(--lit);
+    font-family:var(--mono);
+    font-weight:400;
+    font-size:15px;
+    line-height:1.65;
+    overflow-x:hidden;
+    -webkit-font-smoothing:antialiased;
+  }
+
+  /* ─── Scanline overlay ─── */
+  body::after{
+    content:'';
+    position:fixed;
+    inset:0;
+    pointer-events:none;
+    z-index:9999;
+    background:repeating-linear-gradient(
+      0deg,
+      transparent,
+      transparent 2px,
+      rgba(0,0,0,.03) 2px,
+      rgba(0,0,0,.03) 4px
+    );
+  }
+
+  /* ─── Grid background ─── */
+  .grid-bg{
+    position:fixed;
+    inset:0;
+    z-index:-1;
+    background-image:
+      linear-gradient(var(--rule) 1px,transparent 1px),
+      linear-gradient(90deg,var(--rule) 1px,transparent 1px);
+    background-size:60px 60px;
+    opacity:.25;
+    mask-image:radial-gradient(ellipse 80% 70% at 50% 30%,black 20%,transparent 70%);
+  }
+
+  a{color:var(--probe);text-decoration:none;transition:color .2s}
+  a:hover{color:var(--trace)}
+
+  /* ─── TOP NAV ─── */
+  .top-nav{
+    display:flex;
+    justify-content:center;
+    gap:4px;
+    padding:16px 24px 0;
+  }
+  .top-nav a{
+    font-size:.75rem;
+    font-weight:500;
+    letter-spacing:.06em;
+    padding:6px 16px;
+    border-radius:4px;
+    color:var(--mute);
+    transition:all .2s;
+  }
+  .top-nav a:hover{color:var(--read)}
+  .top-nav a.active{
+    color:var(--gpu);
+    background:rgba(192,132,252,.06);
+  }
+
+  /* ─── HERO ─── */
+  .hero{
+    position:relative;
+    display:flex;
+    flex-direction:column;
+    align-items:center;
+    text-align:center;
+    padding:48px 24px 40px;
+    max-width:800px;
+    margin:0 auto;
+  }
+
+  .hero-glow{
+    position:absolute;
+    top:-120px;left:50%;
+    transform:translateX(-50%);
+    width:600px;height:400px;
+    background:radial-gradient(ellipse,rgba(192,132,252,.1) 0%,transparent 70%);
+    pointer-events:none;
+  }
+
+  .hero .logo{width:120px;filter:drop-shadow(0 0 40px rgba(192,132,252,.2));margin-bottom:24px}
+
+  .hero .badge{
+    display:inline-flex;align-items:center;gap:8px;
+    font-size:.72rem;
+    color:var(--mute);
+    letter-spacing:.08em;
+    margin-bottom:24px;
+  }
+  .hero .badge a{color:var(--read)}
+
+  .hero h1{
+    font-family:var(--serif);
+    font-weight:400;
+    font-size:clamp(2.2rem,5vw,3.4rem);
+    line-height:1.15;
+    color:var(--white);
+    margin-bottom:20px;
+    letter-spacing:-.02em;
+  }
+  .hero h1 em{
+    font-style:italic;
+    color:var(--gpu);
+    text-shadow:0 0 30px rgba(192,132,252,.3);
+  }
+
+  .hero .sub{
+    font-size:.95rem;
+    color:var(--read);
+    max-width:500px;
+    margin-bottom:36px;
+    line-height:1.7;
+  }
+
+  .hero .actions{display:flex;gap:12px;flex-wrap:wrap;justify-content:center}
+
+  .btn{
+    display:inline-flex;align-items:center;gap:6px;
+    padding:10px 22px;
+    border-radius:4px;
+    font-family:var(--mono);font-size:.85rem;font-weight:500;
+    text-decoration:none !important;
+    transition:all .2s;
+    border:1px solid transparent;
+  }
+  .btn-g{
+    background:var(--gpu);color:var(--void) !important;
+    box-shadow:0 0 20px rgba(192,132,252,.15);
+  }
+  .btn-g:hover{box-shadow:0 0 30px rgba(192,132,252,.3);transform:translateY(-1px)}
+  .btn-o{
+    background:transparent;color:var(--probe) !important;
+    border-color:var(--rule);
+  }
+  .btn-o:hover{border-color:var(--probe);background:rgba(94,234,212,.04)}
+
+  /* ─── SECTIONS ─── */
+  .wrap{max-width:820px;margin:0 auto;padding:0 24px}
+  section{padding:36px 0}
+
+  .sec-label{
+    font-size:.7rem;
+    font-weight:500;
+    letter-spacing:.15em;
+    text-transform:uppercase;
+    color:var(--mute);
+    margin-bottom:10px;
+  }
+  .sec-title{
+    font-family:var(--serif);
+    font-weight:400;
+    font-size:clamp(1.6rem,3vw,2.2rem);
+    color:var(--white);
+    margin-bottom:12px;
+    letter-spacing:-.01em;
+  }
+  .sec-desc{
+    color:var(--read);
+    font-size:.9rem;
+    margin-bottom:40px;
+  }
+
+  /* ─── PITCH ─── */
+  .versus{
+    display:grid;
+    grid-template-columns:1fr 1fr;
+    gap:2px;
+    background:var(--rule);
+    border-radius:6px;
+    overflow:hidden;
+  }
+  @media(max-width:640px){.versus{grid-template-columns:1fr}}
+  .versus-card{
+    background:var(--ink);
+    padding:32px 28px;
+  }
+  .versus-card .tag{
+    display:inline-block;
+    font-size:.65rem;
+    font-weight:500;
+    letter-spacing:.12em;
+    text-transform:uppercase;
+    padding:3px 8px;
+    border-radius:3px;
+    margin-bottom:14px;
+  }
+  .versus-card.before .tag{background:rgba(255,92,92,.12);color:var(--fault)}
+  .versus-card.after .tag{background:rgba(192,132,252,.12);color:var(--gpu)}
+  .versus-card p{font-size:.88rem;color:var(--read);line-height:1.7}
+  .versus-card p strong{color:var(--lit);font-weight:500}
+
+  /* ─── DEMO PANELS ─── */
+  .demo-grid{
+    display:grid;
+    grid-template-columns:repeat(2,1fr);
+    gap:16px;
+    margin-bottom:28px;
+  }
+  .demo-panel{
+    background:var(--ink);
+    border:1px solid var(--rule);
+    border-radius:6px;
+    padding:14px 16px;
+    overflow:hidden;
+    position:relative;
+  }
+  .demo-panel::before{
+    content:'';position:absolute;inset:0;
+    background:radial-gradient(ellipse at 50% 0%,rgba(192,132,252,.04),transparent 70%);
+    pointer-events:none;
+  }
+  .demo-cmd{
+    font-family:var(--mono);
+    font-size:.78rem;
+    color:var(--read);
+    padding-bottom:8px;
+    margin-bottom:8px;
+    border-bottom:1px solid var(--rule);
+    letter-spacing:.02em;
+  }
+  .demo-out{
+    font-family:var(--mono);
+    font-size:.72rem;
+    line-height:1.55;
+    color:#c9d1d9;
+    white-space:pre;
+    overflow-x:auto;
+    margin:0;
+  }
+  .demo-out::-webkit-scrollbar{height:4px}
+  .demo-out::-webkit-scrollbar-track{background:transparent}
+  .demo-out::-webkit-scrollbar-thumb{background:var(--rule);border-radius:2px}
+
+  .c-fg-green{color:#3dffa0}
+  .c-fg-yellow{color:#fbbf24}
+  .c-fg-red{color:#ff6b6b}
+  .c-fg-magenta{color:#c084fc}
+
+  /* ─── PHASES ─── */
+  .phase-grid{
+    display:grid;
+    grid-template-columns:repeat(3,1fr);
+    gap:2px;
+    background:var(--rule);
+    border-radius:6px;
+    overflow:hidden;
+  }
+  @media(max-width:640px){.phase-grid{grid-template-columns:1fr}}
+  .phase-card{
+    background:var(--ink);
+    padding:28px 24px;
+  }
+  .phase-card .num{
+    font-family:var(--serif);
+    font-size:1.3rem;
+    color:var(--gpu);
+    opacity:.7;
+    margin-bottom:10px;
+  }
+  .phase-card h3{
+    font-size:.85rem;
+    font-weight:500;
+    color:var(--white);
+    margin-bottom:8px;
+  }
+  .phase-card .tool-name{
+    display:inline-block;
+    font-size:.7rem;
+    color:var(--gpu);
+    background:rgba(192,132,252,.08);
+    padding:2px 8px;
+    border-radius:3px;
+    margin-bottom:10px;
+  }
+  .phase-card p{font-size:.82rem;color:var(--read);line-height:1.6}
+
+  /* ─── BACKENDS ─── */
+  .backend-grid{
+    display:grid;
+    grid-template-columns:repeat(3,1fr);
+    gap:2px;
+    background:var(--rule);
+    border-radius:6px;
+    overflow:hidden;
+  }
+  @media(max-width:640px){.backend-grid{grid-template-columns:1fr}}
+  .backend-card{
+    background:var(--ink);
+    padding:28px 24px;
+  }
+  .backend-card h3{
+    font-size:.95rem;
+    font-weight:500;
+    color:var(--white);
+    margin-bottom:6px;
+  }
+  .backend-card .tools{
+    font-size:.72rem;
+    color:var(--gpu);
+    letter-spacing:.03em;
+    margin-bottom:16px;
+    padding-bottom:12px;
+    border-bottom:1px solid var(--rule);
+  }
+  .backend-card p{font-size:.82rem;color:var(--read);line-height:1.6}
+  .backend-card ul{
+    list-style:none;
+    padding:0;margin:0;
+    display:grid;
+    gap:6px;
+  }
+  .backend-card ul li{
+    font-size:.82rem;
+    color:var(--read);
+    line-height:1.5;
+    padding-left:14px;
+    position:relative;
+  }
+  .backend-card ul li::before{
+    content:'\203A';
+    position:absolute;
+    left:0;
+    color:var(--gpu);
+    opacity:.6;
+  }
+
+  /* ─── COMMANDS ─── */
+  .cmd-group{margin-bottom:32px}
+  .cmd-group:last-child{margin-bottom:0}
+  .cmd-group-title{
+    font-size:.7rem;
+    font-weight:500;
+    letter-spacing:.12em;
+    text-transform:uppercase;
+    color:var(--gpu);
+    margin-bottom:12px;
+    padding-bottom:6px;
+    border-bottom:1px solid var(--rule);
+  }
+  .cmd-list{display:grid;gap:0}
+  .cmd-row{
+    display:grid;
+    grid-template-columns:200px 1fr;
+    gap:16px;
+    padding:8px 0;
+    border-bottom:1px solid rgba(26,34,51,.5);
+    align-items:baseline;
+  }
+  .cmd-row:last-child{border-bottom:none}
+  .cmd-name{
+    font-size:.82rem;
+    color:var(--trace);
+    white-space:nowrap;
+  }
+  .cmd-desc{
+    font-size:.82rem;
+    color:var(--read);
+  }
+
+  /* ─── WORKFLOW ─── */
+  .workflow-list{display:grid;gap:0;counter-reset:wf}
+  .wf-item{
+    display:grid;
+    grid-template-columns:48px 1fr;
+    gap:0;
+    padding:20px 0;
+    border-bottom:1px solid var(--rule);
+  }
+  .wf-item:last-child{border-bottom:none}
+  .wf-item::before{
+    counter-increment:wf;
+    content:counter(wf,decimal-leading-zero);
+    font-family:var(--serif);
+    font-size:1.1rem;
+    color:var(--gpu);
+    opacity:.6;
+    padding-top:1px;
+  }
+  .wf-item strong{color:var(--white);font-weight:500;display:block;margin-bottom:2px}
+  .wf-item span{color:var(--read);font-size:.85rem}
+  .wf-item code{
+    background:var(--slab);
+    padding:1px 6px;
+    border-radius:3px;
+    font-size:.8em;
+    color:var(--probe);
+  }
+
+  /* ─── INSTALL ─── */
+  .install-steps{display:grid;gap:2px;background:var(--rule);border-radius:6px;overflow:hidden}
+  .install-step{
+    background:var(--ink);
+    padding:24px 28px;
+    display:grid;
+    grid-template-columns:32px 1fr;
+    gap:16px;
+    align-items:start;
+  }
+  .install-step .num{
+    font-family:var(--serif);
+    font-size:1.4rem;
+    color:var(--gpu);
+    line-height:1;
+    padding-top:2px;
+  }
+  .install-step pre{
+    background:var(--slab);
+    border:1px solid var(--rule);
+    border-radius:4px;
+    padding:10px 14px;
+    font-family:var(--mono);
+    font-size:.82rem;
+    color:var(--gpu);
+    overflow-x:auto;
+    margin-top:8px;
+  }
+  .install-step p{font-size:.85rem;color:var(--read)}
+  .install-step p strong{color:var(--lit);font-weight:500}
+
+  /* ─── ARCHITECTURE ─── */
+  .arch-list{display:grid;gap:0;counter-reset:arch}
+  .arch-item{
+    display:grid;
+    grid-template-columns:48px 1fr;
+    gap:0;
+    padding:20px 0;
+    border-bottom:1px solid var(--rule);
+  }
+  .arch-item:last-child{border-bottom:none}
+  .arch-item::before{
+    counter-increment:arch;
+    content:counter(arch,decimal-leading-zero);
+    font-family:var(--serif);
+    font-size:1.1rem;
+    color:var(--gpu);
+    opacity:.6;
+    padding-top:1px;
+  }
+  .arch-item strong{color:var(--white);font-weight:500;display:block;margin-bottom:2px}
+  .arch-item span{color:var(--read);font-size:.85rem}
+
+  /* ─── FOOTER ─── */
+  footer{
+    padding:60px 24px;
+    text-align:center;
+    border-top:1px solid var(--rule);
+  }
+  footer p{font-size:.78rem;color:var(--mute)}
+  footer a{color:var(--read)}
+  footer a:hover{color:var(--gpu)}
+  footer .sig{margin-top:12px;font-size:.7rem;color:var(--rule);letter-spacing:.05em}
+
+  /* ─── FADE-IN ─── */
+  .reveal{opacity:0;transform:translateY(16px);transition:opacity .6s ease,transform .6s ease}
+  .reveal.visible{opacity:1;transform:translateY(0)}
+
+  /* ─── MOBILE ─── */
+  @media(max-width:640px){
+    body{font-size:14px}
+    .hero{padding:48px 20px 32px}
+    .hero .logo{width:80px;margin-bottom:16px}
+    .hero h1{font-size:1.7rem;margin-bottom:14px}
+    .hero .sub{font-size:.82rem;margin-bottom:24px;line-height:1.6}
+    .btn{padding:9px 16px;font-size:.78rem}
+    section{padding:20px 0}
+    .wrap{padding:0 16px}
+    .sec-title{font-size:1.3rem;margin-bottom:8px}
+    .sec-desc{font-size:.8rem;margin-bottom:28px}
+    .versus{grid-template-columns:1fr}
+    .versus-card{padding:20px 18px}
+    .versus-card p{font-size:.8rem;line-height:1.6}
+    .demo-grid{grid-template-columns:1fr;gap:12px}
+    .demo-panel{padding:12px 14px}
+    .demo-cmd{font-size:.72rem}
+    .demo-out{font-size:.66rem;line-height:1.5}
+    .phase-grid{grid-template-columns:1fr}
+    .phase-card{padding:20px 18px}
+    .backend-grid{grid-template-columns:1fr}
+    .backend-card{padding:20px 18px}
+    .cmd-row{grid-template-columns:1fr;gap:2px}
+    .cmd-name{font-size:.78rem}
+    .cmd-desc{font-size:.78rem}
+    .install-step{grid-template-columns:1fr;padding:18px 16px}
+    .install-step .num{display:none}
+    .install-step pre{font-size:.73rem;padding:8px 10px}
+    .wf-item{grid-template-columns:36px 1fr;padding:14px 0}
+    .arch-item{grid-template-columns:36px 1fr;padding:14px 0}
+    footer{padding:32px 16px}
+  }
+
+  @media(max-width:380px){
+    .hero{padding:40px 16px 28px}
+    .hero .logo{width:70px;margin-bottom:12px}
+    .hero h1{font-size:1.5rem}
+    .btn{padding:8px 14px;font-size:.75rem}
+    .sec-title{font-size:1.2rem}
+  }
+</style>
+</head>
+<body>
+
+<div class="grid-bg" aria-hidden="true"></div>
+
+<nav class="top-nav">
+  <a href="index.html">dbg</a>
+  <a href="gdbg.html" class="active">gdbg</a>
+</nav>
+
+<!-- ═══ HERO ═══ -->
+<header class="hero">
+  <div class="hero-glow" aria-hidden="true"></div>
+  <img class="logo" src="logo_t.png" alt="gdbg" width="120" height="120">
+  <h1>Multiple profilers. <em>One answer.</em></h1>
+  <p class="sub">GPU performance is opaque. Your AI agent stops guessing at bottlenecks and starts measuring them.</p>
+  <div class="actions">
+    <a class="btn btn-g" href="https://github.com/redknightlois/dbg">View source</a>
+    <a class="btn btn-o" href="#commands">See commands &darr;</a>
+  </div>
+</header>
+
+<!-- ═══ PITCH ═══ -->
+<section>
+  <div class="wrap">
+    <div class="sec-title">Agents guess. Profilers measure.</div>
+    <p class="sec-desc">GPU kernels are opaque. Profiling tools are fragmented. Agents need structured data, not raw traces.</p>
+    <div class="versus reveal">
+      <div class="versus-card before">
+        <div class="tag">Without gdbg</div>
+        <p>The agent reads CUDA code, <strong>guesses at bottlenecks</strong>, suggests generic optimizations. Is the kernel compute-bound or memory-bound? <strong>No idea.</strong> Are there fusion opportunities? <strong>Can't tell without data.</strong></p>
+      </div>
+      <div class="versus-card after">
+        <div class="tag">With gdbg</div>
+        <p>The agent runs <code style="background:var(--slab);padding:1px 6px;border-radius:3px;font-size:.85em;color:var(--gpu)">gdbg train.py</code>, sees the roofline classification, finds <strong>the kernel eating 40% of GPU time is memory-bound</strong>, and targets the fix. <strong>Data, not hunches.</strong></p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ═══ DEMO ═══ -->
+<section>
+  <div class="wrap">
+    <div class="sec-title">See what the agent sees.</div>
+    <p class="sec-desc">One command. Every angle on GPU performance.</p>
+
+    <div class="demo-grid reveal">
+      <div class="demo-panel">
+        <div class="demo-cmd"><span class="c-fg-magenta">gpu&gt;</span> stream-graph</div>
+<pre class="demo-out">  Stream Graph (0.0ms &rarr; 20.9ms, span 20.9ms)
+
+  s13   &boxv;B                         AAA                          B&boxv;
+  s14   &boxv;                           AA                           &boxv;
+  s15   &boxv;                           AA                           &boxv;
+        &boxur;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxul;
+
+  Legend:
+    <span class="c-fg-green">A</span>  burst_kernel(float *, int, int)       490.2us
+    <span class="c-fg-green">B</span>  quiet_kernel(float *, int)             25.2us</pre>
+      </div>
+
+      <div class="demo-panel">
+        <div class="demo-cmd"><span class="c-fg-magenta">gpu&gt;</span> hotspot 5000</div>
+<pre class="demo-out">  Hottest 5.0ms window:
+
+  Window:     574.3ms &rarr; 579.3ms
+  Busy time:  <span class="c-fg-green">490.2us</span>  (9.8% of window)
+  Launches:   12
+
+  Kernel                         Launches  Time      % busy
+  ─────────────────────────────  ────────  ────────  ──────
+  burst_kernel                         12   490.2us  <span class="c-fg-green">100.0%</span></pre>
+      </div>
+
+      <div class="demo-panel">
+        <div class="demo-cmd"><span class="c-fg-magenta">gpu&gt;</span> bandwidth</div>
+<pre class="demo-out">  Per-kernel Memory Bandwidth:
+
+  #  Kernel            Achieved    % peak   Bound
+  ── ────────────────  ──────────  ──────   ────────
+  1  coalesced_copy    <span class="c-fg-green">612.4 GB/s</span>   82.3%   memory
+  2  strided_copy       <span class="c-fg-yellow">78.2 GB/s</span>   10.5%   memory  <span class="c-fg-red">&larr;low</span>
+
+  1 kernel under 50% of peak &mdash; likely memory-access bound
+  (poor coalescing, low L2, uncoalesced strided loads)</pre>
+      </div>
+
+      <div class="demo-panel">
+        <div class="demo-cmd"><span class="c-fg-magenta">gpu&gt;</span> critical-path</div>
+<pre class="demo-out">  Critical path chains (same stream, gap &le; 100.0us):
+
+  Longest chain: stream 7  span 12.4ms  active 12.2ms (<span class="c-fg-green">98%</span>)
+                 24 kernel(s)
+
+  Top kernels on chain:
+  Kernel                 Launches  Time      % chain
+  ─────────────────────  ────────  ────────  ───────
+  trunk_step                   24    12.2ms   <span class="c-fg-green">100.0%</span></pre>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ═══ THREE PHASES ═══ -->
+<section>
+  <div class="wrap">
+    <div class="sec-title">Collect everything. At once.</div>
+    <p class="sec-desc">One command triggers three independent collection phases. Each can fail without blocking the others. You always get the data that's available.</p>
+    <div class="phase-grid reveal">
+      <div class="phase-card">
+        <div class="num">1</div>
+        <div class="tool-name">Timeline</div>
+        <h3>GPU Timeline</h3>
+        <p>Kernel launches, memory transfers, stream activity, NVTX regions. The big picture of what the GPU actually did.</p>
+      </div>
+      <div class="phase-card">
+        <div class="num">2</div>
+        <div class="tool-name">Metrics</div>
+        <h3>Hardware Metrics</h3>
+        <p>Occupancy, throughput, registers, shared memory, L2 hit rate. Collected on the hottest kernels, where the detail matters.</p>
+      </div>
+      <div class="phase-card">
+        <div class="num">3</div>
+        <div class="tool-name">Mapping</div>
+        <h3>Op Mapping</h3>
+        <p>Which operator launched which kernel. Bridges the gap between your code and the hardware.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ═══ BACKENDS ═══ -->
+<section>
+  <div class="wrap">
+    <div class="sec-title">Auto-detects your target.</div>
+    <p class="sec-desc">Point gdbg at a file. It reads the imports and picks the right collection strategy.</p>
+    <div class="backend-grid reveal">
+      <div class="backend-card">
+        <h3>CUDA</h3>
+        <ul>
+          <li>.cu source files</li>
+          <li>Compiled CUDA binaries</li>
+          <li>PyCUDA / CuPy scripts</li>
+        </ul>
+      </div>
+      <div class="backend-card">
+        <h3>PyTorch</h3>
+        <ul>
+          <li>Training scripts</li>
+          <li>Inference pipelines</li>
+          <li>Custom autograd ops</li>
+        </ul>
+      </div>
+      <div class="backend-card">
+        <h3>Triton</h3>
+        <ul>
+          <li>Triton kernels</li>
+          <li>Flash Attention variants</li>
+          <li>Custom fused ops</li>
+        </ul>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ═══ COMMANDS ═══ -->
+<section id="commands">
+  <div class="wrap">
+    <div class="sec-title">30+ commands.</div>
+    <p class="sec-desc">After collection, the agent queries everything from a single interface.</p>
+
+    <div class="cmd-group reveal">
+      <div class="cmd-group-title">Hotspots</div>
+      <div class="cmd-list">
+        <div class="cmd-row"><div class="cmd-name">kernels [N] [pattern]</div><div class="cmd-desc">Top kernels by total GPU time</div></div>
+        <div class="cmd-row"><div class="cmd-name">ops [N] [pattern]</div><div class="cmd-desc">Top operators by GPU time (needs op mapping data)</div></div>
+        <div class="cmd-row"><div class="cmd-name">stats</div><div class="cmd-desc">Overall session summary</div></div>
+        <div class="cmd-row"><div class="cmd-name">top-ops [N] [pattern]</div><div class="cmd-desc">Operators ranked by GPU time contribution</div></div>
+      </div>
+    </div>
+
+    <div class="cmd-group reveal">
+      <div class="cmd-group-title">Analysis</div>
+      <div class="cmd-list">
+        <div class="cmd-row"><div class="cmd-name">roofline [pattern]</div><div class="cmd-desc">Classify compute-bound vs memory-bound</div></div>
+        <div class="cmd-row"><div class="cmd-name">bound &lt;kernel&gt;</div><div class="cmd-desc">Detailed boundedness diagnosis for a kernel</div></div>
+        <div class="cmd-row"><div class="cmd-name">occupancy [N]</div><div class="cmd-desc">SM occupancy ranking</div></div>
+        <div class="cmd-row"><div class="cmd-name">variance &lt;kernel&gt;</div><div class="cmd-desc">Launch-to-launch timing variance</div></div>
+        <div class="cmd-row"><div class="cmd-name">warmup</div><div class="cmd-desc">Detect warmup launches before steady state</div></div>
+        <div class="cmd-row"><div class="cmd-name">small [N]</div><div class="cmd-desc">Kernels where launch overhead exceeds compute</div></div>
+        <div class="cmd-row"><div class="cmd-name">fuse [N]</div><div class="cmd-desc">Sequential kernels that could be fused</div></div>
+        <div class="cmd-row"><div class="cmd-name">concurrency</div><div class="cmd-desc">Stream utilization and parallelism gaps</div></div>
+        <div class="cmd-row"><div class="cmd-name">hotpath</div><div class="cmd-desc">Critical path through ops (CPU vs GPU bound)</div></div>
+        <div class="cmd-row"><div class="cmd-name">compare-ops [N]</div><div class="cmd-desc">CPU vs GPU time ratio per operator</div></div>
+        <div class="cmd-row"><div class="cmd-name">breakdown &lt;op&gt;</div><div class="cmd-desc">Which kernels an operator expands into</div></div>
+        <div class="cmd-row"><div class="cmd-name">idle-between &lt;a&gt; &lt;b&gt;</div><div class="cmd-desc">GPU idle gap between two operators</div></div>
+      </div>
+    </div>
+
+    <div class="cmd-group reveal">
+      <div class="cmd-group-title">Timeline</div>
+      <div class="cmd-list">
+        <div class="cmd-row"><div class="cmd-name">transfers [N]</div><div class="cmd-desc">Memory copies ranked by cost</div></div>
+        <div class="cmd-row"><div class="cmd-name">gaps [N]</div><div class="cmd-desc">GPU idle periods</div></div>
+        <div class="cmd-row"><div class="cmd-name">overlap</div><div class="cmd-desc">Compute/transfer concurrency</div></div>
+        <div class="cmd-row"><div class="cmd-name">streams</div><div class="cmd-desc">Per-stream utilization breakdown</div></div>
+        <div class="cmd-row"><div class="cmd-name">timeline [N]</div><div class="cmd-desc">Chronological kernel launches</div></div>
+      </div>
+    </div>
+
+    <div class="cmd-group reveal">
+      <div class="cmd-group-title">Drill-down</div>
+      <div class="cmd-list">
+        <div class="cmd-row"><div class="cmd-name">inspect &lt;kernel&gt;</div><div class="cmd-desc">Full detail from all data layers</div></div>
+        <div class="cmd-row"><div class="cmd-name">trace &lt;op&gt;</div><div class="cmd-desc">Operator to kernel mapping</div></div>
+        <div class="cmd-row"><div class="cmd-name">callers &lt;kernel&gt;</div><div class="cmd-desc">Which operator launched this kernel</div></div>
+      </div>
+    </div>
+
+    <div class="cmd-group reveal">
+      <div class="cmd-group-title">Filtering</div>
+      <div class="cmd-list">
+        <div class="cmd-row"><div class="cmd-name">focus &lt;pattern&gt;</div><div class="cmd-desc">Show only matching kernels</div></div>
+        <div class="cmd-row"><div class="cmd-name">ignore &lt;pattern&gt;</div><div class="cmd-desc">Hide matching kernels</div></div>
+        <div class="cmd-row"><div class="cmd-name">region &lt;name&gt;</div><div class="cmd-desc">Focus on NVTX / profiler step</div></div>
+        <div class="cmd-row"><div class="cmd-name">reset</div><div class="cmd-desc">Clear all filters</div></div>
+      </div>
+    </div>
+
+    <div class="cmd-group reveal">
+      <div class="cmd-group-title">Sessions</div>
+      <div class="cmd-list">
+        <div class="cmd-row"><div class="cmd-name">save &lt;name&gt;</div><div class="cmd-desc">Save session to .dbg/gpu/</div></div>
+        <div class="cmd-row"><div class="cmd-name">list</div><div class="cmd-desc">List saved sessions</div></div>
+        <div class="cmd-row"><div class="cmd-name">diff &lt;name&gt;</div><div class="cmd-desc">Compare current session against a saved one</div></div>
+        <div class="cmd-row"><div class="cmd-name">layers</div><div class="cmd-desc">Show loaded data layers</div></div>
+        <div class="cmd-row"><div class="cmd-name">suggest</div><div class="cmd-desc">Suggest what data to collect next</div></div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ═══ WORKFLOW ═══ -->
+<section>
+  <div class="wrap">
+    <div class="sec-title">How the agent thinks.</div>
+    <p class="sec-desc">The agent doesn't follow a script. It reasons about GPU performance the way an engineer would.</p>
+    <div class="workflow-list reveal">
+      <div class="wf-item"><div><strong>&ldquo;What's actually slow?&rdquo;</strong><span>The agent runs <code>gdbg train.py</code>, then <code>stats</code> and <code>kernels</code>. Now it knows where GPU time goes &mdash; not where it assumed it went.</span></div></div>
+      <div class="wf-item"><div><strong>&ldquo;Why is it slow?&rdquo;</strong><span><code>roofline</code> answers the question that matters: is this kernel starved for compute or starved for memory? The fix depends on the answer.</span></div></div>
+      <div class="wf-item"><div><strong>&ldquo;What else is wrong?&rdquo;</strong><span><code>fuse</code> finds sequential kernels that should be one. <code>small</code> finds kernels where launch overhead dominates. <code>gaps</code> finds idle time the GPU wasted.</span></div></div>
+      <div class="wf-item"><div><strong>&ldquo;Show me everything about this kernel.&rdquo;</strong><span><code>inspect</code> pulls hardware counters, occupancy, timing, and the operator that launched it &mdash; all in one view.</span></div></div>
+      <div class="wf-item"><div><strong>&ldquo;Did the fix actually help?&rdquo;</strong><span>The agent saves a baseline, makes changes, re-profiles, and runs <code>diff</code>. No guessing. Numbers go up or they don't.</span></div></div>
+    </div>
+  </div>
+</section>
+
+<!-- ═══ INSTALL ═══ -->
+<section>
+  <div class="wrap">
+    <div class="sec-title">Get started.</div>
+    <p class="sec-desc">gdbg ships with dbg. One install gives you both.</p>
+    <div class="install-steps reveal">
+      <div class="install-step">
+        <div class="num">1</div>
+        <div>
+          <p><strong>Install</strong></p>
+          <pre>cargo install dbg-cli</pre>
+        </div>
+      </div>
+      <div class="install-step">
+        <div class="num">2</div>
+        <div>
+          <p><strong>Check dependencies</strong></p>
+          <pre>gdbg check</pre>
+          <p style="margin-top:10px">Verifies all required tools are available. Tells you exactly what's missing and how to install it.</p>
+        </div>
+      </div>
+      <div class="install-step">
+        <div class="num">3</div>
+        <div>
+          <p><strong>Profile</strong></p>
+          <pre>gdbg train.py</pre>
+          <p style="margin-top:10px">Auto-detects the target type, collects data, and drops you into the REPL.</p>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ═══ ARCHITECTURE ─── -->
+<section>
+  <div class="wrap">
+    <div class="sec-title">How it works.</div>
+    <div class="arch-list reveal">
+      <div class="arch-item"><div><strong>Three independent phases.</strong><span>Timeline, hardware metrics, and op mapping collect separately. A failure in one doesn't block the others. You always get the data that's available.</span></div></div>
+      <div class="arch-item"><div><strong>One session, every layer.</strong><span>Timeline, hardware counters, and op mapping merge into a single queryable session. No jumping between tools or parsing different output formats.</span></div></div>
+      <div class="arch-item"><div><strong>Top-5 targeting.</strong><span>Hardware metrics collection is expensive. gdbg runs it only on the hottest kernels from the timeline, not everything. Fast enough to use interactively.</span></div></div>
+      <div class="arch-item"><div><strong>Cross-layer correlation.</strong><span>Op mapping connects Python operators to GPU kernels. <code style="background:var(--slab);padding:1px 6px;border-radius:3px;font-size:.8em;color:var(--probe)">trace matmul</code> shows every kernel that a matmul op launched.</span></div></div>
+      <div class="arch-item"><div><strong>Session diffing.</strong><span>Save a baseline, optimize, re-profile, diff. The agent sees exactly what changed &mdash; faster kernels, fewer launches, better occupancy.</span></div></div>
+    </div>
+  </div>
+</section>
+
+<footer>
+  <p><a href="index.html">dbg</a> &ensp;&middot;&ensp; <a href="gdbg.html">gdbg</a> &ensp;&middot;&ensp; <a href="https://github.com/redknightlois/dbg">GitHub</a> &ensp;&middot;&ensp; MIT License &ensp;&middot;&ensp; Built by <a href="https://github.com/redknightlois">Federico Lois</a></p>
+  <div class="sig">gdbg &mdash; gpu profiler for ai agents</div>
+</footer>
+
+<script>
+/* ─── SCROLL REVEALS ─── */
+var rev=new IntersectionObserver(function(entries){
+  entries.forEach(function(e){if(e.isIntersecting){e.target.classList.add('visible');rev.unobserve(e.target)}})
+},{threshold:.15,rootMargin:'0px 0px -40px 0px'});
+document.querySelectorAll('.reveal').forEach(function(el){rev.observe(el)});
+</script>
+</body>
+</html>
