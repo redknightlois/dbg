@@ -142,6 +142,13 @@ pub fn collect_all(db: &GpuDb, target: &str, args: &[String]) -> Result<()> {
         }
     }
 
+    // Re-compute op GPU times against the best timeline layer.
+    // During phase 3 import, ops.gpu_time_us is computed from torch/proton
+    // layer launches.  If nsys is also present (phase 1), its kernel
+    // durations are more complete.  This ensures top-ops, compare-ops, and
+    // hotpath stay consistent with breakdown and kernels.
+    db.recompute_op_gpu_times();
+
     Ok(())
 }
 
