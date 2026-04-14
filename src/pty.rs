@@ -6,7 +6,7 @@ use anyhow::{Context, Result, bail};
 use nix::poll::{PollFd, PollFlags, poll};
 use nix::pty::{OpenptyResult, openpty};
 use nix::sys::signal::Signal;
-use nix::unistd::{ForkResult, Pid, close, dup2, execvpe, fork, setsid};
+use nix::unistd::{ForkResult, Pid, close, dup2, execvp, fork, setsid};
 use regex::Regex;
 
 static ANSI_RE: LazyLock<Regex> =
@@ -45,15 +45,15 @@ impl DebuggerProcess {
                     close(slave_fd).ok();
                 }
 
-                // Build environment
-                let mut env: Vec<(String, String)> = std::env::vars().collect();
-                for (k, v) in env_extra {
-                    // Remove existing, then add
-                    env.retain(|(ek, _)| ek != k);
-                    env.push((k.clone(), v.clone()));
+                // Mutate the child's environment in place then exec.
+                // Safe: the child is single-threaded immediately after fork().
+                // Portable across Linux and macOS (macOS libc has no execvpe).
+                unsafe {
+                    for (k, v) in env_extra {
+                        std::env::set_var(k, v);
+                    }
+                    std::env::set_var("TERM", "dumb");
                 }
-                env.retain(|(k, _)| k != "TERM");
-                env.push(("TERM".into(), "dumb".into()));
 
                 let c_bin =
                     std::ffi::CString::new(bin).unwrap_or_else(|_| std::process::exit(127));
@@ -64,15 +64,8 @@ impl DebuggerProcess {
                             .unwrap_or_else(|_| std::process::exit(127)),
                     );
                 }
-                let c_env: Vec<std::ffi::CString> = env
-                    .iter()
-                    .map(|(k, v)| {
-                        std::ffi::CString::new(format!("{k}={v}"))
-                            .unwrap_or_else(|_| std::process::exit(127))
-                    })
-                    .collect();
 
-                execvpe(&c_bin, &c_args, &c_env).ok();
+                execvp(&c_bin, &c_args).ok();
                 std::process::exit(127);
             }
             ForkResult::Parent { child } => {
