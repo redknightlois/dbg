@@ -3,9 +3,51 @@ use std::process::{Command, Output};
 use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
+use dbg_cli::deps::{BundledToolkit, ToolkitAnchor, ToolkitRoot, find_bundled_tool};
 
 use super::db::GpuDb;
 use super::parsers;
+
+/// NVIDIA Nsight Systems install layout.
+///
+/// Helpers like `QdstrmImporter` live in `host-linux-x64/`, which is a
+/// sibling of the `target-linux-x64/` directory that holds the `nsys`
+/// binary on `$PATH`.  Debian's multiarch split puts those two dirs
+/// under *different* prefixes, so the static-root list is load-bearing.
+pub(super) const NSIGHT_SYSTEMS: BundledToolkit = BundledToolkit {
+    name: "nsight-systems",
+    bin_subdir: "host-linux-x64",
+    roots: &[
+        // Debian/Ubuntu apt (arch-independent helper dir).
+        ToolkitRoot {
+            path: "/usr/lib/nsight-systems",
+            max_depth: 0,
+            dir_filter: &[],
+        },
+        // Debian/Ubuntu apt (multiarch).
+        ToolkitRoot {
+            path: "/usr/lib/x86_64-linux-gnu/nsight-systems",
+            max_depth: 0,
+            dir_filter: &[],
+        },
+        // Standalone tarball / /opt install, possibly version-nested.
+        ToolkitRoot {
+            path: "/opt/nvidia/nsight-systems",
+            max_depth: 1,
+            dir_filter: &[],
+        },
+        // CUDA toolkit: /usr/local/cuda-<ver>/nsight-systems-<ver>/...
+        ToolkitRoot {
+            path: "/usr/local",
+            max_depth: 2,
+            dir_filter: &["cuda", "nsight-systems"],
+        },
+    ],
+    anchor: Some(ToolkitAnchor {
+        bin: "nsys",
+        walk_up: 3,
+    }),
+};
 
 /// Run a Command, check for success, bail with stderr on failure.
 fn run_cmd(cmd: &mut Command, context: &str) -> Result<Output> {
@@ -156,6 +198,7 @@ pub fn collect_all(db: &GpuDb, target: &str, args: &[String]) -> Result<()> {
 // nsys collection
 // ---------------------------------------------------------------------------
 
+
 fn collect_nsys(
     db: &GpuDb,
     target: &str,
@@ -186,11 +229,36 @@ fn collect_nsys(
         cmd.arg(a);
     }
 
-    run_cmd(&mut cmd, "nsys profile failed")?;
+    let profile_output = run_cmd(&mut cmd, "nsys profile failed")?;
     let elapsed = start.elapsed().as_secs_f64();
 
+    // nsys 2023.x on Debian/Ubuntu has a silent-importer bug: it writes
+    // `trace.qdstrm` during profiling but fails to invoke QdstrmImporter
+    // at the end (missing Qt runtime deps), yet still exits 0.  Detect
+    // that case and run the importer ourselves.  nsys 2024+ folded the
+    // importer into the main binary, so this branch becomes a no-op.
     if !trace_rep.exists() {
-        bail!("nsys did not produce {}", trace_rep.display());
+        let qdstrm = session.join("trace.qdstrm");
+        if qdstrm.exists() {
+            let importer = find_bundled_tool(&NSIGHT_SYSTEMS, "QdstrmImporter").ok_or_else(|| {
+                let stderr = String::from_utf8_lossy(&profile_output.stderr);
+                anyhow::anyhow!(
+                    "nsys produced {} but no trace.nsys-rep (silent QdstrmImporter failure).\n\
+                     Could not locate QdstrmImporter binary on this system.\n\
+                     Install nsight-systems with its runtime deps, or upgrade nsys to 2024+.\n\
+                     nsys stderr:\n{}",
+                    qdstrm.display(),
+                    stderr
+                )
+            })?;
+            run_cmd(
+                Command::new(&importer).arg("-i").arg(&qdstrm),
+                "QdstrmImporter fallback failed",
+            )?;
+        }
+        if !trace_rep.exists() {
+            bail!("nsys did not produce {}", trace_rep.display());
+        }
     }
 
     // nsys-rep is a proprietary container, not plain SQLite.
