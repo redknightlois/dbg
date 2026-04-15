@@ -1,0 +1,30 @@
+# Build artifacts produced by build.sh
+.build-*.log
+*/algos
+!*/algos.*
+*.class
+__pycache__/
+
+# Rust
+rust/target/
+rust/Cargo.lock
+
+# Go
+go/go.sum
+
+# .NET
+csharp/bin/
+csharp/obj/
+
+# Zig
+zig/zig-cache/
+zig/zig-out/
+zig/algos.o
+
+# Haskell
+haskell/*.hi
+haskell/*.o
+
+# OCaml
+ocaml/*.cmi
+ocaml/*.cmo

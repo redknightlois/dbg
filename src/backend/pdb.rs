@@ -1,3 +1,10 @@
+use std::process::Command;
+use std::sync::OnceLock;
+
+use regex::Regex;
+use serde_json::{Map, Value};
+
+use super::canonical::{BreakId, BreakLoc, CanonicalOps, HitEvent, unsupported};
 use super::{Backend, CleanResult, Dependency, DependencyCheck, SpawnConfig};
 
 pub struct PdbBackend;
@@ -98,6 +105,232 @@ impl Backend for PdbBackend {
             events: vec![],
         }
     }
+
+    fn canonical_ops(&self) -> Option<&dyn CanonicalOps> {
+        Some(self)
+    }
+}
+
+impl CanonicalOps for PdbBackend {
+    fn tool_name(&self) -> &'static str { "pdb" }
+
+    fn tool_version(&self) -> Option<String> {
+        static V: OnceLock<Option<String>> = OnceLock::new();
+        V.get_or_init(|| {
+            let python = std::env::var("PYTHON").unwrap_or_else(|_| "python3".into());
+            let out = Command::new(&python).arg("--version").output().ok()?;
+            let s = String::from_utf8_lossy(&out.stdout);
+            let s = if s.trim().is_empty() {
+                String::from_utf8_lossy(&out.stderr).to_string()
+            } else {
+                s.to_string()
+            };
+            // The `[via pdb <ver>]` header already names pdb via
+            // `tool_name`, so the version string shouldn't repeat it.
+            s.lines().next().map(|l| l.trim().to_string())
+        })
+        .clone()
+    }
+
+    fn op_break(&self, loc: &BreakLoc) -> anyhow::Result<String> {
+        Ok(match loc {
+            BreakLoc::FileLine { file, line } => format!("break {file}:{line}"),
+            BreakLoc::Fqn(name) => format!("break {name}"),
+            BreakLoc::ModuleMethod { module, method } => {
+                // pdb accepts `module:function` to break by symbol within a module.
+                format!("break {module}:{method}")
+            }
+        })
+    }
+
+    fn op_unbreak(&self, id: BreakId) -> anyhow::Result<String> {
+        Ok(format!("clear {}", id.0))
+    }
+
+    fn op_breaks(&self) -> anyhow::Result<String> { Ok("break".into()) }
+
+    fn op_run(&self, _args: &[String]) -> anyhow::Result<String> {
+        // pdb launches the script on daemon start; `run` restarts
+        // execution and pdb supports `restart [args...]`.
+        Ok("restart".into())
+    }
+    fn op_continue(&self) -> anyhow::Result<String> { Ok("continue".into()) }
+    fn op_step(&self) -> anyhow::Result<String> { Ok("step".into()) }
+    fn op_next(&self) -> anyhow::Result<String> { Ok("next".into()) }
+    fn op_finish(&self) -> anyhow::Result<String> { Ok("return".into()) }
+
+    fn op_stack(&self, _n: Option<u32>) -> anyhow::Result<String> {
+        // pdb `where` has no count arg — full stack always.
+        Ok("where".into())
+    }
+    fn op_frame(&self, n: u32) -> anyhow::Result<String> {
+        // Requires Python 3.8+; earlier pdb versions only have up/down.
+        Ok(format!("frame {n}"))
+    }
+    fn op_locals(&self) -> anyhow::Result<String> {
+        // pdb has no dedicated "locals" command; pretty-print the
+        // `locals()` builtin which yields a Python dict.
+        Ok("pp locals()".into())
+    }
+    fn op_print(&self, expr: &str) -> anyhow::Result<String> {
+        Ok(format!("p {expr}"))
+    }
+    fn op_watch(&self, _expr: &str) -> anyhow::Result<String> {
+        Err(unsupported(self.tool_name(), "watchpoints"))
+    }
+    fn op_threads(&self) -> anyhow::Result<String> {
+        Err(unsupported(
+            self.tool_name(),
+            "thread listing (stock pdb is single-threaded)",
+        ))
+    }
+    fn op_thread(&self, _n: u32) -> anyhow::Result<String> {
+        Err(unsupported(
+            self.tool_name(),
+            "thread switching (stock pdb is single-threaded)",
+        ))
+    }
+    fn op_list(&self, loc: Option<&str>) -> anyhow::Result<String> {
+        Ok(match loc {
+            Some(s) => format!("list {s}"),
+            None => "list".into(),
+        })
+    }
+
+    /// pdb prints a `> <file>(<line>)<func>()` marker whenever execution
+    /// stops. That single line is the authoritative stop signal.
+    fn parse_hit(&self, output: &str) -> Option<HitEvent> {
+        let re = stop_regex();
+        for line in output.lines() {
+            if let Some(c) = re.captures(line) {
+                let file = c[1].to_string();
+                let line_no: u32 = c[2].parse().ok()?;
+                let func = c[3].to_string();
+                return Some(HitEvent {
+                    location_key: format!("{file}:{line_no}"),
+                    thread: None,
+                    frame_symbol: Some(func),
+                    file: Some(file),
+                    line: Some(line_no),
+                });
+            }
+        }
+        None
+    }
+
+    /// Parse the output of `pp locals()` — a Python dict literal —
+    /// into a JSON object of `name -> {value: "<repr>"}`. A full Python
+    /// expression parser is out of scope; we walk the dict body
+    /// respecting bracket/quote depth so nested collections stay with
+    /// their key instead of leaking into the next pair.
+    fn parse_locals(&self, output: &str) -> Option<Value> {
+        let text = output.trim();
+        let inner = text
+            .strip_prefix('{')
+            .and_then(|s| s.strip_suffix('}'))
+            .unwrap_or(text);
+        let mut obj = Map::new();
+        for pair in split_top_level_commas(inner) {
+            let pair = pair.trim();
+            if pair.is_empty() {
+                continue;
+            }
+            // Find the first top-level ':' — that's the key/value boundary.
+            let colon = match find_top_level_colon(pair) {
+                Some(i) => i,
+                None => continue,
+            };
+            let key = pair[..colon].trim();
+            let val = pair[colon + 1..].trim();
+            // Strip the surrounding quotes from the key.
+            let key = key.trim_matches(|c| c == '\'' || c == '"');
+            if key.is_empty() {
+                continue;
+            }
+            let mut entry = Map::new();
+            entry.insert("value".into(), Value::String(val.to_string()));
+            obj.insert(key.to_string(), Value::Object(entry));
+        }
+        if obj.is_empty() {
+            None
+        } else {
+            Some(Value::Object(obj))
+        }
+    }
+}
+
+fn stop_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(r"^>\s+(\S+?)\((\d+)\)([A-Za-z_<][A-Za-z0-9_<>]*)").unwrap()
+    })
+}
+
+/// Split on commas at bracket-depth zero, respecting `'`/`"` quotes.
+fn split_top_level_commas(s: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut depth = 0i32;
+    let mut in_str: Option<char> = None;
+    let mut last = 0usize;
+    let bytes = s.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let c = bytes[i] as char;
+        if let Some(q) = in_str {
+            if c == '\\' && i + 1 < bytes.len() {
+                i += 2;
+                continue;
+            }
+            if c == q {
+                in_str = None;
+            }
+        } else {
+            match c {
+                '\'' | '"' => in_str = Some(c),
+                '(' | '[' | '{' => depth += 1,
+                ')' | ']' | '}' => depth -= 1,
+                ',' if depth == 0 => {
+                    out.push(&s[last..i]);
+                    last = i + 1;
+                }
+                _ => {}
+            }
+        }
+        i += 1;
+    }
+    if last < s.len() {
+        out.push(&s[last..]);
+    }
+    out
+}
+
+fn find_top_level_colon(s: &str) -> Option<usize> {
+    let mut depth = 0i32;
+    let mut in_str: Option<char> = None;
+    let bytes = s.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let c = bytes[i] as char;
+        if let Some(q) = in_str {
+            if c == '\\' && i + 1 < bytes.len() {
+                i += 2;
+                continue;
+            }
+            if c == q {
+                in_str = None;
+            }
+        } else {
+            match c {
+                '\'' | '"' => in_str = Some(c),
+                '(' | '[' | '{' => depth += 1,
+                ')' | ']' | '}' => depth -= 1,
+                ':' if depth == 0 => return Some(i),
+                _ => {}
+            }
+        }
+        i += 1;
+    }
+    None
 }
 
 #[cfg(test)]
@@ -144,5 +377,119 @@ mod tests {
         assert!(result.contains("continue"));
         let count = result.matches("break").count();
         assert_eq!(count, 1);
+    }
+
+    // --------------------------------------------------------------
+    // CanonicalOps
+    // --------------------------------------------------------------
+
+    #[test]
+    fn canonical_break_ops() {
+        let ops: &dyn CanonicalOps = &PdbBackend;
+        assert_eq!(
+            ops.op_break(&BreakLoc::FileLine { file: "app.py".into(), line: 10 }).unwrap(),
+            "break app.py:10"
+        );
+        assert_eq!(
+            ops.op_break(&BreakLoc::Fqn("main".into())).unwrap(),
+            "break main"
+        );
+        assert_eq!(
+            ops.op_break(&BreakLoc::ModuleMethod { module: "app".into(), method: "main".into() }).unwrap(),
+            "break app:main"
+        );
+    }
+
+    #[test]
+    fn canonical_exec_ops() {
+        let ops: &dyn CanonicalOps = &PdbBackend;
+        assert_eq!(ops.op_continue().unwrap(), "continue");
+        assert_eq!(ops.op_step().unwrap(), "step");
+        assert_eq!(ops.op_next().unwrap(), "next");
+        assert_eq!(ops.op_finish().unwrap(), "return");
+    }
+
+    #[test]
+    fn canonical_locals_uses_pp_locals_builtin() {
+        let ops: &dyn CanonicalOps = &PdbBackend;
+        assert_eq!(ops.op_locals().unwrap(), "pp locals()");
+    }
+
+    #[test]
+    fn canonical_watch_is_unsupported() {
+        let ops: &dyn CanonicalOps = &PdbBackend;
+        let err = ops.op_watch("x").unwrap_err().to_string();
+        assert!(err.contains("pdb"));
+        assert!(err.contains("watchpoints"));
+        assert!(err.contains("dbg raw"));
+    }
+
+    #[test]
+    fn canonical_threads_are_unsupported() {
+        let ops: &dyn CanonicalOps = &PdbBackend;
+        assert!(ops.op_threads().is_err());
+        assert!(ops.op_thread(1).is_err());
+    }
+
+    #[test]
+    fn parse_hit_from_stop_marker() {
+        let out = "> /app/main.py(42)handle_request()\n-> return result\n(Pdb) ";
+        let hit = PdbBackend.parse_hit(out).expect("should parse");
+        assert_eq!(hit.location_key, "/app/main.py:42");
+        assert_eq!(hit.file.as_deref(), Some("/app/main.py"));
+        assert_eq!(hit.line, Some(42));
+        assert_eq!(hit.frame_symbol.as_deref(), Some("handle_request"));
+    }
+
+    #[test]
+    fn parse_hit_none_without_marker() {
+        assert!(PdbBackend.parse_hit("some output without marker").is_none());
+    }
+
+    #[test]
+    fn parse_locals_from_pp_dict() {
+        let out = "{'x': 42, 'name': 'hello', 'items': [1, 2, 3]}";
+        let v = PdbBackend.parse_locals(out).expect("should parse");
+        let obj = v.as_object().unwrap();
+        assert_eq!(obj.get("x").unwrap().get("value").unwrap().as_str().unwrap(), "42");
+        assert_eq!(
+            obj.get("name").unwrap().get("value").unwrap().as_str().unwrap(),
+            "'hello'"
+        );
+        assert_eq!(
+            obj.get("items").unwrap().get("value").unwrap().as_str().unwrap(),
+            "[1, 2, 3]"
+        );
+    }
+
+    #[test]
+    fn parse_locals_handles_nested_dicts() {
+        let out = "{'cfg': {'host': 'localhost', 'port': 8080}, 'ready': True}";
+        let v = PdbBackend.parse_locals(out).expect("should parse");
+        let obj = v.as_object().unwrap();
+        assert_eq!(
+            obj.get("cfg").unwrap().get("value").unwrap().as_str().unwrap(),
+            "{'host': 'localhost', 'port': 8080}"
+        );
+        assert_eq!(obj.get("ready").unwrap().get("value").unwrap().as_str().unwrap(), "True");
+    }
+
+    #[test]
+    fn parse_locals_handles_commas_inside_strings() {
+        let out = "{'greeting': 'hello, world', 'n': 3}";
+        let v = PdbBackend.parse_locals(out).expect("should parse");
+        let obj = v.as_object().unwrap();
+        assert_eq!(
+            obj.get("greeting").unwrap().get("value").unwrap().as_str().unwrap(),
+            "'hello, world'"
+        );
+        assert_eq!(obj.get("n").unwrap().get("value").unwrap().as_str().unwrap(), "3");
+    }
+
+    #[test]
+    fn backend_canonical_ops_hook_returns_self() {
+        let b: Box<dyn Backend> = Box::new(PdbBackend);
+        assert!(b.canonical_ops().is_some());
+        assert_eq!(b.canonical_ops().unwrap().tool_name(), "pdb");
     }
 }

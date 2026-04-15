@@ -1,5 +1,6 @@
 mod backend;
 mod check;
+mod commands;
 mod daemon;
 mod ghcprof;
 mod init;

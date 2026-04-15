@@ -1,0 +1,13 @@
+[package]
+name = "dbg-example-rust"
+version = "0.0.1"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "algos"
+path = "src/main.rs"
+
+[profile.dev]
+opt-level = 0
+debug = true

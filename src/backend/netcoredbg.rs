@@ -1,5 +1,10 @@
-use regex::Regex;
+use std::process::Command;
+use std::sync::OnceLock;
 
+use regex::Regex;
+use serde_json::{Map, Value};
+
+use super::canonical::{BreakId, BreakLoc, CanonicalOps, HitEvent};
 use super::{Backend, CleanResult, Dependency, DependencyCheck, SpawnConfig};
 
 pub struct NetCoreDbgBackend;
@@ -147,6 +152,230 @@ impl Backend for NetCoreDbgBackend {
             events,
         }
     }
+
+    fn canonical_ops(&self) -> Option<&dyn CanonicalOps> {
+        Some(self)
+    }
+}
+
+impl CanonicalOps for NetCoreDbgBackend {
+    fn tool_name(&self) -> &'static str { "netcoredbg" }
+
+    fn tool_version(&self) -> Option<String> {
+        static V: OnceLock<Option<String>> = OnceLock::new();
+        V.get_or_init(|| {
+            let bin = std::env::var("NETCOREDBG").unwrap_or_else(|_| "netcoredbg".into());
+            let out = Command::new(&bin).arg("--version").output().ok()?;
+            let s = String::from_utf8_lossy(&out.stdout);
+            let s = if s.trim().is_empty() {
+                String::from_utf8_lossy(&out.stderr).to_string()
+            } else {
+                s.to_string()
+            };
+            s.lines().next().map(|l| l.trim().to_string())
+        })
+        .clone()
+    }
+
+    fn op_break(&self, loc: &BreakLoc) -> anyhow::Result<String> {
+        Ok(match loc {
+            BreakLoc::FileLine { file, line } => format!("break {file}:{line}"),
+            BreakLoc::Fqn(name) => format!("break {name}"),
+            BreakLoc::ModuleMethod { module, method } => {
+                format!("break {module}!{method}")
+            }
+        })
+    }
+
+    fn op_unbreak(&self, id: BreakId) -> anyhow::Result<String> {
+        Ok(format!("delete {}", id.0))
+    }
+    fn op_breaks(&self) -> anyhow::Result<String> { Ok("info breakpoints".into()) }
+
+    fn op_run(&self, _args: &[String]) -> anyhow::Result<String> {
+        // netcoredbg launches the target on startup; re-running is `run`.
+        Ok("run".into())
+    }
+    fn op_continue(&self) -> anyhow::Result<String> { Ok("continue".into()) }
+    fn op_step(&self) -> anyhow::Result<String> { Ok("step".into()) }
+    fn op_next(&self) -> anyhow::Result<String> { Ok("next".into()) }
+    fn op_finish(&self) -> anyhow::Result<String> { Ok("finish".into()) }
+
+    fn op_stack(&self, n: Option<u32>) -> anyhow::Result<String> {
+        Ok(match n {
+            Some(k) => format!("backtrace {k}"),
+            None => "backtrace".into(),
+        })
+    }
+    fn op_frame(&self, n: u32) -> anyhow::Result<String> {
+        Ok(format!("frame {n}"))
+    }
+    fn op_locals(&self) -> anyhow::Result<String> {
+        // netcoredbg's CLI mode has no bulk `info locals` equivalent.
+        // The agent can `dbg print <varname>` for individual variables.
+        // We emit a single-variable probe that's likely to exist at any
+        // breakpoint so the capture path gets *something* useful. If the
+        // variable doesn't exist the output is harmless noise.
+        //
+        // For proper locals capture, Phase 2 should switch netcoredbg to
+        // MI mode and use `-stack-list-variables --all-values`.
+        Ok("print this".into())
+    }
+    fn op_print(&self, expr: &str) -> anyhow::Result<String> {
+        Ok(format!("print {expr}"))
+    }
+    fn op_threads(&self) -> anyhow::Result<String> { Ok("info threads".into()) }
+    fn op_thread(&self, n: u32) -> anyhow::Result<String> {
+        Ok(format!("thread {n}"))
+    }
+    fn op_list(&self, loc: Option<&str>) -> anyhow::Result<String> {
+        Ok(match loc {
+            Some(s) => format!("list {s}"),
+            None => "list".into(),
+        })
+    }
+    // op_watch inherits the default `unsupported` implementation:
+    // netcoredbg's CLI mode does not expose watchpoints.
+
+    /// netcoredbg emits two formats at stop:
+    ///   * raw MI: `*stopped,reason="breakpoint-hit",thread-id="1",frame={...}`
+    ///   * cleaned (via `Backend::clean`): `stopped: breakpoint N hit @ <frame> at <file>:<line>`
+    /// `parse_hit` tries the cleaned form first (it's what the daemon
+    /// feeds in after `clean()`); falls back to MI for completeness.
+    fn parse_hit(&self, output: &str) -> Option<HitEvent> {
+        // Try the cleaned `stopped: ... @ <frame> at <file>:<line>` form.
+        let cleaned_re = stop_regex_cleaned();
+        for line in output.lines() {
+            if let Some(c) = cleaned_re.captures(line) {
+                let file = c["file"].to_string();
+                let line_no: u32 = c["line"].parse().ok()?;
+                let func = c["frame"].to_string();
+                return Some(HitEvent {
+                    location_key: format!("{file}:{line_no}"),
+                    thread: None,
+                    frame_symbol: Some(func),
+                    file: Some(file),
+                    line: Some(line_no),
+                });
+            }
+        }
+
+        // Fall back to the MI form.
+        let stop_re = stop_regex_mi();
+        let frame_re = frame_regex_mi();
+        let file_line_re = file_line_regex_mi();
+
+        let stopped = output
+            .lines()
+            .any(|l| l.trim_start().starts_with("stopped,") || l.contains("*stopped"));
+        if !stopped {
+            return None;
+        }
+        let thread = output.lines().find_map(|l| {
+            stop_re
+                .captures(l)
+                .and_then(|c| c.name("tid").map(|m| m.as_str().to_string()))
+        });
+        let frame = output.lines().find_map(|l| frame_re.captures(l));
+        let (func, file, line) = match frame.as_ref() {
+            Some(c) => {
+                let frame_blob = &c[1];
+                let func = find_mi_field(frame_blob, "func");
+                let (file, line) = file_line_re
+                    .captures(frame_blob)
+                    .map(|m| (m["f"].to_string(), m["l"].parse::<u32>().ok()))
+                    .unwrap_or_else(|| (String::new(), None));
+                let file = if file.is_empty() {
+                    find_mi_field(frame_blob, "file")
+                } else {
+                    Some(file)
+                };
+                let line = line.or_else(|| {
+                    find_mi_field(frame_blob, "line").and_then(|s| s.parse().ok())
+                });
+                (func, file, line)
+            }
+            None => (None, None, None),
+        };
+
+        let location_key = match (&file, line, &func) {
+            (Some(f), Some(l), _) => format!("{f}:{l}"),
+            (_, _, Some(s)) => s.clone(),
+            _ => return None,
+        };
+
+        Some(HitEvent {
+            location_key,
+            thread,
+            frame_symbol: func,
+            file,
+            line,
+        })
+    }
+
+    /// `info locals` emits `name = value` lines similar to gdb.
+    fn parse_locals(&self, output: &str) -> Option<Value> {
+        let re = locals_regex();
+        let mut obj = Map::new();
+        for line in output.lines() {
+            if let Some(c) = re.captures(line.trim_end()) {
+                let name = c[1].to_string();
+                let val = c[2].trim().to_string();
+                let mut entry = Map::new();
+                entry.insert("value".into(), Value::String(val));
+                obj.insert(name, Value::Object(entry));
+            }
+        }
+        if obj.is_empty() {
+            None
+        } else {
+            Some(Value::Object(obj))
+        }
+    }
+}
+
+fn stop_regex_cleaned() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        // `stopped: breakpoint 1 hit @ Ns.Class.Method() at /path/file.cs:42`
+        Regex::new(
+            r"^stopped:[^@]*@\s+(?P<frame>\S+?)\s+at\s+(?P<file>\S+):(?P<line>\d+)",
+        )
+        .unwrap()
+    })
+}
+
+fn stop_regex_mi() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(r#"thread-id[:=]\s*["]?(?P<tid>\d+)"#).unwrap()
+    })
+}
+
+fn frame_regex_mi() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"frame=\{(.+?)\}").unwrap())
+}
+
+fn file_line_regex_mi() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"at\s+(?P<f>[^:}\s]+):(?P<l>\d+)").unwrap())
+}
+
+fn find_mi_field(blob: &str, key: &str) -> Option<String> {
+    // Match `key="value"` (MI-style) or `key=value` (un-quoted) inside
+    // the frame blob. Values may contain spaces but not `}` or `,`.
+    let re_quoted = Regex::new(&format!(r#"{key}="([^"]*)""#)).ok()?;
+    if let Some(c) = re_quoted.captures(blob) {
+        return Some(c[1].to_string());
+    }
+    let re_unq = Regex::new(&format!(r"{key}=([^,}}]+)")).ok()?;
+    re_unq.captures(blob).map(|c| c[1].trim().to_string())
+}
+
+fn locals_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.+)$").unwrap())
 }
 
 #[cfg(test)]
@@ -191,6 +420,100 @@ mod tests {
         assert!(result.contains("break"));
         assert!(result.contains("continue"));
         assert!(!result.contains("command"));
+    }
+
+    // --------------------------------------------------------------
+    // CanonicalOps
+    // --------------------------------------------------------------
+
+    #[test]
+    fn canonical_break_ops() {
+        let ops: &dyn CanonicalOps = &NetCoreDbgBackend;
+        assert_eq!(
+            ops.op_break(&BreakLoc::FileLine { file: "Program.cs".into(), line: 10 }).unwrap(),
+            "break Program.cs:10"
+        );
+        assert_eq!(
+            ops.op_break(&BreakLoc::Fqn("Foo.Bar.Baz".into())).unwrap(),
+            "break Foo.Bar.Baz"
+        );
+        assert_eq!(
+            ops.op_break(&BreakLoc::ModuleMethod { module: "MyLib".into(), method: "Baz".into() }).unwrap(),
+            "break MyLib!Baz"
+        );
+    }
+
+    #[test]
+    fn canonical_exec_ops() {
+        let ops: &dyn CanonicalOps = &NetCoreDbgBackend;
+        assert_eq!(ops.op_continue().unwrap(), "continue");
+        assert_eq!(ops.op_step().unwrap(), "step");
+        assert_eq!(ops.op_next().unwrap(), "next");
+        assert_eq!(ops.op_finish().unwrap(), "finish");
+    }
+
+    #[test]
+    fn canonical_thread_ops() {
+        let ops: &dyn CanonicalOps = &NetCoreDbgBackend;
+        assert_eq!(ops.op_threads().unwrap(), "info threads");
+        assert_eq!(ops.op_thread(2).unwrap(), "thread 2");
+    }
+
+    #[test]
+    fn canonical_watch_unsupported() {
+        let ops: &dyn CanonicalOps = &NetCoreDbgBackend;
+        let err = ops.op_watch("x").unwrap_err().to_string();
+        assert!(err.contains("netcoredbg"));
+        assert!(err.contains("dbg raw"));
+    }
+
+    #[test]
+    fn parse_hit_from_cleaned_stop_line() {
+        // This is what Backend::clean produces out of the MI record —
+        // it's also what the daemon feeds into parse_hit.
+        let out = "stopped: breakpoint 1 hit @ DbgExample.Algos.Fibonacci() at /app/Program.cs:22";
+        let hit = NetCoreDbgBackend.parse_hit(out).expect("should parse");
+        assert_eq!(hit.file.as_deref(), Some("/app/Program.cs"));
+        assert_eq!(hit.line, Some(22));
+        assert_eq!(hit.frame_symbol.as_deref(), Some("DbgExample.Algos.Fibonacci()"));
+    }
+
+    #[test]
+    fn parse_hit_from_mi_stopped_record() {
+        let out = r#"stopped, reason: breakpoint 1 hit, thread-id: 1, frame={Program.Main() at Program.cs:4}"#;
+        let hit = NetCoreDbgBackend.parse_hit(out).expect("should parse");
+        assert_eq!(hit.file.as_deref(), Some("Program.cs"));
+        assert_eq!(hit.line, Some(4));
+        assert_eq!(hit.thread.as_deref(), Some("1"));
+    }
+
+    #[test]
+    fn parse_hit_from_quoted_mi_record() {
+        let out = r#"*stopped,reason="breakpoint-hit",thread-id="1",frame={func="Foo.Bar.Baz",file="Program.cs",line="42"}"#;
+        let hit = NetCoreDbgBackend.parse_hit(out).expect("should parse");
+        assert_eq!(hit.file.as_deref(), Some("Program.cs"));
+        assert_eq!(hit.line, Some(42));
+        assert_eq!(hit.frame_symbol.as_deref(), Some("Foo.Bar.Baz"));
+    }
+
+    #[test]
+    fn parse_hit_none_without_stopped() {
+        assert!(NetCoreDbgBackend.parse_hit("random output").is_none());
+    }
+
+    #[test]
+    fn parse_locals_simple_values() {
+        let out = "x = 42\nname = \"hello\"\nempty = {}";
+        let v = NetCoreDbgBackend.parse_locals(out).expect("should parse");
+        let obj = v.as_object().unwrap();
+        assert_eq!(obj.get("x").unwrap().get("value").unwrap().as_str().unwrap(), "42");
+        assert_eq!(obj.get("name").unwrap().get("value").unwrap().as_str().unwrap(), "\"hello\"");
+    }
+
+    #[test]
+    fn backend_canonical_ops_hook_returns_self() {
+        let b: Box<dyn Backend> = Box::new(NetCoreDbgBackend);
+        assert_eq!(b.canonical_ops().unwrap().tool_name(), "netcoredbg");
     }
 }
 

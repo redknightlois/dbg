@@ -1,0 +1,1300 @@
+//! Cross-track commands — operate on the SessionDb, not on a live
+//! debugger PTY. These implement the "what do I know about this
+//! symbol / location?" layer of the plan, joining debug-track hits
+//! with profile-track samples and on-demand disasm/source rows.
+//!
+//! Pure input → output: every function here takes a `&SessionDb` and
+//! the parsed arguments, returning a formatted string. The daemon
+//! does the plumbing; these functions stay testable with a tempdir DB.
+
+use std::fs;
+use std::path::Path;
+
+use anyhow::Result;
+use dbg_cli::session_db::{
+    CollectCtx, CollectTrigger, LiveDebugger, OnDemandCollector, SessionDb, TargetClass,
+    collectors::disasm::{GoDisassCollector, JitDasmCollector, LldbDisassembleCollector},
+    persist_disasm,
+};
+use rusqlite::{OptionalExtension, params};
+use serde_json::Value;
+
+/// Parsed cross-track command. The dispatcher builds one of these;
+/// `run` executes it against a SessionDb and returns the formatted
+/// report.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Query {
+    Hits {
+        loc: String,
+        /// When set, aggregate rows by this locals field instead of
+        /// listing them. `--group-by foo` shows count per distinct
+        /// value of `foo`. `--count-by foo --top N` is the same with
+        /// a ranked top-N truncation.
+        group_by: Option<String>,
+        top: Option<usize>,
+    },
+    HitDiff { loc: String, a: u32, b: u32 },
+    HitTrend { loc: String, field: String },
+    Disasm { symbol: Option<String>, refresh: bool },
+    DisasmDiff { a: String, b: String },
+    Source { symbol: String, radius: u32 },
+    Cross { symbol: String },
+    AtHitDisasm,
+}
+
+impl Query {
+    /// Canonical-op name for the `commands.canonical_op` log column.
+    pub fn canonical_op(&self) -> &'static str {
+        match self {
+            Query::Hits { .. } => "hits",
+            Query::HitDiff { .. } => "hit-diff",
+            Query::HitTrend { .. } => "hit-trend",
+            Query::Disasm { .. } => "disasm",
+            Query::DisasmDiff { .. } => "disasm-diff",
+            Query::Source { .. } => "source",
+            Query::Cross { .. } => "cross",
+            Query::AtHitDisasm => "at-hit",
+        }
+    }
+}
+
+/// Parse `input` as a cross-track command. Returns `Some(Dispatched)`
+/// when the verb is a crosstrack verb; returns `None` so callers can
+/// defer to the debug dispatcher or fall through.
+pub fn try_dispatch(input: &str) -> Option<super::Dispatched> {
+    let input = input.trim();
+    let (verb, rest) = match input.find(|c: char| c.is_ascii_whitespace()) {
+        Some(i) => (&input[..i], input[i..].trim_start()),
+        None => (input, ""),
+    };
+    let q = match verb {
+        "hits" => {
+            if rest.is_empty() {
+                return Some(super::Dispatched::Immediate(
+                    "usage: dbg hits <loc> [--group-by FIELD] [--count-by FIELD --top N]".into(),
+                ));
+            }
+            let mut loc: Option<String> = None;
+            let mut group_by: Option<String> = None;
+            let mut top: Option<usize> = None;
+            let mut toks = rest.split_whitespace().peekable();
+            while let Some(t) = toks.next() {
+                match t {
+                    "--group-by" | "--count-by" => {
+                        if let Some(v) = toks.next() {
+                            group_by = Some(v.to_string());
+                        } else {
+                            return Some(super::Dispatched::Immediate(
+                                format!("{t} needs a field name").into(),
+                            ));
+                        }
+                    }
+                    "--top" => {
+                        if let Some(v) = toks.next() {
+                            match v.parse::<usize>() {
+                                Ok(n) => top = Some(n),
+                                Err(_) => {
+                                    return Some(super::Dispatched::Immediate(
+                                        format!("--top needs a number, got `{v}`"),
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                    _ => {
+                        if loc.is_none() {
+                            loc = Some(t.to_string());
+                        }
+                    }
+                }
+            }
+            let loc = match loc {
+                Some(l) => l,
+                None => return Some(super::Dispatched::Immediate(
+                    "usage: dbg hits <loc> [--group-by FIELD] [--count-by FIELD --top N]".into(),
+                )),
+            };
+            Query::Hits { loc, group_by, top }
+        }
+        "hit-diff" => {
+            let parts: Vec<&str> = rest.split_whitespace().collect();
+            if parts.len() != 3 {
+                return Some(super::Dispatched::Immediate(
+                    "usage: dbg hit-diff <loc> <seq_a> <seq_b>".into(),
+                ));
+            }
+            match (parts[1].parse::<u32>(), parts[2].parse::<u32>()) {
+                (Ok(a), Ok(b)) => Query::HitDiff { loc: parts[0].into(), a, b },
+                _ => {
+                    return Some(super::Dispatched::Immediate(
+                        "hit-diff needs numeric seq_a and seq_b".into(),
+                    ));
+                }
+            }
+        }
+        "hit-trend" => {
+            let parts: Vec<&str> = rest.splitn(2, char::is_whitespace).collect();
+            if parts.len() != 2 {
+                return Some(super::Dispatched::Immediate(
+                    "usage: dbg hit-trend <loc> <field>".into(),
+                ));
+            }
+            Query::HitTrend {
+                loc: parts[0].into(),
+                field: parts[1].into(),
+            }
+        }
+        "disasm" => {
+            let (symbol, refresh) = parse_disasm_args(rest);
+            Query::Disasm { symbol, refresh }
+        }
+        "disasm-diff" => {
+            let parts: Vec<&str> = rest.split_whitespace().collect();
+            if parts.len() != 2 {
+                return Some(super::Dispatched::Immediate(
+                    "usage: dbg disasm-diff <symbol_a> <symbol_b>".into(),
+                ));
+            }
+            Query::DisasmDiff {
+                a: parts[0].into(),
+                b: parts[1].into(),
+            }
+        }
+        "source" => {
+            if rest.is_empty() {
+                return Some(super::Dispatched::Immediate(
+                    "usage: dbg source <symbol> [radius=5]".into(),
+                ));
+            }
+            let parts: Vec<&str> = rest.split_whitespace().collect();
+            let radius = parts
+                .get(1)
+                .and_then(|s| s.parse::<u32>().ok())
+                .unwrap_or(5);
+            Query::Source {
+                symbol: parts[0].into(),
+                radius,
+            }
+        }
+        "cross" => {
+            if rest.is_empty() {
+                return Some(super::Dispatched::Immediate(
+                    "usage: dbg cross <symbol>".into(),
+                ));
+            }
+            Query::Cross {
+                symbol: rest.to_string(),
+            }
+        }
+        "at-hit" => {
+            let sub = rest.split_whitespace().next().unwrap_or("");
+            match sub {
+                "disasm" => Query::AtHitDisasm,
+                "" => {
+                    return Some(super::Dispatched::Immediate(
+                        "usage: dbg at-hit disasm".into(),
+                    ));
+                }
+                other => {
+                    return Some(super::Dispatched::Immediate(format!(
+                        "unknown at-hit subcommand `{other}` — supported: disasm"
+                    )));
+                }
+            }
+        }
+        _ => return None,
+    };
+    Some(super::Dispatched::Query(q))
+}
+
+fn parse_disasm_args(rest: &str) -> (Option<String>, bool) {
+    let mut symbol: Option<String> = None;
+    let mut refresh = false;
+    for tok in rest.split_whitespace() {
+        match tok {
+            "--refresh" | "-r" => refresh = true,
+            _ => {
+                if symbol.is_none() {
+                    symbol = Some(tok.to_string());
+                }
+            }
+        }
+    }
+    (symbol, refresh)
+}
+
+/// Inputs a cross-track query needs beyond the DB.
+pub struct RunCtx<'a> {
+    pub target: &'a str,
+    pub target_class: TargetClass,
+    pub cwd: &'a Path,
+    /// `None` in profile-only contexts; `Some` when a live debug
+    /// session is attached (unlocks `at-hit` and lets the disasm
+    /// collector reuse the existing PTY).
+    pub live: Option<&'a dyn LiveDebugger>,
+}
+
+/// Dispatch one `Query` against the provided DB.
+pub fn run(q: &Query, db: &SessionDb, ctx: &RunCtx<'_>) -> String {
+    match q {
+        Query::Hits { loc, group_by, top } => {
+            if let Some(field) = group_by {
+                cmd_hits_grouped(db, loc, field, *top)
+            } else {
+                cmd_hits(db, loc)
+            }
+        }
+        Query::HitDiff { loc, a, b } => cmd_hit_diff(db, loc, *a, *b),
+        Query::HitTrend { loc, field } => cmd_hit_trend(db, loc, field),
+        Query::Disasm { symbol, refresh } => {
+            cmd_disasm(db, ctx, symbol.as_deref(), *refresh)
+        }
+        Query::DisasmDiff { a, b } => cmd_disasm_diff(db, a, b),
+        Query::Source { symbol, radius } => cmd_source(db, symbol, *radius),
+        Query::Cross { symbol } => cmd_cross(db, symbol),
+        Query::AtHitDisasm => cmd_at_hit_disasm(db, ctx),
+    }
+}
+
+/// The `<basename>:<line>` suffix of a `file:line` key. When the agent
+/// queries `/a/b/main.go:22` but the debugger stored `./main.go:22` (or
+/// `main.go:22`), we accept either by matching on this suffix.
+fn basename_line_key(loc: &str) -> String {
+    let (file, line) = match loc.rsplit_once(':') {
+        Some(x) => x,
+        None => return loc.to_string(),
+    };
+    let base = match file.rsplit_once('/') {
+        Some((_, b)) => b,
+        None => file,
+    };
+    format!("{base}:{line}")
+}
+
+// ============================================================
+// dbg hits <loc>
+// ============================================================
+
+fn cmd_hits(db: &SessionDb, loc: &str) -> String {
+    // Query by exact match first, then fall back to basename:line so
+    // `/abs/path/to/main.go:22` matches the `./main.go:22` form delve
+    // stores, the `src/main.rs:42` form lldb stores, and so on.
+    let (exact, tail) = (loc.to_string(), basename_line_key(loc));
+    let mut stmt = match db.conn().prepare(
+        "SELECT hit_seq, thread, ts, locals_json
+         FROM breakpoint_hits
+         WHERE location_key = ?1
+            OR location_key LIKE '%' || ?2
+         ORDER BY hit_seq ASC",
+    ) {
+        Ok(s) => s,
+        Err(e) => return format!("[error: {e}]"),
+    };
+    let rows = stmt
+        .query_map(params![exact, tail], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, Option<String>>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, Option<String>>(3)?,
+            ))
+        });
+    let rows = match rows {
+        Ok(it) => it.collect::<Result<Vec<_>, _>>().unwrap_or_default(),
+        Err(e) => return format!("[error: {e}]"),
+    };
+    if rows.is_empty() {
+        return format!("no captured hits at {loc}");
+    }
+    let mut out = String::new();
+    out.push_str(&format!("{loc} — {} hit(s)\n", rows.len()));
+    out.push_str("  seq  thread  ts                    locals summary\n");
+    for (seq, thread, ts, locals) in rows {
+        let summary = locals
+            .as_deref()
+            .and_then(|s| locals_summary(s))
+            .unwrap_or_else(|| "(none)".into());
+        out.push_str(&format!(
+            "  #{seq:<3} {th:<6}  {ts:<20}  {summary}\n",
+            th = thread.unwrap_or_else(|| "-".into()),
+        ));
+    }
+    out
+}
+
+/// Aggregate hits by a locals field. Groups rows whose parsed
+/// `locals_json[field].value` matches; outputs `value -> count` sorted
+/// descending. With `top=Some(n)`, truncates to the n most-frequent.
+fn cmd_hits_grouped(db: &SessionDb, loc: &str, field: &str, top: Option<usize>) -> String {
+    let tail = basename_line_key(loc);
+    let stem_tail = stem_line_key(loc);
+    let mut stmt = match db.conn().prepare(
+        "SELECT locals_json FROM breakpoint_hits
+         WHERE location_key = ?1
+            OR location_key LIKE '%' || ?2
+            OR location_key LIKE ?3 || '%'",
+    ) {
+        Ok(s) => s,
+        Err(e) => return format!("[error: {e}]"),
+    };
+    let rows: Vec<Option<String>> = stmt
+        .query_map(params![loc, tail, stem_tail], |r| r.get::<_, Option<String>>(0))
+        .and_then(|it| it.collect::<Result<Vec<_>, _>>())
+        .unwrap_or_default();
+    if rows.is_empty() {
+        return format!("no captured hits at {loc}");
+    }
+
+    let total = rows.len();
+    let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut with_locals = 0;
+    let mut matched = 0;
+    for locals in rows.into_iter().flatten() {
+        with_locals += 1;
+        let Ok(v) = serde_json::from_str::<Value>(&locals) else { continue };
+        let Some(val) = lookup_field(&v, field) else { continue };
+        matched += 1;
+        *counts.entry(val).or_insert(0) += 1;
+    }
+    if counts.is_empty() {
+        if with_locals == 0 {
+            return format!(
+                "no locals captured at {loc} — run `dbg locals` at a hit to populate, \
+                 or enable auto-capture for the backend"
+            );
+        }
+        // Enumerate captured field names to help the agent pick a real one.
+        let names = collect_captured_names(db, loc);
+        return if names.is_empty() {
+            format!("field `{field}` not present in any captured locals at {loc}")
+        } else {
+            format!(
+                "field `{field}` not captured at {loc} (available: {})",
+                names.join(", ")
+            )
+        };
+    }
+    let mut pairs: Vec<(String, usize)> = counts.into_iter().collect();
+    pairs.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    if let Some(n) = top {
+        pairs.truncate(n);
+    }
+
+    let mut out = format!(
+        "{loc} — {total} hit(s), grouped by `{field}` ({matched} match)\n"
+    );
+    let max_val_len = pairs.iter().map(|(v, _)| v.chars().count()).max().unwrap_or(5);
+    for (val, count) in &pairs {
+        out.push_str(&format!(
+            "  {val:<w$}  {count}\n",
+            w = max_val_len.max(5)
+        ));
+    }
+    out
+}
+
+/// Look up `field` in a locals object. Supports dotted paths
+/// (`self.x`, `obj.nested.v`) and plain names. Value is the stringified
+/// `"value"` sub-key when present, otherwise the node itself.
+fn lookup_field(locals: &Value, field: &str) -> Option<String> {
+    let mut cur = locals;
+    for part in field.split('.') {
+        cur = cur.get(part)?;
+    }
+    if let Some(val) = cur.get("value").and_then(|v| v.as_str()) {
+        Some(val.to_string())
+    } else if let Some(s) = cur.as_str() {
+        Some(s.to_string())
+    } else {
+        Some(cur.to_string())
+    }
+}
+
+/// Collect the set of captured locals field names across all hits at
+/// `loc`. Used to enumerate options in error messages.
+fn collect_captured_names(db: &SessionDb, loc: &str) -> Vec<String> {
+    let tail = basename_line_key(loc);
+    let stem_tail = stem_line_key(loc);
+    let Ok(mut stmt) = db.conn().prepare(
+        "SELECT locals_json FROM breakpoint_hits
+         WHERE (location_key = ?1
+                OR location_key LIKE '%' || ?2
+                OR location_key LIKE ?3 || '%')
+           AND locals_json IS NOT NULL",
+    ) else {
+        return Vec::new();
+    };
+    let rows: Vec<String> = stmt
+        .query_map(params![loc, tail, stem_tail], |r| r.get::<_, String>(0))
+        .and_then(|it| it.collect::<Result<Vec<_>, _>>())
+        .unwrap_or_default();
+    let mut names: std::collections::BTreeSet<String> = Default::default();
+    for s in rows {
+        if let Ok(Value::Object(obj)) = serde_json::from_str::<Value>(&s) {
+            for k in obj.keys() {
+                names.insert(k.clone());
+            }
+        }
+    }
+    names.into_iter().collect()
+}
+
+fn locals_summary(locals_json: &str) -> Option<String> {
+    let v: Value = serde_json::from_str(locals_json).ok()?;
+    let obj = v.as_object()?;
+    if obj.is_empty() {
+        return Some("(empty)".into());
+    }
+    let mut parts = Vec::new();
+    for (k, v) in obj.iter().take(4) {
+        let val = v
+            .get("value")
+            .and_then(|s| s.as_str())
+            .unwrap_or("")
+            .chars()
+            .take(30)
+            .collect::<String>();
+        parts.push(format!("{k}={val}"));
+    }
+    if obj.len() > 4 {
+        parts.push(format!("… +{} more", obj.len() - 4));
+    }
+    Some(parts.join(", "))
+}
+
+// ============================================================
+// dbg hit-diff <loc> <a> <b>
+// ============================================================
+
+fn cmd_hit_diff(db: &SessionDb, loc: &str, a: u32, b: u32) -> String {
+    let tail = basename_line_key(loc);
+    let fetch = |seq: u32| -> Option<(Option<String>, Option<String>)> {
+        db.conn()
+            .query_row(
+                "SELECT locals_json, stack_json
+                 FROM breakpoint_hits
+                 WHERE (location_key = ?1 OR location_key LIKE '%' || ?2)
+                   AND hit_seq = ?3",
+                params![loc, tail, seq as i64],
+                |r| {
+                    Ok((
+                        r.get::<_, Option<String>>(0)?,
+                        r.get::<_, Option<String>>(1)?,
+                    ))
+                },
+            )
+            .optional()
+            .ok()
+            .flatten()
+    };
+    let (la, _sa) = match fetch(a) {
+        Some(x) => x,
+        None => return format!("no hit #{a} at {loc}"),
+    };
+    let (lb, _sb) = match fetch(b) {
+        Some(x) => x,
+        None => return format!("no hit #{b} at {loc}"),
+    };
+
+    let va: Value = la
+        .as_deref()
+        .and_then(|s| serde_json::from_str(s).ok())
+        .unwrap_or(Value::Object(Default::default()));
+    let vb: Value = lb
+        .as_deref()
+        .and_then(|s| serde_json::from_str(s).ok())
+        .unwrap_or(Value::Object(Default::default()));
+
+    let mut out = format!("hit-diff {loc}  #{a} vs #{b}\n");
+    let oa = va.as_object().cloned().unwrap_or_default();
+    let ob = vb.as_object().cloned().unwrap_or_default();
+    let mut keys: Vec<&String> = oa.keys().chain(ob.keys()).collect();
+    keys.sort();
+    keys.dedup();
+    if keys.is_empty() {
+        out.push_str("  (no locals captured on either hit)\n");
+        return out;
+    }
+    out.push_str("  field            #a                    #b\n");
+    for k in keys {
+        let va = oa
+            .get(k)
+            .and_then(|v| v.get("value"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("-");
+        let vb = ob
+            .get(k)
+            .and_then(|v| v.get("value"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("-");
+        let mark = if va != vb { "≠" } else { " " };
+        out.push_str(&format!(
+            "  {mark} {k:<14}  {va:<20}  {vb:<20}\n"
+        ));
+    }
+    out
+}
+
+// ============================================================
+// dbg hit-trend <loc> <field>
+// ============================================================
+
+fn cmd_hit_trend(db: &SessionDb, loc: &str, field: &str) -> String {
+    let tail = basename_line_key(loc);
+    let mut stmt = match db.conn().prepare(
+        "SELECT hit_seq, locals_json FROM breakpoint_hits
+         WHERE location_key = ?1 OR location_key LIKE '%' || ?2
+         ORDER BY hit_seq ASC",
+    ) {
+        Ok(s) => s,
+        Err(e) => return format!("[error: {e}]"),
+    };
+    let rows: Vec<(i64, Option<String>)> = stmt
+        .query_map(params![loc, tail], |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, Option<String>>(1)?))
+        })
+        .and_then(|it| it.collect::<Result<Vec<_>, _>>())
+        .unwrap_or_default();
+    if rows.is_empty() {
+        return format!("no hits at {loc}");
+    }
+
+    let mut have_any_locals = false;
+    let values: Vec<(i64, String)> = rows
+        .into_iter()
+        .filter_map(|(seq, locals)| {
+            let locals = locals.as_deref()?;
+            have_any_locals = true;
+            let v: Value = serde_json::from_str(locals).ok()?;
+            let raw = lookup_field(&v, field)?;
+            Some((seq, raw))
+        })
+        .collect();
+    if values.is_empty() {
+        if !have_any_locals {
+            return format!(
+                "no locals captured at {loc} — run `dbg locals` at a hit to populate, \
+                 or enable auto-capture for the backend"
+            );
+        }
+        let names = collect_captured_names(db, loc);
+        return if names.is_empty() {
+            format!("field `{field}` not captured at {loc}")
+        } else {
+            format!(
+                "field `{field}` not captured at {loc} (available: {}). \
+                 dotted paths supported (e.g. self.{field})",
+                names.join(", ")
+            )
+        };
+    }
+
+    let mut out = format!("hit-trend {loc} / {field}\n");
+    let numeric: Vec<(i64, f64)> = values
+        .iter()
+        .filter_map(|(s, v)| v.parse::<f64>().ok().map(|f| (*s, f)))
+        .collect();
+    if numeric.len() == values.len() {
+        // All numeric — render a sparkline alongside the table.
+        out.push_str(&format!("  sparkline: {}\n", sparkline(&numeric)));
+    }
+    out.push_str("  seq   value\n");
+    for (seq, v) in &values {
+        out.push_str(&format!("  #{seq:<3}  {v}\n"));
+    }
+    out
+}
+
+fn sparkline(points: &[(i64, f64)]) -> String {
+    if points.is_empty() {
+        return String::new();
+    }
+    let bars = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+    let min = points.iter().map(|(_, v)| *v).fold(f64::INFINITY, f64::min);
+    let max = points.iter().map(|(_, v)| *v).fold(f64::NEG_INFINITY, f64::max);
+    let range = (max - min).max(1e-9);
+    points
+        .iter()
+        .map(|(_, v)| {
+            let ix = (((v - min) / range) * (bars.len() - 1) as f64).round() as usize;
+            bars[ix.min(bars.len() - 1)]
+        })
+        .collect()
+}
+
+// ============================================================
+// dbg disasm [<sym>]
+// ============================================================
+
+fn cmd_disasm(
+    db: &SessionDb,
+    ctx: &RunCtx<'_>,
+    symbol: Option<&str>,
+    refresh: bool,
+) -> String {
+    let sym = match symbol {
+        Some(s) => s.to_string(),
+        None => match resolve_current_symbol(db) {
+            Some(s) => s,
+            None => {
+                return "no symbol given and no recent breakpoint hit to infer from — try `dbg disasm <symbol>`".into();
+            }
+        },
+    };
+
+    let collector: Box<dyn OnDemandCollector> = match ctx.target_class {
+        TargetClass::ManagedDotnet => Box::new(JitDasmCollector),
+        TargetClass::NativeCpu => {
+            // Go vs C/Rust: prefer go-objdump when the target file
+            // claims to be a Go binary (cheap heuristic: extension
+            // unlikely, so rely on user explicitly passing `--tool=go`
+            // in future). Default lldb for now.
+            Box::new(LldbDisassembleCollector)
+        }
+        _ => {
+            return format!(
+                "disasm not implemented for target class `{}` yet",
+                ctx.target_class
+            );
+        }
+    };
+
+    let collect_ctx = CollectCtx {
+        target: ctx.target,
+        target_class: ctx.target_class,
+        symbol: &sym,
+        refresh,
+        trigger: CollectTrigger::Explicit,
+        cwd: ctx.cwd,
+    };
+
+    let output = match collector.collect(&collect_ctx, ctx.live) {
+        Ok(o) => o,
+        Err(e) => return format!("[disasm {}: {e}]", collector.kind()),
+    };
+    if let Err(e) = persist_disasm(db, &collect_ctx, &output) {
+        eprintln!("[dbg] warning: disasm persist failed: {e}");
+    }
+
+    let mut header = format!(
+        "[via {tool}] disasm {sym}",
+        tool = collector.kind(),
+        sym = sym,
+    );
+    if let Some(tier) = output.tier.as_deref() {
+        header.push_str(&format!(" ({tier})"));
+    }
+    if let Some(bytes) = output.code_bytes {
+        header.push_str(&format!(" — {bytes} bytes"));
+    }
+    format!("{header}\n{}", output.asm_text)
+}
+
+/// Locate a canonical symbol from the most recent breakpoint hit —
+/// used when `dbg disasm` is called without a symbol at a stop point.
+fn resolve_current_symbol(db: &SessionDb) -> Option<String> {
+    // Prefer a stack-captured frame symbol over the location key
+    // because a frame symbol maps cleanly to a disasm target, while
+    // `file:line` does not.
+    let stack_json: Option<String> = db
+        .conn()
+        .query_row(
+            "SELECT stack_json FROM breakpoint_hits
+             WHERE stack_json IS NOT NULL
+             ORDER BY id DESC LIMIT 1",
+            [],
+            |r| r.get(0),
+        )
+        .optional()
+        .ok()
+        .flatten();
+    if let Some(s) = stack_json {
+        if let Ok(v) = serde_json::from_str::<Value>(&s) {
+            if let Some(sym) = v.get("frame_symbol").and_then(|s| s.as_str()) {
+                return Some(sym.to_string());
+            }
+        }
+    }
+    None
+}
+
+// ============================================================
+// dbg disasm-diff <sym_a> <sym_b>
+// ============================================================
+
+fn cmd_disasm_diff(db: &SessionDb, a: &str, b: &str) -> String {
+    let fetch = |fqn: &str| -> Option<String> {
+        db.conn()
+            .query_row(
+                "SELECT d.asm_text FROM disassembly d
+                 JOIN symbols s ON s.id = d.symbol_id
+                 WHERE s.fqn = ?1
+                 ORDER BY d.id DESC LIMIT 1",
+                params![fqn],
+                |r| r.get(0),
+            )
+            .optional()
+            .ok()
+            .flatten()
+    };
+    let aa = fetch(a);
+    let bb = fetch(b);
+    let mut out = format!("disasm-diff  {a}  ↔  {b}\n");
+    match (aa, bb) {
+        (None, None) => {
+            out.push_str("neither symbol has cached disassembly — run `dbg disasm` on each first");
+        }
+        (Some(_), None) => {
+            out.push_str(&format!("only {a} has disassembly; run `dbg disasm {b}` first"));
+        }
+        (None, Some(_)) => {
+            out.push_str(&format!("only {b} has disassembly; run `dbg disasm {a}` first"));
+        }
+        (Some(a_asm), Some(b_asm)) => {
+            out.push_str(&side_by_side(&a_asm, &b_asm));
+        }
+    }
+    out
+}
+
+fn side_by_side(a: &str, b: &str) -> String {
+    let a_lines: Vec<&str> = a.lines().collect();
+    let b_lines: Vec<&str> = b.lines().collect();
+    let n = a_lines.len().max(b_lines.len());
+    let mut out = String::new();
+    for i in 0..n {
+        let la = a_lines.get(i).copied().unwrap_or("");
+        let lb = b_lines.get(i).copied().unwrap_or("");
+        let mark = if la == lb { " " } else { "|" };
+        out.push_str(&format!("{la:<50} {mark} {lb}\n"));
+    }
+    out
+}
+
+// ============================================================
+// dbg source <sym>
+// ============================================================
+
+fn cmd_source(db: &SessionDb, symbol: &str, radius: u32) -> String {
+    let row: Option<(Option<String>, Option<i64>)> = db
+        .conn()
+        .query_row(
+            "SELECT file, line FROM symbols WHERE fqn = ?1 ORDER BY id DESC LIMIT 1",
+            params![symbol],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()
+        .ok()
+        .flatten();
+    let (file, line) = match row {
+        Some((Some(f), Some(l))) => (f, l as u32),
+        _ => {
+            // Fall back to the most recent breakpoint hit at a
+            // file:line location key matching this symbol somehow —
+            // best-effort only.
+            return format!("no source location known for {symbol} yet");
+        }
+    };
+    let text = match fs::read_to_string(&file) {
+        Ok(t) => t,
+        Err(e) => return format!("source {symbol} ({file}): {e}"),
+    };
+    let target = line.saturating_sub(1) as usize;
+    let start = target.saturating_sub(radius as usize);
+    let end = (target + radius as usize + 1).min(text.lines().count());
+    let mut out = format!("source {symbol} ({file}:{line})\n");
+    for (i, l) in text.lines().enumerate().take(end).skip(start) {
+        let marker = if i == target { "→" } else { " " };
+        out.push_str(&format!("  {marker} {:>5}: {l}\n", i + 1));
+    }
+    out
+}
+
+// ============================================================
+// dbg cross <sym>
+// ============================================================
+
+fn cmd_cross(db: &SessionDb, symbol: &str) -> String {
+    let mut out = format!("cross {symbol}\n");
+
+    // Symbol row
+    if let Ok(Some((lang, file, line))) = db.conn().query_row(
+        "SELECT lang, file, line FROM symbols WHERE fqn = ?1 ORDER BY id DESC LIMIT 1",
+        params![symbol],
+        |r| Ok::<_, rusqlite::Error>((
+            r.get::<_, String>(0)?,
+            r.get::<_, Option<String>>(1)?,
+            r.get::<_, Option<i64>>(2)?,
+        )),
+    ).optional() {
+        out.push_str(&format!("  lang={lang}"));
+        if let Some(f) = file.as_deref() {
+            out.push_str(&format!("  file={f}"));
+        }
+        if let Some(l) = line {
+            out.push_str(&format!(":{l}"));
+        }
+        out.push('\n');
+    }
+
+    // Hits. `breakpoint_hits.location_key` is a `file:line` string
+    // (what the debugger reported at the stop), not a symbol name. So
+    // we resolve the symbol's file+line from `symbols` and match by
+    // that. We accept an exact fqn match (`fqn = ?1`), a suffix match
+    // (e.g. `Algos.fibonacci` ↔ `fibonacci`), and a case-insensitive
+    // suffix — the agent often types the short name.
+    //
+    // For the file:line match we normalize to `basename:line` on both
+    // sides so `/abs/path/foo.rb:17` stored by the debugger matches
+    // the symbol row's `file=/other/path/foo.rb, line=17`.
+    let hits: i64 = count_hits_for_symbol(db, symbol);
+    out.push_str(&format!("  breakpoint hits: {hits}\n"));
+
+    // Samples (profile track — likely empty in Phase 1 debug-only sessions)
+    let samples: i64 = db
+        .conn()
+        .query_row(
+            "SELECT COUNT(*) FROM samples sa
+             JOIN symbols s ON s.id = sa.symbol_id
+             WHERE s.fqn = ?1",
+            params![symbol],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+    out.push_str(&format!("  profile samples: {samples}\n"));
+
+    // JIT events
+    let jits: i64 = db
+        .conn()
+        .query_row(
+            "SELECT COUNT(*) FROM jit_events je
+             JOIN symbols s ON s.id = je.symbol_id
+             WHERE s.fqn = ?1",
+            params![symbol],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+    out.push_str(&format!("  jit events:      {jits}\n"));
+
+    // Disassembly
+    let disasms: Vec<(String, Option<String>, Option<i64>)> = db
+        .conn()
+        .prepare(
+            "SELECT d.source, d.tier, d.code_bytes
+             FROM disassembly d
+             JOIN symbols s ON s.id = d.symbol_id
+             WHERE s.fqn = ?1
+             ORDER BY d.id DESC",
+        )
+        .and_then(|mut s| {
+            s.query_map(params![symbol], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })
+            .and_then(|it| it.collect::<Result<Vec<_>, _>>())
+        })
+        .unwrap_or_default();
+    out.push_str(&format!("  disassembly:     {} row(s)\n", disasms.len()));
+    for (src, tier, bytes) in disasms {
+        let tier = tier.as_deref().unwrap_or("-");
+        let bytes = bytes.map(|b| format!("{b} B")).unwrap_or_else(|| "?".into());
+        out.push_str(&format!("    {src}  tier={tier}  size={bytes}\n"));
+    }
+
+    // Source snapshots
+    let snaps: i64 = db
+        .conn()
+        .query_row(
+            "SELECT COUNT(*) FROM source_snapshots ss
+             JOIN symbols s ON s.id = ss.symbol_id
+             WHERE s.fqn = ?1",
+            params![symbol],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+    out.push_str(&format!("  source snapshots:{snaps}\n"));
+
+    out
+}
+
+/// Count breakpoint_hits that plausibly correspond to the given symbol.
+///
+/// Strategy:
+///   1. Collect every `(file, line)` in `symbols` whose `fqn` matches
+///      the query — exact, as a suffix (`Algos.fibonacci` ends with
+///      `.fibonacci`), or as an `::`-delimited suffix
+///      (`algos::fibonacci` ends with `::fibonacci`). Many indexers
+///      store the fully-qualified name; the agent usually types only
+///      the short one.
+///   2. For each `(file, line)`, count hits whose `location_key` ends
+///      with `basename(file):line`. The debugger may store an absolute
+///      path, a relative path, or just the basename — basename+line
+///      uniquely identifies the stop line within the session.
+fn count_hits_for_symbol(db: &SessionDb, symbol: &str) -> i64 {
+    let conn = db.conn();
+    let Ok(mut stmt) = conn.prepare(
+        "SELECT file, line FROM symbols
+         WHERE file IS NOT NULL AND line IS NOT NULL
+           AND ( fqn = ?1
+                 OR fqn LIKE '%.' || ?1
+                 OR fqn LIKE '%::' || ?1
+                 OR fqn LIKE '%/' || ?1 )",
+    ) else {
+        return 0;
+    };
+    let rows: Vec<(String, i64)> = stmt
+        .query_map(params![symbol], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+        })
+        .and_then(|it| it.collect::<Result<Vec<_>, _>>())
+        .unwrap_or_default();
+
+    let mut total: i64 = 0;
+    for (file, line) in rows {
+        let base = match file.rsplit_once('/') {
+            Some((_, b)) => b,
+            None => &file,
+        };
+        let tail = format!("{base}:{line}");
+        let n: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM breakpoint_hits
+                 WHERE location_key = ?1
+                    OR location_key LIKE '%/' || ?1
+                    OR location_key LIKE '%' || ?1",
+                params![tail],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+        total += n;
+    }
+    total
+}
+
+// ============================================================
+// dbg at-hit disasm
+// ============================================================
+
+fn cmd_at_hit_disasm(db: &SessionDb, ctx: &RunCtx<'_>) -> String {
+    let Some(sym) = resolve_current_symbol(db) else {
+        return "no recent breakpoint hit — `at-hit` requires the debugger to be stopped".into();
+    };
+    cmd_disasm(db, ctx, Some(&sym), false)
+}
+
+// Silence unused-import clippy when building with only some of the
+// collectors in scope (all three stay referenced above but lints may
+// false-positive across target classes).
+#[allow(dead_code)]
+fn _keep_types_linked() -> (
+    LldbDisassembleCollector,
+    JitDasmCollector,
+    GoDisassCollector,
+) {
+    (LldbDisassembleCollector, JitDasmCollector, GoDisassCollector)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use dbg_cli::session_db::{CreateOptions, SessionKind};
+    use rusqlite::params;
+    use std::path::PathBuf;
+    use tempfile::TempDir;
+
+    fn db_and_ctx<'a>(tmp: &'a TempDir) -> (SessionDb, PathBuf) {
+        let cwd = tmp.path().to_path_buf();
+        let db = SessionDb::create(CreateOptions {
+            kind: SessionKind::Debug,
+            target: "./app",
+            target_class: TargetClass::NativeCpu,
+            cwd: &cwd,
+            db_path: None,
+            label: Some("t".into()),
+            target_hash: Some("h".into()),
+        })
+        .unwrap();
+        (db, cwd)
+    }
+
+    fn insert_hit(
+        db: &SessionDb,
+        loc: &str,
+        seq: i64,
+        locals_json: &str,
+        stack_json: Option<&str>,
+    ) {
+        db.conn()
+            .execute(
+                "INSERT INTO breakpoint_hits
+                    (session_id, location_key, hit_seq, thread, ts, locals_json, stack_json)
+                 VALUES ((SELECT id FROM sessions LIMIT 1), ?1, ?2, '1',
+                         datetime('now'), ?3, ?4)",
+                params![loc, seq, locals_json, stack_json],
+            )
+            .unwrap();
+    }
+
+    // ---------- basename matching ----------
+
+    #[test]
+    fn basename_line_key_strips_dir() {
+        assert_eq!(basename_line_key("/a/b/main.go:22"), "main.go:22");
+        assert_eq!(basename_line_key("./main.go:22"),     "main.go:22");
+        assert_eq!(basename_line_key("main.go:22"),       "main.go:22");
+        assert_eq!(basename_line_key("foo"),              "foo");
+    }
+
+    #[test]
+    fn hits_matches_on_basename_when_dir_differs() {
+        let tmp = TempDir::new().unwrap();
+        let (db, _) = db_and_ctx(&tmp);
+        // Capture was stored with the debugger's relative form.
+        insert_hit(&db, "./examples/go/main.go:22", 1, r#"{"a":{"value":"0"}}"#, None);
+        insert_hit(&db, "./examples/go/main.go:22", 2, r#"{"a":{"value":"1"}}"#, None);
+        // Agent queries the absolute form.
+        let out = cmd_hits(&db, "/repo/examples/go/main.go:22");
+        assert!(out.contains("2 hit(s)"), "{out}");
+        assert!(out.contains("a=0"));
+        assert!(out.contains("a=1"));
+    }
+
+    // ---------- hits ----------
+
+    #[test]
+    fn hits_none_when_empty() {
+        let tmp = TempDir::new().unwrap();
+        let (db, _) = db_and_ctx(&tmp);
+        let out = cmd_hits(&db, "main.c:1");
+        assert!(out.contains("no captured hits"));
+    }
+
+    #[test]
+    fn hits_formats_locals_summary() {
+        let tmp = TempDir::new().unwrap();
+        let (db, _) = db_and_ctx(&tmp);
+        insert_hit(
+            &db,
+            "main.c:42",
+            1,
+            r#"{"x":{"value":"42"},"y":{"value":"hello"}}"#,
+            None,
+        );
+        insert_hit(
+            &db,
+            "main.c:42",
+            2,
+            r#"{"x":{"value":"43"},"y":{"value":"world"}}"#,
+            None,
+        );
+        let out = cmd_hits(&db, "main.c:42");
+        assert!(out.contains("2 hit(s)"));
+        assert!(out.contains("#1"));
+        assert!(out.contains("x=42"));
+        assert!(out.contains("#2"));
+        assert!(out.contains("x=43"));
+    }
+
+    // ---------- hit-diff ----------
+
+    #[test]
+    fn hit_diff_highlights_changed_fields() {
+        let tmp = TempDir::new().unwrap();
+        let (db, _) = db_and_ctx(&tmp);
+        insert_hit(&db, "main.c:42", 1, r#"{"x":{"value":"1"},"y":{"value":"A"}}"#, None);
+        insert_hit(&db, "main.c:42", 2, r#"{"x":{"value":"2"},"y":{"value":"A"}}"#, None);
+        let out = cmd_hit_diff(&db, "main.c:42", 1, 2);
+        assert!(out.contains("#1 vs #2"));
+        // x changed — should have the ≠ marker
+        let x_line = out.lines().find(|l| l.contains(" x ")).unwrap();
+        assert!(x_line.starts_with("  ≠"), "{x_line}");
+        // y unchanged — space marker
+        let y_line = out.lines().find(|l| l.contains(" y ")).unwrap();
+        assert!(!y_line.contains("≠"), "{y_line}");
+    }
+
+    #[test]
+    fn hit_diff_missing_hit_reports_error() {
+        let tmp = TempDir::new().unwrap();
+        let (db, _) = db_and_ctx(&tmp);
+        let out = cmd_hit_diff(&db, "main.c:42", 1, 2);
+        assert!(out.contains("no hit #1"));
+    }
+
+    // ---------- hit-trend ----------
+
+    #[test]
+    fn hit_trend_renders_sparkline_for_numeric_series() {
+        let tmp = TempDir::new().unwrap();
+        let (db, _) = db_and_ctx(&tmp);
+        for (i, v) in [1, 3, 2, 5, 4].iter().enumerate() {
+            insert_hit(
+                &db,
+                "loop:1",
+                (i + 1) as i64,
+                &format!(r#"{{"i":{{"value":"{v}"}}}}"#),
+                None,
+            );
+        }
+        let out = cmd_hit_trend(&db, "loop:1", "i");
+        assert!(out.contains("sparkline:"));
+        assert!(out.contains("#1"));
+        assert!(out.contains("#5"));
+    }
+
+    #[test]
+    fn hit_trend_missing_field() {
+        let tmp = TempDir::new().unwrap();
+        let (db, _) = db_and_ctx(&tmp);
+        insert_hit(&db, "loop:1", 1, r#"{"i":{"value":"1"}}"#, None);
+        let out = cmd_hit_trend(&db, "loop:1", "other");
+        assert!(out.contains("not captured"), "{out}");
+        // Enumerates available field names so the agent can correct.
+        assert!(out.contains("i"), "{out}");
+    }
+
+    // ---------- source ----------
+
+    #[test]
+    fn source_reads_file_around_line() {
+        let tmp = TempDir::new().unwrap();
+        let (db, cwd) = db_and_ctx(&tmp);
+        let f = cwd.join("t.c");
+        fs::write(&f, "int a = 1;\nint b = 2;\nint main(){ return 0; }\nint c = 3;\n").unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO symbols (session_id, lang, fqn, file, line, raw)
+                 VALUES ((SELECT id FROM sessions LIMIT 1), 'cpp', 'main',
+                         ?1, 3, 'main')",
+                params![f.to_string_lossy().as_ref()],
+            )
+            .unwrap();
+        let out = cmd_source(&db, "main", 1);
+        assert!(out.contains("int b = 2"));
+        assert!(out.contains("int main"));
+        assert!(out.contains("int c = 3"));
+        assert!(out.contains("→"));
+    }
+
+    #[test]
+    fn source_reports_missing_symbol() {
+        let tmp = TempDir::new().unwrap();
+        let (db, _) = db_and_ctx(&tmp);
+        let out = cmd_source(&db, "unknown", 1);
+        assert!(out.contains("no source location known"));
+    }
+
+    // ---------- cross ----------
+
+    #[test]
+    fn cross_aggregates_counts() {
+        let tmp = TempDir::new().unwrap();
+        let (db, _) = db_and_ctx(&tmp);
+        db.conn()
+            .execute(
+                "INSERT INTO symbols (session_id, lang, fqn, file, line, raw)
+                 VALUES ((SELECT id FROM sessions LIMIT 1), 'cpp', 'foo',
+                         'main.c', 42, 'foo')",
+                [],
+            )
+            .unwrap();
+        insert_hit(&db, "main.c:42", 1, "{}", None);
+        insert_hit(&db, "main.c:42", 2, "{}", None);
+        let out = cmd_cross(&db, "foo");
+        assert!(out.contains("cross foo"));
+        assert!(out.contains("breakpoint hits: 2"), "{out}");
+        assert!(out.contains("profile samples: 0"));
+        assert!(out.contains("disassembly:     0 row(s)"));
+    }
+
+    // Regression for X1: the indexer may store a fully-qualified name
+    // (`Algos.fibonacci`, `algos::fibonacci`, `module/foo`) while the
+    // agent types only the short symbol (`fibonacci`, `foo`). The hit
+    // join must still find the hits — location_key is `file:line`, not
+    // the function name, so we resolve file+line from the symbol row.
+    #[test]
+    fn cross_counts_hits_for_suffixed_fqn() {
+        let tmp = TempDir::new().unwrap();
+        let (db, _) = db_and_ctx(&tmp);
+        // Indexer stored the fully-qualified name.
+        db.conn()
+            .execute(
+                "INSERT INTO symbols (session_id, lang, fqn, file, line, raw)
+                 VALUES ((SELECT id FROM sessions LIMIT 1), 'ruby',
+                         'Algos.fibonacci', '/repo/algos.rb', 17,
+                         'Algos.fibonacci')",
+                [],
+            )
+            .unwrap();
+        // Debugger stored hits by `file:line` with a relative path.
+        for seq in 1..=5 {
+            insert_hit(&db, "./algos.rb:17", seq, "{}", None);
+        }
+        // Agent types the short symbol name.
+        let out = cmd_cross(&db, "fibonacci");
+        assert!(
+            out.contains("breakpoint hits: 5"),
+            "expected 5 hits, got:\n{out}"
+        );
+    }
+
+    // Same shape but with the `::` Rust/C++-style separator.
+    #[test]
+    fn cross_counts_hits_for_double_colon_fqn() {
+        let tmp = TempDir::new().unwrap();
+        let (db, _) = db_and_ctx(&tmp);
+        db.conn()
+            .execute(
+                "INSERT INTO symbols (session_id, lang, fqn, file, line, raw)
+                 VALUES ((SELECT id FROM sessions LIMIT 1), 'cpp',
+                         'algos::fibonacci', 'src/main.rs', 22,
+                         'algos::fibonacci')",
+                [],
+            )
+            .unwrap();
+        for seq in 1..=3 {
+            insert_hit(&db, "/abs/src/main.rs:22", seq, "{}", None);
+        }
+        let out = cmd_cross(&db, "fibonacci");
+        assert!(
+            out.contains("breakpoint hits: 3"),
+            "expected 3 hits, got:\n{out}"
+        );
+    }
+
+    // ---------- query canonical-op names ----------
+
+    #[test]
+    fn canonical_op_names_are_stable() {
+        assert_eq!(
+            Query::Hits { loc: "x".into(), group_by: None, top: None }.canonical_op(),
+            "hits"
+        );
+        assert_eq!(
+            Query::Disasm { symbol: None, refresh: false }.canonical_op(),
+            "disasm"
+        );
+        assert_eq!(Query::Cross { symbol: "x".into() }.canonical_op(), "cross");
+        assert_eq!(Query::AtHitDisasm.canonical_op(), "at-hit");
+    }
+
+    // ---------- sparkline ----------
+
+    #[test]
+    fn sparkline_uses_all_bars_for_monotonic_series() {
+        let points: Vec<(i64, f64)> = (0..8).map(|i| (i as i64, i as f64)).collect();
+        let s = sparkline(&points);
+        assert_eq!(s.chars().count(), 8);
+        assert_eq!(s.chars().next(), Some('▁'));
+        assert_eq!(s.chars().last(), Some('█'));
+    }
+
+    #[test]
+    fn sparkline_flat_series_is_single_bar() {
+        let points = vec![(1, 5.0), (2, 5.0), (3, 5.0)];
+        let s = sparkline(&points);
+        assert_eq!(s.chars().count(), 3);
+        // All the same value — all the same bar.
+        let first = s.chars().next().unwrap();
+        assert!(s.chars().all(|c| c == first));
+    }
+}

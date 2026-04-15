@@ -1,5 +1,10 @@
-use regex::Regex;
+use std::process::Command;
+use std::sync::OnceLock;
 
+use regex::Regex;
+use serde_json::{Map, Value};
+
+use super::canonical::{BreakId, BreakLoc, CanonicalOps, HitEvent};
 use super::{Backend, CleanResult, Dependency, DependencyCheck, SpawnConfig};
 
 pub struct LldbBackend;
@@ -121,6 +126,198 @@ impl Backend for LldbBackend {
 
         CleanResult { output, events }
     }
+
+    fn canonical_ops(&self) -> Option<&dyn CanonicalOps> {
+        Some(self)
+    }
+}
+
+impl CanonicalOps for LldbBackend {
+    fn tool_name(&self) -> &'static str {
+        "lldb"
+    }
+
+    fn tool_version(&self) -> Option<String> {
+        static V: OnceLock<Option<String>> = OnceLock::new();
+        V.get_or_init(|| {
+            let bin = find_lldb().unwrap_or_else(|| "lldb".into());
+            let out = Command::new(&bin).arg("--version").output().ok()?;
+            let s = String::from_utf8_lossy(&out.stdout);
+            s.lines().next().map(|l| l.trim().to_string())
+        })
+        .clone()
+    }
+
+    fn op_break(&self, loc: &BreakLoc) -> anyhow::Result<String> {
+        Ok(match loc {
+            BreakLoc::FileLine { file, line } => {
+                format!("breakpoint set --file {file} --line {line}")
+            }
+            BreakLoc::Fqn(name) => format!("breakpoint set --name {name}"),
+            BreakLoc::ModuleMethod { module, method } => {
+                format!("breakpoint set --shlib {module} --name {method}")
+            }
+        })
+    }
+
+    fn op_unbreak(&self, id: BreakId) -> anyhow::Result<String> {
+        Ok(format!("breakpoint delete {}", id.0))
+    }
+
+    fn op_breaks(&self) -> anyhow::Result<String> {
+        Ok("breakpoint list".into())
+    }
+
+    fn op_run(&self, args: &[String]) -> anyhow::Result<String> {
+        if args.is_empty() {
+            Ok("process launch".into())
+        } else {
+            let joined = args
+                .iter()
+                .map(|a| {
+                    let e = a.replace('\\', "\\\\").replace('"', "\\\"");
+                    format!("\"{e}\"")
+                })
+                .collect::<Vec<_>>()
+                .join(" ");
+            Ok(format!("process launch -- {joined}"))
+        }
+    }
+
+    fn op_continue(&self) -> anyhow::Result<String> { Ok("process continue".into()) }
+    fn op_step(&self) -> anyhow::Result<String> { Ok("thread step-in".into()) }
+    fn op_next(&self) -> anyhow::Result<String> { Ok("thread step-over".into()) }
+    fn op_finish(&self) -> anyhow::Result<String> { Ok("thread step-out".into()) }
+
+    fn op_stack(&self, n: Option<u32>) -> anyhow::Result<String> {
+        Ok(match n {
+            Some(k) => format!("thread backtrace --count {k}"),
+            None => "thread backtrace".into(),
+        })
+    }
+    fn op_frame(&self, n: u32) -> anyhow::Result<String> {
+        Ok(format!("frame select {n}"))
+    }
+    fn op_locals(&self) -> anyhow::Result<String> { Ok("frame variable".into()) }
+    fn op_print(&self, expr: &str) -> anyhow::Result<String> {
+        Ok(format!("expression -- {expr}"))
+    }
+    fn op_watch(&self, expr: &str) -> anyhow::Result<String> {
+        Ok(format!("watchpoint set variable {expr}"))
+    }
+    fn op_threads(&self) -> anyhow::Result<String> { Ok("thread list".into()) }
+    fn op_thread(&self, n: u32) -> anyhow::Result<String> {
+        Ok(format!("thread select {n}"))
+    }
+    fn op_list(&self, loc: Option<&str>) -> anyhow::Result<String> {
+        Ok(match loc {
+            Some(s) => format!("source list --name {s}"),
+            None => "source list".into(),
+        })
+    }
+
+    /// lldb stops announce via lines like
+    ///   ` * thread #1, queue = 'com.apple.main-thread', stop reason = breakpoint 1.1`
+    /// followed shortly by a frame line:
+    ///   `    frame #0: 0x... foo`main + 12 at main.c:42`
+    /// We treat the latter as authoritative for file/line + symbol.
+    fn parse_hit(&self, output: &str) -> Option<HitEvent> {
+        // Require a stop banner to count this as a hit.
+        let has_stop = output.lines().any(|l| {
+            l.contains("stop reason = breakpoint")
+                || l.contains("stop reason = watchpoint")
+                || l.contains("stop reason = step")
+                || l.contains("stop reason = signal")
+        });
+        if !has_stop {
+            return None;
+        }
+        let frame_re = frame_regex();
+        let thread_re = thread_regex();
+
+        let thread = output.lines().find_map(|l| {
+            thread_re.captures(l).map(|c| c[1].to_string())
+        });
+
+        let frame = output.lines().find_map(|l| frame_re.captures(l));
+        let (symbol, file, line) = match frame.as_ref() {
+            Some(c) => (
+                Some(c[2].to_string()),
+                Some(c[3].to_string()),
+                c.get(4).and_then(|m| m.as_str().parse::<u32>().ok()),
+            ),
+            None => (None, None, None),
+        };
+
+        let location_key = match (&file, line, &symbol) {
+            (Some(f), Some(l), _) => format!("{f}:{l}"),
+            (_, _, Some(s)) => s.clone(),
+            _ => return None,
+        };
+
+        Some(HitEvent {
+            location_key,
+            thread,
+            frame_symbol: symbol,
+            file,
+            line,
+        })
+    }
+
+    /// `frame variable` emits a `(Type) name = value` table. We parse
+    /// each top-level entry into a JSON object: { name: {type, value} }.
+    fn parse_locals(&self, output: &str) -> Option<Value> {
+        let mut obj = Map::new();
+        let re = locals_regex();
+        for line in output.lines() {
+            let line = line.trim_end();
+            if line.is_empty() {
+                continue;
+            }
+            if let Some(c) = re.captures(line) {
+                let ty = c.get(1).map(|m| m.as_str().trim().to_string());
+                let name = c.get(2).unwrap().as_str().to_string();
+                let val = c.get(3).unwrap().as_str().trim().to_string();
+                let mut entry = Map::new();
+                if let Some(t) = ty {
+                    entry.insert("type".into(), Value::String(t));
+                }
+                entry.insert("value".into(), Value::String(val));
+                obj.insert(name, Value::Object(entry));
+            }
+        }
+        if obj.is_empty() {
+            None
+        } else {
+            Some(Value::Object(obj))
+        }
+    }
+}
+
+fn frame_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(
+            r"^\s*(?:\*\s*)?frame #(\d+):[^`]*`([^+]+?)(?:\s+\+\s+\d+)?\s+at\s+(\S+):(\d+)",
+        )
+        .unwrap()
+    })
+}
+
+fn thread_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"^\s*\*?\s*thread\s+#(\d+)").unwrap())
+}
+
+fn locals_regex() -> &'static Regex {
+    // `(Type) name = <value ...>` — the initial `(...)` is optional
+    // because lldb sometimes prints `name = ...` alone for reprinted
+    // locals after step.
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(r"^\s*(?:\(([^)]+)\)\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.+)$")
+            .unwrap()
+    })
 }
 
 fn find_lldb() -> Option<String> {
@@ -267,5 +464,112 @@ mod tests {
         assert!(result.contains("breakpoint"));
         assert!(result.contains("continue"));
         assert!(!result.contains("Some other"));
+    }
+
+    // --------------------------------------------------------------
+    // CanonicalOps
+    // --------------------------------------------------------------
+
+    #[test]
+    fn canonical_break_file_line() {
+        let ops: &dyn CanonicalOps = &LldbBackend;
+        let s = ops.op_break(&BreakLoc::FileLine { file: "main.c".into(), line: 42 }).unwrap();
+        assert_eq!(s, "breakpoint set --file main.c --line 42");
+    }
+
+    #[test]
+    fn canonical_break_fqn() {
+        let ops: &dyn CanonicalOps = &LldbBackend;
+        let s = ops.op_break(&BreakLoc::Fqn("main".into())).unwrap();
+        assert_eq!(s, "breakpoint set --name main");
+    }
+
+    #[test]
+    fn canonical_break_module_method() {
+        let ops: &dyn CanonicalOps = &LldbBackend;
+        let s = ops.op_break(&BreakLoc::ModuleMethod {
+            module: "libfoo.so".into(),
+            method: "bar".into(),
+        }).unwrap();
+        assert_eq!(s, "breakpoint set --shlib libfoo.so --name bar");
+    }
+
+    #[test]
+    fn canonical_exec_ops() {
+        let ops: &dyn CanonicalOps = &LldbBackend;
+        assert_eq!(ops.op_continue().unwrap(), "process continue");
+        assert_eq!(ops.op_step().unwrap(), "thread step-in");
+        assert_eq!(ops.op_next().unwrap(), "thread step-over");
+        assert_eq!(ops.op_finish().unwrap(), "thread step-out");
+    }
+
+    #[test]
+    fn canonical_run_with_args_quoted() {
+        let ops: &dyn CanonicalOps = &LldbBackend;
+        let s = ops.op_run(&["arg 1".into(), "arg\"2".into()]).unwrap();
+        assert_eq!(s, "process launch -- \"arg 1\" \"arg\\\"2\"");
+    }
+
+    #[test]
+    fn canonical_stack_with_and_without_count() {
+        let ops: &dyn CanonicalOps = &LldbBackend;
+        assert_eq!(ops.op_stack(None).unwrap(), "thread backtrace");
+        assert_eq!(ops.op_stack(Some(5)).unwrap(), "thread backtrace --count 5");
+    }
+
+    #[test]
+    fn canonical_locals_and_print() {
+        let ops: &dyn CanonicalOps = &LldbBackend;
+        assert_eq!(ops.op_locals().unwrap(), "frame variable");
+        assert_eq!(ops.op_print("x + 1").unwrap(), "expression -- x + 1");
+    }
+
+    #[test]
+    fn canonical_tool_name() {
+        let ops: &dyn CanonicalOps = &LldbBackend;
+        assert_eq!(ops.tool_name(), "lldb");
+    }
+
+    #[test]
+    fn parse_hit_from_breakpoint_stop() {
+        let output = "* thread #1, queue = 'com.apple.main-thread', stop reason = breakpoint 1.1\n\
+                      * frame #0: 0x00005555 test`main + 12 at main.c:42\n\
+                        frame #1: 0x00007fff libc`__libc_start_main + 128 at start.c:100";
+        let hit = LldbBackend.parse_hit(output).expect("should parse");
+        assert_eq!(hit.location_key, "main.c:42");
+        assert_eq!(hit.file.as_deref(), Some("main.c"));
+        assert_eq!(hit.line, Some(42));
+        assert_eq!(hit.thread.as_deref(), Some("1"));
+        assert_eq!(hit.frame_symbol.as_deref(), Some("main"));
+    }
+
+    #[test]
+    fn parse_hit_none_when_no_stop_reason() {
+        let output = "some unrelated output";
+        assert!(LldbBackend.parse_hit(output).is_none());
+    }
+
+    #[test]
+    fn parse_locals_typed_entries() {
+        let output = "(int) x = 42\n(const char *) name = \"hello\"\n(std::vector<int>) v = size=3";
+        let v = LldbBackend.parse_locals(output).expect("should parse");
+        let obj = v.as_object().unwrap();
+        assert_eq!(obj.get("x").unwrap().get("type").unwrap().as_str().unwrap(), "int");
+        assert_eq!(obj.get("x").unwrap().get("value").unwrap().as_str().unwrap(), "42");
+        assert_eq!(obj.get("name").unwrap().get("type").unwrap().as_str().unwrap(), "const char *");
+        assert!(obj.contains_key("v"));
+    }
+
+    #[test]
+    fn parse_locals_returns_none_on_empty() {
+        assert!(LldbBackend.parse_locals("").is_none());
+        assert!(LldbBackend.parse_locals("garbage with no = sign").is_none());
+    }
+
+    #[test]
+    fn backend_canonical_ops_hook_returns_self() {
+        let b: Box<dyn Backend> = Box::new(LldbBackend);
+        assert!(b.canonical_ops().is_some());
+        assert_eq!(b.canonical_ops().unwrap().tool_name(), "lldb");
     }
 }

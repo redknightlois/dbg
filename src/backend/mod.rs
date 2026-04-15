@@ -1,3 +1,4 @@
+pub mod canonical;
 pub mod delve;
 pub mod dotnettrace;
 pub mod callgrind;
@@ -24,6 +25,8 @@ use std::collections::HashMap;
 
 // Re-export dependency types from shared crate for backwards compatibility
 pub use dbg_cli::deps::{Dependency, DependencyCheck, DepStatus};
+
+pub use canonical::{BreakId, BreakLoc, CanonicalOps};
 
 /// Result of cleaning debugger output.
 pub struct CleanResult {
@@ -105,6 +108,15 @@ pub trait Backend: Send + Sync {
             output: output.to_string(),
             events: vec![],
         }
+    }
+
+    /// Canonical-operations hook. Debug backends that implement the
+    /// `CanonicalOps` trait should override this to return `Some(self)`.
+    /// Profiler backends and backends not yet ported return `None`; the
+    /// canonical dispatcher will surface a clear "canonical ops not
+    /// available for <tool>" to the agent in that case.
+    fn canonical_ops(&self) -> Option<&dyn CanonicalOps> {
+        None
     }
 }
 

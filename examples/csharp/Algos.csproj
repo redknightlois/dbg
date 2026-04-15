@@ -1,0 +1,16 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <RootNamespace>DbgExample</RootNamespace>
+    <AssemblyName>algos</AssemblyName>
+    <!-- Debug-friendly build: keep symbols, avoid tiered-JIT surprise
+         so `dbg disasm` on a hot method yields the same codegen each run. -->
+    <DebugType>portable</DebugType>
+    <Optimize>false</Optimize>
+    <TieredCompilation>false</TieredCompilation>
+  </PropertyGroup>
+
+</Project>

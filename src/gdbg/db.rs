@@ -3,6 +3,19 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, params};
 
+/// gdbg's schema version.
+///
+/// Kept separate from `dbg_cli::session_db::SCHEMA_VERSION` for now —
+/// gdbg's tables are GPU-specific and don't include the `session_id`
+/// column that the unified SessionDb format uses. When gdbg is fully
+/// migrated to SessionDb (see plan task 10 "full rewrite deferred"),
+/// the two versions will unify.
+///
+/// Bumping this invalidates every saved `.gpu.db` file: `GpuDb::open`
+/// refuses to load anything that doesn't match, pointing the user at
+/// the raw `.nsys-rep` + `.csv` artifacts to re-ingest.
+pub const GDBG_SCHEMA_VERSION: i64 = 1;
+
 /// A GPU profiling session backed by a SQLite database.
 pub struct GpuDb {
     pub conn: Connection,
@@ -15,6 +28,17 @@ pub struct GpuDb {
     pub region_filter: Option<String>,
 }
 
+impl std::fmt::Debug for GpuDb {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GpuDb")
+            .field("path", &self._path)
+            .field("focus", &self.focus)
+            .field("ignore", &self.ignore)
+            .field("region_filter", &self.region_filter)
+            .finish()
+    }
+}
+
 impl GpuDb {
     /// Create a new session database at the given path.
     pub fn create(path: &Path) -> Result<Self> {
@@ -25,6 +49,10 @@ impl GpuDb {
             .with_context(|| format!("cannot create {}", path.display()))?;
         conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")?;
         init_schema(&conn)?;
+        conn.execute(
+            &format!("PRAGMA user_version = {GDBG_SCHEMA_VERSION}"),
+            [],
+        )?;
         Ok(Self {
             conn,
             _path: path.to_path_buf(),
@@ -35,12 +63,30 @@ impl GpuDb {
     }
 
     /// Open an existing session database.
+    ///
+    /// Refuses to open any DB whose `user_version` doesn't match
+    /// `GDBG_SCHEMA_VERSION`. There is no migration path — the raw
+    /// `.nsys-rep` + `.csv` files under the session's collection
+    /// directory are the durable artifact; re-run `gdbg <target>`
+    /// to rebuild the index.
     pub fn open(path: &Path) -> Result<Self> {
         if !path.exists() {
             bail!("session not found: {}", path.display());
         }
         let conn = Connection::open(path)
             .with_context(|| format!("cannot open {}", path.display()))?;
+        let found: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap_or(0);
+        if found != GDBG_SCHEMA_VERSION {
+            bail!(
+                "gdbg session DB at {path} has schema_version={found}, \
+                 expected {expected}. No migration path — delete it and \
+                 re-run `gdbg <target>` to rebuild from the raw captures.",
+                path = path.display(),
+                expected = GDBG_SCHEMA_VERSION,
+            );
+        }
         Ok(Self {
             conn,
             _path: path.to_path_buf(),
@@ -723,5 +769,64 @@ mod tests {
         let loaded = GpuDb::open(&dest).unwrap();
         assert_eq!(loaded.meta("target"), "test.py");
         assert_eq!(loaded.unique_kernel_count(), 1);
+    }
+
+    #[test]
+    fn create_stamps_schema_version() {
+        let db = temp_db();
+        let v: i64 = db
+            .conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, GDBG_SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn open_refuses_unstamped_old_format() {
+        // Simulate a pre-versioning `.gpu.db`: the tables + schema are
+        // there but PRAGMA user_version is 0 (SQLite's default).
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("legacy.gpu.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            init_schema(&conn).unwrap();
+            // deliberately NOT stamping user_version
+        }
+        let err = GpuDb::open(&path).unwrap_err().to_string();
+        assert!(err.contains("schema_version=0"), "{err}");
+        assert!(err.contains("No migration path"), "{err}");
+        assert!(err.contains("re-run `gdbg"), "{err}");
+    }
+
+    #[test]
+    fn open_refuses_future_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("future.gpu.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            init_schema(&conn).unwrap();
+            conn.execute("PRAGMA user_version = 99", []).unwrap();
+        }
+        let err = GpuDb::open(&path).unwrap_err().to_string();
+        assert!(err.contains("schema_version=99"));
+    }
+
+    #[test]
+    fn save_preserves_version_through_backup() {
+        let db = temp_db();
+        db.set_meta("marker", "present").unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("backed_up.gpu.db");
+        {
+            let mut dest_conn = Connection::open(&dest).unwrap();
+            let backup =
+                rusqlite::backup::Backup::new(&db.conn, &mut dest_conn).unwrap();
+            backup
+                .run_to_completion(100, std::time::Duration::from_millis(10), None)
+                .unwrap();
+        }
+        // The backup path must pass the version gate cleanly.
+        let loaded = GpuDb::open(&dest).unwrap();
+        assert_eq!(loaded.meta("marker"), "present");
     }
 }
