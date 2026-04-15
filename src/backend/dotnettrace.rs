@@ -112,14 +112,11 @@ impl Backend for DotnetTraceBackend {
 }
 
 fn find_dotnet_root() -> Option<String> {
-    let dotnet = which::which("dotnet").ok()?;
-    let canonical = std::fs::canonicalize(dotnet).ok()?;
-    let bin_dir = canonical.parent()?;
-    let libexec = bin_dir.parent()?.join("libexec");
-    if libexec.join("shared").exists() {
-        return Some(libexec.display().to_string());
-    }
-    Some(bin_dir.display().to_string())
+    // Homebrew layout: .../dotnet/<ver>/bin/dotnet → sibling libexec/shared.
+    // Standard layout: dotnet binary lives directly in the root.
+    // Require `libexec/shared` to avoid false-positives on bare libexec dirs.
+    dbg_cli::deps::find_tool_root("dotnet", Some("libexec"), Some("shared"), 2)
+        .map(|p| p.display().to_string())
 }
 
 fn dirs_home() -> std::path::PathBuf {

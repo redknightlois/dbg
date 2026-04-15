@@ -1,4 +1,8 @@
-use dbg_cli::deps::{self, Dependency, DependencyCheck, DepStatus};
+use std::process::Command;
+
+use dbg_cli::deps::{self, Dependency, DependencyCheck, DepStatus, find_bundled_tool};
+
+use super::collect::NSIGHT_SYSTEMS;
 
 /// All dependencies gdbg can use.
 fn dependencies() -> Vec<Dependency> {
@@ -59,7 +63,48 @@ pub fn check_all() -> Vec<(&'static str, Vec<DepStatus>)> {
         }
     }
 
+    // nsys 2023.x silent-importer bug: nsys profile exits 0 but fails to
+    // convert .qdstrm → .nsys-rep because QdstrmImporter can't load.  If
+    // this system has an affected nsys AND no locatable importer, warn —
+    // our fallback path inside collect_nsys relies on finding it.
+    if let Some(nsys) = statuses.iter_mut().find(|s| s.name == "nsys" && s.ok) {
+        if let Some(ver) = nsys_major_version() {
+            if ver == 2023 && find_bundled_tool(&NSIGHT_SYSTEMS, "QdstrmImporter").is_none() {
+                nsys.warning = Some(
+                    "nsys 2023.x has a silent QdstrmImporter bug and the helper \
+                     is not locatable.\n\
+                     \x20   GPU profiling will capture data but fail to produce \
+                     trace.nsys-rep.\n\
+                     \x20   fix: repair nsight-systems Qt runtime deps, or upgrade \
+                     to nsys 2024+ (importer built in)."
+                        .into(),
+                );
+            }
+        }
+    }
+
     vec![("gdbg", statuses)]
+}
+
+/// Parse `nsys --version` output for the major release year (e.g. 2023, 2024).
+/// Returns `None` if nsys isn't callable or the output can't be parsed.
+fn nsys_major_version() -> Option<u32> {
+    let output = Command::new("nsys").arg("--version").output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    // Typical line: "NVIDIA (R) Nsight Systems ... Version 2023.4.4.54-234412822800v0"
+    for tok in text.split(|c: char| c.is_whitespace() || c == ',') {
+        let stripped = tok.trim_start_matches('v');
+        let head = stripped.split('.').next()?;
+        if let Ok(n) = head.parse::<u32>() {
+            if (2019..=2099).contains(&n) {
+                return Some(n);
+            }
+        }
+    }
+    None
 }
 
 /// Check whether the NVIDIA driver restricts GPU profiling to admin users.

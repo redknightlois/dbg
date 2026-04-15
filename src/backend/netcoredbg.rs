@@ -195,16 +195,8 @@ mod tests {
 }
 
 fn detect_dotnet_root() -> Option<String> {
-    let dotnet = which::which("dotnet").ok()?;
-    let real = std::fs::canonicalize(dotnet).ok()?;
-    // Homebrew: .../dotnet/10.0.103/bin/dotnet → libexec is sibling to bin
-    let parent = real.parent()?;
-    let libexec = parent.parent().map(|p| p.join("libexec"));
-    if let Some(ref le) = libexec {
-        if le.is_dir() {
-            return le.to_str().map(|s| s.to_string());
-        }
-    }
-    // Standard: dotnet binary is in the root
-    parent.to_str().map(|s| s.to_string())
+    // Homebrew layout: .../dotnet/<ver>/bin/dotnet → sibling libexec/.
+    // Standard layout: dotnet binary lives directly in the root.
+    dbg_cli::deps::find_tool_root("dotnet", Some("libexec"), None, 2)
+        .and_then(|p| p.to_str().map(str::to_string))
 }
