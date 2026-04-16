@@ -170,6 +170,12 @@ pub fn run_daemon(backend: &dyn Backend, target: &str, args: &[String]) -> Resul
     // jdb waiting on a `continue` that hasn't hit a breakpoint yet).
     let child_pid = AtomicI32::new(proc.child_pid().as_raw());
 
+    // Pre-clone the event-log handle outside the session mutex. `dbg
+    // events --wait` blocks on the log's condvar without touching the
+    // session lock, so live-tailing works concurrently even while a
+    // `continue` holds the mutex for minutes.
+    let log_handle = proc.log();
+
     // Wait for initial prompt
     proc.wait_for_prompt(Duration::from_secs(120))
         .context("debugger did not produce prompt")?;
@@ -260,6 +266,7 @@ pub fn run_daemon(backend: &dyn Backend, target: &str, args: &[String]) -> Resul
             let session = &session;
             let cached_help = &cached_help;
             let child_pid = &child_pid;
+            let log_handle = &log_handle;
 
             scope.spawn(move || {
                 let mut stream = stream;
@@ -281,7 +288,8 @@ pub fn run_daemon(backend: &dyn Backend, target: &str, args: &[String]) -> Resul
                     cleanup_and_exit();
                 }
 
-                let response = handle_command(&cmd, backend, session, cached_help);
+                let response =
+                    handle_command(&cmd, backend, session, cached_help, log_handle);
                 let _ = stream.write_all(response.as_bytes());
             });
         }
@@ -326,14 +334,22 @@ fn handle_quit(backend: &dyn Backend, session: &Mutex<Session>, child_pid: &Atom
     "stopped".to_string()
 }
 
-fn handle_command(cmd: &str, backend: &dyn Backend, session: &Mutex<Session>, cached_help: &str) -> String {
+fn handle_command(
+    cmd: &str,
+    backend: &dyn Backend,
+    session: &Mutex<Session>,
+    cached_help: &str,
+    log_handle: &crate::pty::LogHandle,
+) -> String {
     // Serve help from cache — no lock needed, works even when the debugger is busy.
     if cmd == "help" {
         return cached_help.to_string();
     }
 
     if cmd == "events" || cmd.starts_with("events ") {
-        return handle_events(cmd, session);
+        // Uses the pre-cloned log handle — does NOT touch the session
+        // mutex, so live-tailing is concurrent with a blocked command.
+        return handle_events(cmd, log_handle);
     }
 
     // Profile mode: handle commands from in-memory profile data
@@ -471,29 +487,42 @@ fn log_command(session: &mut Session, input: &str, output: &str, canonical_op: O
 }
 
 /// Format the reader's event log for `dbg events`. Supports:
-///   * `events`              — full retained log
-///   * `events --since=<N>`  — only entries with seq > N
-///   * `events --tail=<N>`   — only last N entries
+///   * `events`                 — full retained log
+///   * `events --since=<N>`     — only entries with seq > N
+///   * `events --tail=<N>`      — only last N entries
+///   * `events --wait=<ms>`     — block up to this many ms for new
+///                                 entries past `--since` before
+///                                 returning. Capped at 60s.
 ///
-/// Agents use this to tail a session's PTY timeline without racing
-/// `send_and_wait`. The log is populated by the reader thread, so it
-/// updates even while a command is blocked — `dbg events` can be served
-/// from a read-lock-free path except for the one lock on the log itself.
-fn handle_events(cmd: &str, session: &Mutex<Session>) -> String {
+/// Agents use this to tail a session's PTY timeline live. The log is
+/// populated by the reader thread, so it updates even while a command
+/// is blocked — for `--wait` we clone the log handle, drop the session
+/// mutex, then block on the log's condvar. That keeps `dbg events`
+/// concurrent with a long-running `continue`.
+fn handle_events(cmd: &str, log_handle: &crate::pty::LogHandle) -> String {
     let mut since: u64 = 0;
     let mut tail: Option<usize> = None;
+    let mut wait_ms: Option<u64> = None;
     for tok in cmd.split_whitespace().skip(1) {
         if let Some(v) = tok.strip_prefix("--since=") {
             since = v.parse().unwrap_or(0);
         } else if let Some(v) = tok.strip_prefix("--tail=") {
             tail = v.parse().ok();
+        } else if let Some(v) = tok.strip_prefix("--wait=") {
+            wait_ms = v.parse().ok();
         }
     }
 
-    let guard = lock_session(session);
-    let mut entries = guard.proc.events_since(since);
-    let last_seq = guard.proc.last_event_seq();
-    drop(guard);
+    let mut entries = log_handle.since(since);
+    if entries.is_empty() {
+        if let Some(ms) = wait_ms {
+            // Cap below CMD_TIMEOUT (60s) so the client's socket read
+            // timeout always fires after the server responds, not during.
+            let capped = ms.min(50_000);
+            entries = log_handle.since_wait(since, Duration::from_millis(capped));
+        }
+    }
+    let last_seq = log_handle.last_seq();
 
     if let Some(n) = tail {
         if entries.len() > n {

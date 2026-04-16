@@ -2,7 +2,7 @@ use std::collections::VecDeque;
 use std::os::fd::{AsRawFd, BorrowedFd, OwnedFd};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
-use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::{Arc, Condvar, LazyLock, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -110,6 +110,51 @@ impl EventLog {
     }
 }
 
+/// Shared event-log handle. Hands out snapshots of the log and supports
+/// blocking until new events arrive via an internal `Condvar`. Cloning
+/// the handle is an Arc bump; all clones see the same log.
+///
+/// The handle is a separate type from `DebuggerProcess` so daemon
+/// handlers can clone it, drop the session mutex, and wait on the
+/// condvar without blocking other commands.
+#[derive(Clone)]
+pub struct LogHandle(Arc<(Mutex<EventLog>, Condvar)>);
+
+impl LogHandle {
+    fn new() -> Self {
+        Self(Arc::new((Mutex::new(EventLog::new()), Condvar::new())))
+    }
+
+    /// Reader-side push. Appends the event and notifies all waiters.
+    fn push(&self, kind: EventKind, bytes: Vec<u8>) {
+        let (lock, cvar) = &*self.0;
+        lock.lock().unwrap().push(kind, bytes);
+        cvar.notify_all();
+    }
+
+    /// Non-blocking snapshot of entries with `seq > since`.
+    pub fn since(&self, since: u64) -> Vec<EventEntry> {
+        self.0.0.lock().unwrap().since(since)
+    }
+
+    /// Current highest assigned seq (even if that entry was evicted).
+    pub fn last_seq(&self) -> u64 {
+        self.0.0.lock().unwrap().last_seq
+    }
+
+    /// Block up to `timeout` for any entry with `seq > since`. If one
+    /// already exists, returns immediately. Spurious wakeups loop
+    /// internally; the closure re-checks the predicate each wake.
+    pub fn since_wait(&self, since: u64, timeout: Duration) -> Vec<EventEntry> {
+        let (lock, cvar) = &*self.0;
+        let guard = lock.lock().unwrap();
+        let (guard, _result) = cvar
+            .wait_timeout_while(guard, timeout, |log| log.last_seq <= since)
+            .unwrap();
+        guard.since(since)
+    }
+}
+
 /// A debugger process running in a PTY. The reader thread owns the
 /// read side of the master fd; the daemon holds this struct and writes
 /// commands + consumes events from the channel.
@@ -120,11 +165,10 @@ pub struct DebuggerProcess {
     /// itself isn't `Sync`, but all access paths hold the daemon's
     /// session lock, so contention here is zero.
     rx: Mutex<Receiver<PtyEvent>>,
-    /// Bounded log of every event the reader produced. Lives in an
-    /// `Arc<Mutex>` so the reader thread can push while the daemon
-    /// queries. Separate from the channel so `dbg events` can read
-    /// history without racing `send_and_wait`.
-    log: Arc<Mutex<EventLog>>,
+    /// Shared handle to the reader's event log. Clonable — daemon
+    /// handlers grab their own clone so they can wait on the condvar
+    /// without pinning the session mutex.
+    log: LogHandle,
     shutdown: Arc<AtomicBool>,
     reader: Option<JoinHandle<()>>,
     prompt_re: Regex,
@@ -188,7 +232,7 @@ impl DebuggerProcess {
                 let (tx, rx) = mpsc::channel::<PtyEvent>();
                 let shutdown = Arc::new(AtomicBool::new(false));
                 let reader_shutdown = shutdown.clone();
-                let log = Arc::new(Mutex::new(EventLog::new()));
+                let log = LogHandle::new();
                 let reader_log = log.clone();
 
                 let reader = std::thread::Builder::new()
@@ -359,16 +403,12 @@ impl DebuggerProcess {
         Ok(lines[start..end].join("\n").trim().to_string())
     }
 
-    /// Return event-log entries with `seq > since`. Pass `since = 0`
-    /// for the full retained log.
-    pub fn events_since(&self, since: u64) -> Vec<EventEntry> {
-        self.log.lock().unwrap().since(since)
-    }
-
-    /// Current highest assigned sequence number (even if the entry was
-    /// evicted from the ring). Agents use this to bookmark `--since`.
-    pub fn last_event_seq(&self) -> u64 {
-        self.log.lock().unwrap().last_seq
+    /// Clone a shared handle to the event log. Handlers that need to
+    /// wait for new events drop the session mutex first, then call
+    /// `since_wait` on the handle — otherwise a blocking wait would
+    /// pin the session.
+    pub fn log(&self) -> LogHandle {
+        self.log.clone()
     }
 
     /// The PID of the child process, for out-of-band signalling (e.g.
@@ -405,7 +445,7 @@ fn reader_loop(
     prompt_re: Regex,
     tx: Sender<PtyEvent>,
     shutdown: Arc<AtomicBool>,
-    log: Arc<Mutex<EventLog>>,
+    log: LogHandle,
 ) {
     let mut buf = [0u8; 4096];
     // Pending output bytes not yet emitted. Flushed to a single Output
@@ -414,29 +454,26 @@ fn reader_loop(
     let mut pending: Vec<u8> = Vec::new();
 
     let flush_output =
-        |pending: &mut Vec<u8>, tx: &Sender<PtyEvent>, log: &Arc<Mutex<EventLog>>| -> bool {
+        |pending: &mut Vec<u8>, tx: &Sender<PtyEvent>, log: &LogHandle| -> bool {
             if pending.is_empty() {
                 return true;
             }
             let bytes = std::mem::take(pending);
-            log.lock()
-                .unwrap()
-                .push(EventKind::Output, bytes.clone());
+            log.push(EventKind::Output, bytes.clone());
             tx.send(PtyEvent::Data(bytes)).is_ok()
         };
 
-    let emit_marker =
-        |kind: EventKind, tx: &Sender<PtyEvent>, log: &Arc<Mutex<EventLog>>| -> bool {
-            log.lock().unwrap().push(kind, Vec::new());
-            let ev = match kind {
-                EventKind::Prompt => PtyEvent::Prompt,
-                EventKind::Exit => PtyEvent::Exit,
-                // Callers only pass Prompt/Exit here; Output goes via
-                // flush_output because it carries bytes.
-                EventKind::Output => unreachable!("emit_marker called with Output"),
-            };
-            tx.send(ev).is_ok()
+    let emit_marker = |kind: EventKind, tx: &Sender<PtyEvent>, log: &LogHandle| -> bool {
+        log.push(kind, Vec::new());
+        let ev = match kind {
+            EventKind::Prompt => PtyEvent::Prompt,
+            EventKind::Exit => PtyEvent::Exit,
+            // Callers only pass Prompt/Exit here; Output goes via
+            // flush_output because it carries bytes.
+            EventKind::Output => unreachable!("emit_marker called with Output"),
         };
+        tx.send(ev).is_ok()
+    };
 
     loop {
         if shutdown.load(Ordering::Relaxed) {
