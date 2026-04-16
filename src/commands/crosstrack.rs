@@ -256,6 +256,25 @@ pub fn run(q: &Query, db: &SessionDb, ctx: &RunCtx<'_>) -> String {
     }
 }
 
+/// The `<stem>:<line>` prefix — strips directory AND extension so
+/// `/a/b/Algos.java:17` → `Algos:17`. Matches jdb's `Algos.fibonacci:17`
+/// via `LIKE 'Algos:' || '%'` (prefix match).
+fn stem_line_key(loc: &str) -> String {
+    let (file, line) = match loc.rsplit_once(':') {
+        Some(x) => x,
+        None => return loc.to_string(),
+    };
+    let base = match file.rsplit_once('/') {
+        Some((_, b)) => b,
+        None => file,
+    };
+    let stem = match base.rsplit_once('.') {
+        Some((s, _)) => s,
+        None => base,
+    };
+    format!("{stem}:{line}")
+}
+
 /// The `<basename>:<line>` suffix of a `file:line` key. When the agent
 /// queries `/a/b/main.go:22` but the debugger stored `./main.go:22` (or
 /// `main.go:22`), we accept either by matching on this suffix.
@@ -279,19 +298,26 @@ fn cmd_hits(db: &SessionDb, loc: &str) -> String {
     // Query by exact match first, then fall back to basename:line so
     // `/abs/path/to/main.go:22` matches the `./main.go:22` form delve
     // stores, the `src/main.rs:42` form lldb stores, and so on.
-    let (exact, tail) = (loc.to_string(), basename_line_key(loc));
+    // Also try stem:line (strip file extension) so `Algos.java:17`
+    // matches jdb's `Algos:17` or `Algos.fibonacci:17`.
+    let (exact, tail, stem_tail) = (
+        loc.to_string(),
+        basename_line_key(loc),
+        stem_line_key(loc),
+    );
     let mut stmt = match db.conn().prepare(
         "SELECT hit_seq, thread, ts, locals_json
          FROM breakpoint_hits
          WHERE location_key = ?1
             OR location_key LIKE '%' || ?2
+            OR location_key LIKE ?3 || '%'
          ORDER BY hit_seq ASC",
     ) {
         Ok(s) => s,
         Err(e) => return format!("[error: {e}]"),
     };
     let rows = stmt
-        .query_map(params![exact, tail], |r| {
+        .query_map(params![exact, tail, stem_tail], |r| {
             Ok((
                 r.get::<_, i64>(0)?,
                 r.get::<_, Option<String>>(1)?,
@@ -468,14 +494,16 @@ fn locals_summary(locals_json: &str) -> Option<String> {
 
 fn cmd_hit_diff(db: &SessionDb, loc: &str, a: u32, b: u32) -> String {
     let tail = basename_line_key(loc);
+    let stem_tail = stem_line_key(loc);
     let fetch = |seq: u32| -> Option<(Option<String>, Option<String>)> {
         db.conn()
             .query_row(
                 "SELECT locals_json, stack_json
                  FROM breakpoint_hits
-                 WHERE (location_key = ?1 OR location_key LIKE '%' || ?2)
-                   AND hit_seq = ?3",
-                params![loc, tail, seq as i64],
+                 WHERE (location_key = ?1 OR location_key LIKE '%' || ?2
+                        OR location_key LIKE ?3 || '%')
+                   AND hit_seq = ?4",
+                params![loc, tail, stem_tail, seq as i64],
                 |r| {
                     Ok((
                         r.get::<_, Option<String>>(0)?,
@@ -541,16 +569,19 @@ fn cmd_hit_diff(db: &SessionDb, loc: &str, a: u32, b: u32) -> String {
 
 fn cmd_hit_trend(db: &SessionDb, loc: &str, field: &str) -> String {
     let tail = basename_line_key(loc);
+    let stem_tail = stem_line_key(loc);
     let mut stmt = match db.conn().prepare(
         "SELECT hit_seq, locals_json FROM breakpoint_hits
-         WHERE location_key = ?1 OR location_key LIKE '%' || ?2
+         WHERE location_key = ?1
+            OR location_key LIKE '%' || ?2
+            OR location_key LIKE ?3 || '%'
          ORDER BY hit_seq ASC",
     ) {
         Ok(s) => s,
         Err(e) => return format!("[error: {e}]"),
     };
     let rows: Vec<(i64, Option<String>)> = stmt
-        .query_map(params![loc, tail], |r| {
+        .query_map(params![loc, tail, stem_tail], |r| {
             Ok((r.get::<_, i64>(0)?, r.get::<_, Option<String>>(1)?))
         })
         .and_then(|it| it.collect::<Result<Vec<_>, _>>())

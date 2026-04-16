@@ -160,6 +160,7 @@ impl Backend for NetCoreDbgBackend {
 
 impl CanonicalOps for NetCoreDbgBackend {
     fn tool_name(&self) -> &'static str { "netcoredbg" }
+    fn auto_capture_locals(&self) -> bool { false }
 
     fn tool_version(&self) -> Option<String> {
         static V: OnceLock<Option<String>> = OnceLock::new();

@@ -1,3 +1,9 @@
+use std::sync::OnceLock;
+
+use regex::Regex;
+use serde_json::{Map, Value};
+
+use super::canonical::{BreakLoc, CanonicalOps, HitEvent, unsupported};
 use super::{Backend, CleanResult, Dependency, DependencyCheck, SpawnConfig};
 
 pub struct RdbgBackend;
@@ -100,6 +106,8 @@ impl Backend for RdbgBackend {
         vec![("ruby.md", include_str!("../../skills/adapters/ruby.md"))]
     }
 
+    fn canonical_ops(&self) -> Option<&dyn CanonicalOps> { Some(self) }
+
     fn clean(&self, cmd: &str, output: &str) -> CleanResult {
         let trimmed = cmd.trim();
         let mut events = Vec::new();
@@ -134,6 +142,73 @@ impl Backend for RdbgBackend {
             output: lines.join("\n"),
             events,
         }
+    }
+}
+
+impl CanonicalOps for RdbgBackend {
+    fn tool_name(&self) -> &'static str { "rdbg" }
+
+    fn op_break(&self, loc: &BreakLoc) -> anyhow::Result<String> {
+        Ok(match loc {
+            BreakLoc::FileLine { file, line } => format!("break {file}:{line}"),
+            BreakLoc::Fqn(name) => format!("break {name}"),
+            BreakLoc::ModuleMethod { module, method } => format!("break {module}#{method}"),
+        })
+    }
+    fn op_run(&self, _args: &[String]) -> anyhow::Result<String> { Ok("continue".into()) }
+    fn op_continue(&self) -> anyhow::Result<String> { Ok("continue".into()) }
+    fn op_step(&self) -> anyhow::Result<String> { Ok("step".into()) }
+    fn op_next(&self) -> anyhow::Result<String> { Ok("next".into()) }
+    fn op_finish(&self) -> anyhow::Result<String> { Ok("finish".into()) }
+    fn op_stack(&self, _n: Option<u32>) -> anyhow::Result<String> { Ok("bt".into()) }
+    fn op_frame(&self, n: u32) -> anyhow::Result<String> { Ok(format!("frame {n}")) }
+    fn op_locals(&self) -> anyhow::Result<String> { Ok("info".into()) }
+    fn op_print(&self, expr: &str) -> anyhow::Result<String> { Ok(format!("p {expr}")) }
+    fn op_list(&self, _loc: Option<&str>) -> anyhow::Result<String> { Ok("list".into()) }
+    fn op_breaks(&self) -> anyhow::Result<String> {
+        // rdbg's native list-breakpoints verb is `info breakpoint` (alias
+        // `info b`); the default trait string `breakpoint list` raises
+        // `undefined local variable or method 'list'` because rdbg
+        // evaluates unknown commands as Ruby expressions in the debuggee.
+        Ok("info breakpoint".into())
+    }
+
+    fn parse_hit(&self, output: &str) -> Option<HitEvent> {
+        // rdbg raw: `Stop by #0  BP - Line  /path/to/file.rb:10`
+        static RE: OnceLock<Regex> = OnceLock::new();
+        let re = RE.get_or_init(|| {
+            Regex::new(r"Stop by #\d+\s+BP - Line\s+(\S+):(\d+)").unwrap()
+        });
+        for line in output.lines() {
+            if let Some(c) = re.captures(line) {
+                let file = c[1].to_string();
+                let line_no: u32 = c[2].parse().ok()?;
+                return Some(HitEvent {
+                    location_key: format!("{file}:{line_no}"),
+                    thread: None,
+                    frame_symbol: None,
+                    file: Some(file),
+                    line: Some(line_no),
+                });
+            }
+        }
+        None
+    }
+
+    fn parse_locals(&self, output: &str) -> Option<Value> {
+        // rdbg `info` prints `%self = #<...>`, `a = 0`, `b = 1`, etc.
+        let mut obj = Map::new();
+        for line in output.lines() {
+            let line = line.trim();
+            if let Some((name, val)) = line.split_once(" = ") {
+                let name = name.trim().trim_start_matches('%').to_string();
+                if name.is_empty() || name == "self" { continue; }
+                let mut entry = Map::new();
+                entry.insert("value".into(), Value::String(val.trim().to_string()));
+                obj.insert(name, Value::Object(entry));
+            }
+        }
+        if obj.is_empty() { None } else { Some(Value::Object(obj)) }
     }
 }
 

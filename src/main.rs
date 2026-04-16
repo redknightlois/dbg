@@ -302,16 +302,29 @@ fn cmd_start(registry: &Registry, args: &[String]) -> Result<()> {
                 bail!("daemon failed to start");
             }
 
-            // Set breakpoints
+            // Set breakpoints — send through the canonical `break <spec>`
+            // vocabulary so the dispatcher routes via CanonicalOps (which
+            // handles jdb class-name extraction, ghci module inference,
+            // etc.). Falls back to format_breakpoint for backends without
+            // CanonicalOps.
             for bp in &breakpoints {
-                let cmd = backend.format_breakpoint(bp);
+                let cmd = if backend.canonical_ops().is_some() {
+                    format!("break {bp}")
+                } else {
+                    backend.format_breakpoint(bp)
+                };
                 let resp = daemon::send_command(&cmd)?;
                 println!("{resp}");
             }
 
-            // Auto-run
+            // Auto-run — use the canonical `run` verb when available.
             if do_run {
-                let resp = daemon::send_command(backend.run_command())?;
+                let cmd = if backend.canonical_ops().is_some() {
+                    "run".to_string()
+                } else {
+                    backend.run_command().to_string()
+                };
+                let resp = daemon::send_command(&cmd)?;
                 println!("{resp}");
             }
 

@@ -1,3 +1,9 @@
+use std::sync::OnceLock;
+
+use regex::Regex;
+use serde_json::{Map, Value};
+
+use super::canonical::{BreakLoc, CanonicalOps, HitEvent, unsupported};
 use super::{Backend, CleanResult, Dependency, DependencyCheck, SpawnConfig};
 
 pub struct PhpdbgBackend;
@@ -108,6 +114,90 @@ impl Backend for PhpdbgBackend {
             output: lines.join("\n"),
             events,
         }
+    }
+
+    fn canonical_ops(&self) -> Option<&dyn CanonicalOps> { Some(self) }
+}
+
+impl CanonicalOps for PhpdbgBackend {
+    fn tool_name(&self) -> &'static str { "phpdbg" }
+    fn auto_capture_locals(&self) -> bool { false }
+
+    fn op_break(&self, loc: &BreakLoc) -> anyhow::Result<String> {
+        Ok(match loc {
+            BreakLoc::FileLine { file, line } => format!("break {file}:{line}"),
+            BreakLoc::Fqn(name) => format!("break {name}"),
+            BreakLoc::ModuleMethod { module, method } => format!("break {module}::{method}"),
+        })
+    }
+    fn op_run(&self, _args: &[String]) -> anyhow::Result<String> { Ok("run".into()) }
+    fn op_continue(&self) -> anyhow::Result<String> { Ok("continue".into()) }
+    fn op_step(&self) -> anyhow::Result<String> { Ok("step".into()) }
+    fn op_next(&self) -> anyhow::Result<String> { Ok("next".into()) }
+    fn op_finish(&self) -> anyhow::Result<String> { Ok("finish".into()) }
+    fn op_stack(&self, _n: Option<u32>) -> anyhow::Result<String> { Ok("back".into()) }
+    fn op_frame(&self, n: u32) -> anyhow::Result<String> { Ok(format!("frame {n}")) }
+    fn op_locals(&self) -> anyhow::Result<String> {
+        // phpdbg's `info locals` shows execution context, not variables.
+        // `ev get_defined_vars()` returns a PHP array of all locals.
+        Ok("ev get_defined_vars()".into())
+    }
+    fn op_print(&self, expr: &str) -> anyhow::Result<String> { Ok(format!("ev {expr}")) }
+    fn op_list(&self, _loc: Option<&str>) -> anyhow::Result<String> { Ok("list".into()) }
+
+    fn parse_hit(&self, output: &str) -> Option<HitEvent> {
+        // phpdbg raw: `[Breakpoint #0 at /path/algos.php:19, hits: 1]`
+        // or `[Break at /path/algos.php:19]`
+        static RE: OnceLock<Regex> = OnceLock::new();
+        let re = RE.get_or_init(|| {
+            Regex::new(r"\[Break(?:point #\d+)? at (\S+):(\d+)").unwrap()
+        });
+        for line in output.lines() {
+            if let Some(c) = re.captures(line) {
+                let file = c[1].to_string();
+                let line_no: u32 = c[2].parse().ok()?;
+                return Some(HitEvent {
+                    location_key: format!("{file}:{line_no}"),
+                    thread: None,
+                    frame_symbol: None,
+                    file: Some(file),
+                    line: Some(line_no),
+                });
+            }
+        }
+        None
+    }
+
+    fn parse_locals(&self, output: &str) -> Option<Value> {
+        // `ev get_defined_vars()` produces PHP array output like:
+        //   array(4) {
+        //     ["n"]=> int(10)
+        //     ["a"]=> int(0)
+        //     ["b"]=> int(1)
+        //     ["next"]=> int(1)
+        //   }
+        // Parse `["name"]=> type(value)` lines.
+        static RE: OnceLock<Regex> = OnceLock::new();
+        let re = RE.get_or_init(|| {
+            Regex::new(r#"\["(\w+)"\]\s*=>\s*(.+)"#).unwrap()
+        });
+        let mut obj = Map::new();
+        for line in output.lines() {
+            if let Some(c) = re.captures(line) {
+                let name = c[1].to_string();
+                let val = c[2].trim().to_string();
+                // Extract the inner value from type(value) → just value
+                let clean_val = if let Some(inner) = val.strip_suffix(')') {
+                    inner.rsplit_once('(').map(|(_, v)| v).unwrap_or(inner)
+                } else {
+                    &val
+                };
+                let mut entry = Map::new();
+                entry.insert("value".into(), Value::String(clean_val.to_string()));
+                obj.insert(name, Value::Object(entry));
+            }
+        }
+        if obj.is_empty() { None } else { Some(Value::Object(obj)) }
     }
 }
 

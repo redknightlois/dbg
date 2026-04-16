@@ -174,6 +174,14 @@ pub trait CanonicalOps: Send + Sync {
     fn parse_locals(&self, _output: &str) -> Option<Value> {
         None
     }
+
+    /// Whether the daemon should auto-send `op_locals()` + `op_stack()`
+    /// after a hit to populate `breakpoint_hits.locals_json`. Backends
+    /// whose PTY state is fragile (jdb, ghci, netcoredbg CLI mode)
+    /// return `false` — agents use `dbg locals` explicitly instead.
+    fn auto_capture_locals(&self) -> bool {
+        true
+    }
 }
 
 /// Construct the standard "op X not supported by tool Y" error. The

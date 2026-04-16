@@ -9,6 +9,60 @@ use super::{Backend, CleanResult, Dependency, DependencyCheck, SpawnConfig};
 
 pub struct PdbBackend;
 
+/// If `file` exists and line `line` is a `def`/`class`/decorator line
+/// that can't hold a bytecode breakpoint in pdb, advance to the first
+/// statement inside the function body. Returns `None` when the file
+/// isn't readable or the line looks fine as-is.
+fn advance_to_body_line(file: &str, line: u32) -> Option<u32> {
+    let text = std::fs::read_to_string(file).ok()?;
+    let lines: Vec<&str> = text.lines().collect();
+    let idx = (line as usize).saturating_sub(1);
+    if idx >= lines.len() {
+        return None;
+    }
+    let trimmed = lines[idx].trim_start();
+    let is_header = trimmed.starts_with("def ")
+        || trimmed.starts_with("async def ")
+        || trimmed.starts_with("class ")
+        || trimmed.starts_with('@'); // decorator line
+    if !is_header {
+        return None;
+    }
+    // Determine the header's indent, then walk forward until we find a
+    // non-blank, non-comment line at a strictly deeper indent — that's
+    // the first body statement.
+    let header_indent = lines[idx].chars().take_while(|c| c.is_whitespace()).count();
+    // Also skip past continuation lines (multi-line `def` signatures):
+    // keep advancing until we've passed the line that ends with `:` at
+    // the header indent level.
+    let mut i = idx;
+    loop {
+        if i >= lines.len() {
+            return None;
+        }
+        let cur = lines[i].trim_end();
+        let cur_indent = lines[i].chars().take_while(|c| c.is_whitespace()).count();
+        if cur_indent == header_indent && cur.ends_with(':') {
+            i += 1;
+            break;
+        }
+        i += 1;
+    }
+    while i < lines.len() {
+        let cur = lines[i].trim_start();
+        let cur_indent = lines[i].chars().take_while(|c| c.is_whitespace()).count();
+        if cur.is_empty() || cur.starts_with('#') {
+            i += 1;
+            continue;
+        }
+        if cur_indent > header_indent {
+            return Some((i + 1) as u32);
+        }
+        break;
+    }
+    None
+}
+
 impl Backend for PdbBackend {
     fn name(&self) -> &'static str {
         "pdb"
@@ -134,7 +188,17 @@ impl CanonicalOps for PdbBackend {
 
     fn op_break(&self, loc: &BreakLoc) -> anyhow::Result<String> {
         Ok(match loc {
-            BreakLoc::FileLine { file, line } => format!("break {file}:{line}"),
+            BreakLoc::FileLine { file, line } => {
+                // pdb silently accepts a `break` on a `def`/`class`
+                // header line but the trap never fires — the
+                // compiler emits no bytecode for the `def` line
+                // itself. Bump to the first executable body line
+                // when we detect this, so the breakpoint actually
+                // triggers. If we can't read the file (relative
+                // path, etc.) we fall through unchanged.
+                let line = advance_to_body_line(file, *line).unwrap_or(*line);
+                format!("break {file}:{line}")
+            }
             BreakLoc::Fqn(name) => format!("break {name}"),
             BreakLoc::ModuleMethod { module, method } => {
                 // pdb accepts `module:function` to break by symbol within a module.
@@ -340,6 +404,44 @@ mod tests {
     #[test]
     fn format_breakpoint() {
         assert_eq!(PdbBackend.format_breakpoint("test.py:10"), "break test.py:10");
+    }
+
+    #[test]
+    fn advance_def_line_to_first_body_line() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(
+            tmp.path(),
+            "def foo(\n    a,\n    b,\n):\n    # first body line is a comment\n    return a + b\n",
+        )
+        .unwrap();
+        // Line 1 is `def foo(` — advance to line 6 (`return a + b`).
+        let p = tmp.path().to_str().unwrap();
+        assert_eq!(advance_to_body_line(p, 1), Some(6));
+    }
+
+    #[test]
+    fn advance_decorator_line() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(
+            tmp.path(),
+            "@cache\ndef foo():\n    return 1\n",
+        )
+        .unwrap();
+        let p = tmp.path().to_str().unwrap();
+        assert_eq!(advance_to_body_line(p, 1), Some(3));
+    }
+
+    #[test]
+    fn advance_noop_on_body_line() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(
+            tmp.path(),
+            "def foo():\n    return 1\n",
+        )
+        .unwrap();
+        // Already a body line — no advance.
+        let p = tmp.path().to_str().unwrap();
+        assert_eq!(advance_to_body_line(p, 2), None);
     }
 
     #[test]

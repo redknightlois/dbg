@@ -297,8 +297,11 @@ impl CanonicalOps for LldbBackend {
 fn frame_regex() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
+        // lldb 22+ appends a column number: `at algos.c:26:18`. The
+        // trailing `(?::\d+)?` absorbs it so we capture file=algos.c
+        // and line=26, not file=algos.c:26 and line=18.
         Regex::new(
-            r"^\s*(?:\*\s*)?frame #(\d+):[^`]*`([^+]+?)(?:\s+\+\s+\d+)?\s+at\s+(\S+):(\d+)",
+            r"^\s*(?:\*\s*)?frame #(\d+):[^`]*`([^+]+?)(?:\s+\+\s+\d+)?\s+at\s+(\S+?):(\d+)(?::\d+)?",
         )
         .unwrap()
     })
@@ -541,6 +544,17 @@ mod tests {
         assert_eq!(hit.line, Some(42));
         assert_eq!(hit.thread.as_deref(), Some("1"));
         assert_eq!(hit.frame_symbol.as_deref(), Some("main"));
+    }
+
+    #[test]
+    fn parse_hit_with_column_number() {
+        // lldb 22+ appends :column to the file:line location.
+        let output = "* thread #1, name = 'algos', stop reason = breakpoint 1.1\n\
+                        frame #0: 0x55555555518f algos`fibonacci(n=10) at algos.c:26:18";
+        let hit = LldbBackend.parse_hit(output).expect("should parse");
+        assert_eq!(hit.file.as_deref(), Some("algos.c"));
+        assert_eq!(hit.line, Some(26));
+        assert_eq!(hit.frame_symbol.as_deref(), Some("fibonacci(n=10)"));
     }
 
     #[test]

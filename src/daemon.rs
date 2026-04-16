@@ -348,6 +348,14 @@ fn handle_command(cmd: &str, backend: &dyn Backend, session: &Mutex<Session>, ca
             let mut guard = lock_session(session);
             match guard.proc.send_and_wait(&native_cmd, CMD_TIMEOUT) {
                 Ok(raw) => {
+                    // Run hit capture on the RAW output — some backends
+                    // (rdbg, phpdbg) strip stop banners into events during
+                    // clean, so parse_hit wouldn't see them on the cleaned
+                    // form. The raw text always contains the debugger's
+                    // stop announcement verbatim.
+                    if command_may_stop(cmd) {
+                        capture_hit_if_stopped(&mut guard, backend, &raw);
+                    }
                     let result = backend.clean(&native_cmd, &raw);
                     for event in result.events {
                         guard.events.push_back(event);
@@ -357,9 +365,6 @@ fn handle_command(cmd: &str, backend: &dyn Backend, session: &Mutex<Session>, ca
                         cleaned = debug_cmds::decorate_output(backend, &cleaned);
                     }
                     log_command(&mut guard, cmd, &cleaned, Some(canonical_op));
-                    if command_may_stop(cmd) {
-                        capture_hit_if_stopped(&mut guard, backend, &cleaned);
-                    }
                     cleaned
                 }
                 Err(e) => format!("[error: {e}]"),
@@ -387,15 +392,15 @@ fn handle_command(cmd: &str, backend: &dyn Backend, session: &Mutex<Session>, ca
             let mut guard = lock_session(session);
             match guard.proc.send_and_wait(cmd, CMD_TIMEOUT) {
                 Ok(raw) => {
+                    if command_may_stop(cmd) {
+                        capture_hit_if_stopped(&mut guard, backend, &raw);
+                    }
                     let result = backend.clean(cmd, &raw);
                     for event in result.events {
                         guard.events.push_back(event);
                     }
                     let cleaned = result.output;
                     log_command(&mut guard, cmd, &cleaned, None);
-                    if command_may_stop(cmd) {
-                        capture_hit_if_stopped(&mut guard, backend, &cleaned);
-                    }
                     cleaned
                 }
                 Err(e) => format!("[error: {e}]"),
@@ -434,6 +439,16 @@ fn capture_hit_if_stopped(session: &mut Session, backend: &dyn Backend, cleaned:
         Some(o) => o,
         None => return,
     };
+    // Diagnostic: dump capture input to a temp file so we can see
+    // exactly what parse_hit receives. Remove once all backends stable.
+    if let Ok(diag_path) = std::env::var("DBG_CAPTURE_DIAG") {
+        use std::io::Write as IoWrite;
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&diag_path) {
+            let _ = writeln!(f, "--- capture_hit_if_stopped (tool={}) ---", ops.tool_name());
+            let _ = writeln!(f, "input ({} bytes):\n{}\n---END---", cleaned.len(), cleaned);
+        }
+    }
+
     let hit = match ops.parse_hit(cleaned) {
         Some(h) => h,
         None => return,
@@ -448,24 +463,53 @@ fn capture_hit_if_stopped(session: &mut Session, backend: &dyn Backend, cleaned:
     *seq += 1;
     let hit_seq = *seq as i64;
 
-    // Synthesize the locals roundtrip; tolerate all failures since the
-    // debugger may be in a transient state after a stop.
-    let locals_json = ops
-        .op_locals()
-        .ok()
-        .and_then(|op| session.proc.send_and_wait(&op, CMD_TIMEOUT).ok())
-        .and_then(|raw| ops.parse_locals(&raw))
-        .map(|v| v.to_string());
-
-    // And the stack roundtrip. We store the raw cleaned text; a full
-    // structured parse is out of scope for Phase 1.
-    let stack_text = ops
-        .op_stack(Some(20))
-        .ok()
-        .and_then(|op| session.proc.send_and_wait(&op, CMD_TIMEOUT).ok());
-    let stack_json = stack_text.map(|s| {
-        serde_json::json!({ "raw": s, "frame_symbol": hit.frame_symbol }).to_string()
-    });
+    // Synthesize the locals + stack roundtrips after a stop. Use a
+    // SHORT timeout so a backend whose prompt doesn't match cleanly
+    // (jdb on `locals`) doesn't block the session for 60s. 3s is
+    // enough for any debugger that's already stopped to reply.
+    // Only auto-capture locals + stack when the backend says it's safe.
+    // Fragile backends (jdb, ghci, netcoredbg CLI) set
+    // `auto_capture_locals = false` because the synthesized roundtrip
+    // can destroy their PTY state. Agents use `dbg locals` explicitly.
+    let (locals_json, stack_json) = if ops.auto_capture_locals() {
+        const CAPTURE_TIMEOUT: Duration = Duration::from_secs(1);
+        let lj = ops
+            .op_locals()
+            .ok()
+            .and_then(|op| {
+                match session.proc.send_and_wait(&op, CAPTURE_TIMEOUT) {
+                    Ok(raw) => ops.parse_locals(&raw).map(|v| v.to_string()),
+                    Err(_) => {
+                        drain_pty(&session.proc);
+                        None
+                    }
+                }
+            });
+        let sj = ops
+            .op_stack(Some(20))
+            .ok()
+            .and_then(|op| {
+                match session.proc.send_and_wait(&op, CAPTURE_TIMEOUT) {
+                    Ok(raw) => Some(serde_json::json!({
+                        "raw": raw,
+                        "frame_symbol": hit.frame_symbol,
+                    })
+                    .to_string()),
+                    Err(_) => {
+                        drain_pty(&session.proc);
+                        None
+                    }
+                }
+            });
+        (lj, sj)
+    } else {
+        // Store just the frame_symbol from parse_hit so `cross` can
+        // still find the symbol even without locals.
+        let sj = hit.frame_symbol.as_ref().map(|s| {
+            serde_json::json!({ "frame_symbol": s }).to_string()
+        });
+        (None, sj)
+    };
 
     let _ = db.conn().execute(
         "INSERT INTO breakpoint_hits
@@ -501,6 +545,26 @@ fn run_crosstrack(session: &mut Session, backend: &dyn Backend, q: &crosstrack::
         live: Some(&live),
     };
     crosstrack::run(q, db, &ctx)
+}
+
+/// Discard any pending PTY output so the next `send_and_wait` starts
+/// from a clean buffer. Called after a timed-out synthesized roundtrip
+/// to prevent stale data from poisoning the next agent command.
+/// Discard any pending PTY output so the next `send_and_wait` starts
+/// from a clean buffer. Called after a timed-out synthesized roundtrip
+/// to prevent stale data from poisoning the next agent command.
+fn drain_pty(proc: &DebuggerProcess) {
+    let mut buf = [0u8; 4096];
+    // Keep reading as long as there's data ready (poll 50ms).
+    // Once the buffer is quiet for 50ms, we're done.
+    loop {
+        if !proc.poll_ready(50) {
+            break;
+        }
+        if proc.read_master_raw(&mut buf) == 0 {
+            break;
+        }
+    }
 }
 
 /// Back up the session DB to `.dbg/sessions/<label>.db` iff the

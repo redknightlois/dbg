@@ -172,8 +172,15 @@ run_one() {
     sleep 0.3
 
     # --- start session with --break --run
+    # For Java, start from the directory containing the .class files
+    # so jdb can find the class. For everything else, start from $REPO.
+    local start_dir="$REPO"
+    case "$lang" in
+        java) start_dir="$ROOT/java" ;;
+    esac
+
     local ok=0 fail=0
-    if (cd "$REPO" && timeout 30 "$DBG" start "$backend" "$target" --break "$loc" --run >> "$log" 2>&1); then
+    if (cd "$start_dir" && timeout 30 "$DBG" start "$backend" "$target" --break "$loc" --run >> "$log" 2>&1); then
         ok=$((ok + 1))
         echo "    ✓ start"
     else

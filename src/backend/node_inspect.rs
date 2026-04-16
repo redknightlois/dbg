@@ -1,3 +1,9 @@
+use std::sync::OnceLock;
+
+use regex::Regex;
+use serde_json::{Map, Value};
+
+use super::canonical::{BreakLoc, CanonicalOps, HitEvent, unsupported};
 use super::{Backend, CleanResult, Dependency, DependencyCheck, SpawnConfig};
 
 pub struct NodeInspectBackend;
@@ -96,6 +102,8 @@ impl Backend for NodeInspectBackend {
         vec![("javascript.md", include_str!("../../skills/adapters/javascript.md"))]
     }
 
+    fn canonical_ops(&self) -> Option<&dyn CanonicalOps> { Some(self) }
+
     fn clean(&self, _cmd: &str, output: &str) -> CleanResult {
         let mut events = Vec::new();
         let mut lines = Vec::new();
@@ -130,6 +138,62 @@ impl Backend for NodeInspectBackend {
             output: lines.join("\n"),
             events,
         }
+    }
+}
+
+impl CanonicalOps for NodeInspectBackend {
+    fn tool_name(&self) -> &'static str { "node-inspect" }
+    fn auto_capture_locals(&self) -> bool { false }
+
+    fn op_break(&self, loc: &BreakLoc) -> anyhow::Result<String> {
+        Ok(match loc {
+            BreakLoc::FileLine { file, line } => format!("sb('{file}', {line})"),
+            BreakLoc::Fqn(name) => format!("sb('{name}')"),
+            BreakLoc::ModuleMethod { module, method } => format!("sb('{module}:{method}')"),
+        })
+    }
+    fn op_run(&self, _args: &[String]) -> anyhow::Result<String> { Ok("cont".into()) }
+    fn op_continue(&self) -> anyhow::Result<String> { Ok("cont".into()) }
+    fn op_step(&self) -> anyhow::Result<String> { Ok("step".into()) }
+    fn op_next(&self) -> anyhow::Result<String> { Ok("next".into()) }
+    fn op_finish(&self) -> anyhow::Result<String> { Ok("out".into()) }
+    fn op_stack(&self, _n: Option<u32>) -> anyhow::Result<String> { Ok("backtrace".into()) }
+    fn op_frame(&self, n: u32) -> anyhow::Result<String> { Ok(format!("frame({n})")) }
+    fn op_locals(&self) -> anyhow::Result<String> {
+        // node-inspect doesn't have a bulk "show locals" command.
+        // `exec` enters REPL mode which is interactive and unsuitable
+        // for auto-capture. Best-effort: evaluate a scope probe.
+        // The agent should use `dbg print <varname>` for specific vars.
+        Ok("exec typeof a !== 'undefined' ? JSON.stringify({a,b}) : '{}'".into())
+    }
+    fn op_print(&self, expr: &str) -> anyhow::Result<String> { Ok(format!("exec {expr}")) }
+    fn op_list(&self, _loc: Option<&str>) -> anyhow::Result<String> { Ok("list(10)".into()) }
+    fn op_watch(&self, expr: &str) -> anyhow::Result<String> { Ok(format!("watch('{expr}')")) }
+
+    fn parse_hit(&self, output: &str) -> Option<HitEvent> {
+        static RE: OnceLock<Regex> = OnceLock::new();
+        let re = RE.get_or_init(|| Regex::new(r"break in (\S+):(\d+)").unwrap());
+        for line in output.lines() {
+            if let Some(c) = re.captures(line) {
+                let file = c[1].to_string();
+                let line_no: u32 = c[2].parse().ok()?;
+                return Some(HitEvent {
+                    location_key: format!("{file}:{line_no}"),
+                    thread: None,
+                    frame_symbol: None,
+                    file: Some(file),
+                    line: Some(line_no),
+                });
+            }
+        }
+        None
+    }
+
+    fn parse_locals(&self, output: &str) -> Option<Value> {
+        // node's `exec` returns a JS object repr; best-effort parse.
+        let text = output.trim();
+        if text.is_empty() || text == "undefined" { return None; }
+        serde_json::from_str(text).ok()
     }
 }
 

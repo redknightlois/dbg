@@ -1,3 +1,9 @@
+use std::sync::OnceLock;
+
+use regex::Regex;
+use serde_json::{Map, Value};
+
+use super::canonical::{BreakLoc, CanonicalOps, HitEvent, unsupported};
 use super::{Backend, CleanResult, Dependency, DependencyCheck, SpawnConfig};
 use crate::check::find_bin;
 
@@ -150,6 +156,87 @@ impl Backend for GhciBackend {
         };
 
         CleanResult { output, events }
+    }
+
+    fn canonical_ops(&self) -> Option<&dyn CanonicalOps> { Some(self) }
+}
+
+impl CanonicalOps for GhciBackend {
+    fn tool_name(&self) -> &'static str { "ghci" }
+    fn auto_capture_locals(&self) -> bool { false }
+
+    fn op_break(&self, loc: &BreakLoc) -> anyhow::Result<String> {
+        Ok(match loc {
+            BreakLoc::FileLine { file: _, line } => {
+                // `:break <line>` sets a breakpoint in the most recently
+                // loaded module. We can't reliably infer the Haskell module
+                // name from the filename (algos.hs → Main, not Algos).
+                format!(":break {line}")
+            }
+            BreakLoc::Fqn(name) => format!(":break {name}"),
+            BreakLoc::ModuleMethod { module, method } => format!(":break {module}.{method}"),
+        })
+    }
+    fn op_run(&self, _args: &[String]) -> anyhow::Result<String> { Ok(":trace main".into()) }
+    fn op_continue(&self) -> anyhow::Result<String> { Ok(":continue".into()) }
+    fn op_step(&self) -> anyhow::Result<String> { Ok(":step".into()) }
+    fn op_next(&self) -> anyhow::Result<String> { Ok(":steplocal".into()) }
+    fn op_finish(&self) -> anyhow::Result<String> {
+        Err(unsupported("ghci", "step-out (Haskell uses :back for time-travel)"))
+    }
+    fn op_stack(&self, n: Option<u32>) -> anyhow::Result<String> {
+        Ok(match n {
+            Some(k) => format!(":history {k}"),
+            None => ":history".into(),
+        })
+    }
+    fn op_frame(&self, _n: u32) -> anyhow::Result<String> { Ok(":back".into()) }
+    fn op_locals(&self) -> anyhow::Result<String> { Ok(":show bindings".into()) }
+    fn op_print(&self, expr: &str) -> anyhow::Result<String> { Ok(expr.to_string()) }
+    fn op_list(&self, _loc: Option<&str>) -> anyhow::Result<String> { Ok(":list".into()) }
+
+    fn parse_hit(&self, output: &str) -> Option<HitEvent> {
+        // GHCi raw: `Stopped at Main.hs:5:3-39` (stays in output even
+        // though clean() also pushes it to events — we parse raw).
+        static RE: OnceLock<Regex> = OnceLock::new();
+        let re = RE.get_or_init(|| {
+            Regex::new(r"Stopped at (\S+):(\d+)").unwrap()
+        });
+        for line in output.lines() {
+            if let Some(c) = re.captures(line) {
+                let file = c[1].to_string();
+                let line_no: u32 = c[2].parse().ok()?;
+                return Some(HitEvent {
+                    location_key: format!("{file}:{line_no}"),
+                    thread: None,
+                    frame_symbol: None,
+                    file: Some(file),
+                    line: Some(line_no),
+                });
+            }
+        }
+        None
+    }
+
+    fn parse_locals(&self, output: &str) -> Option<Value> {
+        // `:show bindings` prints `name :: Type = value` lines.
+        let mut obj = Map::new();
+        for line in output.lines() {
+            let line = line.trim();
+            if let Some((before_eq, val)) = line.split_once(" = ") {
+                let name = before_eq
+                    .split("::")
+                    .next()
+                    .unwrap_or("")
+                    .trim()
+                    .to_string();
+                if name.is_empty() || name.starts_with("it") { continue; }
+                let mut entry = Map::new();
+                entry.insert("value".into(), Value::String(val.trim().to_string()));
+                obj.insert(name, Value::Object(entry));
+            }
+        }
+        if obj.is_empty() { None } else { Some(Value::Object(obj)) }
     }
 }
 

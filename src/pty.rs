@@ -139,6 +139,19 @@ impl DebuggerProcess {
         Ok(output.trim().to_string())
     }
 
+    /// Poll whether any data is ready on the master fd, waiting up to
+    /// `timeout_ms`. Returns `true` if data is available.
+    pub fn poll_ready(&self, timeout_ms: u16) -> bool {
+        let fd = PollFd::new(self.master.as_fd(), PollFlags::POLLIN);
+        poll(&mut [fd], timeout_ms).unwrap_or(0) > 0
+    }
+
+    /// Read raw bytes from the master fd. Returns byte count (0 on
+    /// EOF or error). Used by the drain helper in the daemon.
+    pub fn read_master_raw(&self, buf: &mut [u8]) -> usize {
+        self.read_master(buf)
+    }
+
     /// Check if the child process is still alive.
     pub fn is_alive(&self) -> bool {
         nix::sys::wait::waitpid(self.child_pid, Some(nix::sys::wait::WaitPidFlag::WNOHANG))
@@ -195,14 +208,48 @@ impl DebuggerProcess {
             // Check for prompt at end of accumulated output
             let cleaned = strip_ansi(&accumulated);
             if self.prompt_re.is_match(&cleaned) {
-                // Small extra wait to ensure no more output is coming
-                std::thread::sleep(Duration::from_millis(20));
-
-                let extra_fd = PollFd::new(self.master.as_fd(), PollFlags::POLLIN);
-                if poll(&mut [extra_fd], 30u16).unwrap_or(0) > 0 {
+                // Some debuggers (jdb, ghci) print their prompt BEFORE
+                // the stop banner arrives — the breakpoint-hit text
+                // shows up 50-150ms after the first prompt. Drain until
+                // either:
+                //   * No new data for POST_PROMPT_DRAIN_MS, or
+                //   * New data arrived AND a prompt reappears at the
+                //     end (the real "ready" signal after the stop
+                //     banner + source listing).
+                // This keeps fast debuggers (lldb/pdb/delve) snappy
+                // while giving async debuggers time to flush.
+                const POST_PROMPT_DRAIN_MS: u16 = 500;
+                let len_at_first_prompt = accumulated.len();
+                let drain_start = Instant::now();
+                loop {
+                    let elapsed = drain_start.elapsed().as_millis() as u16;
+                    if elapsed >= POST_PROMPT_DRAIN_MS {
+                        break;
+                    }
+                    let wait = POST_PROMPT_DRAIN_MS - elapsed;
+                    let extra_fd = PollFd::new(self.master.as_fd(), PollFlags::POLLIN);
+                    if poll(&mut [extra_fd], wait).unwrap_or(0) == 0 {
+                        break; // no more data within the drain window
+                    }
                     let extra = self.read_master(&mut buf);
-                    if extra > 0 {
-                        accumulated.push_str(&String::from_utf8_lossy(&buf[..extra]));
+                    if extra == 0 {
+                        break;
+                    }
+                    accumulated.push_str(&String::from_utf8_lossy(&buf[..extra]));
+
+                    // If new data arrived after the first prompt AND a
+                    // prompt now sits at the end again, the debugger is
+                    // truly ready — the stop banner + source listing
+                    // has been flushed and the debugger re-prompted.
+                    // (Many prompt regexes use `\z` so find_iter only
+                    // returns 1 match — we can't count prompts. Instead
+                    // check: did new bytes land AND does the current
+                    // tail still end with a prompt?)
+                    if accumulated.len() > len_at_first_prompt {
+                        let new_cleaned = strip_ansi(&accumulated);
+                        if self.prompt_re.is_match(&new_cleaned) {
+                            break;
+                        }
                     }
                 }
                 break;
