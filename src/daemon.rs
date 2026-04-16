@@ -157,13 +157,18 @@ fn command_may_stop(cmd: &str) -> bool {
 pub fn run_daemon(backend: &dyn Backend, target: &str, args: &[String]) -> Result<()> {
     // Branch on transport kind. Most backends use the default PTY
     // transport; `node-proto` uses the V8 Inspector WebSocket
-    // transport so program stdout and stop events arrive structured
-    // and race-free. Both paths produce a `Box<dyn DebuggerIo>`.
-    // Inspector backends have no post-spawn init commands — their
-    // domain enables happen inside the transport itself.
+    // transport; DAP-capable backends (delve-proto, debugpy-proto, …)
+    // use the Debug Adapter Protocol over TCP. All paths produce a
+    // `Box<dyn DebuggerIo>`. Protocol backends have no post-spawn
+    // init commands — their handshake happens inside the transport.
     let (proc, init_commands): (Box<dyn DebuggerIo>, Vec<String>) = if backend.uses_inspector() {
         let t = crate::inspector::InspectorTransport::spawn(target, args)
             .context("failed to spawn inspector transport")?;
+        (Box::new(t), Vec::new())
+    } else if backend.uses_dap() {
+        let cfg = backend.dap_launch(target, args)?;
+        let t = crate::dap::DapTransport::spawn(target, cfg)
+            .context("failed to spawn DAP transport")?;
         (Box::new(t), Vec::new())
     } else {
         let config = backend.spawn_config(target, args)?;

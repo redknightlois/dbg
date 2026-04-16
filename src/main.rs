@@ -2,6 +2,7 @@ mod backend;
 mod check;
 mod commands;
 mod daemon;
+mod dap;
 mod ghcprof;
 mod init;
 mod inspector;
@@ -58,6 +59,7 @@ fn main() -> Result<()> {
     registry.register(Box::new(backend::pdb::PdbBackend));
     registry.register(Box::new(backend::netcoredbg::NetCoreDbgBackend));
     registry.register(Box::new(backend::delve::DelveBackend));
+    registry.register(Box::new(backend::delve_proto::DelveProtoBackend));
     registry.register(Box::new(backend::jdb::JdbBackend));
     registry.register(Box::new(backend::pprof::PprofBackend));
     registry.register(Box::new(backend::perf::PerfBackend));
@@ -293,7 +295,7 @@ fn cmd_start(registry: &Registry, args: &[String]) -> Result<()> {
             // Daemon process
             let _ = nix::unistd::setsid();
             if let Err(e) = daemon::run_daemon(backend, &resolved, &run_args) {
-                eprintln!("daemon error: {e}");
+                eprintln!("daemon error: {e:#}");
                 std::process::exit(1);
             }
             std::process::exit(0);

@@ -1,5 +1,6 @@
 pub mod canonical;
 pub mod delve;
+pub mod delve_proto;
 pub mod dotnettrace;
 pub mod callgrind;
 pub mod ghci;
@@ -125,6 +126,20 @@ pub trait Backend: Send + Sync {
     /// today; future protocol backends (DAP) add their own hooks.
     fn uses_inspector(&self) -> bool {
         false
+    }
+
+    /// Override to route through the DAP transport. When true, the
+    /// backend must provide `dap_launch` to describe how to spawn
+    /// the adapter and configure `launch`. The daemon calls this
+    /// instead of `spawn_config`.
+    fn uses_dap(&self) -> bool {
+        false
+    }
+
+    /// Adapter spawn + launch configuration for DAP backends. Only
+    /// invoked when `uses_dap()` returns true.
+    fn dap_launch(&self, _target: &str, _args: &[String]) -> anyhow::Result<crate::dap::DapLaunchConfig> {
+        anyhow::bail!("dap_launch not implemented for this backend")
     }
 }
 
