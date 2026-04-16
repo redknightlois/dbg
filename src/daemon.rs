@@ -288,6 +288,12 @@ pub fn run_daemon(backend: &dyn Backend, target: &str, args: &[String]) -> Resul
                     cleanup_and_exit();
                 }
 
+                if cmd == "cancel" {
+                    let response = handle_cancel(child_pid);
+                    let _ = stream.write_all(response.as_bytes());
+                    return;
+                }
+
                 let response =
                     handle_command(&cmd, backend, session, cached_help, log_handle);
                 let _ = stream.write_all(response.as_bytes());
@@ -332,6 +338,20 @@ fn handle_quit(backend: &dyn Backend, session: &Mutex<Session>, child_pid: &Atom
         std::thread::sleep(Duration::from_millis(50));
     }
     "stopped".to_string()
+}
+
+/// Interrupt the running command by SIGINT'ing the child without
+/// tearing down the session. Unlike `quit`, this keeps the debugger
+/// alive: the blocked `send_and_wait` returns (prompt reappears after
+/// the interrupt), the session lock drops, and subsequent commands
+/// proceed normally. Used to break out of a `continue` that hasn't
+/// hit a breakpoint, an infinite loop in the target, etc.
+fn handle_cancel(child_pid: &AtomicI32) -> String {
+    let pid = nix::unistd::Pid::from_raw(child_pid.load(Ordering::Relaxed));
+    match nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGINT) {
+        Ok(()) => "interrupted".to_string(),
+        Err(e) => format!("[error: {e}]"),
+    }
 }
 
 fn handle_command(
