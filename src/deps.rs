@@ -52,29 +52,50 @@ pub fn check_dep(dep: Dependency) -> DepStatus {
     match &dep.check {
         DependencyCheck::Binary {
             alternatives,
+            version_cmd,
             ..
         } => {
             for name in *alternatives {
-                if let Ok(path) = which::which(name) {
+                let found_path = which::which(name)
+                    .map(|p| p.display().to_string())
+                    .or_else(|_| {
+                        for dir in extra_tool_dirs() {
+                            let path = dir.join(name);
+                            if path.is_file() {
+                                return Ok(path.display().to_string());
+                            }
+                        }
+                        Err(())
+                    });
+                if let Ok(path) = found_path {
+                    // Binary exists on disk. If a version_cmd is
+                    // provided, run it to verify the toolchain
+                    // actually works (catches broken installs like a
+                    // Homebrew GHC that can't find libc).
+                    if let Some((probe_bin, probe_args)) = version_cmd {
+                        let runnable = Command::new(probe_bin)
+                            .args(*probe_args)
+                            .stdout(std::process::Stdio::null())
+                            .stderr(std::process::Stdio::null())
+                            .status()
+                            .is_ok_and(|s| s.success());
+                        if !runnable {
+                            return DepStatus {
+                                name: dep.name,
+                                ok: false,
+                                detail: format!("{path} (found but broken — `{probe_bin}` failed to run)"),
+                                install: dep.install,
+                                warning: None,
+                            };
+                        }
+                    }
                     return DepStatus {
                         name: dep.name,
                         ok: true,
-                        detail: path.display().to_string(),
+                        detail: path,
                         install: dep.install,
                         warning: None,
                     };
-                }
-                for dir in extra_tool_dirs() {
-                    let path = dir.join(name);
-                    if path.is_file() {
-                        return DepStatus {
-                            name: dep.name,
-                            ok: true,
-                            detail: path.display().to_string(),
-                            install: dep.install,
-                            warning: None,
-                        };
-                    }
                 }
             }
             DepStatus {

@@ -53,7 +53,12 @@ impl Backend for GhciBackend {
             check: DependencyCheck::Binary {
                 name: "ghci",
                 alternatives: &["ghci"],
-                version_cmd: Some(("ghc", &["--version"])),
+                // `ghci --version` uses a compiled path that can succeed
+                // even when the REPL runtime is broken (e.g. Homebrew
+                // GHC with a missing /lib64/libc.so.6 symlink).
+                // `-e '()'` forces the interpreter to start, catching
+                // linker/runtime failures that --version would miss.
+                version_cmd: Some(("ghci", &["-v0", "-e", "()"])),
             },
             install: "curl --proto '=https' --tlsv1.2 -sSf https://get-ghcup.haskell.org | sh  # or: sudo apt install ghc",
         }]
@@ -111,7 +116,9 @@ impl Backend for GhciBackend {
             let l = line.trim();
 
             // Extract stop events (breakpoint hits)
-            if l.starts_with("Stopped at ") {
+            // GHC <9.6: `Stopped at Main.hs:5:3-39`
+            // GHC ≥9.6: `Stopped in Main.fibonacci.go, Main.hs:5:3-39`
+            if l.starts_with("Stopped at ") || l.starts_with("Stopped in ") {
                 events.push(l.to_string());
             }
 
@@ -196,20 +203,29 @@ impl CanonicalOps for GhciBackend {
     fn op_list(&self, _loc: Option<&str>) -> anyhow::Result<String> { Ok(":list".into()) }
 
     fn parse_hit(&self, output: &str) -> Option<HitEvent> {
-        // GHCi raw: `Stopped at Main.hs:5:3-39` (stays in output even
-        // though clean() also pushes it to events — we parse raw).
+        // GHC <9.6: `Stopped at Main.hs:5:3-39`
+        // GHC ≥9.6: `Stopped in Main.fibonacci.go, /path/Main.hs:20:16-35`
+        // Match both forms with a single regex.
         static RE: OnceLock<Regex> = OnceLock::new();
         let re = RE.get_or_init(|| {
-            Regex::new(r"Stopped at (\S+):(\d+)").unwrap()
+            // GHC <9.6: `Stopped at file:line:col`
+            // GHC ≥9.6: `Stopped in symbol, file:line:col`
+            // `[^,]+` for the symbol avoids eating the comma separator.
+            Regex::new(r"Stopped (?:at|in [^,]+,)\s+(.+?):(\d+):\d+").unwrap()
         });
         for line in output.lines() {
             if let Some(c) = re.captures(line) {
                 let file = c[1].to_string();
                 let line_no: u32 = c[2].parse().ok()?;
+                // Extract frame symbol from the "Stopped in <sym>," form.
+                let frame_symbol = line
+                    .strip_prefix("Stopped in ")
+                    .and_then(|rest| rest.split(',').next())
+                    .map(|s| s.trim().to_string());
                 return Some(HitEvent {
                     location_key: format!("{file}:{line_no}"),
                     thread: None,
-                    frame_symbol: None,
+                    frame_symbol,
                     file: Some(file),
                     line: Some(line_no),
                 });
@@ -264,6 +280,14 @@ mod tests {
     }
 
     #[test]
+    fn clean_extracts_stop_events_ghc96() {
+        // GHC ≥9.6 format: "Stopped in <symbol>, <file>:<line>:<col>"
+        let input = "Stopped in Main.fibonacci.go, /path/algos.hs:20:16-35\n_result :: Integer";
+        let r = GhciBackend.clean(":continue", input);
+        assert!(r.events.iter().any(|e| e.contains("Stopped in")));
+    }
+
+    #[test]
     fn clean_filters_loading_noise() {
         let input = "[1 of 2] Compiling Lib\nOk, modules loaded: Main, Lib.\nactual output here";
         let r = GhciBackend.clean(":load Main.hs", input);
@@ -315,6 +339,23 @@ mod tests {
         assert!(result.contains(":step"));
         assert!(result.contains(":type"));
         assert!(!result.contains("some"));
+    }
+
+    #[test]
+    fn parse_hit_stopped_at() {
+        let raw = "Stopped at Main.hs:5:3-39\n_result :: [Integer]";
+        let hit = GhciBackend.parse_hit(raw).expect("should match Stopped at");
+        assert_eq!(hit.location_key, "Main.hs:5");
+        assert_eq!(hit.line, Some(5));
+    }
+
+    #[test]
+    fn parse_hit_stopped_in_ghc96() {
+        let raw = "Stopped in Main.fibonacci.go, /path/algos.hs:20:16-35\n_result :: Integer";
+        let hit = GhciBackend.parse_hit(raw).expect("should match Stopped in");
+        assert_eq!(hit.location_key, "/path/algos.hs:20");
+        assert_eq!(hit.line, Some(20));
+        assert_eq!(hit.frame_symbol.as_deref(), Some("Main.fibonacci.go"));
     }
 
     #[test]

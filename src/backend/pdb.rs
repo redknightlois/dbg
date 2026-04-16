@@ -214,9 +214,10 @@ impl CanonicalOps for PdbBackend {
     fn op_breaks(&self) -> anyhow::Result<String> { Ok("break".into()) }
 
     fn op_run(&self, _args: &[String]) -> anyhow::Result<String> {
-        // pdb launches the script on daemon start; `run` restarts
-        // execution and pdb supports `restart [args...]`.
-        Ok("restart".into())
+        // pdb launches the script on daemon start and pauses at the
+        // module's first line. `continue` runs to the first breakpoint
+        // — the expected behaviour for the `--run` flag.
+        Ok("continue".into())
     }
     fn op_continue(&self) -> anyhow::Result<String> { Ok("continue".into()) }
     fn op_step(&self) -> anyhow::Result<String> { Ok("step".into()) }
@@ -270,6 +271,12 @@ impl CanonicalOps for PdbBackend {
                 let file = c[1].to_string();
                 let line_no: u32 = c[2].parse().ok()?;
                 let func = c[3].to_string();
+                // Skip synthetic stops at module load — pdb pauses at
+                // the first line of the module before any breakpoint is
+                // reached. These are not real breakpoint hits.
+                if func == "<module>" {
+                    continue;
+                }
                 return Some(HitEvent {
                     location_key: format!("{file}:{line_no}"),
                     thread: None,
@@ -546,6 +553,13 @@ mod tests {
     #[test]
     fn parse_hit_none_without_marker() {
         assert!(PdbBackend.parse_hit("some output without marker").is_none());
+    }
+
+    #[test]
+    fn parse_hit_skips_module_load_stop() {
+        // pdb stops at the first line of the module before any breakpoint.
+        let out = "> /app/main.py(2)<module>()\n-> \"\"\"Algorithms.\"\"\"\n(Pdb) ";
+        assert!(PdbBackend.parse_hit(out).is_none(), "should skip <module> stop");
     }
 
     #[test]

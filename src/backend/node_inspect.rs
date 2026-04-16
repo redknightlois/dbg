@@ -145,6 +145,8 @@ impl CanonicalOps for NodeInspectBackend {
     fn tool_name(&self) -> &'static str { "node-inspect" }
     fn auto_capture_locals(&self) -> bool { false }
 
+    fn op_breaks(&self) -> anyhow::Result<String> { Ok("breakpoints".into()) }
+
     fn op_break(&self, loc: &BreakLoc) -> anyhow::Result<String> {
         Ok(match loc {
             BreakLoc::FileLine { file, line } => format!("sb('{file}', {line})"),

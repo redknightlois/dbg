@@ -150,9 +150,12 @@ impl CanonicalOps for DelveBackend {
     fn op_breaks(&self) -> anyhow::Result<String> { Ok("breakpoints".into()) }
 
     fn op_run(&self, _args: &[String]) -> anyhow::Result<String> {
-        // Delve was launched with `dlv exec <target>`. `restart` re-runs
-        // with the same args (delve remembers from the launch config).
-        Ok("restart".into())
+        // Delve launches paused at the entry point. `continue` starts
+        // execution and stops at the first breakpoint — the right
+        // behaviour for the initial `--run` flag. If the agent needs a
+        // full restart later, `dbg raw restart` followed by `continue`
+        // achieves that explicitly.
+        Ok("continue".into())
     }
     fn op_continue(&self) -> anyhow::Result<String> { Ok("continue".into()) }
     fn op_step(&self) -> anyhow::Result<String> { Ok("step".into()) }

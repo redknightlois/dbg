@@ -1,5 +1,9 @@
-use std::os::fd::{AsFd, AsRawFd, OwnedFd};
-use std::sync::LazyLock;
+use std::collections::VecDeque;
+use std::os::fd::{AsRawFd, BorrowedFd, OwnedFd};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
+use std::sync::{Arc, LazyLock, Mutex};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
@@ -12,15 +16,122 @@ use regex::Regex;
 static ANSI_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\x1b\[[0-9;]*[A-Za-z]|\x1b\[K|\x1b\[2K").unwrap());
 
-/// A debugger process running in a PTY.
+/// An event emitted by the reader thread.
+///
+/// The reader owns the PTY master read side and produces a stream of
+/// events that the daemon consumes. This decouples reading from
+/// command dispatch so async debuggers (node-inspect, async gdb) don't
+/// lose stop banners that arrive between commands.
+pub enum PtyEvent {
+    /// A chunk of raw output bytes. Multiple `Data` events may precede
+    /// a single `Prompt`; the daemon concatenates them.
+    Data(Vec<u8>),
+    /// The prompt regex matched the accumulated output. The debugger
+    /// is ready for input. The reader resets its internal match buffer
+    /// after emitting this.
+    Prompt,
+    /// The reader detected EOF or a fatal read error. Child is gone.
+    Exit,
+}
+
+/// Kind of entry stored in the event log. The log is a tamer,
+/// persistent view of the channel — same information, but retained so
+/// `dbg events` can replay what happened.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EventKind {
+    Output,
+    Prompt,
+    Exit,
+}
+
+impl EventKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            EventKind::Output => "output",
+            EventKind::Prompt => "prompt",
+            EventKind::Exit => "exit",
+        }
+    }
+}
+
+/// An entry in the event log. `seq` is monotonic and session-unique;
+/// agents pass it as `--since` to query incrementally.
+#[derive(Clone, Debug)]
+pub struct EventEntry {
+    pub seq: u64,
+    /// Milliseconds since the session started.
+    pub ts_ms: u64,
+    pub kind: EventKind,
+    /// Raw bytes. Empty for Prompt/Exit.
+    pub bytes: Vec<u8>,
+}
+
+/// Bounded ring buffer of events. Capped at `MAX_EVENTS`; older entries
+/// are dropped silently. The `last_seq` counter keeps incrementing even
+/// across drops so agents can tell if they missed events.
+const MAX_EVENTS: usize = 2048;
+
+struct EventLog {
+    entries: VecDeque<EventEntry>,
+    last_seq: u64,
+    started: Instant,
+}
+
+impl EventLog {
+    fn new() -> Self {
+        Self {
+            entries: VecDeque::with_capacity(MAX_EVENTS),
+            last_seq: 0,
+            started: Instant::now(),
+        }
+    }
+
+    fn push(&mut self, kind: EventKind, bytes: Vec<u8>) {
+        self.last_seq += 1;
+        let ts_ms = self.started.elapsed().as_millis() as u64;
+        if self.entries.len() == MAX_EVENTS {
+            self.entries.pop_front();
+        }
+        self.entries.push_back(EventEntry {
+            seq: self.last_seq,
+            ts_ms,
+            kind,
+            bytes,
+        });
+    }
+
+    /// Return entries with `seq > since`. `since = 0` returns the full log.
+    fn since(&self, since: u64) -> Vec<EventEntry> {
+        self.entries
+            .iter()
+            .filter(|e| e.seq > since)
+            .cloned()
+            .collect()
+    }
+}
+
+/// A debugger process running in a PTY. The reader thread owns the
+/// read side of the master fd; the daemon holds this struct and writes
+/// commands + consumes events from the channel.
 pub struct DebuggerProcess {
     master: OwnedFd,
     child_pid: Pid,
+    /// Wrapped in a Mutex so `DebuggerProcess: Sync`. The Receiver
+    /// itself isn't `Sync`, but all access paths hold the daemon's
+    /// session lock, so contention here is zero.
+    rx: Mutex<Receiver<PtyEvent>>,
+    /// Bounded log of every event the reader produced. Lives in an
+    /// `Arc<Mutex>` so the reader thread can push while the daemon
+    /// queries. Separate from the channel so `dbg events` can read
+    /// history without racing `send_and_wait`.
+    log: Arc<Mutex<EventLog>>,
+    shutdown: Arc<AtomicBool>,
+    reader: Option<JoinHandle<()>>,
     prompt_re: Regex,
 }
 
 impl DebuggerProcess {
-    /// Spawn a debugger in a PTY.
+    /// Spawn a debugger in a PTY and start the reader thread.
     pub fn spawn(
         bin: &str,
         args: &[String],
@@ -33,7 +144,6 @@ impl DebuggerProcess {
         let fork_result = unsafe { fork() }?;
         match fork_result {
             ForkResult::Child => {
-                // Child: set up PTY as stdin/stdout/stderr, exec debugger.
                 drop(master);
                 setsid().ok();
 
@@ -70,11 +180,37 @@ impl DebuggerProcess {
             }
             ForkResult::Parent { child } => {
                 drop(slave);
-                let prompt_re = Regex::new(prompt_pattern)
-                    .context("invalid prompt pattern")?;
+
+                let prompt_re =
+                    Regex::new(prompt_pattern).context("invalid prompt pattern")?;
+                let reader_prompt_re = prompt_re.clone();
+                let master_fd = master.as_raw_fd();
+                let (tx, rx) = mpsc::channel::<PtyEvent>();
+                let shutdown = Arc::new(AtomicBool::new(false));
+                let reader_shutdown = shutdown.clone();
+                let log = Arc::new(Mutex::new(EventLog::new()));
+                let reader_log = log.clone();
+
+                let reader = std::thread::Builder::new()
+                    .name("dbg-pty-reader".into())
+                    .spawn(move || {
+                        reader_loop(
+                            master_fd,
+                            reader_prompt_re,
+                            tx,
+                            reader_shutdown,
+                            reader_log,
+                        )
+                    })
+                    .context("failed to spawn reader thread")?;
+
                 Ok(Self {
                     master,
                     child_pid: child,
+                    rx: Mutex::new(rx),
+                    log,
+                    shutdown,
+                    reader: Some(reader),
                     prompt_re,
                 })
             }
@@ -87,7 +223,10 @@ impl DebuggerProcess {
         let fd = self.master.as_raw_fd();
         let mut written = 0;
         while written < data.len() {
-            match nix::unistd::write(unsafe { std::os::fd::BorrowedFd::borrow_raw(fd) }, &data[written..]) {
+            match nix::unistd::write(
+                unsafe { BorrowedFd::borrow_raw(fd) },
+                &data[written..],
+            ) {
                 Ok(n) => written += n,
                 Err(nix::errno::Errno::EINTR) => continue,
                 Err(e) => return Err(e.into()),
@@ -96,60 +235,146 @@ impl DebuggerProcess {
         Ok(())
     }
 
-    /// Read bytes from the master fd without creating a File.
-    fn read_master(&self, buf: &mut [u8]) -> usize {
-        nix::unistd::read(self.master.as_raw_fd(), buf).unwrap_or(0)
+    /// Drain any events that arrived since the last `send_and_wait` or
+    /// `drain_pending` call. Returns the accumulated output bytes (ANSI
+    /// stripped). Non-blocking — never waits for new data.
+    ///
+    /// Used by the daemon at the head of each command to process stop
+    /// banners that arrived asynchronously from the last execution
+    /// command (e.g., node-inspect delivers `break in …` after having
+    /// already ack-prompted the `cont`).
+    pub fn drain_pending(&self) -> Option<String> {
+        let rx = self.rx.lock().unwrap();
+        let mut accumulated: Vec<u8> = Vec::new();
+        let mut saw_data = false;
+        loop {
+            match rx.try_recv() {
+                Ok(PtyEvent::Data(bytes)) => {
+                    saw_data = true;
+                    accumulated.extend(bytes);
+                }
+                Ok(PtyEvent::Prompt) => {}
+                Ok(PtyEvent::Exit) => break,
+                Err(_) => break,
+            }
+        }
+        if !saw_data {
+            return None;
+        }
+        Some(strip_ansi(&String::from_utf8_lossy(&accumulated)))
     }
 
     /// Wait for the initial prompt after spawn.
     pub fn wait_for_prompt(&self, timeout: Duration) -> Result<String> {
-        self.read_until_prompt(timeout)
+        let rx = self.rx.lock().unwrap();
+        let mut collected: Vec<u8> = Vec::new();
+        let deadline = Instant::now() + timeout;
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                bail!("timeout waiting for initial prompt");
+            }
+            match rx.recv_timeout(remaining) {
+                Ok(PtyEvent::Data(bytes)) => collected.extend(bytes),
+                Ok(PtyEvent::Prompt) => {
+                    return Ok(strip_ansi(&String::from_utf8_lossy(&collected)));
+                }
+                Ok(PtyEvent::Exit) => bail!("debugger exited before producing prompt"),
+                Err(RecvTimeoutError::Timeout) => {
+                    bail!("timeout waiting for initial prompt")
+                }
+                Err(RecvTimeoutError::Disconnected) => {
+                    bail!("reader thread died before initial prompt")
+                }
+            }
+        }
     }
 
-    /// Send a command and wait for the prompt. Returns output between
-    /// the echoed command and the next prompt.
+    /// Send a command and wait for the prompt. Returns the debugger's
+    /// response between our command and the next prompt.
+    ///
+    /// Call sites that need to handle async stop events should call
+    /// `drain_pending()` first; this method only collects events that
+    /// arrive after the command is written.
     pub fn send_and_wait(&self, cmd: &str, timeout: Duration) -> Result<String> {
-        // Write command
-        self.write_master(format!("{cmd}\n").as_bytes())?;
+        // Sticky "session has exited" guard. Once the child is gone,
+        // the reader-thread channel is drained/closed and the loop
+        // below would bail with "reader thread disconnected" — loudly
+        // and for every subsequent verb. Return a clean, recognizable
+        // status instead so agents can distinguish a dead session
+        // (typical after the debuggee runs to completion) from a
+        // genuine protocol error.
+        if !self.is_alive() {
+            return Ok("(session has exited — start a new one with `dbg start`)".to_string());
+        }
+        if let Err(e) = self.write_master(format!("{cmd}\n").as_bytes()) {
+            // EIO / EPIPE on write almost always means the PTY master
+            // closed under us because the debugger exited between the
+            // alive-check above and the write. Surface the same clean
+            // sticky message rather than the raw errno.
+            if !self.is_alive() {
+                return Ok("(session has exited — start a new one with `dbg start`)".to_string());
+            }
+            return Err(e);
+        }
 
-        // Read until prompt
-        let raw = self.read_until_prompt(timeout)?;
+        let rx = self.rx.lock().unwrap();
+        let mut collected: Vec<u8> = Vec::new();
+        let deadline = Instant::now() + timeout;
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                bail!("timeout waiting for prompt");
+            }
+            match rx.recv_timeout(remaining) {
+                Ok(PtyEvent::Data(bytes)) => collected.extend(bytes),
+                Ok(PtyEvent::Prompt) => break,
+                Ok(PtyEvent::Exit) => break,
+                Err(RecvTimeoutError::Timeout) => bail!("timeout waiting for prompt"),
+                Err(RecvTimeoutError::Disconnected) => {
+                    // Reader thread exited — child is gone. Return the
+                    // sticky status so the agent sees a consistent
+                    // message regardless of which verb first noticed.
+                    return Ok(
+                        "(session has exited — start a new one with `dbg start`)".to_string(),
+                    );
+                }
+            }
+        }
 
-        // Strip ANSI codes
+        let raw = String::from_utf8_lossy(&collected).to_string();
         let clean = strip_ansi(&raw);
-
-        // Remove all prompt occurrences from the output
         let no_prompts = self.prompt_re.replace_all(&clean, "");
 
-        // Remove echoed command (first line)
         let lines: Vec<&str> = no_prompts.lines().collect();
         let start = if !lines.is_empty() && lines[0].contains(cmd.trim()) {
             1
         } else {
             0
         };
-
-        // Skip trailing empty lines
         let mut end = lines.len();
         while end > start && lines[end - 1].trim().is_empty() {
             end -= 1;
         }
-
-        let output = lines[start..end].join("\n");
-        Ok(output.trim().to_string())
+        Ok(lines[start..end].join("\n").trim().to_string())
     }
 
-    /// Poll whether any data is ready on the master fd, waiting up to
-    /// `timeout_ms`. Returns `true` if data is available.
-    pub fn poll_ready(&self, timeout_ms: u16) -> bool {
-        let fd = PollFd::new(self.master.as_fd(), PollFlags::POLLIN);
-        poll(&mut [fd], timeout_ms).unwrap_or(0) > 0
+    /// Return event-log entries with `seq > since`. Pass `since = 0`
+    /// for the full retained log.
+    pub fn events_since(&self, since: u64) -> Vec<EventEntry> {
+        self.log.lock().unwrap().since(since)
     }
 
-    /// Read raw bytes from the master fd. Returns byte count (0 on
-    /// EOF or error). Used by the drain helper in the daemon.
-    pub fn read_master_raw(&self, buf: &mut [u8]) -> usize {
-        self.read_master(buf)
+    /// Current highest assigned sequence number (even if the entry was
+    /// evicted from the ring). Agents use this to bookmark `--since`.
+    pub fn last_event_seq(&self) -> u64 {
+        self.log.lock().unwrap().last_seq
+    }
+
+    /// The PID of the child process, for out-of-band signalling (e.g.
+    /// interrupting a running command from the quit handler).
+    pub fn child_pid(&self) -> Pid {
+        self.child_pid
     }
 
     /// Check if the child process is still alive.
@@ -162,106 +387,115 @@ impl DebuggerProcess {
     pub fn quit(&self, quit_cmd: &str) {
         if self.is_alive() {
             let _ = self.write_master(format!("{quit_cmd}\n").as_bytes());
-
-            // Give it a moment
             std::thread::sleep(Duration::from_millis(500));
-
-            // Force kill if still alive
             if self.is_alive() {
                 let _ = nix::sys::signal::kill(self.child_pid, Signal::SIGKILL);
             }
         }
     }
+}
 
-    fn read_until_prompt(&self, timeout: Duration) -> Result<String> {
-        let mut buf = [0u8; 4096];
-        let mut accumulated = String::new();
-        let start = Instant::now();
+/// Reader thread entry point. Reads PTY bytes, coalesces them into
+/// Output chunks at prompt boundaries, and emits events on the channel
+/// and into the persistent log. Exits when the shutdown flag is set or
+/// EOF. Coalescing keeps the event log readable — one Output entry per
+/// "command response" instead of one per 4KB PTY read.
+fn reader_loop(
+    master_fd: std::os::fd::RawFd,
+    prompt_re: Regex,
+    tx: Sender<PtyEvent>,
+    shutdown: Arc<AtomicBool>,
+    log: Arc<Mutex<EventLog>>,
+) {
+    let mut buf = [0u8; 4096];
+    // Pending output bytes not yet emitted. Flushed to a single Output
+    // event when a prompt is detected, when it grows past 64KB, or on
+    // exit.
+    let mut pending: Vec<u8> = Vec::new();
 
-        loop {
-            let remaining = timeout.saturating_sub(start.elapsed());
-            if remaining.is_zero() {
-                bail!("timeout waiting for prompt");
+    let flush_output =
+        |pending: &mut Vec<u8>, tx: &Sender<PtyEvent>, log: &Arc<Mutex<EventLog>>| -> bool {
+            if pending.is_empty() {
+                return true;
             }
+            let bytes = std::mem::take(pending);
+            log.lock()
+                .unwrap()
+                .push(EventKind::Output, bytes.clone());
+            tx.send(PtyEvent::Data(bytes)).is_ok()
+        };
 
-            let fd = PollFd::new(self.master.as_fd(), PollFlags::POLLIN);
-            let ms = remaining.as_millis().min(u16::MAX as u128) as u16;
-            let n = poll(&mut [fd], ms)?;
+    let emit_marker =
+        |kind: EventKind, tx: &Sender<PtyEvent>, log: &Arc<Mutex<EventLog>>| -> bool {
+            log.lock().unwrap().push(kind, Vec::new());
+            let ev = match kind {
+                EventKind::Prompt => PtyEvent::Prompt,
+                EventKind::Exit => PtyEvent::Exit,
+                // Callers only pass Prompt/Exit here; Output goes via
+                // flush_output because it carries bytes.
+                EventKind::Output => unreachable!("emit_marker called with Output"),
+            };
+            tx.send(ev).is_ok()
+        };
 
-            if n == 0 {
-                // Poll timed out (possibly due to u16 cap) — check prompt
-                if self.prompt_re.is_match(&strip_ansi(&accumulated)) {
-                    break;
-                }
-                // Real timeout is checked at loop top; continue to re-check
-                continue;
-            }
+    loop {
+        if shutdown.load(Ordering::Relaxed) {
+            return;
+        }
 
-            let bytes_read = self.read_master(&mut buf);
-
-            if bytes_read == 0 {
-                break;
-            }
-
-            accumulated.push_str(&String::from_utf8_lossy(&buf[..bytes_read]));
-
-            // Check for prompt at end of accumulated output
-            let cleaned = strip_ansi(&accumulated);
-            if self.prompt_re.is_match(&cleaned) {
-                // Some debuggers (jdb, ghci) print their prompt BEFORE
-                // the stop banner arrives — the breakpoint-hit text
-                // shows up 50-150ms after the first prompt. Drain until
-                // either:
-                //   * No new data for POST_PROMPT_DRAIN_MS, or
-                //   * New data arrived AND a prompt reappears at the
-                //     end (the real "ready" signal after the stop
-                //     banner + source listing).
-                // This keeps fast debuggers (lldb/pdb/delve) snappy
-                // while giving async debuggers time to flush.
-                const POST_PROMPT_DRAIN_MS: u16 = 500;
-                let len_at_first_prompt = accumulated.len();
-                let drain_start = Instant::now();
-                loop {
-                    let elapsed = drain_start.elapsed().as_millis() as u16;
-                    if elapsed >= POST_PROMPT_DRAIN_MS {
-                        break;
-                    }
-                    let wait = POST_PROMPT_DRAIN_MS - elapsed;
-                    let extra_fd = PollFd::new(self.master.as_fd(), PollFlags::POLLIN);
-                    if poll(&mut [extra_fd], wait).unwrap_or(0) == 0 {
-                        break; // no more data within the drain window
-                    }
-                    let extra = self.read_master(&mut buf);
-                    if extra == 0 {
-                        break;
-                    }
-                    accumulated.push_str(&String::from_utf8_lossy(&buf[..extra]));
-
-                    // If new data arrived after the first prompt AND a
-                    // prompt now sits at the end again, the debugger is
-                    // truly ready — the stop banner + source listing
-                    // has been flushed and the debugger re-prompted.
-                    // (Many prompt regexes use `\z` so find_iter only
-                    // returns 1 match — we can't count prompts. Instead
-                    // check: did new bytes land AND does the current
-                    // tail still end with a prompt?)
-                    if accumulated.len() > len_at_first_prompt {
-                        let new_cleaned = strip_ansi(&accumulated);
-                        if self.prompt_re.is_match(&new_cleaned) {
-                            break;
-                        }
-                    }
-                }
-                break;
+        let borrowed = unsafe { BorrowedFd::borrow_raw(master_fd) };
+        let pollfd = PollFd::new(borrowed, PollFlags::POLLIN);
+        match poll(&mut [pollfd], 100u16) {
+            Ok(0) => continue,
+            Ok(_) => {}
+            Err(nix::errno::Errno::EINTR) => continue,
+            Err(_) => {
+                let _ = flush_output(&mut pending, &tx, &log);
+                let _ = emit_marker(EventKind::Exit, &tx, &log);
+                return;
             }
         }
 
-        Ok(accumulated)
+        let n = match nix::unistd::read(master_fd, &mut buf) {
+            Ok(0) => {
+                let _ = flush_output(&mut pending, &tx, &log);
+                let _ = emit_marker(EventKind::Exit, &tx, &log);
+                return;
+            }
+            Ok(n) => n,
+            Err(nix::errno::Errno::EINTR) => continue,
+            Err(_) => {
+                let _ = flush_output(&mut pending, &tx, &log);
+                let _ = emit_marker(EventKind::Exit, &tx, &log);
+                return;
+            }
+        };
+
+        pending.extend_from_slice(&buf[..n]);
+
+        // Prompt detection operates on the ANSI-stripped view of the
+        // entire pending buffer. Cheap enough since pending is capped.
+        let pending_str = String::from_utf8_lossy(&pending);
+        let cleaned = strip_ansi(&pending_str);
+        if prompt_re.is_match(&cleaned) {
+            if !flush_output(&mut pending, &tx, &log) {
+                return;
+            }
+            if !emit_marker(EventKind::Prompt, &tx, &log) {
+                return;
+            }
+        } else if pending.len() > 64 * 1024 {
+            // Safety valve: stream large outputs to the log without
+            // waiting for a prompt. Agents tailing via `dbg events`
+            // still see progress on long-running commands.
+            if !flush_output(&mut pending, &tx, &log) {
+                return;
+            }
+        }
     }
 }
 
 fn strip_ansi(s: &str) -> String {
-    // Fast path: no escape char means no ANSI
     if !s.contains('\x1b') {
         return s.to_string();
     }
@@ -270,6 +504,11 @@ fn strip_ansi(s: &str) -> String {
 
 impl Drop for DebuggerProcess {
     fn drop(&mut self) {
+        self.shutdown.store(true, Ordering::Relaxed);
         let _ = nix::sys::signal::kill(self.child_pid, Signal::SIGTERM);
+        if let Some(h) = self.reader.take() {
+            // Best-effort: reader polls shutdown flag every 100ms.
+            let _ = h.join();
+        }
     }
 }

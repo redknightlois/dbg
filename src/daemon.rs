@@ -1,7 +1,8 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -69,7 +70,6 @@ pub fn session_tmp(filename: &str) -> PathBuf {
 
 struct Session {
     proc: DebuggerProcess,
-    events: VecDeque<String>,
     profile: Option<ProfileData>,
     /// Per-run SessionDb. `None` if DB creation failed on startup — we
     /// keep the debugger session alive either way; capture is best-effort.
@@ -126,11 +126,20 @@ fn backend_target_class(name: &str) -> TargetClass {
     }
 }
 
-/// Is `cmd` a control flow command whose output may contain a stop
-/// banner worth feeding through `parse_hit`? We don't gate hit capture
-/// on this (safe: `parse_hit` only returns `Some` on an actual banner),
-/// but it lets us avoid synthesizing expensive locals roundtrips after
-/// clearly non-stopping commands like `breakpoint list` or `version`.
+/// Does this canonical operation cause an execution-state transition?
+/// Only these ops can produce a *new* breakpoint hit. Inspection ops
+/// (`stack`, `locals`, `print`, `breaks`) echo the current stop state
+/// without transitioning and must NOT feed into `capture_hit_if_stopped`
+/// or they create duplicate hit rows.
+fn op_may_stop(canonical_op: &str) -> bool {
+    matches!(
+        canonical_op,
+        "run" | "continue" | "step" | "next" | "finish"
+    )
+}
+
+/// Same idea for raw/fallthrough commands that bypass the canonical
+/// dispatcher — match on the native command verb.
 fn command_may_stop(cmd: &str) -> bool {
     let first = cmd.trim().split_whitespace().next().unwrap_or("");
     matches!(
@@ -155,6 +164,11 @@ pub fn run_daemon(backend: &dyn Backend, target: &str, args: &[String]) -> Resul
         backend.prompt_pattern(),
     )
     .context("failed to spawn debugger")?;
+
+    // Expose the child PID outside the session mutex so the quit handler
+    // can SIGINT the child to interrupt a blocked `send_and_wait` (e.g.
+    // jdb waiting on a `continue` that hasn't hit a breakpoint yet).
+    let child_pid = AtomicI32::new(proc.child_pid().as_raw());
 
     // Wait for initial prompt
     proc.wait_for_prompt(Duration::from_secs(120))
@@ -220,7 +234,6 @@ pub fn run_daemon(backend: &dyn Backend, target: &str, args: &[String]) -> Resul
 
     let session = Mutex::new(Session {
         proc,
-        events: VecDeque::new(),
         profile,
         db,
         hit_seq: HashMap::new(),
@@ -246,6 +259,7 @@ pub fn run_daemon(backend: &dyn Backend, target: &str, args: &[String]) -> Resul
 
             let session = &session;
             let cached_help = &cached_help;
+            let child_pid = &child_pid;
 
             scope.spawn(move || {
                 let mut stream = stream;
@@ -260,7 +274,7 @@ pub fn run_daemon(backend: &dyn Backend, target: &str, args: &[String]) -> Resul
                 }
 
                 if cmd == "quit" {
-                    let response = handle_command(&cmd, backend, session, cached_help);
+                    let response = handle_quit(backend, session, child_pid);
                     let _ = stream.write_all(response.as_bytes());
                     // Exit immediately — scoped threads would otherwise wait
                     // for any blocked command (e.g. `continue`) to finish.
@@ -282,32 +296,44 @@ fn lock_session(session: &Mutex<Session>) -> std::sync::MutexGuard<'_, Session> 
     session.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// Graceful quit: interrupt the child so any blocked `send_and_wait`
+/// returns, acquire the session lock, persist the DB, then quit the
+/// debugger. This fixes the jdb timing issue where the 2s lock timeout
+/// wasn't enough for a slow `continue` to finish.
+fn handle_quit(backend: &dyn Backend, session: &Mutex<Session>, child_pid: &AtomicI32) -> String {
+    // SIGINT the child to interrupt any blocked PTY read (e.g. jdb
+    // waiting for a breakpoint during `continue`). This causes the
+    // `send_and_wait` in the command thread to return promptly,
+    // releasing the session lock so we can acquire it.
+    let pid = nix::unistd::Pid::from_raw(child_pid.load(Ordering::Relaxed));
+    let _ = nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGINT);
+
+    // Give the interrupted command thread time to release the lock.
+    // 5s is generous — after the SIGINT the prompt usually appears
+    // within 100-200ms, so the lock drops well before the deadline.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Ok(mut guard) = session.try_lock() {
+            persist_session_on_exit(&mut guard);
+            guard.proc.quit(backend.quit_command());
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    "stopped".to_string()
+}
+
 fn handle_command(cmd: &str, backend: &dyn Backend, session: &Mutex<Session>, cached_help: &str) -> String {
     // Serve help from cache — no lock needed, works even when the debugger is busy.
     if cmd == "help" {
         return cached_help.to_string();
     }
 
-    if cmd == "quit" {
-        if let Ok(mut guard) = session.try_lock() {
-            // Best-effort persist the SessionDb to its final location so
-            // the agent can reopen with `dbg sessions` / `dbg diff`.
-            persist_session_on_exit(&mut guard);
-            guard.proc.quit(backend.quit_command());
-        }
-        // If the lock is held (debugger busy), process::exit in the event
-        // loop will handle cleanup via DebuggerProcess::Drop. We lose
-        // the capture in that case — by design; the agent interrupted.
-        return "stopped".to_string();
-    }
-
-    if cmd == "events" {
-        let mut guard = lock_session(session);
-        if guard.events.is_empty() {
-            return "none".to_string();
-        }
-        let events: Vec<String> = guard.events.drain(..).collect();
-        return events.join("\n");
+    if cmd == "events" || cmd.starts_with("events ") {
+        return handle_events(cmd, session);
     }
 
     // Profile mode: handle commands from in-memory profile data
@@ -337,6 +363,10 @@ fn handle_command(cmd: &str, backend: &dyn Backend, session: &Mutex<Session>, ca
     match commands::dispatch(cmd, backend) {
         Dispatched::Immediate(resp) => {
             let mut guard = lock_session(session);
+            // Drain deferred stop banners even for immediate commands.
+            // node-inspect's `locals` dispatches as Immediate (unsupported),
+            // but a prior `continue` may have left a banner in the PTY.
+            drain_pending_events(&mut guard, backend);
             log_command(&mut guard, cmd, &resp, Some("meta"));
             resp
         }
@@ -346,14 +376,13 @@ fn handle_command(cmd: &str, backend: &dyn Backend, session: &Mutex<Session>, ca
             decorate,
         } => {
             let mut guard = lock_session(session);
+            // Drain any deferred stop banner from a prior async
+            // execution command before sending the next one.
+            drain_pending_events(&mut guard, backend);
+
             match guard.proc.send_and_wait(&native_cmd, CMD_TIMEOUT) {
                 Ok(raw) => {
-                    // Run hit capture on the RAW output — some backends
-                    // (rdbg, phpdbg) strip stop banners into events during
-                    // clean, so parse_hit wouldn't see them on the cleaned
-                    // form. The raw text always contains the debugger's
-                    // stop announcement verbatim.
-                    if command_may_stop(cmd) {
+                    if op_may_stop(canonical_op) {
                         capture_hit_if_stopped(&mut guard, backend, &raw);
                     }
                     // When the agent explicitly runs `dbg locals`,
@@ -367,9 +396,6 @@ fn handle_command(cmd: &str, backend: &dyn Backend, session: &Mutex<Session>, ca
                     }
 
                     let result = backend.clean(&native_cmd, &raw);
-                    for event in result.events {
-                        guard.events.push_back(event);
-                    }
                     let mut cleaned = result.output;
                     if decorate {
                         cleaned = debug_cmds::decorate_output(backend, &cleaned);
@@ -383,6 +409,10 @@ fn handle_command(cmd: &str, backend: &dyn Backend, session: &Mutex<Session>, ca
         Dispatched::Query(q) => {
             let canonical_op = q.canonical_op();
             let mut guard = lock_session(session);
+            // Drain first: a deferred stop banner from a prior async
+            // execution may still be pending in the channel. Without
+            // draining here, the query would report stale hit counts.
+            drain_pending_events(&mut guard, backend);
             let response = run_crosstrack(&mut guard, backend, &q);
             log_command(&mut guard, cmd, &response, Some(canonical_op));
             response
@@ -390,6 +420,7 @@ fn handle_command(cmd: &str, backend: &dyn Backend, session: &Mutex<Session>, ca
         Dispatched::Lifecycle(l) => {
             let canonical_op = l.canonical_op();
             let mut guard = lock_session(session);
+            drain_pending_events(&mut guard, backend);
             let ctx = lifecycle_cmds::LifeCtx {
                 cwd: &guard.cwd,
                 active: guard.db.as_ref(),
@@ -400,15 +431,14 @@ fn handle_command(cmd: &str, backend: &dyn Backend, session: &Mutex<Session>, ca
         }
         Dispatched::Fallthrough => {
             let mut guard = lock_session(session);
+            drain_pending_events(&mut guard, backend);
+
             match guard.proc.send_and_wait(cmd, CMD_TIMEOUT) {
                 Ok(raw) => {
                     if command_may_stop(cmd) {
                         capture_hit_if_stopped(&mut guard, backend, &raw);
                     }
                     let result = backend.clean(cmd, &raw);
-                    for event in result.events {
-                        guard.events.push_back(event);
-                    }
                     let cleaned = result.output;
                     log_command(&mut guard, cmd, &cleaned, None);
                     cleaned
@@ -440,26 +470,126 @@ fn log_command(session: &mut Session, input: &str, output: &str, canonical_op: O
     );
 }
 
-/// Parse `cleaned` through the active backend's `CanonicalOps::parse_hit`
+/// Format the reader's event log for `dbg events`. Supports:
+///   * `events`              — full retained log
+///   * `events --since=<N>`  — only entries with seq > N
+///   * `events --tail=<N>`   — only last N entries
+///
+/// Agents use this to tail a session's PTY timeline without racing
+/// `send_and_wait`. The log is populated by the reader thread, so it
+/// updates even while a command is blocked — `dbg events` can be served
+/// from a read-lock-free path except for the one lock on the log itself.
+fn handle_events(cmd: &str, session: &Mutex<Session>) -> String {
+    let mut since: u64 = 0;
+    let mut tail: Option<usize> = None;
+    for tok in cmd.split_whitespace().skip(1) {
+        if let Some(v) = tok.strip_prefix("--since=") {
+            since = v.parse().unwrap_or(0);
+        } else if let Some(v) = tok.strip_prefix("--tail=") {
+            tail = v.parse().ok();
+        }
+    }
+
+    let guard = lock_session(session);
+    let mut entries = guard.proc.events_since(since);
+    let last_seq = guard.proc.last_event_seq();
+    drop(guard);
+
+    if let Some(n) = tail {
+        if entries.len() > n {
+            entries.drain(..entries.len() - n);
+        }
+    }
+
+    if entries.is_empty() {
+        return format!("no events (last seq={last_seq})");
+    }
+
+    let mut out = String::new();
+    for e in &entries {
+        let kind = e.kind.as_str();
+        let ts = format_ms(e.ts_ms);
+        match e.kind {
+            crate::pty::EventKind::Output => {
+                let preview = output_preview(&e.bytes);
+                let nbytes = e.bytes.len();
+                out.push_str(&format!(
+                    "#{seq:<6} {ts:>9}  {kind:<7} {nbytes:>5}B  {preview}\n",
+                    seq = e.seq,
+                    ts = ts,
+                    kind = kind,
+                    nbytes = nbytes,
+                    preview = preview,
+                ));
+            }
+            crate::pty::EventKind::Prompt | crate::pty::EventKind::Exit => {
+                out.push_str(&format!(
+                    "#{seq:<6} {ts:>9}  {kind}\n",
+                    seq = e.seq,
+                    ts = ts,
+                    kind = kind,
+                ));
+            }
+        }
+    }
+    out.push_str(&format!(
+        "({n} entries, last seq={last_seq})\n",
+        n = entries.len(),
+        last_seq = last_seq,
+    ));
+    out
+}
+
+fn format_ms(ms: u64) -> String {
+    if ms < 1000 {
+        format!("+{ms}ms")
+    } else {
+        format!("+{:.2}s", ms as f64 / 1000.0)
+    }
+}
+
+/// One-line preview of an Output event. Strips ANSI, collapses
+/// whitespace, truncates to 80 chars. Used by `dbg events`.
+fn output_preview(bytes: &[u8]) -> String {
+    let s = String::from_utf8_lossy(bytes);
+    let cleaned = s.replace(['\r', '\n'], "⏎").replace('\t', " ");
+    let single: String = cleaned.split_whitespace().collect::<Vec<_>>().join(" ");
+    if single.chars().count() > 80 {
+        let truncated: String = single.chars().take(77).collect();
+        format!("{truncated}…")
+    } else {
+        single
+    }
+}
+
+/// Drain any events that arrived on the reader channel since the last
+/// command. For async debuggers (node-inspect) the stop banner for a
+/// prior `continue` can arrive *after* the ack prompt, while the daemon
+/// is idle. The reader thread captures those bytes regardless; this
+/// helper pulls them from the channel and feeds them through
+/// `capture_hit_if_stopped` before the next command runs. Non-blocking.
+fn drain_pending_events(session: &mut Session, backend: &dyn Backend) {
+    if let Some(pending) = session.proc.drain_pending() {
+        if !pending.trim().is_empty() {
+            capture_hit_if_stopped(session, backend, &pending);
+        }
+    }
+}
+
+/// Parse `output` through the active backend's `CanonicalOps::parse_hit`
 /// and, on a match, synthesize `op_locals` + `op_stack` roundtrips so
 /// we can attach a rich hit record to the SessionDb without asking the
 /// agent to run extra commands.
-fn capture_hit_if_stopped(session: &mut Session, backend: &dyn Backend, cleaned: &str) {
+///
+/// With PTY echo disabled, each `send_and_wait` returns exactly the
+/// debugger's response for that command.  Stop banners always appear
+/// in the execution command's response — no deferred/merged banners.
+fn capture_hit_if_stopped(session: &mut Session, backend: &dyn Backend, output: &str) {
     let ops = match backend.canonical_ops() {
         Some(o) => o,
         None => return,
     };
-    // Diagnostic: dump capture input to a temp file so we can see
-    // exactly what parse_hit receives. Remove once all backends stable.
-    if let Ok(diag_path) = std::env::var("DBG_CAPTURE_DIAG") {
-        use std::io::Write as IoWrite;
-        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&diag_path) {
-            let _ = writeln!(f, "--- capture_hit_if_stopped (tool={}) ---", ops.tool_name());
-            let _ = writeln!(f, "input ({} bytes):\n{}\n---END---", cleaned.len(), cleaned);
-        }
-    }
-
-    let hit = match ops.parse_hit(cleaned) {
+    let hit = match ops.parse_hit(output) {
         Some(h) => h,
         None => return,
     };
@@ -468,16 +598,11 @@ fn capture_hit_if_stopped(session: &mut Session, backend: &dyn Backend, cleaned:
         None => return,
     };
 
-    // Advance the per-location hit counter. First hit is #1.
     let seq = session.hit_seq.entry(hit.location_key.clone()).or_insert(0);
     *seq += 1;
     let hit_seq = *seq as i64;
 
-    // Synthesize the locals + stack roundtrips after a stop. Use a
-    // SHORT timeout so a backend whose prompt doesn't match cleanly
-    // (jdb on `locals`) doesn't block the session for 60s. 3s is
-    // enough for any debugger that's already stopped to reply.
-    // Only auto-capture locals + stack when the backend says it's safe.
+    // Auto-capture locals + stack when the backend says it's safe.
     // Fragile backends (jdb, ghci, netcoredbg CLI) set
     // `auto_capture_locals = false` because the synthesized roundtrip
     // can destroy their PTY state. Agents use `dbg locals` explicitly.
@@ -486,35 +611,24 @@ fn capture_hit_if_stopped(session: &mut Session, backend: &dyn Backend, cleaned:
         let lj = ops
             .op_locals()
             .ok()
-            .and_then(|op| {
-                match session.proc.send_and_wait(&op, CAPTURE_TIMEOUT) {
-                    Ok(raw) => ops.parse_locals(&raw).map(|v| v.to_string()),
-                    Err(_) => {
-                        drain_pty(&session.proc);
-                        None
-                    }
-                }
+            .and_then(|op| match session.proc.send_and_wait(&op, CAPTURE_TIMEOUT) {
+                Ok(raw) => ops.parse_locals(&raw).map(|v| v.to_string()),
+                Err(_) => None,
             });
-        let sj = ops
-            .op_stack(Some(20))
-            .ok()
-            .and_then(|op| {
-                match session.proc.send_and_wait(&op, CAPTURE_TIMEOUT) {
-                    Ok(raw) => Some(serde_json::json!({
+        let sj = ops.op_stack(Some(20)).ok().and_then(|op| {
+            match session.proc.send_and_wait(&op, CAPTURE_TIMEOUT) {
+                Ok(raw) => Some(
+                    serde_json::json!({
                         "raw": raw,
                         "frame_symbol": hit.frame_symbol,
                     })
-                    .to_string()),
-                    Err(_) => {
-                        drain_pty(&session.proc);
-                        None
-                    }
-                }
-            });
+                    .to_string(),
+                ),
+                Err(_) => None,
+            }
+        });
         (lj, sj)
     } else {
-        // Store just the frame_symbol from parse_hit so `cross` can
-        // still find the symbol even without locals.
         let sj = hit.frame_symbol.as_ref().map(|s| {
             serde_json::json!({ "frame_symbol": s }).to_string()
         });
@@ -589,23 +703,6 @@ fn backfill_locals(session: &mut Session, backend: &dyn Backend, raw_output: &st
          )",
         params![locals_json],
     );
-}
-
-/// Discard any pending PTY output so the next `send_and_wait` starts
-/// from a clean buffer. Called after a timed-out synthesized roundtrip
-/// to prevent stale data from poisoning the next agent command.
-fn drain_pty(proc: &DebuggerProcess) {
-    let mut buf = [0u8; 4096];
-    // Keep reading as long as there's data ready (poll 50ms).
-    // Once the buffer is quiet for 50ms, we're done.
-    loop {
-        if !proc.poll_ready(50) {
-            break;
-        }
-        if proc.read_master_raw(&mut buf) == 0 {
-            break;
-        }
-    }
 }
 
 /// Back up the session DB to `.dbg/sessions/<label>.db` iff the
