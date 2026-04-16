@@ -148,7 +148,7 @@ impl EventLog {
 pub struct LogHandle(Arc<(Mutex<EventLog>, Condvar)>);
 
 impl LogHandle {
-    fn new() -> Self {
+    pub fn new() -> Self {
         Self(Arc::new((Mutex::new(EventLog::new()), Condvar::new())))
     }
 
@@ -223,6 +223,21 @@ pub trait DebuggerIo: Send + Sync {
 
     /// Graceful shutdown — send quit command then SIGKILL on timeout.
     fn quit(&self, quit_cmd: &str);
+
+    /// Structured hit event produced by the transport's async channel
+    /// (e.g. a V8 Inspector `Debugger.paused`). When `Some`, the
+    /// daemon uses it directly and skips the text-based `parse_hit`
+    /// pipeline — no regex banner scraping, no async banner races.
+    /// Returns `None` on text/PTY transports; the `parse_hit` path
+    /// handles them.
+    ///
+    /// Contract: each call takes the pending event out. Callers drain
+    /// once per execution command, immediately after the command
+    /// returns. Returning `Some` more than once per actual pause is a
+    /// transport bug.
+    fn pending_hit(&self) -> Option<crate::backend::canonical::HitEvent> {
+        None
+    }
 }
 
 /// A debugger process running in a PTY. The reader thread owns the

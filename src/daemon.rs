@@ -155,15 +155,27 @@ fn command_may_stop(cmd: &str) -> bool {
 /// Start the daemon: spawn the debugger, listen on socket.
 /// This function does NOT return on success — it runs the event loop.
 pub fn run_daemon(backend: &dyn Backend, target: &str, args: &[String]) -> Result<()> {
-    let config = backend.spawn_config(target, args)?;
-
-    let proc = DebuggerProcess::spawn(
-        &config.bin,
-        &config.args,
-        &config.env,
-        backend.prompt_pattern(),
-    )
-    .context("failed to spawn debugger")?;
+    // Branch on transport kind. Most backends use the default PTY
+    // transport; `node-proto` uses the V8 Inspector WebSocket
+    // transport so program stdout and stop events arrive structured
+    // and race-free. Both paths produce a `Box<dyn DebuggerIo>`.
+    // Inspector backends have no post-spawn init commands — their
+    // domain enables happen inside the transport itself.
+    let (proc, init_commands): (Box<dyn DebuggerIo>, Vec<String>) = if backend.uses_inspector() {
+        let t = crate::inspector::InspectorTransport::spawn(target, args)
+            .context("failed to spawn inspector transport")?;
+        (Box::new(t), Vec::new())
+    } else {
+        let config = backend.spawn_config(target, args)?;
+        let p = DebuggerProcess::spawn(
+            &config.bin,
+            &config.args,
+            &config.env,
+            backend.prompt_pattern(),
+        )
+        .context("failed to spawn debugger")?;
+        (Box::new(p), config.init_commands)
+    };
 
     // Expose the child PID outside the session mutex so the quit handler
     // can SIGINT the child to interrupt a blocked `send_and_wait` (e.g.
@@ -180,8 +192,8 @@ pub fn run_daemon(backend: &dyn Backend, target: &str, args: &[String]) -> Resul
     proc.wait_for_prompt(Duration::from_secs(120))
         .context("debugger did not produce prompt")?;
 
-    // Run init commands
-    for cmd in &config.init_commands {
+    // Run init commands (PTY backends only; inspector has none).
+    for cmd in &init_commands {
         proc.send_and_wait(cmd, CMD_TIMEOUT)?;
     }
 
@@ -239,7 +251,7 @@ pub fn run_daemon(backend: &dyn Backend, target: &str, args: &[String]) -> Resul
     };
 
     let session = Mutex::new(Session {
-        proc: Box::new(proc) as Box<dyn DebuggerIo>,
+        proc,
         profile,
         db,
         hit_seq: HashMap::new(),
@@ -723,9 +735,16 @@ fn capture_hit_if_stopped(session: &mut Session, backend: &dyn Backend, output: 
         Some(o) => o,
         None => return,
     };
-    let hit = match ops.parse_hit(output) {
+    // Structured path first: protocol transports (V8 Inspector, DAP)
+    // deliver paused events with frame data inline; we skip text
+    // banner parsing entirely. Falls back to `parse_hit` for PTY
+    // transports that only surface stop info as debugger output.
+    let hit = match session.proc.pending_hit() {
         Some(h) => h,
-        None => return,
+        None => match ops.parse_hit(output) {
+            Some(h) => h,
+            None => return,
+        },
     };
 
     let seq = session.hit_seq.entry(hit.location_key.clone()).or_insert(0);

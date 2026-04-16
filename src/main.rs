@@ -4,6 +4,7 @@ mod commands;
 mod daemon;
 mod ghcprof;
 mod init;
+mod inspector;
 mod jitdasm;
 mod phpprofile;
 mod profile;
@@ -74,6 +75,7 @@ fn main() -> Result<()> {
     registry.register(Box::new(backend::ghcprof::GhcProfBackend));
     registry.register(Box::new(backend::ocamldebug::OcamlDebugBackend));
     registry.register(Box::new(backend::node_inspect::NodeInspectBackend));
+    registry.register(Box::new(backend::node_proto::NodeProtoBackend));
     registry.register(Box::new(backend::nodeprof::NodeProfBackend));
 
     // Auto-update installed skills if binary version changed

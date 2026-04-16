@@ -11,6 +11,7 @@ pub mod netcoredbg;
 pub mod massif;
 pub mod memcheck;
 pub mod node_inspect;
+pub mod node_proto;
 pub mod nodeprof;
 pub mod ocamldebug;
 pub mod perf;
@@ -117,6 +118,13 @@ pub trait Backend: Send + Sync {
     /// available for <tool>" to the agent in that case.
     fn canonical_ops(&self) -> Option<&dyn CanonicalOps> {
         None
+    }
+
+    /// Override to route through the V8 Inspector transport instead
+    /// of the default PTY transport. Only `node-proto` returns true
+    /// today; future protocol backends (DAP) add their own hooks.
+    fn uses_inspector(&self) -> bool {
+        false
     }
 }
 
