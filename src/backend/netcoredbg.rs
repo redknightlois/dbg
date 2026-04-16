@@ -4,7 +4,7 @@ use std::sync::OnceLock;
 use regex::Regex;
 use serde_json::{Map, Value};
 
-use super::canonical::{BreakId, BreakLoc, CanonicalOps, HitEvent};
+use super::canonical::{BreakId, BreakLoc, CanonicalOps, HitEvent, unsupported};
 use super::{Backend, CleanResult, Dependency, DependencyCheck, SpawnConfig};
 
 pub struct NetCoreDbgBackend;
@@ -213,14 +213,11 @@ impl CanonicalOps for NetCoreDbgBackend {
     }
     fn op_locals(&self) -> anyhow::Result<String> {
         // netcoredbg's CLI mode has no bulk `info locals` equivalent.
-        // The agent can `dbg print <varname>` for individual variables.
-        // We emit a single-variable probe that's likely to exist at any
-        // breakpoint so the capture path gets *something* useful. If the
-        // variable doesn't exist the output is harmless noise.
-        //
-        // For proper locals capture, Phase 2 should switch netcoredbg to
-        // MI mode and use `-stack-list-variables --all-values`.
-        Ok("print this".into())
+        // `print this` only shows the implicit receiver and doesn't
+        // list method-local variables. Phase 2 should switch to MI
+        // mode + `-stack-list-variables --all-values`. For now, agents
+        // use `dbg print <varname>` for individual variables.
+        Err(unsupported("netcoredbg", "bulk locals in CLI mode (use `dbg print <var>` for individual variables)"))
     }
     fn op_print(&self, expr: &str) -> anyhow::Result<String> {
         Ok(format!("print {expr}"))

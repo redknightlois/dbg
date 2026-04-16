@@ -3,7 +3,7 @@ use std::sync::OnceLock;
 use regex::Regex;
 use serde_json::{Map, Value};
 
-use super::canonical::{BreakLoc, CanonicalOps, HitEvent, unsupported};
+use super::canonical::{BreakLoc, CanonicalOps, HitEvent};
 use super::{Backend, CleanResult, Dependency, DependencyCheck, SpawnConfig};
 
 pub struct PhpdbgBackend;
@@ -138,11 +138,44 @@ impl CanonicalOps for PhpdbgBackend {
     fn op_stack(&self, _n: Option<u32>) -> anyhow::Result<String> { Ok("back".into()) }
     fn op_frame(&self, n: u32) -> anyhow::Result<String> { Ok(format!("frame {n}")) }
     fn op_locals(&self) -> anyhow::Result<String> {
-        // phpdbg's `info locals` shows execution context, not variables.
-        // `ev get_defined_vars()` returns a PHP array of all locals.
-        Ok("ev get_defined_vars()".into())
+        // phpdbg's `info vars` lists names only; the canonical way to
+        // recover both names and values in one round-trip is
+        // `ev get_defined_vars()`, which prints a `var_dump`-style
+        // nested array we parse below. The historical concern that
+        // this "can hang the session" no longer holds — phpdbg 7.4+
+        // returns immediately and our parse-locals regex handles the
+        // `["name"]=> type(value)` layout that var_dump emits.
+        Ok("ev var_dump(get_defined_vars())".into())
     }
-    fn op_print(&self, expr: &str) -> anyhow::Result<String> { Ok(format!("ev {expr}")) }
+    fn op_print(&self, expr: &str) -> anyhow::Result<String> {
+        // phpdbg's `ev` eval runs its argument as PHP, so a bare
+        // identifier like `a` resolves as a constant ("Undefined
+        // constant 'a'") rather than the variable the user meant.
+        // Rewrite bare identifiers to their `$name` form; leave
+        // anything more complex (already-sigiled, operators, call
+        // syntax, member access, ...) alone so agents stay in control.
+        let trimmed = expr.trim();
+        let is_bare_ident = !trimmed.is_empty()
+            && !trimmed.starts_with('$')
+            && trimmed
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+            && trimmed
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_');
+        if is_bare_ident {
+            Ok(format!("ev ${trimmed}"))
+        } else {
+            Ok(format!("ev {expr}"))
+        }
+    }
+    fn op_breaks(&self) -> anyhow::Result<String> {
+        // phpdbg lists active breakpoints via `info break` (alias `i b`);
+        // the default trait emits `breakpoint list`, which phpdbg rejects
+        // with "command 'breakpoint' could not be found".
+        Ok("info break".into())
+    }
     fn op_list(&self, _loc: Option<&str>) -> anyhow::Result<String> { Ok("list".into()) }
 
     fn parse_hit(&self, output: &str) -> Option<HitEvent> {

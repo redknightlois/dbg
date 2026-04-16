@@ -356,6 +356,16 @@ fn handle_command(cmd: &str, backend: &dyn Backend, session: &Mutex<Session>, ca
                     if command_may_stop(cmd) {
                         capture_hit_if_stopped(&mut guard, backend, &raw);
                     }
+                    // When the agent explicitly runs `dbg locals`,
+                    // retroactively fill in the most recent hit's
+                    // locals_json if it was NULL. This enables sparklines
+                    // for backends where auto_capture_locals=false: the
+                    // agent's natural workflow (continue → locals →
+                    // continue → locals) populates the data.
+                    if canonical_op == "locals" {
+                        backfill_locals(&mut guard, backend, &raw);
+                    }
+
                     let result = backend.clean(&native_cmd, &raw);
                     for event in result.events {
                         guard.events.push_back(event);
@@ -550,6 +560,37 @@ fn run_crosstrack(session: &mut Session, backend: &dyn Backend, q: &crosstrack::
 /// Discard any pending PTY output so the next `send_and_wait` starts
 /// from a clean buffer. Called after a timed-out synthesized roundtrip
 /// to prevent stale data from poisoning the next agent command.
+/// When the agent explicitly runs `dbg locals`, retroactively fill in
+/// the most recent breakpoint_hits row's `locals_json` if it was NULL.
+/// This enables `dbg hit-trend <loc> <field>` sparklines for backends
+/// where `auto_capture_locals=false`: the agent's natural workflow
+/// (`continue` → `locals` → repeat) populates the data progressively.
+fn backfill_locals(session: &mut Session, backend: &dyn Backend, raw_output: &str) {
+    let ops = match backend.canonical_ops() {
+        Some(o) => o,
+        None => return,
+    };
+    let locals_json = match ops.parse_locals(raw_output) {
+        Some(v) => v.to_string(),
+        None => return,
+    };
+    let db = match session.db.as_ref() {
+        Some(d) => d,
+        None => return,
+    };
+    // Update the most recent hit that has NULL locals_json.
+    let _ = db.conn().execute(
+        "UPDATE breakpoint_hits
+         SET locals_json = ?1
+         WHERE id = (
+             SELECT id FROM breakpoint_hits
+             WHERE locals_json IS NULL
+             ORDER BY id DESC LIMIT 1
+         )",
+        params![locals_json],
+    );
+}
+
 /// Discard any pending PTY output so the next `send_and_wait` starts
 /// from a clean buffer. Called after a timed-out synthesized roundtrip
 /// to prevent stale data from poisoning the next agent command.

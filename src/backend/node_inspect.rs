@@ -160,11 +160,11 @@ impl CanonicalOps for NodeInspectBackend {
     fn op_stack(&self, _n: Option<u32>) -> anyhow::Result<String> { Ok("backtrace".into()) }
     fn op_frame(&self, n: u32) -> anyhow::Result<String> { Ok(format!("frame({n})")) }
     fn op_locals(&self) -> anyhow::Result<String> {
-        // node-inspect doesn't have a bulk "show locals" command.
-        // `exec` enters REPL mode which is interactive and unsuitable
-        // for auto-capture. Best-effort: evaluate a scope probe.
-        // The agent should use `dbg print <varname>` for specific vars.
-        Ok("exec typeof a !== 'undefined' ? JSON.stringify({a,b}) : '{}'".into())
+        // node-inspect has no safe bulk-locals command. The `exec`
+        // REPL mode can trigger execution and crash the session.
+        // Agents should use `dbg print <varname>` for specific vars
+        // or `dbg raw exec <expr>` when they know the context.
+        Err(unsupported("node-inspect", "bulk locals (use `dbg print <var>` for individual variables)"))
     }
     fn op_print(&self, expr: &str) -> anyhow::Result<String> { Ok(format!("exec {expr}")) }
     fn op_list(&self, _loc: Option<&str>) -> anyhow::Result<String> { Ok("list(10)".into()) }
