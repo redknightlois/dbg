@@ -487,22 +487,27 @@ fn log_command(session: &mut Session, input: &str, output: &str, canonical_op: O
 }
 
 /// Format the reader's event log for `dbg events`. Supports:
-///   * `events`                 — full retained log
-///   * `events --since=<N>`     — only entries with seq > N
-///   * `events --tail=<N>`      — only last N entries
-///   * `events --wait=<ms>`     — block up to this many ms for new
-///                                 entries past `--since` before
-///                                 returning. Capped at 60s.
+///   * `events`                     — full retained log
+///   * `events --since=<N>`         — only entries with seq > N
+///   * `events --tail=<N>`          — only last N entries
+///   * `events --kind=stop[,output]` — filter by event kind
+///   * `events --wait=<ms>`         — block up to this many ms for
+///                                     new entries matching the filter
+///                                     (capped at 50s).
+///
+/// Combined `--kind=stop --wait=N --since=M` means "wake me on the
+/// next breakpoint hit past seq M, or timeout after N ms."
 ///
 /// Agents use this to tail a session's PTY timeline live. The log is
-/// populated by the reader thread, so it updates even while a command
-/// is blocked — for `--wait` we clone the log handle, drop the session
-/// mutex, then block on the log's condvar. That keeps `dbg events`
-/// concurrent with a long-running `continue`.
+/// populated by the reader thread + daemon (Stop events), so it updates
+/// even while a command is blocked — `handle_events` never touches the
+/// session mutex, so live-tailing is concurrent with a blocked
+/// `continue`.
 fn handle_events(cmd: &str, log_handle: &crate::pty::LogHandle) -> String {
     let mut since: u64 = 0;
     let mut tail: Option<usize> = None;
     let mut wait_ms: Option<u64> = None;
+    let mut kinds: Option<Vec<crate::pty::EventKind>> = None;
     for tok in cmd.split_whitespace().skip(1) {
         if let Some(v) = tok.strip_prefix("--since=") {
             since = v.parse().unwrap_or(0);
@@ -510,16 +515,63 @@ fn handle_events(cmd: &str, log_handle: &crate::pty::LogHandle) -> String {
             tail = v.parse().ok();
         } else if let Some(v) = tok.strip_prefix("--wait=") {
             wait_ms = v.parse().ok();
+        } else if let Some(v) = tok.strip_prefix("--kind=") {
+            let mut parsed = Vec::new();
+            for name in v.split(',') {
+                match crate::pty::EventKind::parse(name) {
+                    Some(k) => parsed.push(k),
+                    None => {
+                        return format!(
+                            "unknown event kind '{name}' in --kind={v} (valid: output, prompt, exit, stop)"
+                        );
+                    }
+                }
+            }
+            if !parsed.is_empty() {
+                kinds = Some(parsed);
+            }
         }
     }
 
-    let mut entries = log_handle.since(since);
+    let matches_filter = |kind: crate::pty::EventKind| -> bool {
+        match &kinds {
+            None => true,
+            Some(ks) => ks.contains(&kind),
+        }
+    };
+
+    // Snapshot + filter.
+    let mut entries: Vec<_> = log_handle
+        .since(since)
+        .into_iter()
+        .filter(|e| matches_filter(e.kind))
+        .collect();
+
+    // If no matching entries and --wait is set, loop-wait on the
+    // condvar until a matching event arrives or the deadline expires.
+    // Plain wait (no filter) wakes on any new event — fine; wake-check
+    // is cheap. With a filter, unrelated events can wake the wait, so
+    // we re-check and re-wait against the remaining deadline.
     if entries.is_empty() {
         if let Some(ms) = wait_ms {
-            // Cap below CMD_TIMEOUT (60s) so the client's socket read
-            // timeout always fires after the server responds, not during.
             let capped = ms.min(50_000);
-            entries = log_handle.since_wait(since, Duration::from_millis(capped));
+            let deadline = std::time::Instant::now() + Duration::from_millis(capped);
+            let mut cursor = since;
+            loop {
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                if remaining.is_zero() {
+                    break;
+                }
+                let woke = log_handle.since_wait(cursor, remaining);
+                if woke.is_empty() {
+                    break;
+                }
+                cursor = woke.last().map(|e| e.seq).unwrap_or(cursor);
+                entries.extend(woke.into_iter().filter(|e| matches_filter(e.kind)));
+                if !entries.is_empty() {
+                    break;
+                }
+            }
         }
     }
     let last_seq = log_handle.last_seq();
@@ -559,6 +611,15 @@ fn handle_events(cmd: &str, log_handle: &crate::pty::LogHandle) -> String {
                     kind = kind,
                 ));
             }
+            crate::pty::EventKind::Stop => {
+                out.push_str(&format!(
+                    "#{seq:<6} {ts:>9}  {kind:<7}   {payload}\n",
+                    seq = e.seq,
+                    ts = ts,
+                    kind = kind,
+                    payload = format_stop_payload(&e.bytes),
+                ));
+            }
         }
     }
     out.push_str(&format!(
@@ -575,6 +636,30 @@ fn format_ms(ms: u64) -> String {
     } else {
         format!("+{:.2}s", ms as f64 / 1000.0)
     }
+}
+
+/// Format a Stop event's JSON payload as a readable one-line summary.
+/// Emitted by `capture_hit_if_stopped`; fields are location_key,
+/// hit_seq, thread, file, line, frame_symbol.
+fn format_stop_payload(bytes: &[u8]) -> String {
+    let s = String::from_utf8_lossy(bytes);
+    let v: serde_json::Value = match serde_json::from_str(&s) {
+        Ok(v) => v,
+        Err(_) => return format!("(unparseable stop: {s})"),
+    };
+    let loc = v.get("location_key").and_then(|x| x.as_str()).unwrap_or("?");
+    let seq = v.get("hit_seq").and_then(|x| x.as_i64()).unwrap_or(0);
+    let frame = v
+        .get("frame_symbol")
+        .and_then(|x| x.as_str())
+        .map(|s| format!(" in {s}"))
+        .unwrap_or_default();
+    let thread = v
+        .get("thread")
+        .and_then(|x| x.as_str())
+        .map(|s| format!(" thread={s}"))
+        .unwrap_or_default();
+    format!("{loc} #{seq}{frame}{thread}")
 }
 
 /// One-line preview of an Output event. Strips ANSI, collapses
@@ -622,14 +707,32 @@ fn capture_hit_if_stopped(session: &mut Session, backend: &dyn Backend, output: 
         Some(h) => h,
         None => return,
     };
-    let db = match session.db.as_ref() {
-        Some(d) => d,
-        None => return,
-    };
 
     let seq = session.hit_seq.entry(hit.location_key.clone()).or_insert(0);
     *seq += 1;
     let hit_seq = *seq as i64;
+
+    // Emit a structured Stop event on the timeline so `dbg events
+    // --kind=stop` can tail program stops. Lean payload — callers who
+    // need locals/stack query the session DB by location_key + hit_seq.
+    let stop_payload = serde_json::json!({
+        "location_key": hit.location_key,
+        "hit_seq": hit_seq,
+        "thread": hit.thread,
+        "file": hit.file,
+        "line": hit.line,
+        "frame_symbol": hit.frame_symbol,
+    })
+    .to_string();
+    session
+        .proc
+        .log()
+        .push(crate::pty::EventKind::Stop, stop_payload.into_bytes());
+
+    let db = match session.db.as_ref() {
+        Some(d) => d,
+        None => return,
+    };
 
     // Auto-capture locals + stack when the backend says it's safe.
     // Fragile backends (jdb, ghci, netcoredbg CLI) set

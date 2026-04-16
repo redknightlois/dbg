@@ -37,11 +37,16 @@ pub enum PtyEvent {
 /// Kind of entry stored in the event log. The log is a tamer,
 /// persistent view of the channel — same information, but retained so
 /// `dbg events` can replay what happened.
+///
+/// `Output`, `Prompt`, `Exit` are pushed by the reader thread. `Stop`
+/// is pushed by the daemon after parse_hit succeeds on an execution
+/// command's output — the bytes field carries a JSON HitEvent.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EventKind {
     Output,
     Prompt,
     Exit,
+    Stop,
 }
 
 impl EventKind {
@@ -50,6 +55,19 @@ impl EventKind {
             EventKind::Output => "output",
             EventKind::Prompt => "prompt",
             EventKind::Exit => "exit",
+            EventKind::Stop => "stop",
+        }
+    }
+
+    /// Parse a kind name (lowercase) for filtering. Returns None if
+    /// the string doesn't match any known kind.
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "output" => Some(EventKind::Output),
+            "prompt" => Some(EventKind::Prompt),
+            "exit" => Some(EventKind::Exit),
+            "stop" => Some(EventKind::Stop),
+            _ => None,
         }
     }
 }
@@ -125,8 +143,10 @@ impl LogHandle {
         Self(Arc::new((Mutex::new(EventLog::new()), Condvar::new())))
     }
 
-    /// Reader-side push. Appends the event and notifies all waiters.
-    fn push(&self, kind: EventKind, bytes: Vec<u8>) {
+    /// Append an event and notify all waiters. Used both by the reader
+    /// thread (Output / Prompt / Exit) and by the daemon (Stop, emitted
+    /// after parse_hit succeeds on an execution command's output).
+    pub fn push(&self, kind: EventKind, bytes: Vec<u8>) {
         let (lock, cvar) = &*self.0;
         lock.lock().unwrap().push(kind, bytes);
         cvar.notify_all();
@@ -468,9 +488,12 @@ fn reader_loop(
         let ev = match kind {
             EventKind::Prompt => PtyEvent::Prompt,
             EventKind::Exit => PtyEvent::Exit,
-            // Callers only pass Prompt/Exit here; Output goes via
-            // flush_output because it carries bytes.
-            EventKind::Output => unreachable!("emit_marker called with Output"),
+            // The reader only emits Prompt/Exit via this helper.
+            // Output carries bytes so it goes through flush_output.
+            // Stop is emitted by the daemon, never by the reader.
+            EventKind::Output | EventKind::Stop => {
+                unreachable!("emit_marker called with {kind:?}")
+            }
         };
         tx.send(ev).is_ok()
     };
