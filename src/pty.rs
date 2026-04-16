@@ -41,12 +41,19 @@ pub enum PtyEvent {
 /// `Output`, `Prompt`, `Exit` are pushed by the reader thread. `Stop`
 /// is pushed by the daemon after parse_hit succeeds on an execution
 /// command's output — the bytes field carries a JSON HitEvent.
+/// `Stdout` is emitted by transports that can distinguish inferior
+/// program output from debugger chatter (protocol backends: V8
+/// Inspector, DAP). The PTY transport never emits `Stdout` because a
+/// TTY mixes both streams at the OS level; everything goes into
+/// `Output`. Agents filter with `--kind=stdout` to see only the
+/// program's own writes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EventKind {
     Output,
     Prompt,
     Exit,
     Stop,
+    Stdout,
 }
 
 impl EventKind {
@@ -56,6 +63,7 @@ impl EventKind {
             EventKind::Prompt => "prompt",
             EventKind::Exit => "exit",
             EventKind::Stop => "stop",
+            EventKind::Stdout => "stdout",
         }
     }
 
@@ -67,6 +75,7 @@ impl EventKind {
             "prompt" => Some(EventKind::Prompt),
             "exit" => Some(EventKind::Exit),
             "stop" => Some(EventKind::Stop),
+            "stdout" => Some(EventKind::Stdout),
             _ => None,
         }
     }
@@ -173,6 +182,47 @@ impl LogHandle {
             .unwrap();
         guard.since(since)
     }
+}
+
+/// Transport-agnostic debugger I/O. The daemon holds a
+/// `Box<dyn DebuggerIo>` and talks to the debugger through this
+/// interface regardless of whether the underlying transport is a PTY,
+/// a V8 Inspector WebSocket, or a DAP JSON-RPC subprocess.
+///
+/// All implementations must be `Send + Sync` because the daemon's
+/// connection-handling threads call into them from inside a mutex.
+///
+/// Implementations:
+///   * `DebuggerProcess` — PTY transport, default for line-oriented
+///     debuggers (pdb, jdb, lldb, gdb, …).
+///   * Protocol transports (coming in later steps) — Inspector, DAP.
+pub trait DebuggerIo: Send + Sync {
+    /// Send a command and wait for the prompt / ready state. Returns
+    /// the debugger's response between command echo and the next
+    /// prompt.
+    fn send_and_wait(&self, cmd: &str, timeout: Duration) -> Result<String>;
+
+    /// Drain any events that arrived asynchronously (e.g. a deferred
+    /// stop banner from a prior `continue`). Non-blocking.
+    fn drain_pending(&self) -> Option<String>;
+
+    /// Wait for the initial prompt / first-ready signal after spawn.
+    fn wait_for_prompt(&self, timeout: Duration) -> Result<String>;
+
+    /// Clone the shared event-log handle. Callers drop the session
+    /// mutex before waiting on the log's condvar.
+    fn log(&self) -> LogHandle;
+
+    /// PID of the process to SIGINT for `cancel` / `quit`. Protocol
+    /// attach-mode transports may not have one; those use a
+    /// protocol-level interrupt request instead and should override.
+    fn child_pid(&self) -> Pid;
+
+    /// Is the debugger still alive?
+    fn is_alive(&self) -> bool;
+
+    /// Graceful shutdown — send quit command then SIGKILL on timeout.
+    fn quit(&self, quit_cmd: &str);
 }
 
 /// A debugger process running in a PTY. The reader thread owns the
@@ -455,6 +505,33 @@ impl DebuggerProcess {
     }
 }
 
+/// Trait-object forwarder so the daemon can hold `Box<dyn DebuggerIo>`
+/// and route the same interface to future transports (Inspector, DAP)
+/// without touching call sites.
+impl DebuggerIo for DebuggerProcess {
+    fn send_and_wait(&self, cmd: &str, timeout: Duration) -> Result<String> {
+        DebuggerProcess::send_and_wait(self, cmd, timeout)
+    }
+    fn drain_pending(&self) -> Option<String> {
+        DebuggerProcess::drain_pending(self)
+    }
+    fn wait_for_prompt(&self, timeout: Duration) -> Result<String> {
+        DebuggerProcess::wait_for_prompt(self, timeout)
+    }
+    fn log(&self) -> LogHandle {
+        DebuggerProcess::log(self)
+    }
+    fn child_pid(&self) -> Pid {
+        DebuggerProcess::child_pid(self)
+    }
+    fn is_alive(&self) -> bool {
+        DebuggerProcess::is_alive(self)
+    }
+    fn quit(&self, quit_cmd: &str) {
+        DebuggerProcess::quit(self, quit_cmd)
+    }
+}
+
 /// Reader thread entry point. Reads PTY bytes, coalesces them into
 /// Output chunks at prompt boundaries, and emits events on the channel
 /// and into the persistent log. Exits when the shutdown flag is set or
@@ -491,7 +568,7 @@ fn reader_loop(
             // The reader only emits Prompt/Exit via this helper.
             // Output carries bytes so it goes through flush_output.
             // Stop is emitted by the daemon, never by the reader.
-            EventKind::Output | EventKind::Stop => {
+            EventKind::Output | EventKind::Stop | EventKind::Stdout => {
                 unreachable!("emit_marker called with {kind:?}")
             }
         };

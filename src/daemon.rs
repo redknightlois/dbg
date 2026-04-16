@@ -13,7 +13,7 @@ use rusqlite::params;
 use crate::backend::Backend;
 use crate::commands::{self, Dispatched, crosstrack, debug as debug_cmds, lifecycle as lifecycle_cmds};
 use crate::profile::ProfileData;
-use crate::pty::DebuggerProcess;
+use crate::pty::{DebuggerIo, DebuggerProcess};
 use dbg_cli::session_db::LiveDebugger;
 
 const CMD_TIMEOUT: Duration = Duration::from_secs(60);
@@ -69,7 +69,7 @@ pub fn session_tmp(filename: &str) -> PathBuf {
 }
 
 struct Session {
-    proc: DebuggerProcess,
+    proc: Box<dyn DebuggerIo>,
     profile: Option<ProfileData>,
     /// Per-run SessionDb. `None` if DB creation failed on startup — we
     /// keep the debugger session alive either way; capture is best-effort.
@@ -95,7 +95,7 @@ struct Session {
 /// the session PTY. Only used while the daemon holds the session lock
 /// — so this is called synchronously from `handle_command`.
 struct ProcLive<'a> {
-    proc: &'a DebuggerProcess,
+    proc: &'a dyn DebuggerIo,
     tool_name: &'static str,
 }
 
@@ -239,7 +239,7 @@ pub fn run_daemon(backend: &dyn Backend, target: &str, args: &[String]) -> Resul
     };
 
     let session = Mutex::new(Session {
-        proc,
+        proc: Box::new(proc) as Box<dyn DebuggerIo>,
         profile,
         db,
         hit_seq: HashMap::new(),
@@ -611,7 +611,7 @@ fn handle_events(cmd: &str, log_handle: &crate::pty::LogHandle) -> String {
         let kind = e.kind.as_str();
         let ts = format_ms(e.ts_ms);
         match e.kind {
-            crate::pty::EventKind::Output => {
+            crate::pty::EventKind::Output | crate::pty::EventKind::Stdout => {
                 let preview = output_preview(&e.bytes);
                 let nbytes = e.bytes.len();
                 out.push_str(&format!(
@@ -811,7 +811,7 @@ fn run_crosstrack(session: &mut Session, backend: &dyn Backend, q: &crosstrack::
         .map(|c| c.tool_name())
         .unwrap_or("unknown");
     let live = ProcLive {
-        proc: &session.proc,
+        proc: &*session.proc,
         tool_name,
     };
     let ctx = crosstrack::RunCtx {
