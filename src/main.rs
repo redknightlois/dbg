@@ -11,6 +11,7 @@ mod phpprofile;
 mod profile;
 mod pty;
 mod resolve;
+mod transport_common;
 
 use std::time::Duration;
 

@@ -83,6 +83,19 @@ impl State {
     }
 }
 
+impl crate::transport_common::StopState for State {
+    fn clear_pending(&mut self) {
+        self.pending_hit = None;
+        self.paused = false;
+    }
+    fn has_pending_hit(&self) -> bool {
+        self.pending_hit.is_some()
+    }
+    fn alive(&self) -> bool {
+        self.alive
+    }
+}
+
 /// Driver-thread command. Anything the daemon wants the driver to do
 /// with the WebSocket funnels through this channel; the driver has
 /// sole ownership of the socket.
@@ -356,31 +369,11 @@ impl InspectorTransport {
     /// any, lands in `state.pending_hit` for the daemon to drain via
     /// `pending_hit()`.
     fn exec<F: FnOnce(&Self) -> Result<Value>>(&self, f: F, timeout: Duration) -> Result<String> {
-        // Clear pending_hit before firing — we want only *new* pauses.
-        {
-            let (lock, _) = &*self.state;
-            let mut s = lock.lock().unwrap();
-            s.pending_hit = None;
-            s.paused = false;
-        }
-        f(self)?;
-        // Wait up to timeout for a new Stop-producing event. The
-        // driver loop sets `pending_hit` when `Debugger.paused`
-        // arrives, and flips `alive=false` on disconnect.
-        let deadline = Instant::now() + timeout;
-        loop {
-            let (lock, cvar) = &*self.state;
-            let guard = lock.lock().unwrap();
-            if guard.pending_hit.is_some() || !guard.alive {
-                break;
-            }
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                bail!("timeout waiting for next pause");
-            }
-            let _ = cvar.wait_timeout(guard, remaining).unwrap();
-        }
-        Ok(String::new())
+        crate::transport_common::wait_for_stop(
+            &self.state,
+            || f(self).map(|_| ()),
+            timeout,
+        )
     }
 
     fn set_breakpoint(&self, bp: ParsedSb, cond: Option<&str>, timeout: Duration) -> Result<String> {

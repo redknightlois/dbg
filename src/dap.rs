@@ -141,6 +141,22 @@ impl State {
     }
 }
 
+impl crate::transport_common::StopState for State {
+    fn clear_pending(&mut self) {
+        self.pending_hit = None;
+        self.paused = false;
+    }
+    fn has_pending_hit(&self) -> bool {
+        self.pending_hit.is_some()
+    }
+    fn alive(&self) -> bool {
+        self.alive
+    }
+    fn terminated(&self) -> bool {
+        self.terminated
+    }
+}
+
 enum DriverCmd {
     /// Send a DAP request with the supplied command + arguments.
     /// Reply is either the `body` of a successful response, or an
@@ -457,25 +473,11 @@ impl DapTransport {
     }
 
     fn exec<F: FnOnce(&Self) -> Result<Value>>(&self, f: F, timeout: Duration) -> Result<String> {
-        {
-            let (lock, _) = &*self.state;
-            let mut s = lock.lock().unwrap();
-            s.pending_hit = None;
-            s.paused = false;
-        }
-        f(self)?;
-        let deadline = Instant::now() + timeout;
-        let (lock, cvar) = &*self.state;
-        let mut guard = lock.lock().unwrap();
-        while guard.alive && guard.pending_hit.is_none() && !guard.terminated {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                bail!("dap: timeout waiting for stopped event");
-            }
-            let r = cvar.wait_timeout(guard, remaining).unwrap();
-            guard = r.0;
-        }
-        Ok(String::new())
+        crate::transport_common::wait_for_stop(
+            &self.state,
+            || f(self).map(|_| ()),
+            timeout,
+        )
     }
 
     fn current_thread(&self) -> Option<i64> {
