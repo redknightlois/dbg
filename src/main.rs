@@ -56,6 +56,7 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     let mut registry = Registry::new();
     registry.register(Box::new(backend::lldb::LldbBackend));
+    registry.register(Box::new(backend::lldb_dap_proto::LldbDapProtoBackend));
     registry.register(Box::new(backend::pdb::PdbBackend));
     registry.register(Box::new(backend::netcoredbg::NetCoreDbgBackend));
     registry.register(Box::new(backend::delve::DelveBackend));

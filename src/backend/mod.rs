@@ -8,6 +8,7 @@ pub mod ghcprof;
 pub mod jdb;
 pub mod jitdasm;
 pub mod lldb;
+pub mod lldb_dap_proto;
 pub mod netcoredbg;
 pub mod massif;
 pub mod memcheck;

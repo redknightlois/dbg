@@ -230,14 +230,22 @@ impl DapTransport {
             }),
             Duration::from_secs(10),
         )?;
-        // `launch` must follow the initialize response. Some adapters
-        // emit the `initialized` event before responding to initialize,
-        // others after; either way, DAP says to send configurationDone
-        // only after both the launch response has come back AND the
-        // initialized event has arrived.
-        transport.call_blocking(&cfg.launch_verb, cfg.launch_args, Duration::from_secs(30))?;
+        // DAP handshake after initialize:
+        //   1. Fire `launch` async — lldb-dap delays its launch response
+        //      until after configurationDone, so a blocking send would
+        //      deadlock. Delve responds to launch immediately; both
+        //      flows work under the async pattern.
+        //   2. Wait for the `initialized` event.
+        //   3. Send configurationDone (blocking).
+        //   4. Drain the launch response before returning.
+        let launch_rx = transport.call_async(&cfg.launch_verb, cfg.launch_args)?;
         transport.wait_for_initialized(Duration::from_secs(15))?;
         transport.call_blocking("configurationDone", json!({}), Duration::from_secs(10))?;
+        match launch_rx.recv_timeout(Duration::from_secs(30)) {
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => bail!("DAP launch: {e}"),
+            Err(_) => bail!("DAP launch: timeout waiting for response"),
+        }
         Ok(transport)
     }
 
@@ -257,6 +265,22 @@ impl DapTransport {
             bail!("adapter terminated before initialized event");
         }
         Ok(())
+    }
+
+    fn call_async(
+        &self,
+        command: &str,
+        arguments: Value,
+    ) -> Result<mpsc::Receiver<std::result::Result<Value, String>>> {
+        let (tx, rx) = mpsc::channel();
+        self.driver_tx
+            .send(DriverCmd::Call {
+                command: command.to_string(),
+                arguments,
+                resp: tx,
+            })
+            .map_err(|_| anyhow!("DAP driver thread gone"))?;
+        Ok(rx)
     }
 
     fn call_blocking(&self, command: &str, arguments: Value, timeout: Duration) -> Result<Value> {
@@ -677,18 +701,40 @@ fn spawn_drain<R: std::io::Read + Send + 'static>(mut r: R, log: Option<LogHandl
 }
 
 fn extract_host_port(line: &str) -> Option<String> {
-    // Looks for the first `host:port` (IPv4 / hostname).
-    // Delve: "DAP server listening at: 127.0.0.1:34407"
+    // Adapters vary on surrounding decoration:
+    //   delve:    "DAP server listening at: 127.0.0.1:34407"
+    //   lldb-dap: "Listening for: connection://[127.0.0.1]:38191"
+    //   debugpy:  "… 127.0.0.1:5678"
+    // Strip scheme prefix (`scheme://`), surrounding brackets, and
+    // trailing punctuation; pull `<host>:<port>` out of whatever
+    // token contains it.
     for tok in line.split_whitespace() {
-        if let Some(colon) = tok.rfind(':') {
-            let (host, port) = (&tok[..colon], &tok[colon + 1..]);
-            if !host.is_empty()
-                && !port.is_empty()
-                && port.trim_end_matches(|c: char| !c.is_ascii_digit()).parse::<u16>().is_ok()
-            {
-                let port_clean: String =
-                    port.chars().take_while(|c| c.is_ascii_digit()).collect();
-                return Some(format!("{host}:{port_clean}"));
+        // Strip a leading `scheme://`.
+        let mut t = tok;
+        if let Some(idx) = t.find("://") {
+            t = &t[idx + 3..];
+        }
+        // Strip square brackets around an IP literal: `[127.0.0.1]:X`.
+        if t.starts_with('[') {
+            if let Some(close) = t.find(']') {
+                let host = &t[1..close];
+                let after = &t[close + 1..];
+                if let Some(port) = after.strip_prefix(':') {
+                    let digits: String =
+                        port.chars().take_while(|c| c.is_ascii_digit()).collect();
+                    if !digits.is_empty() && digits.parse::<u16>().is_ok() {
+                        return Some(format!("{host}:{digits}"));
+                    }
+                }
+                continue;
+            }
+        }
+        // Plain host:port.
+        if let Some(colon) = t.rfind(':') {
+            let (host, port) = (&t[..colon], &t[colon + 1..]);
+            let digits: String = port.chars().take_while(|c| c.is_ascii_digit()).collect();
+            if !host.is_empty() && !digits.is_empty() && digits.parse::<u16>().is_ok() {
+                return Some(format!("{host}:{digits}"));
             }
         }
     }
@@ -1036,6 +1082,12 @@ mod tests {
     fn extract_host_port_delve() {
         let line = "DAP server listening at: 127.0.0.1:34407\n";
         assert_eq!(extract_host_port(line).as_deref(), Some("127.0.0.1:34407"));
+    }
+
+    #[test]
+    fn extract_host_port_lldb_dap_bracketed() {
+        let line = "Listening for: connection://[127.0.0.1]:38191\n";
+        assert_eq!(extract_host_port(line).as_deref(), Some("127.0.0.1:38191"));
     }
 
     #[test]
