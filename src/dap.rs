@@ -366,6 +366,26 @@ impl DapTransport {
         if trimmed == "restart" {
             return self.exec(|s| s.call_blocking("restart", json!({}), timeout), timeout);
         }
+        if trimmed == "catch" || trimmed == "catch off" {
+            self.call_blocking(
+                "setExceptionBreakpoints",
+                json!({"filters": Vec::<String>::new()}),
+                timeout,
+            )?;
+            return Ok("exception breakpoints cleared".into());
+        }
+        if let Some(rest) = trimmed.strip_prefix("catch ") {
+            let filters: Vec<&str> = rest
+                .split(|c: char| c.is_ascii_whitespace() || c == ',')
+                .filter(|s| !s.is_empty())
+                .collect();
+            self.call_blocking(
+                "setExceptionBreakpoints",
+                json!({"filters": filters}),
+                timeout,
+            )?;
+            return Ok(format!("exception breakpoints: {}", filters.join(", ")));
+        }
         if trimmed == "backtrace" || trimmed == "bt" || trimmed == "where" {
             return Ok(self.format_backtrace());
         }

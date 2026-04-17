@@ -187,6 +187,14 @@ pub trait CanonicalOps: Send + Sync {
         Err(unsupported(self.tool_name(), "source listing"))
     }
 
+    /// Configure exception breakpoints. `filters` names the classes of
+    /// throws that should stop the debuggee; common values are
+    /// `uncaught`, `caught`, `raised`, `userUnhandled` depending on the
+    /// adapter. An empty slice clears all exception breakpoints.
+    fn op_catch(&self, _filters: &[String]) -> anyhow::Result<String> {
+        Err(unsupported(self.tool_name(), "exception breakpoints"))
+    }
+
     // ------------------------------------------------------------
     // Event parsing — called by the daemon on every PTY response.
     // Default implementations return `None` / `None` so profiler-style

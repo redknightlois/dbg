@@ -169,6 +169,15 @@ impl CanonicalOps for LldbDapProtoBackend {
     fn op_restart(&self) -> anyhow::Result<String> {
         Ok("restart".into())
     }
+    fn op_catch(&self, filters: &[String]) -> anyhow::Result<String> {
+        // lldb-dap filters: "cpp_throw", "cpp_catch", "swift_throw",
+        // "objc_throw", etc. Empty clears.
+        Ok(if filters.is_empty() {
+            "catch off".into()
+        } else {
+            format!("catch {}", filters.join(" "))
+        })
+    }
     fn op_stack(&self, _n: Option<u32>) -> anyhow::Result<String> {
         Ok("backtrace".into())
     }

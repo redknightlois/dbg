@@ -62,6 +62,7 @@ pub fn dispatch_to(input: &str, backend: &dyn Backend) -> Dispatched {
         "threads" => one_arg_native(ops.op_threads(), "threads"),
         "thread" => dispatch_thread(ops, rest),
         "list" => dispatch_list(ops, rest),
+        "catch" => dispatch_catch(ops, rest),
         _ => Dispatched::Fallthrough,
     }
 }
@@ -204,6 +205,19 @@ fn dispatch_thread(ops: &dyn CanonicalOps, rest: &str) -> Dispatched {
 fn dispatch_list(ops: &dyn CanonicalOps, rest: &str) -> Dispatched {
     let loc = if rest.is_empty() { None } else { Some(rest) };
     one_arg_native(ops.op_list(loc), "list")
+}
+
+fn dispatch_catch(ops: &dyn CanonicalOps, rest: &str) -> Dispatched {
+    // `dbg catch off` clears; otherwise tokens become filter names.
+    let filters: Vec<String> = if rest.is_empty() || rest.trim() == "off" {
+        vec![]
+    } else {
+        rest.split(|c: char| c.is_ascii_whitespace() || c == ',')
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect()
+    };
+    one_arg_native(ops.op_catch(&filters), "catch")
 }
 
 /// Given the canonical-op name the daemon stamped on the response,

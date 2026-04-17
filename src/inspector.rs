@@ -235,6 +235,37 @@ impl InspectorTransport {
         if matches!(trimmed, "out" | "finish") {
             return self.exec(|s| s.call_blocking("Debugger.stepOut", json!({}), timeout), timeout);
         }
+        if trimmed == "catch" || trimmed == "catch off" {
+            self.call_blocking(
+                "Debugger.setPauseOnExceptions",
+                json!({"state": "none"}),
+                timeout,
+            )?;
+            return Ok("exception breakpoints cleared".into());
+        }
+        if let Some(rest) = trimmed.strip_prefix("catch ") {
+            // V8 accepts exactly one of: "none" | "uncaught" | "all".
+            // Map common DAP-style filter names onto these.
+            let filters: Vec<&str> = rest
+                .split(|c: char| c.is_ascii_whitespace() || c == ',')
+                .filter(|s| !s.is_empty())
+                .collect();
+            let has_caught = filters.iter().any(|f| matches!(*f, "caught" | "all"));
+            let has_uncaught = filters.iter().any(|f| matches!(*f, "uncaught"));
+            let state = if has_caught {
+                "all"
+            } else if has_uncaught {
+                "uncaught"
+            } else {
+                "none"
+            };
+            self.call_blocking(
+                "Debugger.setPauseOnExceptions",
+                json!({"state": state}),
+                timeout,
+            )?;
+            return Ok(format!("exception breakpoints: state={state}"));
+        }
         if trimmed == "pause" {
             // Inspector's pause doesn't emit `Debugger.paused` on its own
             // reply — the async notification arrives shortly after. Use
