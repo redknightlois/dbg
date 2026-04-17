@@ -52,6 +52,8 @@ pub fn dispatch_to(input: &str, backend: &dyn Backend) -> Dispatched {
         "step" => one_arg_native(ops.op_step(), "step"),
         "next" => one_arg_native(ops.op_next(), "next"),
         "finish" => one_arg_native(ops.op_finish(), "finish"),
+        "pause" => one_arg_native(ops.op_pause(), "pause"),
+        "restart" => one_arg_native(ops.op_restart(), "restart"),
         "stack" => dispatch_stack(ops, rest),
         "frame" => dispatch_frame(ops, rest),
         "locals" => one_arg_native(ops.op_locals(), "locals"),

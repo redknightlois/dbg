@@ -148,6 +148,19 @@ pub trait CanonicalOps: Send + Sync {
     fn op_next(&self) -> anyhow::Result<String>;
     fn op_finish(&self) -> anyhow::Result<String>;
 
+    /// Async interrupt — ask a running target to stop. Backends that
+    /// can't interrupt (most PTY-based tools, which are pause-to-prompt
+    /// anyway) return `unsupported`.
+    fn op_pause(&self) -> anyhow::Result<String> {
+        Err(unsupported(self.tool_name(), "pause"))
+    }
+
+    /// Restart the debuggee from scratch. DAP has a `restart` request;
+    /// other backends typically need a session tear-down + relaunch.
+    fn op_restart(&self) -> anyhow::Result<String> {
+        Err(unsupported(self.tool_name(), "restart"))
+    }
+
     // ------------------------------------------------------------
     // Inspection
     // ------------------------------------------------------------

@@ -359,6 +359,13 @@ impl DapTransport {
             let tid = self.current_thread().unwrap_or(1);
             return self.exec(|s| s.call_blocking("stepOut", json!({"threadId": tid}), timeout), timeout);
         }
+        if trimmed == "pause" {
+            let tid = self.current_thread().unwrap_or(1);
+            return self.exec(|s| s.call_blocking("pause", json!({"threadId": tid}), timeout), timeout);
+        }
+        if trimmed == "restart" {
+            return self.exec(|s| s.call_blocking("restart", json!({}), timeout), timeout);
+        }
         if trimmed == "backtrace" || trimmed == "bt" || trimmed == "where" {
             return Ok(self.format_backtrace());
         }

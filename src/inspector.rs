@@ -235,6 +235,12 @@ impl InspectorTransport {
         if matches!(trimmed, "out" | "finish") {
             return self.exec(|s| s.call_blocking("Debugger.stepOut", json!({}), timeout), timeout);
         }
+        if trimmed == "pause" {
+            // Inspector's pause doesn't emit `Debugger.paused` on its own
+            // reply — the async notification arrives shortly after. Use
+            // the same exec() helper so we wait for the stopped event.
+            return self.exec(|s| s.call_blocking("Debugger.pause", json!({}), timeout), timeout);
+        }
 
         // backtrace — from cached call_frames, no round trip.
         if trimmed == "backtrace" || trimmed == "bt" || trimmed == "where" {

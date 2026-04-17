@@ -175,6 +175,12 @@ impl CanonicalOps for NetCoreDbgProtoBackend {
     fn op_finish(&self) -> anyhow::Result<String> {
         Ok("out".into())
     }
+    fn op_pause(&self) -> anyhow::Result<String> {
+        Ok("pause".into())
+    }
+    fn op_restart(&self) -> anyhow::Result<String> {
+        Ok("restart".into())
+    }
     fn op_stack(&self, _n: Option<u32>) -> anyhow::Result<String> {
         Ok("backtrace".into())
     }
