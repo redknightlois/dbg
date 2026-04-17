@@ -143,6 +143,22 @@ pub trait Backend: Send + Sync {
     fn dap_launch(&self, _target: &str, _args: &[String]) -> anyhow::Result<crate::dap::DapLaunchConfig> {
         anyhow::bail!("dap_launch not implemented for this backend")
     }
+
+    /// Attach-mode variant of `dap_launch`. Daemon invokes this when
+    /// the user passed `--attach-pid` / `--attach-port`. The
+    /// `AttachSpec` carries whichever identifier the adapter expects.
+    /// Default bails: not every adapter supports attach.
+    fn dap_attach(&self, _spec: &AttachSpec) -> anyhow::Result<crate::dap::DapLaunchConfig> {
+        anyhow::bail!("attach not implemented for this backend")
+    }
+}
+
+/// How to locate a running debuggee for attach mode. Adapters take
+/// different identifiers — some want a pid, some a host:port.
+#[derive(Clone, Debug, Default)]
+pub struct AttachSpec {
+    pub pid: Option<u32>,
+    pub host_port: Option<String>,
 }
 
 /// Path to the current dbg binary, for exec-ing into sub-REPLs.

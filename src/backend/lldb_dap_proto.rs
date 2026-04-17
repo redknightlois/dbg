@@ -122,6 +122,26 @@ impl Backend for LldbDapProtoBackend {
             preassigned_addr: None,
         })
     }
+
+    fn dap_attach(
+        &self,
+        spec: &super::AttachSpec,
+    ) -> anyhow::Result<crate::dap::DapLaunchConfig> {
+        let pid = spec
+            .pid
+            .ok_or_else(|| anyhow::anyhow!("lldb-dap-proto attach needs --attach-pid"))?;
+        Ok(crate::dap::DapLaunchConfig {
+            bin: "lldb-dap".into(),
+            args: vec!["--connection".into(), "listen://127.0.0.1:0".into()],
+            listen_marker: "Listening for:".into(),
+            launch_verb: "attach".into(),
+            launch_args: json!({
+                "request": "attach",
+                "pid": pid,
+            }),
+            preassigned_addr: None,
+        })
+    }
 }
 
 impl CanonicalOps for LldbDapProtoBackend {

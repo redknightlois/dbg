@@ -136,6 +136,28 @@ impl Backend for NetCoreDbgProtoBackend {
             preassigned_addr: Some(format!("127.0.0.1:{port}")),
         })
     }
+
+    fn dap_attach(
+        &self,
+        spec: &super::AttachSpec,
+    ) -> anyhow::Result<crate::dap::DapLaunchConfig> {
+        let pid = spec
+            .pid
+            .ok_or_else(|| anyhow::anyhow!("netcoredbg-proto attach needs --attach-pid"))?;
+        let port = crate::dap::DapLaunchConfig::pick_free_port()?;
+        Ok(crate::dap::DapLaunchConfig {
+            bin: "netcoredbg".into(),
+            args: vec!["--interpreter=vscode".into(), format!("--server={port}")],
+            listen_marker: String::new(),
+            launch_verb: "attach".into(),
+            launch_args: json!({
+                "request": "attach",
+                "processId": pid,
+                "justMyCode": false,
+            }),
+            preassigned_addr: Some(format!("127.0.0.1:{port}")),
+        })
+    }
 }
 
 impl CanonicalOps for NetCoreDbgProtoBackend {

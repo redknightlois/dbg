@@ -121,6 +121,29 @@ impl Backend for DebugpyProtoBackend {
             preassigned_addr: None,
         })
     }
+
+    fn dap_attach(
+        &self,
+        spec: &super::AttachSpec,
+    ) -> anyhow::Result<crate::dap::DapLaunchConfig> {
+        // debugpy attach requires a pid. `--log-stderr` still needed
+        // for the listen-announce line.
+        let pid = spec
+            .pid
+            .ok_or_else(|| anyhow::anyhow!("debugpy-proto attach needs --attach-pid"))?;
+        Ok(crate::dap::DapLaunchConfig {
+            bin: "debugpy-adapter".into(),
+            args: vec!["--port".into(), "0".into(), "--log-stderr".into()],
+            listen_marker: "Listening for incoming Client connections on".into(),
+            launch_verb: "attach".into(),
+            launch_args: json!({
+                "request": "attach",
+                "processId": pid,
+                "justMyCode": false,
+            }),
+            preassigned_addr: None,
+        })
+    }
 }
 
 impl CanonicalOps for DebugpyProtoBackend {

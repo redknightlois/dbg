@@ -221,7 +221,12 @@ fn command_may_stop(cmd: &str) -> bool {
 
 /// Start the daemon: spawn the debugger, listen on socket.
 /// This function does NOT return on success — it runs the event loop.
-pub fn run_daemon(backend: &dyn Backend, target: &str, args: &[String]) -> Result<()> {
+pub fn run_daemon(
+    backend: &dyn Backend,
+    target: &str,
+    args: &[String],
+    attach: Option<&crate::backend::AttachSpec>,
+) -> Result<()> {
     // Branch on transport kind. Most backends use the default PTY
     // transport; `node-proto` uses the V8 Inspector WebSocket
     // transport; DAP-capable backends (delve-proto, debugpy-proto, …)
@@ -233,7 +238,10 @@ pub fn run_daemon(backend: &dyn Backend, target: &str, args: &[String]) -> Resul
             .context("failed to spawn inspector transport")?;
         (Box::new(t), Vec::new())
     } else if backend.uses_dap() {
-        let cfg = backend.dap_launch(target, args)?;
+        let cfg = match attach {
+            Some(spec) => backend.dap_attach(spec)?,
+            None => backend.dap_launch(target, args)?,
+        };
         let t = crate::dap::DapTransport::spawn(target, cfg)
             .context("failed to spawn DAP transport")?;
         (Box::new(t), Vec::new())

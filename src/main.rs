@@ -262,6 +262,8 @@ fn cmd_start(registry: &Registry, args: &[String]) -> Result<()> {
     let mut breakpoints = Vec::new();
     let mut run_args = Vec::new();
     let mut do_run = false;
+    let mut attach_pid: Option<u32> = None;
+    let mut attach_host_port: Option<String> = None;
     let mut i = 2;
     while i < args.len() {
         match args[i].as_str() {
@@ -280,10 +282,30 @@ fn cmd_start(registry: &Registry, args: &[String]) -> Result<()> {
                 continue;
             }
             "--run" | "-r" => do_run = true,
+            "--attach-pid" => {
+                i += 1;
+                if i < args.len() {
+                    attach_pid = args[i].parse().ok();
+                }
+            }
+            "--attach-port" => {
+                i += 1;
+                if i < args.len() {
+                    attach_host_port = Some(args[i].clone());
+                }
+            }
             _ => {}
         }
         i += 1;
     }
+    let attach = if attach_pid.is_some() || attach_host_port.is_some() {
+        Some(backend::AttachSpec {
+            pid: attach_pid,
+            host_port: attach_host_port,
+        })
+    } else {
+        None
+    };
 
     // Resolve target. Attach mode doesn't need a local target file —
     // the debuggee is already running — so skip resolution and pass
@@ -302,7 +324,7 @@ fn cmd_start(registry: &Registry, args: &[String]) -> Result<()> {
         ForkResult::Child => {
             // Daemon process
             let _ = nix::unistd::setsid();
-            if let Err(e) = daemon::run_daemon(backend, &resolved, &run_args) {
+            if let Err(e) = daemon::run_daemon(backend, &resolved, &run_args, attach.as_ref()) {
                 eprintln!("daemon error: {e:#}");
                 std::process::exit(1);
             }

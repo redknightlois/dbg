@@ -129,6 +129,27 @@ impl Backend for DelveProtoBackend {
             preassigned_addr: None,
         })
     }
+
+    fn dap_attach(
+        &self,
+        spec: &super::AttachSpec,
+    ) -> anyhow::Result<crate::dap::DapLaunchConfig> {
+        let pid = spec
+            .pid
+            .ok_or_else(|| anyhow::anyhow!("delve-proto attach needs --attach-pid"))?;
+        Ok(crate::dap::DapLaunchConfig {
+            bin: "dlv".into(),
+            args: vec!["dap".into(), "-l".into(), "127.0.0.1:0".into()],
+            listen_marker: "DAP server listening at:".into(),
+            launch_verb: "attach".into(),
+            launch_args: json!({
+                "request": "attach",
+                "mode": "local",
+                "processId": pid,
+            }),
+            preassigned_addr: None,
+        })
+    }
 }
 
 impl CanonicalOps for DelveProtoBackend {
