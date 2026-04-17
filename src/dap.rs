@@ -64,6 +64,26 @@ pub struct DapLaunchConfig {
     /// Launch verb — almost always "launch"; some adapters support
     /// "attach".
     pub launch_verb: String,
+    /// Skip the stdout/stderr scrape and connect to this address
+    /// directly. For adapters that don't announce their listen port
+    /// (netcoredbg). Backends should pick a free port via
+    /// `DapLaunchConfig::pick_free_port` and pass it to the adapter
+    /// through `args`.
+    pub preassigned_addr: Option<String>,
+}
+
+impl DapLaunchConfig {
+    /// Bind and immediately release a TCP port so the caller can pass
+    /// it to an adapter that doesn't support `:0`. There is a small
+    /// race window before the adapter reclaims the port; in practice
+    /// the `connect_with_retry` loop absorbs it.
+    pub fn pick_free_port() -> Result<u16> {
+        let l = std::net::TcpListener::bind("127.0.0.1:0")
+            .context("bind 127.0.0.1:0 to pick a free port")?;
+        let port = l.local_addr()?.port();
+        drop(l);
+        Ok(port)
+    }
 }
 
 struct State {
@@ -161,26 +181,37 @@ impl DapTransport {
         // stdio to the target and doesn't route program output
         // through DAP `output` events).
         let log = LogHandle::new();
-        let (addr, leftover_stdout, leftover_stderr) = match scrape_listen_addr_either(
-            stdout,
-            stderr,
-            &cfg.listen_marker,
-            Duration::from_secs(10),
-        ) {
-            Ok(r) => r,
-            Err(e) => {
-                if let Ok(Some(status)) = child.try_wait() {
-                    bail!("adapter exited before announcing (status={status:?}): {e:#}");
+        let addr = if let Some(ref a) = cfg.preassigned_addr {
+            // Adapter is silent about its listen port (netcoredbg);
+            // the backend already picked a free port and told the
+            // adapter to bind it. Drain both streams in case the
+            // adapter does chatter later.
+            spawn_drain(stdout, Some(log.clone()));
+            spawn_drain(stderr, None);
+            a.clone()
+        } else {
+            let (addr, leftover_stdout, leftover_stderr) = match scrape_listen_addr_either(
+                stdout,
+                stderr,
+                &cfg.listen_marker,
+                Duration::from_secs(10),
+            ) {
+                Ok(r) => r,
+                Err(e) => {
+                    if let Ok(Some(status)) = child.try_wait() {
+                        bail!("adapter exited before announcing (status={status:?}): {e:#}");
+                    }
+                    return Err(e).context("failed to read listen address");
                 }
-                return Err(e).context("failed to read listen address");
+            };
+            if let Some(so) = leftover_stdout {
+                spawn_drain(so, Some(log.clone()));
             }
+            if let Some(se) = leftover_stderr {
+                spawn_drain(se, None);
+            }
+            addr
         };
-        if let Some(so) = leftover_stdout {
-            spawn_drain(so, Some(log.clone()));
-        }
-        if let Some(se) = leftover_stderr {
-            spawn_drain(se, None);
-        }
 
         // Retry TCP connect a few times — some adapters announce the
         // listen port just before bind() completes.

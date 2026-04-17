@@ -11,6 +11,7 @@ pub mod jitdasm;
 pub mod lldb;
 pub mod lldb_dap_proto;
 pub mod netcoredbg;
+pub mod netcoredbg_proto;
 pub mod massif;
 pub mod memcheck;
 pub mod node_inspect;

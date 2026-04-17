@@ -1,9 +1,9 @@
-//! delve-proto — Go debugging via Delve's DAP server.
+//! netcoredbg-proto — .NET debugging via netcoredbg's VSCode/DAP mode.
 //!
-//! Pilot backend for the generic DAP transport. Spawns
-//! `dlv dap -l 127.0.0.1:0`, scrapes the announced listen port,
-//! then the shared `DapTransport` handles the rest of the handshake
-//! (initialize / launch / configurationDone).
+//! netcoredbg doesn't announce its listen port (and refuses `:0`),
+//! so we pre-allocate a free port with `DapLaunchConfig::pick_free_port`
+//! and pass it via `--server=<port>`. The shared `DapTransport`
+//! handles the rest.
 
 use std::sync::OnceLock;
 
@@ -13,25 +13,24 @@ use serde_json::{Value, json};
 use super::canonical::{BreakLoc, CanonicalOps, HitEvent, unsupported};
 use super::{Backend, CleanResult, Dependency, DependencyCheck, SpawnConfig};
 
-pub struct DelveProtoBackend;
+pub struct NetCoreDbgProtoBackend;
 
-impl Backend for DelveProtoBackend {
+impl Backend for NetCoreDbgProtoBackend {
     fn name(&self) -> &'static str {
-        "delve-proto"
+        "netcoredbg-proto"
     }
 
     fn description(&self) -> &'static str {
-        "Go via Delve DAP (structured events, separate stdout)"
+        ".NET (C#, F#) via netcoredbg DAP (structured events)"
     }
 
     fn types(&self) -> &'static [&'static str] {
-        &["delve-proto"]
+        &["netcoredbg-proto"]
     }
 
     fn spawn_config(&self, _target: &str, _args: &[String]) -> anyhow::Result<SpawnConfig> {
-        // Unused — DAP path goes through `dap_launch`.
         Ok(SpawnConfig {
-            bin: "dlv".into(),
+            bin: "netcoredbg".into(),
             args: vec![],
             env: vec![],
             init_commands: vec![],
@@ -39,36 +38,38 @@ impl Backend for DelveProtoBackend {
     }
 
     fn prompt_pattern(&self) -> &str {
-        // Unused.
-        r"\(dlv\) "
+        r"ncdb>"
     }
 
     fn dependencies(&self) -> Vec<Dependency> {
         vec![
             Dependency {
-                name: "dlv",
+                name: "dotnet",
                 check: DependencyCheck::Binary {
-                    name: "dlv",
-                    alternatives: &["dlv"],
-                    version_cmd: Some(("dlv", &["version"])),
+                    name: "dotnet",
+                    alternatives: &["dotnet"],
+                    version_cmd: None,
                 },
-                install: "go install github.com/go-delve/delve/cmd/dlv@latest",
+                install: "https://dot.net/install",
             },
             Dependency {
-                name: "go",
+                name: "netcoredbg",
                 check: DependencyCheck::Binary {
-                    name: "go",
-                    alternatives: &["go"],
-                    version_cmd: Some(("go", &["version"])),
+                    name: "netcoredbg",
+                    alternatives: &["netcoredbg"],
+                    version_cmd: None,
                 },
-                install: "https://go.dev/dl/",
+                install: concat!(
+                    "mkdir -p ~/.local/share/netcoredbg && ",
+                    "curl -sL https://github.com/Samsung/netcoredbg/releases/latest/download/",
+                    "netcoredbg-linux-amd64.tar.gz | tar xz -C ~/.local/share/netcoredbg && ",
+                    "ln -sf ~/.local/share/netcoredbg/netcoredbg/netcoredbg ~/.local/bin/netcoredbg"
+                ),
             },
         ]
     }
 
     fn format_breakpoint(&self, spec: &str) -> String {
-        // Canonical DAP break verb — the transport's parse_break
-        // expects `break <file>:<line>`.
         format!("break {spec}")
     }
 
@@ -81,13 +82,13 @@ impl Backend for DelveProtoBackend {
     }
 
     fn parse_help(&self, _raw: &str) -> String {
-        "delve-proto: continue, next, step, out, backtrace, break <file>:<line>, \
-         breakpoints, locals, print <expr>, quit"
+        "netcoredbg-proto: continue, next, step, out, backtrace, \
+         break <file>:<line>, breakpoints, locals, print <expr>, quit"
             .into()
     }
 
     fn adapters(&self) -> Vec<(&'static str, &'static str)> {
-        vec![("go.md", include_str!("../../skills/adapters/go.md"))]
+        vec![("dotnet.md", include_str!("../../skills/adapters/dotnet.md"))]
     }
 
     fn canonical_ops(&self) -> Option<&dyn CanonicalOps> {
@@ -105,39 +106,43 @@ impl Backend for DelveProtoBackend {
         true
     }
 
-    fn dap_launch(&self, target: &str, args: &[String]) -> anyhow::Result<crate::dap::DapLaunchConfig> {
-        // `dlv dap -l 127.0.0.1:0` — lets the kernel pick a free port;
-        // delve prints `DAP server listening at: 127.0.0.1:PORT` on
-        // stderr. The transport scrapes that.
+    fn dap_launch(
+        &self,
+        target: &str,
+        args: &[String],
+    ) -> anyhow::Result<crate::dap::DapLaunchConfig> {
+        let port = crate::dap::DapLaunchConfig::pick_free_port()?;
         Ok(crate::dap::DapLaunchConfig {
-            bin: "dlv".into(),
-            args: vec!["dap".into(), "-l".into(), "127.0.0.1:0".into()],
-            listen_marker: "DAP server listening at:".into(),
+            bin: "netcoredbg".into(),
+            args: vec![
+                "--interpreter=vscode".into(),
+                format!("--server={port}"),
+            ],
+            listen_marker: String::new(),
             launch_verb: "launch".into(),
             launch_args: json!({
-                // Delve launch config mirrors VSCode's go.debug settings.
                 "request": "launch",
-                "mode": "debug",
-                "program": target,
+                "program": std::fs::canonicalize(target)
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|_| target.to_string()),
                 "args": args,
                 "cwd": std::env::current_dir()
                     .map(|p| p.display().to_string())
                     .unwrap_or_default(),
+                "stopAtEntry": true,
                 "stopOnEntry": true,
-                "showLog": false,
+                "justMyCode": false,
             }),
-            preassigned_addr: None,
+            preassigned_addr: Some(format!("127.0.0.1:{port}")),
         })
     }
 }
 
-impl CanonicalOps for DelveProtoBackend {
+impl CanonicalOps for NetCoreDbgProtoBackend {
     fn tool_name(&self) -> &'static str {
-        "delve-proto"
+        "netcoredbg-proto"
     }
     fn auto_capture_locals(&self) -> bool {
-        // DAP locals is a handful of structured roundtrips (scopes +
-        // variables per scope) — no PTY state hazards.
         true
     }
 
@@ -149,7 +154,7 @@ impl CanonicalOps for DelveProtoBackend {
             BreakLoc::FileLine { file, line } => format!("break {file}:{line}"),
             BreakLoc::Fqn(_) | BreakLoc::ModuleMethod { .. } => {
                 return Err(unsupported(
-                    "delve-proto",
+                    "netcoredbg-proto",
                     "symbol breakpoints (use file:line)",
                 ));
             }
@@ -183,16 +188,13 @@ impl CanonicalOps for DelveProtoBackend {
         Ok(format!("print {expr}"))
     }
     fn op_list(&self, _loc: Option<&str>) -> anyhow::Result<String> {
-        Err(unsupported("delve-proto", "list (B2 follow-up)"))
+        Err(unsupported("netcoredbg-proto", "list (follow-up)"))
     }
     fn op_watch(&self, expr: &str) -> anyhow::Result<String> {
         Ok(format!("watch {expr}"))
     }
 
     fn parse_hit(&self, output: &str) -> Option<HitEvent> {
-        // DAP delivers structured hits via pending_hit(); this is a
-        // best-effort fallback that matches delve's text stop format
-        // in case an agent routes us a raw text response.
         static RE: OnceLock<Regex> = OnceLock::new();
         let re = RE.get_or_init(|| Regex::new(r"at (\S+):(\d+)").unwrap());
         for line in output.lines() {

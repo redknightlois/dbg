@@ -60,6 +60,7 @@ fn main() -> Result<()> {
     registry.register(Box::new(backend::pdb::PdbBackend));
     registry.register(Box::new(backend::debugpy_proto::DebugpyProtoBackend));
     registry.register(Box::new(backend::netcoredbg::NetCoreDbgBackend));
+    registry.register(Box::new(backend::netcoredbg_proto::NetCoreDbgProtoBackend));
     registry.register(Box::new(backend::delve::DelveBackend));
     registry.register(Box::new(backend::delve_proto::DelveProtoBackend));
     registry.register(Box::new(backend::jdb::JdbBackend));

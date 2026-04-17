@@ -119,6 +119,7 @@ impl Backend for LldbDapProtoBackend {
                 "stopOnEntry": true,
                 "runInTerminal": false,
             }),
+            preassigned_addr: None,
         })
     }
 }

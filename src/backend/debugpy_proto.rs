@@ -118,6 +118,7 @@ impl Backend for DebugpyProtoBackend {
                 // shouldn't hit a silent skip.
                 "justMyCode": false,
             }),
+            preassigned_addr: None,
         })
     }
 }
