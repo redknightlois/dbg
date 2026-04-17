@@ -119,6 +119,18 @@ pub trait CanonicalOps: Send + Sync {
     // ------------------------------------------------------------
 
     fn op_break(&self, loc: &BreakLoc) -> anyhow::Result<String>;
+
+    /// Conditional breakpoint. Default falls back to `op_break` when
+    /// `cond` is empty; backends that can't express conditions return
+    /// `unsupported(...)`. DAP and Inspector backends override this to
+    /// pass the condition through the wire.
+    fn op_break_conditional(&self, loc: &BreakLoc, cond: &str) -> anyhow::Result<String> {
+        if cond.is_empty() {
+            self.op_break(loc)
+        } else {
+            Err(unsupported(self.tool_name(), "conditional breakpoints"))
+        }
+    }
     fn op_unbreak(&self, id: BreakId) -> anyhow::Result<String> {
         Ok(format!("breakpoint delete {}", id.0))
     }

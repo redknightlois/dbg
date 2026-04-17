@@ -152,6 +152,10 @@ impl CanonicalOps for DelveProtoBackend {
             BreakLoc::ModuleMethod { module, method } => format!("bfn {module}.{method}"),
         })
     }
+    fn op_break_conditional(&self, loc: &BreakLoc, cond: &str) -> anyhow::Result<String> {
+        let base = self.op_break(loc)?;
+        Ok(format!("{base} if {cond}"))
+    }
     fn op_run(&self, _args: &[String]) -> anyhow::Result<String> {
         Ok("continue".into())
     }

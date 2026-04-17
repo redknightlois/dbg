@@ -266,8 +266,8 @@ impl InspectorTransport {
         // sb('name')         → function breakpoint (Debugger.setBreakpointByUrl on regex
         //                      over function name — best-effort)
         // sb(10)             → breakpoint on current script at line 10
-        if let Some(bp) = parse_sb(trimmed) {
-            return self.set_breakpoint(bp, timeout);
+        if let Some((bp, cond)) = parse_sb(trimmed) {
+            return self.set_breakpoint(bp, cond.as_deref(), timeout);
         }
 
         // exec <expr>  / print <expr>  → evaluateOnCallFrame
@@ -326,7 +326,7 @@ impl InspectorTransport {
         Ok(String::new())
     }
 
-    fn set_breakpoint(&self, bp: ParsedSb, timeout: Duration) -> Result<String> {
+    fn set_breakpoint(&self, bp: ParsedSb, cond: Option<&str>, timeout: Duration) -> Result<String> {
         match bp {
             ParsedSb::FileLine { file, line } => {
                 // Inspector wants `url` or `urlRegex`. Node reports
@@ -334,11 +334,17 @@ impl InspectorTransport {
                 // match on the tail so user-supplied `foo.js:10`
                 // matches a fully-qualified url.
                 let escaped = regex_escape(&file);
-                let params = json!({
-                    "urlRegex": format!("{}$", escaped),
-                    "lineNumber": line.saturating_sub(1), // inspector is 0-based
-                });
-                let resp = self.call_blocking("Debugger.setBreakpointByUrl", params, timeout)?;
+                let mut params = serde_json::Map::new();
+                params.insert("urlRegex".into(), Value::String(format!("{}$", escaped)));
+                params.insert("lineNumber".into(), json!(line.saturating_sub(1)));
+                if let Some(c) = cond {
+                    params.insert("condition".into(), Value::String(c.to_string()));
+                }
+                let resp = self.call_blocking(
+                    "Debugger.setBreakpointByUrl",
+                    Value::Object(params),
+                    timeout,
+                )?;
                 let bp_id = resp
                     .get("breakpointId")
                     .and_then(|v| v.as_str())
@@ -349,7 +355,10 @@ impl InspectorTransport {
                     let (lock, _) = &*self.state;
                     lock.lock().unwrap().breakpoints.insert(key.clone(), bp_id.clone());
                 }
-                Ok(format!("Breakpoint set at {key} (id={bp_id})"))
+                match cond {
+                    Some(c) => Ok(format!("Breakpoint set at {key} if {c} (id={bp_id})")),
+                    None => Ok(format!("Breakpoint set at {key} (id={bp_id})")),
+                }
             }
             ParsedSb::Line(line) => {
                 // Without a file we'd need the current script id; use
@@ -372,10 +381,19 @@ impl InspectorTransport {
                 if script_id.is_empty() {
                     bail!("sb(line) without a file requires a current frame");
                 }
-                let params = json!({
-                    "location": { "scriptId": script_id, "lineNumber": line.saturating_sub(1) },
-                });
-                let resp = self.call_blocking("Debugger.setBreakpoint", params, timeout)?;
+                let mut params = serde_json::Map::new();
+                params.insert(
+                    "location".into(),
+                    json!({ "scriptId": script_id, "lineNumber": line.saturating_sub(1) }),
+                );
+                if let Some(c) = cond {
+                    params.insert("condition".into(), Value::String(c.to_string()));
+                }
+                let resp = self.call_blocking(
+                    "Debugger.setBreakpoint",
+                    Value::Object(params),
+                    timeout,
+                )?;
                 let bp_id = resp
                     .get("breakpointId")
                     .and_then(|v| v.as_str())
@@ -1091,22 +1109,29 @@ enum ParsedSb {
     Name(String),
 }
 
-fn parse_sb(cmd: &str) -> Option<ParsedSb> {
+fn parse_sb(cmd: &str) -> Option<(ParsedSb, Option<String>)> {
     // sb('file.js', 10)  |  sb(10)  |  sb('funcName')
-    let rest = cmd.strip_prefix("sb(")?.strip_suffix(')')?.trim();
-    if rest.is_empty() {
+    // Optionally followed by ` if <expr>`.
+    let rest = cmd.strip_prefix("sb(")?;
+    let (inner, cond) = match rest.find(") if ") {
+        Some(i) => (&rest[..i], Some(rest[i + 5..].trim().to_string())),
+        None => (rest.strip_suffix(')')?, None),
+    };
+    let inner = inner.trim();
+    if inner.is_empty() {
         return None;
     }
-    if let Some((a, b)) = rest.split_once(',') {
+    let parsed = if let Some((a, b)) = inner.split_once(',') {
         let file = a.trim().trim_matches('\'').trim_matches('"').to_string();
         let line: u32 = b.trim().parse().ok()?;
-        return Some(ParsedSb::FileLine { file, line });
-    }
-    if let Ok(line) = rest.parse::<u32>() {
-        return Some(ParsedSb::Line(line));
-    }
-    let name = rest.trim_matches('\'').trim_matches('"').to_string();
-    Some(ParsedSb::Name(name))
+        ParsedSb::FileLine { file, line }
+    } else if let Ok(line) = inner.parse::<u32>() {
+        ParsedSb::Line(line)
+    } else {
+        let name = inner.trim_matches('\'').trim_matches('"').to_string();
+        ParsedSb::Name(name)
+    };
+    Some((parsed, cond))
 }
 
 fn regex_escape(s: &str) -> String {
@@ -1128,7 +1153,7 @@ mod tests {
     #[test]
     fn parse_sb_file_line() {
         match parse_sb("sb('app.js', 10)") {
-            Some(ParsedSb::FileLine { file, line }) => {
+            Some((ParsedSb::FileLine { file, line }, None)) => {
                 assert_eq!(file, "app.js");
                 assert_eq!(line, 10);
             }
@@ -1138,14 +1163,26 @@ mod tests {
 
     #[test]
     fn parse_sb_line_only() {
-        assert!(matches!(parse_sb("sb(42)"), Some(ParsedSb::Line(42))));
+        assert!(matches!(parse_sb("sb(42)"), Some((ParsedSb::Line(42), None))));
     }
 
     #[test]
     fn parse_sb_name() {
         match parse_sb("sb('handleRequest')") {
-            Some(ParsedSb::Name(n)) => assert_eq!(n, "handleRequest"),
+            Some((ParsedSb::Name(n), None)) => assert_eq!(n, "handleRequest"),
             other => panic!("expected Name, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_sb_conditional() {
+        match parse_sb("sb('app.js', 10) if x > 5") {
+            Some((ParsedSb::FileLine { file, line }, Some(cond))) => {
+                assert_eq!(file, "app.js");
+                assert_eq!(line, 10);
+                assert_eq!(cond, "x > 5");
+            }
+            other => panic!("expected FileLine with cond, got {other:?}"),
         }
     }
 

@@ -137,6 +137,12 @@ impl CanonicalOps for NodeProtoBackend {
             BreakLoc::ModuleMethod { module, method } => format!("sb('{module}:{method}')"),
         })
     }
+    fn op_break_conditional(&self, loc: &BreakLoc, cond: &str) -> anyhow::Result<String> {
+        let base = self.op_break(loc)?;
+        // The inspector transport sniffs the trailing ` if <expr>` and
+        // feeds it to `Debugger.setBreakpointByUrl.condition`.
+        Ok(format!("{base} if {cond}"))
+    }
     fn op_run(&self, _args: &[String]) -> anyhow::Result<String> {
         Ok("cont".into())
     }

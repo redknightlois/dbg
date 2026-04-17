@@ -112,11 +112,22 @@ fn one_arg_native(
 fn dispatch_break(ops: &dyn CanonicalOps, rest: &str) -> Dispatched {
     if rest.is_empty() {
         return Dispatched::Immediate(
-            "usage: dbg break <file:line | symbol | module!method>".into(),
+            "usage: dbg break <file:line | symbol | module!method> [if <cond>]".into(),
         );
     }
-    let loc = BreakLoc::parse(rest);
-    match ops.op_break(&loc) {
+    // Split off an optional ` if <expr>` suffix. The location is whatever
+    // came before; the condition is everything after the delimiter.
+    let (loc_str, cond) = match rest.find(" if ") {
+        Some(i) => (&rest[..i], &rest[i + 4..]),
+        None => (rest, ""),
+    };
+    let loc = BreakLoc::parse(loc_str.trim());
+    let result = if cond.is_empty() {
+        ops.op_break(&loc)
+    } else {
+        ops.op_break_conditional(&loc, cond.trim())
+    };
+    match result {
         Ok(cmd) => Dispatched::Native {
             canonical_op: "break",
             native_cmd: cmd,

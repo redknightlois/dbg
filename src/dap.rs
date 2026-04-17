@@ -103,6 +103,11 @@ struct State {
     /// Accumulated function-breakpoint names. DAP `setFunctionBreakpoints`
     /// replaces the whole set on each call, so we replay them all.
     function_breakpoints: Vec<String>,
+    /// "absolute-path:line" → condition expression, for replaying
+    /// conditional line breakpoints across the full-set setBreakpoints call.
+    breakpoint_conditions: HashMap<String, String>,
+    /// Function-name → condition expression, same idea for setFunctionBreakpoints.
+    function_breakpoint_conditions: HashMap<String, String>,
     /// True between `stopped` and the next `continue`/step.
     paused: bool,
     /// Flipped when the adapter disconnects or terminates.
@@ -123,6 +128,8 @@ impl State {
             pending_hit: None,
             breakpoints: HashMap::new(),
             function_breakpoints: Vec::new(),
+            breakpoint_conditions: HashMap::new(),
+            function_breakpoint_conditions: HashMap::new(),
             paused: false,
             alive: true,
             initialized: false,
@@ -375,8 +382,12 @@ impl DapTransport {
         if let Some(loc) = trimmed.strip_prefix("list ") {
             return self.list_source(Some(loc.trim()));
         }
-        if let Some(name) = trimmed.strip_prefix("bfn ") {
-            return self.set_function_breakpoint(name.trim(), timeout);
+        if let Some(rest) = trimmed.strip_prefix("bfn ") {
+            let (name, cond) = match rest.find(" if ") {
+                Some(i) => (rest[..i].trim(), Some(rest[i + 4..].trim())),
+                None => (rest.trim(), None),
+            };
+            return self.set_function_breakpoint(name, cond, timeout);
         }
         if let Some(spec) = parse_break(trimmed) {
             return self.set_breakpoint(&spec, timeout);
@@ -494,7 +505,12 @@ impl DapTransport {
         Ok(out)
     }
 
-    fn set_function_breakpoint(&self, name: &str, timeout: Duration) -> Result<String> {
+    fn set_function_breakpoint(
+        &self,
+        name: &str,
+        cond: Option<&str>,
+        timeout: Duration,
+    ) -> Result<String> {
         // DAP `setFunctionBreakpoints` replaces the whole set per call,
         // same semantics as `setBreakpoints`. Accumulate in state so
         // adding a second fn bp doesn't remove the first.
@@ -504,15 +520,36 @@ impl DapTransport {
             if !s.function_breakpoints.contains(&name.to_string()) {
                 s.function_breakpoints.push(name.to_string());
             }
+            if let Some(c) = cond {
+                s.function_breakpoint_conditions.insert(name.to_string(), c.to_string());
+            } else {
+                s.function_breakpoint_conditions.remove(name);
+            }
             s.function_breakpoints.clone()
         };
-        let fns: Vec<Value> = all.iter().map(|n| json!({ "name": n })).collect();
+        let fns: Vec<Value> = {
+            let (lock, _) = &*self.state;
+            let s = lock.lock().unwrap();
+            all.iter()
+                .map(|n| {
+                    let mut b = serde_json::Map::new();
+                    b.insert("name".into(), Value::String(n.clone()));
+                    if let Some(c) = s.function_breakpoint_conditions.get(n) {
+                        b.insert("condition".into(), Value::String(c.clone()));
+                    }
+                    Value::Object(b)
+                })
+                .collect()
+        };
         self.call_blocking("setFunctionBreakpoints", json!({ "breakpoints": fns }), timeout)?;
-        Ok(format!("Function breakpoint set: {name}"))
+        match cond {
+            Some(c) => Ok(format!("Function breakpoint set: {name} if {c}")),
+            None => Ok(format!("Function breakpoint set: {name}")),
+        }
     }
 
     fn set_breakpoint(&self, spec: &BreakSpec, timeout: Duration) -> Result<String> {
-        let BreakSpec { file, line } = spec;
+        let BreakSpec { file, line, condition } = spec;
         // DAP requires the full set of breakpoints for a source each
         // call — it doesn't merge. Accumulate in state.breakpoints
         // and replay the full list per source on each add.
@@ -526,13 +563,37 @@ impl DapTransport {
         let lines: Vec<u32> = {
             let (lock, _) = &*self.state;
             let mut s = lock.lock().unwrap();
-            let entry = s.breakpoints.entry(resolved_path.clone()).or_default();
-            if !entry.contains(line) {
-                entry.push(*line);
+            let lines_snapshot = {
+                let entry = s.breakpoints.entry(resolved_path.clone()).or_default();
+                if !entry.contains(line) {
+                    entry.push(*line);
+                }
+                entry.clone()
+            };
+            let key = format!("{resolved_path}:{line}");
+            if let Some(c) = condition {
+                s.breakpoint_conditions.insert(key, c.clone());
+            } else {
+                s.breakpoint_conditions.remove(&key);
             }
-            entry.clone()
+            lines_snapshot
         };
-        let breakpoints: Vec<Value> = lines.iter().map(|l| json!({"line": l})).collect();
+        let breakpoints: Vec<Value> = {
+            let (lock, _) = &*self.state;
+            let s = lock.lock().unwrap();
+            lines
+                .iter()
+                .map(|l| {
+                    let mut b = serde_json::Map::new();
+                    b.insert("line".into(), json!(l));
+                    let key = format!("{resolved_path}:{l}");
+                    if let Some(c) = s.breakpoint_conditions.get(&key) {
+                        b.insert("condition".into(), Value::String(c.clone()));
+                    }
+                    Value::Object(b)
+                })
+                .collect()
+        };
         self.call_blocking(
             "setBreakpoints",
             json!({
@@ -542,7 +603,10 @@ impl DapTransport {
             }),
             timeout,
         )?;
-        Ok(format!("Breakpoint set at {file}:{line}"))
+        match condition {
+            Some(c) => Ok(format!("Breakpoint set at {file}:{line} if {c}")),
+            None => Ok(format!("Breakpoint set at {file}:{line}")),
+        }
     }
 
     fn evaluate(&self, expr: &str, timeout: Duration) -> Result<String> {
@@ -1206,18 +1270,23 @@ fn handle_stack_response(body: Value, state: &Arc<(Mutex<State>, Condvar)>) {
 struct BreakSpec {
     file: String,
     line: u32,
+    condition: Option<String>,
 }
 
 fn parse_break(cmd: &str) -> Option<BreakSpec> {
-    // Accepts `break file:line` or `b file:line` — the canonical
-    // dispatcher hands us native-verb strings, which for DAP backends
-    // we define as exactly this form.
+    // Accepts `break file:line` or `b file:line`, optionally followed
+    // by ` if <expr>`. The canonical dispatcher hands us native-verb
+    // strings in exactly this shape.
     let rest = cmd
         .strip_prefix("break ")
         .or_else(|| cmd.strip_prefix("b "))?;
-    let (file, line_s) = rest.rsplit_once(':')?;
+    let (locspec, condition) = match rest.find(" if ") {
+        Some(i) => (&rest[..i], Some(rest[i + 4..].trim().to_string())),
+        None => (rest, None),
+    };
+    let (file, line_s) = locspec.rsplit_once(':')?;
     let line: u32 = line_s.trim().parse().ok()?;
-    Some(BreakSpec { file: file.trim().to_string(), line })
+    Some(BreakSpec { file: file.trim().to_string(), line, condition })
 }
 
 #[cfg(test)]
