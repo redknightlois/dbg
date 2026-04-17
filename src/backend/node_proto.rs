@@ -138,25 +138,9 @@ impl CanonicalOps for NodeProtoBackend {
         })
     }
     fn op_break_conditional(&self, loc: &BreakLoc, cond: &str) -> anyhow::Result<String> {
-        let base = self.op_break(loc)?;
         // The inspector transport sniffs the trailing ` if <expr>` and
         // feeds it to `Debugger.setBreakpointByUrl.condition`.
-        Ok(format!("{base} if {cond}"))
-    }
-    fn op_run(&self, _args: &[String]) -> anyhow::Result<String> {
-        Ok("cont".into())
-    }
-    fn op_continue(&self) -> anyhow::Result<String> {
-        Ok("cont".into())
-    }
-    fn op_step(&self) -> anyhow::Result<String> {
-        Ok("step".into())
-    }
-    fn op_next(&self) -> anyhow::Result<String> {
-        Ok("next".into())
-    }
-    fn op_finish(&self) -> anyhow::Result<String> {
-        Ok("out".into())
+        Ok(format!("{} if {cond}", self.op_break(loc)?))
     }
     fn op_pause(&self) -> anyhow::Result<String> {
         Ok("pause".into())
@@ -170,17 +154,9 @@ impl CanonicalOps for NodeProtoBackend {
             format!("catch {}", filters.join(" "))
         })
     }
-    fn op_stack(&self, _n: Option<u32>) -> anyhow::Result<String> {
-        Ok("backtrace".into())
-    }
     fn op_frame(&self, n: u32) -> anyhow::Result<String> {
+        // Inspector uses parenthesized `frame(N)` in its REPL flavour.
         Ok(format!("frame({n})"))
-    }
-    fn op_locals(&self) -> anyhow::Result<String> {
-        Ok("locals".into())
-    }
-    fn op_print(&self, expr: &str) -> anyhow::Result<String> {
-        Ok(format!("print {expr}"))
     }
     fn op_set(&self, lhs: &str, rhs: &str) -> anyhow::Result<String> {
         // V8 Inspector's `Debugger.setVariableValue` requires a scope

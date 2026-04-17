@@ -155,37 +155,11 @@ impl CanonicalOps for LldbDapProtoBackend {
     fn op_breaks(&self) -> anyhow::Result<String> {
         Ok("breakpoints".into())
     }
-    fn op_break(&self, loc: &BreakLoc) -> anyhow::Result<String> {
-        Ok(match loc {
-            BreakLoc::FileLine { file, line } => format!("break {file}:{line}"),
-            BreakLoc::Fqn(name) => format!("bfn {name}"),
-            // `lldb-dap` accepts mangled or unqualified method names;
-            // "module::method" is the idiomatic form for C++.
-            BreakLoc::ModuleMethod { module, method } => format!("bfn {module}::{method}"),
-        })
-    }
     fn op_break_conditional(&self, loc: &BreakLoc, cond: &str) -> anyhow::Result<String> {
-        let base = self.op_break(loc)?;
-        Ok(format!("{base} if {cond}"))
+        Ok(format!("{} if {cond}", self.op_break(loc)?))
     }
     fn op_break_log(&self, loc: &BreakLoc, msg: &str) -> anyhow::Result<String> {
-        let base = self.op_break(loc)?;
-        Ok(format!("{base} log {msg}"))
-    }
-    fn op_run(&self, _args: &[String]) -> anyhow::Result<String> {
-        Ok("continue".into())
-    }
-    fn op_continue(&self) -> anyhow::Result<String> {
-        Ok("continue".into())
-    }
-    fn op_step(&self) -> anyhow::Result<String> {
-        Ok("step".into())
-    }
-    fn op_next(&self) -> anyhow::Result<String> {
-        Ok("next".into())
-    }
-    fn op_finish(&self) -> anyhow::Result<String> {
-        Ok("out".into())
+        Ok(format!("{} log {msg}", self.op_break(loc)?))
     }
     fn op_pause(&self) -> anyhow::Result<String> {
         Ok("pause".into())
@@ -201,18 +175,6 @@ impl CanonicalOps for LldbDapProtoBackend {
         } else {
             format!("catch {}", filters.join(" "))
         })
-    }
-    fn op_stack(&self, _n: Option<u32>) -> anyhow::Result<String> {
-        Ok("backtrace".into())
-    }
-    fn op_frame(&self, n: u32) -> anyhow::Result<String> {
-        Ok(format!("frame {n}"))
-    }
-    fn op_locals(&self) -> anyhow::Result<String> {
-        Ok("locals".into())
-    }
-    fn op_print(&self, expr: &str) -> anyhow::Result<String> {
-        Ok(format!("print {expr}"))
     }
     fn op_set(&self, lhs: &str, rhs: &str) -> anyhow::Result<String> {
         Ok(format!("set {lhs} = {rhs}"))
@@ -231,23 +193,6 @@ impl CanonicalOps for LldbDapProtoBackend {
     }
     fn op_watch(&self, expr: &str) -> anyhow::Result<String> {
         Ok(format!("watch {expr}"))
-    }
-
-    fn parse_hit(&self, output: &str) -> Option<HitEvent> {
-        static RE: OnceLock<Regex> = OnceLock::new();
-        let re = RE.get_or_init(|| Regex::new(r"at (\S+):(\d+)").unwrap());
-        for line in output.lines() {
-            if let Some(c) = re.captures(line) {
-                return Some(HitEvent {
-                    location_key: format!("{}:{}", &c[1], &c[2]),
-                    thread: None,
-                    frame_symbol: None,
-                    file: Some(c[1].to_string()),
-                    line: c[2].parse().ok(),
-                });
-            }
-        }
-        None
     }
 
     fn parse_locals(&self, output: &str) -> Option<Value> {

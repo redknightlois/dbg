@@ -129,7 +129,15 @@ pub trait CanonicalOps: Send + Sync {
     // Breakpoint management
     // ------------------------------------------------------------
 
-    fn op_break(&self, loc: &BreakLoc) -> anyhow::Result<String>;
+    /// Default emits DAP-style `break file:line` / `bfn name`. PTY
+    /// backends with different breakpoint syntax override this.
+    fn op_break(&self, loc: &BreakLoc) -> anyhow::Result<String> {
+        Ok(match loc {
+            BreakLoc::FileLine { file, line } => format!("break {file}:{line}"),
+            BreakLoc::Fqn(name) => format!("bfn {name}"),
+            BreakLoc::ModuleMethod { module, method } => format!("bfn {module}::{method}"),
+        })
+    }
 
     /// Conditional breakpoint. Default falls back to `op_break` when
     /// `cond` is empty; backends that can't express conditions return
@@ -160,11 +168,21 @@ pub trait CanonicalOps: Send + Sync {
     // Execution control
     // ------------------------------------------------------------
 
-    fn op_run(&self, args: &[String]) -> anyhow::Result<String>;
-    fn op_continue(&self) -> anyhow::Result<String>;
-    fn op_step(&self) -> anyhow::Result<String>;
-    fn op_next(&self) -> anyhow::Result<String>;
-    fn op_finish(&self) -> anyhow::Result<String>;
+    fn op_run(&self, _args: &[String]) -> anyhow::Result<String> {
+        Ok("continue".into())
+    }
+    fn op_continue(&self) -> anyhow::Result<String> {
+        Ok("continue".into())
+    }
+    fn op_step(&self) -> anyhow::Result<String> {
+        Ok("step".into())
+    }
+    fn op_next(&self) -> anyhow::Result<String> {
+        Ok("next".into())
+    }
+    fn op_finish(&self) -> anyhow::Result<String> {
+        Ok("out".into())
+    }
 
     /// Async interrupt — ask a running target to stop. Backends that
     /// can't interrupt (most PTY-based tools, which are pause-to-prompt
@@ -183,10 +201,18 @@ pub trait CanonicalOps: Send + Sync {
     // Inspection
     // ------------------------------------------------------------
 
-    fn op_stack(&self, n: Option<u32>) -> anyhow::Result<String>;
-    fn op_frame(&self, n: u32) -> anyhow::Result<String>;
-    fn op_locals(&self) -> anyhow::Result<String>;
-    fn op_print(&self, expr: &str) -> anyhow::Result<String>;
+    fn op_stack(&self, _n: Option<u32>) -> anyhow::Result<String> {
+        Ok("backtrace".into())
+    }
+    fn op_frame(&self, n: u32) -> anyhow::Result<String> {
+        Ok(format!("frame {n}"))
+    }
+    fn op_locals(&self) -> anyhow::Result<String> {
+        Ok("locals".into())
+    }
+    fn op_print(&self, expr: &str) -> anyhow::Result<String> {
+        Ok(format!("print {expr}"))
+    }
 
     /// Mutate a live variable or expression. `lhs` is the target
     /// (usually a name, member access, or indexing); `rhs` is any
