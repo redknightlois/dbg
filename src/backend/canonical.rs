@@ -1,9 +1,3 @@
-// TODO(task-5): once the daemon dispatches canonical ops these will be
-// live. Until then the impl blocks in each backend register as
-// "unused" to the binary build — silence the noise here, not with
-// scattered #[allow] attributes on every fn in every backend.
-#![allow(dead_code)]
-
 //! Canonical debug-operation vocabulary.
 //!
 //! A thin translation layer over the native debugger's own command

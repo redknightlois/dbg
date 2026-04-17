@@ -3,7 +3,7 @@ use std::sync::OnceLock;
 use regex::Regex;
 use serde_json::{Map, Value};
 
-use super::canonical::{BreakLoc, CanonicalOps, HitEvent, unsupported};
+use super::canonical::{BreakLoc, CanonicalOps, HitEvent};
 use super::{Backend, CleanResult, Dependency, DependencyCheck, SpawnConfig};
 
 pub struct JdbBackend;

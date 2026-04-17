@@ -60,6 +60,12 @@ struct State {
     breakpoints: HashMap<String, String>,
     /// Set by the driver when the WS closes or node exits.
     alive: bool,
+    /// Main V8 execution context id. Captured on the first
+    /// `Runtime.executionContextCreated` and used to scope
+    /// `executionContextDestroyed` — worker_threads tear down their
+    /// own contexts during a healthy run, and we must not mark the
+    /// whole session dead in that case.
+    main_context_id: Option<i64>,
 }
 
 impl State {
@@ -72,6 +78,7 @@ impl State {
             script_sources: HashMap::new(),
             breakpoints: HashMap::new(),
             alive: true,
+            main_context_id: None,
         }
     }
 }
@@ -121,7 +128,9 @@ impl InspectorTransport {
         let child_pid = Pid::from_raw(child.id() as i32);
 
         let stderr = child.stderr.take().context("missing node stderr")?;
-        let stdout = child.stdout.take().context("missing node stdout")?;
+        // Claim stdout from the Child so it closes cleanly on Drop.
+        // Not piped into the event log — see comment below.
+        let _stdout = child.stdout.take().context("missing node stdout")?;
 
         // Scrape the ws URL from stderr. Node emits
         //   "Debugger listening on ws://127.0.0.1:PORT/UUID"
@@ -150,7 +159,6 @@ impl InspectorTransport {
         // Node's stderr after the "Debugger listening" line is pure
         // attach-handshake noise ("Debugger attached.", "For help…")
         // with no diagnostic value, so we drop it too.
-        let _ = stdout; // closed on drop; not piped into the log.
 
         // Spawn the driver thread. It owns the WebSocket and is the
         // single place reads + writes happen. Uses a 5ms poll cadence
@@ -348,7 +356,6 @@ impl InspectorTransport {
     /// any, lands in `state.pending_hit` for the daemon to drain via
     /// `pending_hit()`.
     fn exec<F: FnOnce(&Self) -> Result<Value>>(&self, f: F, timeout: Duration) -> Result<String> {
-        let since = self.log.last_seq();
         // Clear pending_hit before firing — we want only *new* pauses.
         {
             let (lock, _) = &*self.state;
@@ -372,7 +379,6 @@ impl InspectorTransport {
                 bail!("timeout waiting for next pause");
             }
             let _ = cvar.wait_timeout(guard, remaining).unwrap();
-            let _ = since; // quiet unused warning; kept for future use
         }
         Ok(String::new())
     }
@@ -457,12 +463,7 @@ impl InspectorTransport {
                 }
                 Ok(format!("Breakpoint set at {key} (id={bp_id})"))
             }
-            ParsedSb::Name(name) => {
-                // Function breakpoint — approximate with urlRegex
-                // targeting the literal function name. Intentionally
-                // coarse; users who care should pass file:line.
-                let pattern = format!(r"function\s+{}\s*\(", regex_escape(&name));
-                let _ = pattern; // not directly usable via setBreakpointByUrl — would need source maps
+            ParsedSb::Name(_) => {
                 bail!("node-proto: function-name breakpoints unsupported — use `break file.js:line`");
             }
         }
@@ -476,14 +477,15 @@ impl InspectorTransport {
                 .first()
                 .and_then(|f| f.get("callFrameId").and_then(|v| v.as_str()).map(String::from))
         };
-        let params = match call_frame_id {
-            Some(id) => json!({ "callFrameId": id, "expression": expr, "returnByValue": true }),
-            None => json!({ "expression": expr, "returnByValue": true }),
-        };
-        let method = if call_frame_id_present(&params) {
-            "Debugger.evaluateOnCallFrame"
-        } else {
-            "Runtime.evaluate"
+        let (method, params) = match call_frame_id {
+            Some(id) => (
+                "Debugger.evaluateOnCallFrame",
+                json!({ "callFrameId": id, "expression": expr, "returnByValue": true }),
+            ),
+            None => (
+                "Runtime.evaluate",
+                json!({ "expression": expr, "returnByValue": true }),
+            ),
         };
         let resp = self.call_blocking(method, params, timeout)?;
         let result = resp.get("result").unwrap_or(&Value::Null);
@@ -689,7 +691,7 @@ impl InspectorTransport {
             return Ok(String::new());
         }
         let centre = centre_line.max(1) as usize;
-        let start = centre.saturating_sub(WINDOW as usize + 1).max(0);
+        let start = centre.saturating_sub(WINDOW as usize + 1);
         let end = (centre + WINDOW as usize).min(lines.len());
         let mut out = String::new();
         for (i, line) in lines.iter().enumerate().take(end).skip(start) {
@@ -734,9 +736,6 @@ impl InspectorTransport {
     }
 }
 
-fn call_frame_id_present(params: &Value) -> bool {
-    params.get("callFrameId").is_some()
-}
 
 /// Render a `Runtime.RemoteObject` as a JSON-friendly value for the
 /// locals dump. Primitives come through with their real value;
@@ -820,6 +819,14 @@ impl DebuggerIo for InspectorTransport {
     fn quit(&self, _quit_cmd: &str) {
         self.shutdown.store(true, Ordering::Relaxed);
         let _ = self.driver_tx.send(DriverCmd::Shutdown);
+        // Wake any exec() parked waiting for a pending_hit that will
+        // never arrive now that we're tearing down.
+        {
+            let (lock, cvar) = &*self.state;
+            let mut s = lock.lock().unwrap();
+            s.alive = false;
+            cvar.notify_all();
+        }
         // Best-effort SIGTERM to node, SIGKILL after 500ms.
         let _ = nix::sys::signal::kill(self.child_pid, nix::sys::signal::Signal::SIGTERM);
         std::thread::sleep(Duration::from_millis(500));
@@ -954,6 +961,7 @@ fn driver_loop(
                 }
                 Ok(Message::Binary(_)) => {}
                 Ok(Message::Close(_)) => {
+                    drain_pending(&mut pending);
                     mark_dead(&state);
                     return;
                 }
@@ -964,6 +972,7 @@ fn driver_loop(
                     break;
                 }
                 Err(_) => {
+                    drain_pending(&mut pending);
                     mark_dead(&state);
                     return;
                 }
@@ -975,6 +984,7 @@ fn driver_loop(
             match rx.try_recv() {
                 Ok(DriverCmd::Shutdown) => {
                     let _ = ws.close(None);
+                    drain_pending(&mut pending);
                     mark_dead(&state);
                     return;
                 }
@@ -991,6 +1001,7 @@ fn driver_loop(
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
                     let _ = ws.close(None);
+                    drain_pending(&mut pending);
                     mark_dead(&state);
                     return;
                 }
@@ -998,6 +1009,12 @@ fn driver_loop(
         }
 
         std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+fn drain_pending(pending: &mut HashMap<u64, Sender<Result<Value, String>>>) {
+    for (_id, tx) in pending.drain() {
+        let _ = tx.send(Err("Inspector driver thread exited".into()));
     }
 }
 
@@ -1070,7 +1087,6 @@ fn dispatch_incoming(
             s.call_frames = call_frames;
             s.pending_hit = Some(hit);
             cvar.notify_all();
-            let _ = log; // log reserved for consoleAPICalled; unused here
         }
         "Debugger.resumed" => {
             let (lock, _) = &**state;
@@ -1106,9 +1122,31 @@ fn dispatch_incoming(
             line.push('\n');
             log.push(EventKind::Stdout, line.into_bytes());
         }
+        "Runtime.executionContextCreated" => {
+            // First context is the main realm; subsequent ones are
+            // worker_threads, vm modules, etc. — ignore those.
+            if let Some(id) = params.get("context").and_then(|c| c.get("id")).and_then(|v| v.as_i64()) {
+                let (lock, _) = &**state;
+                let mut s = lock.lock().unwrap();
+                if s.main_context_id.is_none() {
+                    s.main_context_id = Some(id);
+                }
+            }
+        }
         "Runtime.executionContextDestroyed" => {
-            // Program finished — flip alive so waiters unblock.
-            mark_dead(state);
+            // Only tear down when the *main* context dies. A
+            // worker_thread finishing should not kill the session.
+            let destroyed_id = params
+                .get("executionContextId")
+                .and_then(|v| v.as_i64());
+            let is_main = {
+                let (lock, _) = &**state;
+                let s = lock.lock().unwrap();
+                s.main_context_id.is_some() && s.main_context_id == destroyed_id
+            };
+            if is_main {
+                mark_dead(state);
+            }
         }
         _ => {}
     }

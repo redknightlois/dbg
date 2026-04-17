@@ -27,7 +27,6 @@
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::TcpStream;
-use std::os::fd::AsRawFd;
 use std::process::{Child, ChildStderr, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
@@ -936,6 +935,15 @@ impl DebuggerIo for DapTransport {
     fn quit(&self, _quit_cmd: &str) {
         self.shutdown.store(true, Ordering::Relaxed);
         let _ = self.driver_tx.send(DriverCmd::Shutdown);
+        // Wake anybody parked in exec() waiting on pending_hit —
+        // without this, kill_daemon blocks until their timeout fires.
+        {
+            let (lock, cvar) = &*self.state;
+            let mut s = lock.lock().unwrap();
+            s.alive = false;
+            s.terminated = true;
+            cvar.notify_all();
+        }
         let _ = nix::sys::signal::kill(self.child_pid, nix::sys::signal::Signal::SIGTERM);
         std::thread::sleep(Duration::from_millis(500));
         if let Some(mut child) = self.child.lock().unwrap().take() {
@@ -1182,9 +1190,6 @@ fn driver_loop(
     let mut inbox: Vec<u8> = Vec::with_capacity(16 * 1024);
     let mut next_seq: i64 = 1;
     let mut pending: HashMap<i64, (String, Sender<Result<Value, String>>)> = HashMap::new();
-    // Temporary storage for auto-fetched stackTrace responses keyed
-    // by the originating request seq (so the event-side auto-fetch
-    // flow can await the response without blocking the driver).
     loop {
         if shutdown.load(Ordering::Relaxed) {
             break;
@@ -1195,12 +1200,14 @@ fn driver_loop(
         loop {
             match stream.read(&mut buf) {
                 Ok(0) => {
+                    drain_pending(&mut pending);
                     mark_dead(&state);
                     return;
                 }
                 Ok(n) => inbox.extend_from_slice(&buf[..n]),
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
                 Err(_) => {
+                    drain_pending(&mut pending);
                     mark_dead(&state);
                     return;
                 }
@@ -1230,6 +1237,7 @@ fn driver_loop(
         loop {
             match rx.try_recv() {
                 Ok(DriverCmd::Shutdown) => {
+                    drain_pending(&mut pending);
                     mark_dead(&state);
                     return;
                 }
@@ -1250,6 +1258,7 @@ fn driver_loop(
                 }
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
+                    drain_pending(&mut pending);
                     mark_dead(&state);
                     return;
                 }
@@ -1257,6 +1266,16 @@ fn driver_loop(
         }
 
         std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+/// When the driver thread exits, any `call_blocking` senders still
+/// parked in `pending` would time out with the generic "timeout" error.
+/// Drain them with a clearer "driver dead" message so callers can
+/// distinguish a dead adapter from a slow one.
+fn drain_pending(pending: &mut HashMap<i64, (String, Sender<Result<Value, String>>)>) {
+    for (_seq, (_cmd, tx)) in pending.drain() {
+        let _ = tx.send(Err("DAP driver thread exited".into()));
     }
 }
 

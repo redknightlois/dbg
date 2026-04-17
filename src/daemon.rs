@@ -34,9 +34,8 @@ fn session_tmp_dir() -> PathBuf {
 }
 
 fn users_uid() -> u32 {
-    // Fall through to the USER env var if /etc/passwd lookup somehow
-    // fails — the value only needs to be stable and unique within the
-    // host, not authoritative.
+    // Read from /proc/self/status; the value only needs to be stable
+    // per-user within the host, not authoritative.
     std::env::var("UID")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -201,7 +200,7 @@ fn backend_target_class(name: &str) -> TargetClass {
 fn op_may_stop(canonical_op: &str) -> bool {
     matches!(
         canonical_op,
-        "run" | "continue" | "step" | "next" | "finish"
+        "run" | "continue" | "step" | "next" | "finish" | "restart" | "pause"
     )
 }
 
@@ -783,7 +782,7 @@ fn handle_events(cmd: &str, log_handle: &crate::pty::LogHandle) -> String {
                     Some(k) => parsed.push(k),
                     None => {
                         return format!(
-                            "unknown event kind '{name}' in --kind={v} (valid: output, prompt, exit, stop)"
+                            "unknown event kind '{name}' in --kind={v} (valid: stdout, output, prompt, exit, stop)"
                         );
                     }
                 }
