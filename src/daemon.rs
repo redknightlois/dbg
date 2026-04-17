@@ -33,20 +33,87 @@ fn session_tmp_dir() -> PathBuf {
     with_file.parent().unwrap_or(&with_file).to_path_buf()
 }
 
-/// Pick the best directory for IPC files.
-/// Prefers $XDG_RUNTIME_DIR (per-user, tmpfs), falls back to /tmp.
+fn users_uid() -> u32 {
+    // Fall through to the USER env var if /etc/passwd lookup somehow
+    // fails — the value only needs to be stable and unique within the
+    // host, not authoritative.
+    std::env::var("UID")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or_else(|| {
+            std::fs::read_to_string("/proc/self/status")
+                .ok()
+                .and_then(|s| {
+                    s.lines()
+                        .find(|l| l.starts_with("Uid:"))
+                        .and_then(|l| l.split_ascii_whitespace().nth(1)?.parse().ok())
+                })
+                .unwrap_or(0)
+        })
+}
+
+/// Per-user IPC directory. Prefers `$XDG_RUNTIME_DIR/dbg-<uid>` (tmpfs,
+/// already private), falls back to `/tmp/dbg-<uid>` with `0700` perms.
+/// Containing the socket+pid in a `0700` dir keeps other local users
+/// from racing the socket creation or hijacking the pid file — Unix
+/// socket permissions aren't portable enough to rely on the socket
+/// inode itself.
 fn runtime_dir() -> PathBuf {
-    std::env::var("XDG_RUNTIME_DIR")
+    use std::os::unix::fs::PermissionsExt;
+    // Unix user — used to scope the IPC dir per-user so collisions
+    // and permission races are impossible on shared /tmp.
+    let uid = users_uid();
+    let base = std::env::var("XDG_RUNTIME_DIR")
         .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("/tmp"))
+        .unwrap_or_else(|_| PathBuf::from("/tmp"));
+    let dir = base.join(format!("dbg-{uid}"));
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        // Fall back — we can't abort here (callers treat this as
+        // infallible). The bind() will fail with a clearer error.
+        eprintln!("dbg: cannot create {}: {e}", dir.display());
+    } else {
+        let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+    }
+    dir
+}
+
+/// Stable per-working-directory slug used to scope the daemon socket
+/// and pid file. Two agents running `dbg start` in different cwds get
+/// different sockets and don't stomp each other. `DBG_SESSION` env var
+/// overrides the cwd hash — useful for tests and for explicit
+/// multi-session workflows within a single cwd.
+fn session_slug() -> String {
+    if let Ok(v) = std::env::var("DBG_SESSION") {
+        let safe: String = v
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+            .collect();
+        if !safe.is_empty() {
+            return safe;
+        }
+    }
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
+    let mut h = DefaultHasher::new();
+    cwd.hash(&mut h);
+    format!("{:016x}", h.finish())
 }
 
 fn socket_path() -> PathBuf {
-    runtime_dir().join("dbg.sock")
+    runtime_dir().join(format!("dbg-{}.sock", session_slug()))
 }
 
 fn pid_path() -> PathBuf {
-    runtime_dir().join("dbg.pid")
+    runtime_dir().join(format!("dbg-{}.pid", session_slug()))
+}
+
+/// File the forked daemon's stderr is redirected to during startup.
+/// The parent reads it back when the daemon dies before binding the
+/// socket, so the agent sees the real failure reason instead of
+/// "daemon failed to start".
+pub fn startup_log_path() -> PathBuf {
+    runtime_dir().join(format!("dbg-{}.startup.log", session_slug()))
 }
 
 /// Session-scoped temp directory for profile data etc.
@@ -407,6 +474,13 @@ fn handle_command(
     }
 
     if let Some(topic) = cmd.strip_prefix("help ") {
+        // dbg's own verbs (start, kill, hits, break, …) — served from
+        // a static registry so `dbg help start` actually returns text
+        // even when the backend doesn't know about it.
+        let topic = topic.trim();
+        if let Some(text) = dbg_verb_help(topic) {
+            return text.to_string();
+        }
         let help_cmd = backend.help_command();
         let guard = match session.try_lock() {
             Ok(g) => g,
@@ -442,6 +516,22 @@ fn handle_command(
             // Drain any deferred stop banner from a prior async
             // execution command before sending the next one.
             drain_pending_events(&mut guard, backend);
+
+            // Post-mortem fallback: once the debuggee has exited, live
+            // inspection verbs (stack/locals) can still be answered
+            // from the last captured breakpoint hit in the session DB.
+            // Execution verbs (step/continue/run/…) have no useful
+            // fallback — return a directed exit message instead.
+            if !guard.proc.is_alive() {
+                // First post-mortem access also flushes the DB to
+                // `.dbg/sessions/<label>.db` so `dbg kill` isn't
+                // required to make the run discoverable via
+                // `dbg sessions` / `dbg replay`.
+                persist_session_on_exit(&mut guard);
+                let fallback = post_mortem_fallback(&guard, canonical_op);
+                log_command(&mut guard, cmd, &fallback, Some(canonical_op));
+                return fallback;
+            }
 
             let send_result = match structured.as_ref() {
                 Some(req) => match guard.proc.dispatch_structured(req, CMD_TIMEOUT) {
@@ -538,6 +628,115 @@ fn log_command(session: &mut Session, input: &str, output: &str, canonical_op: O
          )",
         params![input, head, output_bytes, canonical_op],
     );
+}
+
+/// Help text for dbg-level verbs. Returns `None` when the verb is
+/// unknown — callers fall through to the backend's own help.
+fn dbg_verb_help(verb: &str) -> Option<&'static str> {
+    Some(match verb {
+        "start" => "\
+dbg start <type> <target> [--break SPEC] [--args ...] [--run]
+  Spawn a debugger session. <type> may be omitted when <target>'s
+  extension unambiguously identifies a backend (.py, .go, .java, .rb,
+  .php, .csproj, .js, .ts, .hs, .ml).
+  --break SPEC        set a breakpoint before run (repeatable)
+  --args a b c        forward args to the debuggee
+  --run               continue past the debugger's startup prompt;
+                      breakpoints still fire.
+  --attach-pid N      attach to a running process (DAP backends)
+  --attach-port H:P   attach via host:port (DAP backends)",
+        "kill" | "quit" => "\
+dbg kill
+  Stop the active session, persisting captured data to .dbg/sessions/
+  before exit. Idempotent — safe to run when no session is live.",
+        "status" => "\
+dbg status
+  Show live session info: backend, target, PID, elapsed time. Returns
+  \"no session\" when nothing is running.",
+        "sessions" => "\
+dbg sessions
+  List persisted sessions under .dbg/sessions/. The currently-live
+  session (if any) is marked with *.",
+        "replay" => "\
+dbg replay <label>
+  Open a persisted session read-only and run crosstrack queries against
+  it. Same vocabulary as a live session: hits, hit-trend, hit-diff,
+  cross, disasm, source. No live debugger — exec verbs are rejected.",
+        "run" => "\
+dbg run
+  Start the debuggee (or restart it). Stops at the first breakpoint
+  that fires.",
+        "continue" | "c" => "\
+dbg continue
+  Resume the debuggee until the next breakpoint, signal, or exit.",
+        "step" | "s" => "\
+dbg step
+  Step into the next line (source-level).",
+        "next" | "n" => "\
+dbg next
+  Step over the next line, not descending into function calls.",
+        "finish" => "\
+dbg finish
+  Run until the current function returns.",
+        "break" | "b" => "\
+dbg break <spec>
+  Set a breakpoint. <spec> is one of:
+    file:line               — e.g. main.c:42, broken.py:20
+    function                — e.g. MyClass.run, main
+    /abs/file:line          — absolute paths always work unambiguously
+  For pdb/delve/others, breaking on a `def` / function-header line
+  may not fire until the first body line — dbg auto-advances when it
+  can detect this; otherwise use file:line with a body line.",
+        "locals" => "\
+dbg locals
+  Print local variables at the current stop. Also backfills
+  locals_json on the most recent captured hit, enabling
+  `dbg hit-trend`/`--group-by` sparklines progressively.",
+        "stack" | "bt" => "\
+dbg stack
+  Print the call stack at the current stop.",
+        "print" | "p" => "\
+dbg print <expr>
+  Evaluate <expr> in the debuggee's current frame.",
+        "hits" => "\
+dbg hits <loc> [--group-by FIELD] [--count-by FIELD --top N]
+  List captured breakpoint hits at <loc>. With --group-by, aggregate
+  by a locals field: `dbg hits broken.py:20 --group-by n` → count per
+  distinct n. --count-by is an alias; --top N truncates to the most
+  frequent. Dotted paths supported (self.x).",
+        "hit-diff" => "\
+dbg hit-diff <loc> <seq_a> <seq_b>
+  Show a field-by-field diff of captured locals between two hits.",
+        "hit-trend" => "\
+dbg hit-trend <loc> <field>
+  Render a sparkline of a locals field across hits. Accepts dotted
+  paths (self.x). When the field isn't captured, enumerates available
+  field names in the error so you can pick one.",
+        "cross" => "\
+dbg cross <symbol>
+  Show everything known about <symbol>: hit count, profile samples,
+  jit events, disassembly rows, source snapshots.",
+        "disasm" => "\
+dbg disasm [<symbol>] [--refresh]
+  Capture and show disassembly for <symbol>. Omit <symbol> at a stop
+  point to disasm the current frame. --refresh forces recollection.",
+        "source" => "\
+dbg source <symbol> [radius=5]
+  Show the source of <symbol> with ±radius lines of context.",
+        "events" => "\
+dbg events [--since=SEQ] [--tail=N] [--kind=stop,stdout,...] [--wait=MS]
+  Live-tail the session's PTY event log. Does not touch the session
+  mutex, so it works while a `continue` is blocked.",
+        "save" => "\
+dbg save [--label NAME]
+  Persist the current session DB to .dbg/sessions/<label>.db.",
+        "cancel" => "\
+dbg cancel
+  Interrupt the currently-running debugger command without tearing
+  down the session (sends SIGINT to the debuggee). Use to break out
+  of a `continue` that hasn't hit a breakpoint.",
+        _ => return None,
+    })
 }
 
 /// Format the reader's event log for `dbg events`. Supports:
@@ -736,6 +935,77 @@ fn output_preview(bytes: &[u8]) -> String {
 /// is idle. The reader thread captures those bytes regardless; this
 /// helper pulls them from the channel and feeds them through
 /// `capture_hit_if_stopped` before the next command runs. Non-blocking.
+/// After the debuggee exits, live inspection verbs have no live
+/// debugger to ask. For stack/locals we serve the last captured hit
+/// from the session DB so the agent can still look at the program's
+/// final observable state. Execution verbs get a clear "you're
+/// post-mortem" message pointing at `dbg hits` / `dbg cross`.
+fn post_mortem_fallback(session: &Session, canonical_op: &str) -> String {
+    let db = match session.db.as_ref() {
+        Some(d) => d,
+        None => {
+            return "(debuggee has exited and no session DB is available — \
+                    start a fresh session with `dbg start`)"
+                .to_string();
+        }
+    };
+    match canonical_op {
+        "locals" => {
+            let row: Option<(i64, String, Option<String>)> = db
+                .conn()
+                .query_row(
+                    "SELECT hit_seq, location_key, locals_json
+                     FROM breakpoint_hits
+                     WHERE locals_json IS NOT NULL
+                     ORDER BY id DESC LIMIT 1",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+                .ok();
+            match row {
+                Some((seq, loc, Some(json))) => format!(
+                    "[post-mortem] locals at last captured hit {loc} #{seq}\n{json}\n\
+                     (debuggee has exited; use `dbg hits <loc>` to browse all hits)"
+                ),
+                _ => "[post-mortem] debuggee has exited and no locals were \
+                      captured — run a new session with `dbg start`"
+                    .to_string(),
+            }
+        }
+        "stack" | "bt" | "backtrace" => {
+            let row: Option<(i64, String, Option<String>)> = db
+                .conn()
+                .query_row(
+                    "SELECT hit_seq, location_key, stack_json
+                     FROM breakpoint_hits
+                     WHERE stack_json IS NOT NULL
+                     ORDER BY id DESC LIMIT 1",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+                .ok();
+            match row {
+                Some((seq, loc, Some(json))) => format!(
+                    "[post-mortem] stack at last captured hit {loc} #{seq}\n{json}"
+                ),
+                _ => "[post-mortem] debuggee has exited and no stack was \
+                      captured — run a new session with `dbg start`"
+                    .to_string(),
+            }
+        }
+        "run" | "continue" | "step" | "next" | "finish" | "restart" | "pause" => {
+            "debuggee has exited — cannot resume. Use `dbg hits <loc>`, \
+             `dbg stack`, `dbg locals`, `dbg cross <sym>` to inspect \
+             captured state, or `dbg start` for a fresh run."
+                .to_string()
+        }
+        _ => "debuggee has exited — live inspection unavailable. Use \
+              `dbg hits`, `dbg cross`, `dbg replay <label>` against the \
+              captured DB, or `dbg start` for a new session."
+            .to_string(),
+    }
+}
+
 fn drain_pending_events(session: &mut Session, backend: &dyn Backend) {
     if let Some(pending) = session.proc.drain_pending() {
         if !pending.trim().is_empty() {

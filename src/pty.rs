@@ -447,7 +447,9 @@ impl DebuggerProcess {
         // (typical after the debuggee runs to completion) from a
         // genuine protocol error.
         if !self.is_alive() {
-            return Ok("(session has exited — start a new one with `dbg start`)".to_string());
+            return Ok("(debuggee has exited — live inspection is over, but captured state is \
+still available: `dbg hits <loc>`, `dbg stack`, `dbg locals`, `dbg cross <sym>`, \
+`dbg sessions`. Start a fresh session with `dbg start` when ready.)".to_string());
         }
         if let Err(e) = self.write_master(format!("{cmd}\n").as_bytes()) {
             // EIO / EPIPE on write almost always means the PTY master
@@ -455,7 +457,9 @@ impl DebuggerProcess {
             // alive-check above and the write. Surface the same clean
             // sticky message rather than the raw errno.
             if !self.is_alive() {
-                return Ok("(session has exited — start a new one with `dbg start`)".to_string());
+                return Ok("(debuggee has exited — live inspection is over, but captured state is \
+still available: `dbg hits <loc>`, `dbg stack`, `dbg locals`, `dbg cross <sym>`, \
+`dbg sessions`. Start a fresh session with `dbg start` when ready.)".to_string());
             }
             return Err(e);
         }
@@ -478,7 +482,9 @@ impl DebuggerProcess {
                     // sticky status so the agent sees a consistent
                     // message regardless of which verb first noticed.
                     return Ok(
-                        "(session has exited — start a new one with `dbg start`)".to_string(),
+                        "(debuggee has exited — live inspection is over, but captured state is \
+still available: `dbg hits <loc>`, `dbg stack`, `dbg locals`, `dbg cross <sym>`, \
+`dbg sessions`. Start a fresh session with `dbg start` when ready.)".to_string(),
                     );
                 }
             }
