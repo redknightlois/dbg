@@ -79,7 +79,6 @@ fn main() -> Result<()> {
     registry.register(Box::new(backend::ghci::GhciBackend));
     registry.register(Box::new(backend::ghcprof::GhcProfBackend));
     registry.register(Box::new(backend::ocamldebug::OcamlDebugBackend));
-    registry.register(Box::new(backend::node_inspect::NodeInspectBackend));
     registry.register(Box::new(backend::node_proto::NodeProtoBackend));
     registry.register(Box::new(backend::nodeprof::NodeProfBackend));
 

@@ -26,7 +26,7 @@ impl Backend for NodeProtoBackend {
     }
 
     fn types(&self) -> &'static [&'static str] {
-        &["node-proto"]
+        &["node-proto", "node", "nodejs", "js", "javascript", "ts", "typescript"]
     }
 
     fn spawn_config(&self, target: &str, _args: &[String]) -> anyhow::Result<SpawnConfig> {

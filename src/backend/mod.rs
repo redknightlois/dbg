@@ -14,7 +14,6 @@ pub mod netcoredbg;
 pub mod netcoredbg_proto;
 pub mod massif;
 pub mod memcheck;
-pub mod node_inspect;
 pub mod node_proto;
 pub mod nodeprof;
 pub mod ocamldebug;
