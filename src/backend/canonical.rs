@@ -83,6 +83,23 @@ impl BreakLoc {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BreakId(pub u32);
 
+/// Structured canonical request carried alongside the native-command
+/// string. Transports that can consume the structured form directly
+/// (DAP, Inspector) use it to skip the string → regex round-trip; PTY
+/// backends ignore it and fall back to parsing the native command.
+///
+/// Only ops with a real parse-back problem live here. Simple verbs like
+/// `continue` / `step` have no structured data to recover and stay
+/// string-only.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CanonicalReq {
+    Break {
+        loc: BreakLoc,
+        cond: Option<String>,
+        log: Option<String>,
+    },
+}
+
 /// Parsed out of the PTY read loop after an op returns. A `Some` means
 /// "the debugger just stopped"; the daemon then issues follow-up
 /// `op_locals` + `op_stack` and persists a `breakpoint_hits` row.
@@ -131,6 +148,13 @@ pub trait CanonicalOps: Send + Sync {
             Err(unsupported(self.tool_name(), "conditional breakpoints"))
         }
     }
+    /// Logpoint: a breakpoint that prints `msg` without stopping the
+    /// debuggee. Templates typically interpolate `{expr}` — the
+    /// underlying adapter defines the exact syntax. Backends that
+    /// can't emit logpoints return `unsupported`.
+    fn op_break_log(&self, _loc: &BreakLoc, _msg: &str) -> anyhow::Result<String> {
+        Err(unsupported(self.tool_name(), "logpoints"))
+    }
     fn op_unbreak(&self, id: BreakId) -> anyhow::Result<String> {
         Ok(format!("breakpoint delete {}", id.0))
     }
@@ -169,6 +193,14 @@ pub trait CanonicalOps: Send + Sync {
     fn op_frame(&self, n: u32) -> anyhow::Result<String>;
     fn op_locals(&self) -> anyhow::Result<String>;
     fn op_print(&self, expr: &str) -> anyhow::Result<String>;
+
+    /// Mutate a live variable or expression. `lhs` is the target
+    /// (usually a name, member access, or indexing); `rhs` is any
+    /// expression the adapter can evaluate. Backends without assignment
+    /// support return `unsupported`.
+    fn op_set(&self, _lhs: &str, _rhs: &str) -> anyhow::Result<String> {
+        Err(unsupported(self.tool_name(), "variable assignment"))
+    }
 
     // ------------------------------------------------------------
     // Optional ops — backends lacking them return `unsupported(...)`.

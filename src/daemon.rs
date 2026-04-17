@@ -436,13 +436,21 @@ fn handle_command(
             canonical_op,
             native_cmd,
             decorate,
+            structured,
         } => {
             let mut guard = lock_session(session);
             // Drain any deferred stop banner from a prior async
             // execution command before sending the next one.
             drain_pending_events(&mut guard, backend);
 
-            match guard.proc.send_and_wait(&native_cmd, CMD_TIMEOUT) {
+            let send_result = match structured.as_ref() {
+                Some(req) => match guard.proc.dispatch_structured(req, CMD_TIMEOUT) {
+                    Some(r) => r,
+                    None => guard.proc.send_and_wait(&native_cmd, CMD_TIMEOUT),
+                },
+                None => guard.proc.send_and_wait(&native_cmd, CMD_TIMEOUT),
+            };
+            match send_result {
                 Ok(raw) => {
                     if op_may_stop(canonical_op) {
                         capture_hit_if_stopped(&mut guard, backend, &raw);

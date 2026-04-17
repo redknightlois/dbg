@@ -8,7 +8,7 @@
 //! passthrough keeps working.
 
 use super::Dispatched;
-use crate::backend::{Backend, BreakId, BreakLoc, CanonicalOps};
+use crate::backend::{Backend, BreakId, BreakLoc, CanonicalOps, CanonicalReq};
 
 /// Dispatch a user-facing canonical debug command. Unknown input
 /// returns `Fallthrough` so the daemon can run the legacy passthrough
@@ -35,6 +35,7 @@ pub fn dispatch_to(input: &str, backend: &dyn Backend) -> Dispatched {
             canonical_op: "raw",
             native_cmd: rest.to_string(),
             decorate: false,
+            structured: None,
         };
     }
 
@@ -56,8 +57,9 @@ pub fn dispatch_to(input: &str, backend: &dyn Backend) -> Dispatched {
         "restart" => one_arg_native(ops.op_restart(), "restart"),
         "stack" => dispatch_stack(ops, rest),
         "frame" => dispatch_frame(ops, rest),
-        "locals" => one_arg_native(ops.op_locals(), "locals"),
+        "locals" => dispatch_locals(ops),
         "print" => dispatch_print(ops, rest),
+        "set" => dispatch_set(ops, rest),
         "watch" => dispatch_watch(ops, rest),
         "threads" => one_arg_native(ops.op_threads(), "threads"),
         "thread" => dispatch_thread(ops, rest),
@@ -107,6 +109,7 @@ fn one_arg_native(
             canonical_op,
             native_cmd,
             decorate: true,
+            structured: None,
         },
         Err(e) => Dispatched::Immediate(format!("[error: {e}]")),
     }
@@ -115,26 +118,44 @@ fn one_arg_native(
 fn dispatch_break(ops: &dyn CanonicalOps, rest: &str) -> Dispatched {
     if rest.is_empty() {
         return Dispatched::Immediate(
-            "usage: dbg break <file:line | symbol | module!method> [if <cond>]".into(),
+            "usage: dbg break <file:line | symbol | module!method> [if <cond>] [log <msg>]".into(),
         );
     }
-    // Split off an optional ` if <expr>` suffix. The location is whatever
-    // came before; the condition is everything after the delimiter.
-    let (loc_str, cond) = match rest.find(" if ") {
-        Some(i) => (&rest[..i], &rest[i + 4..]),
+    // Peel ` log <template>` first (templates can contain ` if ` text),
+    // then an optional ` if <expr>`. The remainder is the location.
+    let (head, log_msg) = match rest.find(" log ") {
+        Some(i) => (&rest[..i], &rest[i + 5..]),
         None => (rest, ""),
     };
+    let (loc_str, cond) = match head.find(" if ") {
+        Some(i) => (&head[..i], &head[i + 4..]),
+        None => (head, ""),
+    };
     let loc = BreakLoc::parse(loc_str.trim());
-    let result = if cond.is_empty() {
+    let cond_trim = cond.trim();
+    let log_trim = log_msg.trim();
+    let result = if !log_trim.is_empty() {
+        // Logpoints take precedence: condition + logMessage both land
+        // on the same native breakpoint in DAP, and the backend's
+        // `op_break_log` is responsible for threading both through.
+        // For now, if a caller combines `if` and `log`, we drop the
+        // condition — agents wanting both should use `dbg raw`.
+        ops.op_break_log(&loc, log_trim)
+    } else if cond_trim.is_empty() {
         ops.op_break(&loc)
     } else {
-        ops.op_break_conditional(&loc, cond.trim())
+        ops.op_break_conditional(&loc, cond_trim)
     };
     match result {
         Ok(cmd) => Dispatched::Native {
             canonical_op: "break",
             native_cmd: cmd,
             decorate: true,
+            structured: Some(CanonicalReq::Break {
+                loc,
+                cond: if cond_trim.is_empty() { None } else { Some(cond_trim.to_string()) },
+                log: if log_trim.is_empty() { None } else { Some(log_trim.to_string()) },
+            }),
         },
         Err(e) => Dispatched::Immediate(format!("[error: {e}]")),
     }
@@ -183,6 +204,53 @@ fn dispatch_print(ops: &dyn CanonicalOps, rest: &str) -> Dispatched {
         return Dispatched::Immediate("usage: dbg print <expression>".into());
     }
     one_arg_native(ops.op_print(rest), "print")
+}
+
+fn dispatch_set(ops: &dyn CanonicalOps, rest: &str) -> Dispatched {
+    // `dbg set <lhs> = <expr>`. Split on the first `=` so LHS may
+    // contain dots, indexing, etc.
+    let (lhs, rhs) = match rest.find('=') {
+        Some(i) => (rest[..i].trim(), rest[i + 1..].trim()),
+        None => return Dispatched::Immediate("usage: dbg set <lhs> = <expr>".into()),
+    };
+    if lhs.is_empty() || rhs.is_empty() {
+        return Dispatched::Immediate("usage: dbg set <lhs> = <expr>".into());
+    }
+    one_arg_native(ops.op_set(lhs, rhs), "set")
+}
+
+/// `locals` is special: when a backend's CLI doesn't expose a bulk
+/// "list all locals" verb (netcoredbg CLI, jdb in some states) the
+/// previous behaviour surfaced `[error: bulk locals not supported …]`
+/// which agents had to special-case. Instead, translate a capability
+/// gap into a structured Ok result so callers can branch on it the
+/// same way they do for any other `unsupported` flag, and reserve the
+/// `[error: …]` path for genuine runtime failures.
+fn dispatch_locals(ops: &dyn CanonicalOps) -> Dispatched {
+    match ops.op_locals() {
+        Ok(native_cmd) => Dispatched::Native {
+            canonical_op: "locals",
+            native_cmd,
+            decorate: true,
+            structured: None,
+        },
+        Err(e) => {
+            let reason = e.to_string();
+            // If the backend signalled "unsupported" (via the shared
+            // `unsupported(...)` helper) return a structured JSON
+            // result — otherwise the original error stands.
+            if reason.contains("not supported by") || reason.contains("unsupported") {
+                let payload = serde_json::json!({
+                    "unsupported": true,
+                    "op": "locals",
+                    "reason": reason,
+                });
+                Dispatched::Immediate(payload.to_string())
+            } else {
+                Dispatched::Immediate(format!("[error: {reason}]"))
+            }
+        }
+    }
 }
 
 fn dispatch_watch(ops: &dyn CanonicalOps, rest: &str) -> Dispatched {
@@ -247,7 +315,7 @@ mod tests {
 
     fn native_of(d: Dispatched) -> (&'static str, String, bool) {
         match d {
-            Dispatched::Native { canonical_op, native_cmd, decorate } => {
+            Dispatched::Native { canonical_op, native_cmd, decorate, .. } => {
                 (canonical_op, native_cmd, decorate)
             }
             other => panic!("expected Native, got {:?}", describe(&other)),
@@ -256,7 +324,7 @@ mod tests {
 
     fn describe(d: &Dispatched) -> String {
         match d {
-            Dispatched::Native { canonical_op, native_cmd, decorate } => {
+            Dispatched::Native { canonical_op, native_cmd, decorate, .. } => {
                 format!("Native({canonical_op}, {native_cmd:?}, decorate={decorate})")
             }
             Dispatched::Immediate(s) => format!("Immediate({s:?})"),
@@ -264,6 +332,58 @@ mod tests {
             Dispatched::Lifecycle(l) => format!("Lifecycle({})", l.canonical_op()),
             Dispatched::Fallthrough => "Fallthrough".into(),
         }
+    }
+
+    fn structured_of(d: Dispatched) -> Option<crate::backend::CanonicalReq> {
+        match d {
+            Dispatched::Native { structured, .. } => structured,
+            other => panic!("expected Native, got {:?}", describe(&other)),
+        }
+    }
+
+    #[test]
+    fn break_carries_structured_req_plain() {
+        use crate::backend::{BreakLoc, CanonicalReq};
+        let d = dispatch_to("break app.go:10", &lldb());
+        match structured_of(d) {
+            Some(CanonicalReq::Break { loc, cond, log }) => {
+                assert_eq!(loc, BreakLoc::FileLine { file: "app.go".into(), line: 10 });
+                assert!(cond.is_none());
+                assert!(log.is_none());
+            }
+            other => panic!("expected Break, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn break_carries_structured_req_with_cond_and_log() {
+        use crate::backend::delve_proto::DelveProtoBackend;
+        use crate::backend::{BreakLoc, CanonicalReq};
+        let d = dispatch_to("break app.go:10 if x > 0", &DelveProtoBackend);
+        match structured_of(d) {
+            Some(CanonicalReq::Break { loc, cond, log }) => {
+                assert_eq!(loc, BreakLoc::FileLine { file: "app.go".into(), line: 10 });
+                assert_eq!(cond.as_deref(), Some("x > 0"));
+                assert!(log.is_none());
+            }
+            other => panic!("expected Break, got {other:?}"),
+        }
+
+        let d = dispatch_to("break app.go:10 log hit {x}", &DelveProtoBackend);
+        match structured_of(d) {
+            Some(CanonicalReq::Break { loc, cond, log }) => {
+                assert_eq!(loc, BreakLoc::FileLine { file: "app.go".into(), line: 10 });
+                assert!(cond.is_none());
+                assert_eq!(log.as_deref(), Some("hit {x}"));
+            }
+            other => panic!("expected Break, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn non_break_ops_have_no_structured_req() {
+        assert!(structured_of(dispatch_to("continue", &lldb())).is_none());
+        assert!(structured_of(dispatch_to("step", &lldb())).is_none());
     }
 
     #[test]

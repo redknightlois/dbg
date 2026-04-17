@@ -285,8 +285,14 @@ fn cmd_start(registry: &Registry, args: &[String]) -> Result<()> {
         i += 1;
     }
 
-    // Resolve target
-    let resolved = resolve::resolve(backend_type, target_raw)?;
+    // Resolve target. Attach mode doesn't need a local target file —
+    // the debuggee is already running — so skip resolution and pass
+    // the raw value through for logging.
+    let resolved = if attach.is_some() {
+        target_raw.clone()
+    } else {
+        resolve::resolve(backend_type, target_raw)?
+    };
     eprintln!("target: {resolved}");
 
     // Fork daemon

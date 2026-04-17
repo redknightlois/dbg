@@ -108,6 +108,9 @@ struct State {
     breakpoint_conditions: HashMap<String, String>,
     /// Function-name → condition expression, same idea for setFunctionBreakpoints.
     function_breakpoint_conditions: HashMap<String, String>,
+    /// "absolute-path:line" → logMessage template. Logpoints emit
+    /// formatted output without stopping the debuggee.
+    breakpoint_log_messages: HashMap<String, String>,
     /// True between `stopped` and the next `continue`/step.
     paused: bool,
     /// Flipped when the adapter disconnects or terminates.
@@ -130,6 +133,7 @@ impl State {
             function_breakpoints: Vec::new(),
             breakpoint_conditions: HashMap::new(),
             function_breakpoint_conditions: HashMap::new(),
+            breakpoint_log_messages: HashMap::new(),
             paused: false,
             alive: true,
             initialized: false,
@@ -364,7 +368,27 @@ impl DapTransport {
             return self.exec(|s| s.call_blocking("pause", json!({"threadId": tid}), timeout), timeout);
         }
         if trimmed == "restart" {
-            return self.exec(|s| s.call_blocking("restart", json!({}), timeout), timeout);
+            // Adapter behavior on restart varies: some relaunch with
+            // stopOnEntry (emits a new stopped event), others resume the
+            // process as if continue was pressed (no stop event). We
+            // just fire the request and return — callers can query
+            // state afterward. Wrapping in exec() would hang waiting
+            // for a stop that may never arrive.
+            //
+            // Clear per-session frame state *before* the restart so the
+            // post-restart `stopped` event (if any) repopulates from
+            // scratch instead of returning stale frameIds to
+            // `locals`/`print`.
+            {
+                let (lock, _) = &*self.state;
+                let mut s = lock.lock().unwrap();
+                s.paused = false;
+                s.top_frame = None;
+                s.call_frames.clear();
+                s.pending_hit = None;
+            }
+            self.call_blocking("restart", json!({}), timeout)?;
+            return Ok("restart requested".into());
         }
         if trimmed == "catch" || trimmed == "catch off" {
             self.call_blocking(
@@ -421,6 +445,9 @@ impl DapTransport {
         }
         if let Some(expr) = trimmed.strip_prefix("print ").or_else(|| trimmed.strip_prefix("p ")) {
             return self.evaluate(expr, timeout);
+        }
+        if let Some(rest) = trimmed.strip_prefix("set ") {
+            return self.set_expression(rest, timeout);
         }
         if trimmed == ".exit" || trimmed == "quit" {
             self.shutdown.store(true, Ordering::Relaxed);
@@ -576,7 +603,7 @@ impl DapTransport {
     }
 
     fn set_breakpoint(&self, spec: &BreakSpec, timeout: Duration) -> Result<String> {
-        let BreakSpec { file, line, condition } = spec;
+        let BreakSpec { file, line, condition, log_message } = spec;
         // DAP requires the full set of breakpoints for a source each
         // call — it doesn't merge. Accumulate in state.breakpoints
         // and replay the full list per source on each add.
@@ -599,9 +626,14 @@ impl DapTransport {
             };
             let key = format!("{resolved_path}:{line}");
             if let Some(c) = condition {
-                s.breakpoint_conditions.insert(key, c.clone());
+                s.breakpoint_conditions.insert(key.clone(), c.clone());
             } else {
                 s.breakpoint_conditions.remove(&key);
+            }
+            if let Some(m) = log_message {
+                s.breakpoint_log_messages.insert(key, m.clone());
+            } else {
+                s.breakpoint_log_messages.remove(&key);
             }
             lines_snapshot
         };
@@ -617,6 +649,9 @@ impl DapTransport {
                     if let Some(c) = s.breakpoint_conditions.get(&key) {
                         b.insert("condition".into(), Value::String(c.clone()));
                     }
+                    if let Some(m) = s.breakpoint_log_messages.get(&key) {
+                        b.insert("logMessage".into(), Value::String(m.clone()));
+                    }
                     Value::Object(b)
                 })
                 .collect()
@@ -630,10 +665,114 @@ impl DapTransport {
             }),
             timeout,
         )?;
-        match condition {
-            Some(c) => Ok(format!("Breakpoint set at {file}:{line} if {c}")),
-            None => Ok(format!("Breakpoint set at {file}:{line}")),
+        match (condition, log_message) {
+            (Some(c), Some(m)) => Ok(format!("Logpoint set at {file}:{line} if {c}: {m}")),
+            (None, Some(m)) => Ok(format!("Logpoint set at {file}:{line}: {m}")),
+            (Some(c), None) => Ok(format!("Breakpoint set at {file}:{line} if {c}")),
+            (None, None) => Ok(format!("Breakpoint set at {file}:{line}")),
         }
+    }
+
+    fn set_expression(&self, rest: &str, timeout: Duration) -> Result<String> {
+        // `set <lhs> = <rhs>`. Split on the first `=` so LHS may contain
+        // dots, indexing, etc.
+        let (lhs, rhs) = match rest.find('=') {
+            Some(i) => (rest[..i].trim().to_string(), rest[i + 1..].trim().to_string()),
+            None => bail!("usage: dbg set <lhs> = <expr>"),
+        };
+        if lhs.is_empty() || rhs.is_empty() {
+            bail!("usage: dbg set <lhs> = <expr>");
+        }
+        let frame_id = {
+            let (lock, _) = &*self.state;
+            let s = lock.lock().unwrap();
+            s.top_frame.as_ref().and_then(|f| f.get("id").and_then(|v| v.as_i64()))
+        };
+        let mut args = json!({
+            "expression": lhs,
+            "value": rhs,
+        });
+        if let Some(id) = frame_id {
+            args["frameId"] = json!(id);
+        }
+        // Try setExpression first; fall back to scope-walking
+        // setVariable only when the adapter reports the request as
+        // unsupported (e.g. delve: "Not yet implemented"). Any other
+        // error is a genuine evaluation failure — surface it.
+        match self.call_blocking("setExpression", args, timeout) {
+            Ok(resp) => Ok(resp
+                .get("value")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string()),
+            Err(e) => {
+                let msg = e.to_string().to_lowercase();
+                let looks_unsupported = msg.contains("not yet implemented")
+                    || msg.contains("unsupported")
+                    || msg.contains("not supported")
+                    || msg.contains("unknown command")
+                    // lldb-dap returns the opaque "request failed" with
+                    // no body for setExpression — also treat that as
+                    // a signal to try the setVariable path. Real
+                    // evaluation failures on lldb-dap come back with
+                    // a more specific message.
+                    || msg.contains("request failed");
+                if looks_unsupported {
+                    self.set_variable_fallback(&lhs, &rhs, timeout)
+                } else {
+                    Err(e)
+                }
+            }
+        }
+    }
+
+    /// When an adapter doesn't support `setExpression`, walk the top
+    /// frame's scopes, find the variable by name, and send
+    /// `setVariable` against its containing scope's variablesReference.
+    /// Only handles plain names (no dotted LHS) — complex lvalues
+    /// should use `dbg raw` with the adapter's native syntax.
+    fn set_variable_fallback(&self, lhs: &str, rhs: &str, timeout: Duration) -> Result<String> {
+        let frame_id = {
+            let (lock, _) = &*self.state;
+            let s = lock.lock().unwrap();
+            s.top_frame
+                .as_ref()
+                .and_then(|f| f.get("id").and_then(|v| v.as_i64()))
+                .ok_or_else(|| anyhow!("no active frame"))?
+        };
+        let scopes = self.call_blocking("scopes", json!({"frameId": frame_id}), timeout)?;
+        let arr = scopes
+            .get("scopes")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        for scope in arr {
+            let Some(vref) = scope.get("variablesReference").and_then(|v| v.as_i64()) else {
+                continue;
+            };
+            if vref == 0 {
+                continue;
+            }
+            let vars = self.call_blocking("variables", json!({"variablesReference": vref}), timeout)?;
+            let found = vars
+                .get("variables")
+                .and_then(|v| v.as_array())
+                .map(|a| a.iter().any(|v| v.get("name").and_then(|n| n.as_str()) == Some(lhs)))
+                .unwrap_or(false);
+            if found {
+                let resp = self.call_blocking(
+                    "setVariable",
+                    json!({"variablesReference": vref, "name": lhs, "value": rhs}),
+                    timeout,
+                )?;
+                return Ok(resp
+                    .get("value")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string());
+            }
+        }
+        bail!("variable `{lhs}` not found in any frame scope")
     }
 
     fn evaluate(&self, expr: &str, timeout: Duration) -> Result<String> {
@@ -810,6 +949,37 @@ impl DebuggerIo for DapTransport {
     fn pending_hit(&self) -> Option<HitEvent> {
         let (lock, _) = &*self.state;
         lock.lock().unwrap().pending_hit.take()
+    }
+    fn dispatch_structured(
+        &self,
+        req: &crate::backend::canonical::CanonicalReq,
+        timeout: Duration,
+    ) -> Option<Result<String>> {
+        use crate::backend::canonical::{BreakLoc, CanonicalReq};
+        match req {
+            CanonicalReq::Break { loc, cond, log } => match loc {
+                BreakLoc::FileLine { file, line } => {
+                    let spec = BreakSpec {
+                        file: file.clone(),
+                        line: *line,
+                        condition: cond.clone(),
+                        log_message: log.clone(),
+                    };
+                    Some(self.set_breakpoint(&spec, timeout))
+                }
+                BreakLoc::Fqn(name) => {
+                    // Function breakpoints don't carry a log template
+                    // in the current DAP path; logpoints on a symbol
+                    // fall back to the native string (`bfn` has no
+                    // log field) so PTY-style callers still work.
+                    if log.is_some() {
+                        return None;
+                    }
+                    Some(self.set_function_breakpoint(name, cond.as_deref(), timeout))
+                }
+                BreakLoc::ModuleMethod { .. } => None,
+            },
+        }
     }
 }
 
@@ -1298,22 +1468,34 @@ struct BreakSpec {
     file: String,
     line: u32,
     condition: Option<String>,
+    log_message: Option<String>,
 }
 
 fn parse_break(cmd: &str) -> Option<BreakSpec> {
-    // Accepts `break file:line` or `b file:line`, optionally followed
-    // by ` if <expr>`. The canonical dispatcher hands us native-verb
-    // strings in exactly this shape.
+    // Accepts `break file:line` or `b file:line`, optionally followed by
+    // ` if <expr>` and/or ` log <template>`. Peel the log suffix first
+    // because log templates can contain ` if ` literally; conditions
+    // cannot embed ` log ` without confusing the parser, so that
+    // trade-off matches DAP's own field separation.
     let rest = cmd
         .strip_prefix("break ")
         .or_else(|| cmd.strip_prefix("b "))?;
-    let (locspec, condition) = match rest.find(" if ") {
-        Some(i) => (&rest[..i], Some(rest[i + 4..].trim().to_string())),
+    let (head, log_message) = match rest.find(" log ") {
+        Some(i) => (&rest[..i], Some(rest[i + 5..].trim().to_string())),
         None => (rest, None),
+    };
+    let (locspec, condition) = match head.find(" if ") {
+        Some(i) => (&head[..i], Some(head[i + 4..].trim().to_string())),
+        None => (head, None),
     };
     let (file, line_s) = locspec.rsplit_once(':')?;
     let line: u32 = line_s.trim().parse().ok()?;
-    Some(BreakSpec { file: file.trim().to_string(), line, condition })
+    Some(BreakSpec {
+        file: file.trim().to_string(),
+        line,
+        condition,
+        log_message,
+    })
 }
 
 #[cfg(test)]

@@ -148,6 +148,10 @@ impl CanonicalOps for LldbDapProtoBackend {
         let base = self.op_break(loc)?;
         Ok(format!("{base} if {cond}"))
     }
+    fn op_break_log(&self, loc: &BreakLoc, msg: &str) -> anyhow::Result<String> {
+        let base = self.op_break(loc)?;
+        Ok(format!("{base} log {msg}"))
+    }
     fn op_run(&self, _args: &[String]) -> anyhow::Result<String> {
         Ok("continue".into())
     }
@@ -189,6 +193,9 @@ impl CanonicalOps for LldbDapProtoBackend {
     }
     fn op_print(&self, expr: &str) -> anyhow::Result<String> {
         Ok(format!("print {expr}"))
+    }
+    fn op_set(&self, lhs: &str, rhs: &str) -> anyhow::Result<String> {
+        Ok(format!("set {lhs} = {rhs}"))
     }
     fn op_list(&self, loc: Option<&str>) -> anyhow::Result<String> {
         Ok(match loc {

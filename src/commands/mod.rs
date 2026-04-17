@@ -14,7 +14,7 @@ pub mod crosstrack;
 pub mod debug;
 pub mod lifecycle;
 
-use crate::backend::Backend;
+use crate::backend::{Backend, CanonicalReq};
 
 /// Unified dispatch outcome. Daemon consumes one of these per command.
 pub enum Dispatched {
@@ -25,6 +25,12 @@ pub enum Dispatched {
         canonical_op: &'static str,
         native_cmd: String,
         decorate: bool,
+        /// Structured form of the request for transports that can
+        /// consume it directly (DAP, Inspector). PTY backends ignore
+        /// this and rely on `native_cmd`. `None` for ops that have no
+        /// parse-back problem (step/continue/…) or for `raw`
+        /// passthrough.
+        structured: Option<CanonicalReq>,
     },
     /// Pre-computed response — no PTY roundtrip.
     Immediate(String),

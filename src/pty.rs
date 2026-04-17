@@ -238,6 +238,19 @@ pub trait DebuggerIo: Send + Sync {
     fn pending_hit(&self) -> Option<crate::backend::canonical::HitEvent> {
         None
     }
+
+    /// Transport-direct dispatch for structured canonical requests.
+    /// Transports that can consume the structured form (DAP, Inspector)
+    /// return `Some(Ok/Err)` after servicing the request; returning
+    /// `None` signals "not handled — fall back to `send_and_wait` on the
+    /// formatted native command." PTY backends always return `None`.
+    fn dispatch_structured(
+        &self,
+        _req: &crate::backend::canonical::CanonicalReq,
+        _timeout: Duration,
+    ) -> Option<Result<String>> {
+        None
+    }
 }
 
 /// A debugger process running in a PTY. The reader thread owns the

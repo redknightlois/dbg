@@ -182,6 +182,14 @@ impl CanonicalOps for NodeProtoBackend {
     fn op_print(&self, expr: &str) -> anyhow::Result<String> {
         Ok(format!("print {expr}"))
     }
+    fn op_set(&self, lhs: &str, rhs: &str) -> anyhow::Result<String> {
+        // V8 Inspector's `Debugger.setVariableValue` requires a scope
+        // number + variable name, not an arbitrary LHS expression. For
+        // now we surface the same native `set` syntax and let the
+        // transport fall back to `evaluate` with an assignment
+        // expression — V8 happily runs `x = 5` as an expression.
+        Ok(format!("set {lhs} = {rhs}"))
+    }
     fn op_list(&self, loc: Option<&str>) -> anyhow::Result<String> {
         // The transport's `list` reads the top frame's current
         // line by default. An optional `file:line` argument retargets

@@ -315,6 +315,20 @@ impl InspectorTransport {
         {
             return self.evaluate(expr, timeout);
         }
+        if let Some(rest) = trimmed.strip_prefix("set ") {
+            // V8 evaluates `x = 5` as a regular expression on the top
+            // frame — no dedicated setVariableValue call needed for the
+            // common case. Agents wanting scope-targeted assignment can
+            // still drop to `dbg raw` with Debugger.setVariableValue.
+            let (lhs, rhs) = match rest.find('=') {
+                Some(i) => (rest[..i].trim(), rest[i + 1..].trim()),
+                None => return Err(anyhow!("usage: set <lhs> = <expr>")),
+            };
+            if lhs.is_empty() || rhs.is_empty() {
+                return Err(anyhow!("usage: set <lhs> = <expr>"));
+            }
+            return self.evaluate(&format!("{lhs} = {rhs}"), timeout);
+        }
 
         // .exit / quit  — shutdown
         if trimmed == ".exit" || trimmed == "quit" {

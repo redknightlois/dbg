@@ -30,7 +30,7 @@ use std::collections::HashMap;
 // Re-export dependency types from shared crate for backwards compatibility
 pub use dbg_cli::deps::{Dependency, DependencyCheck, DepStatus};
 
-pub use canonical::{BreakId, BreakLoc, CanonicalOps};
+pub use canonical::{BreakId, BreakLoc, CanonicalOps, CanonicalReq};
 
 /// Result of cleaning debugger output.
 pub struct CleanResult {
