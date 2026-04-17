@@ -100,6 +100,9 @@ struct State {
     /// Tracked user breakpoints: "file:line" → nothing (DAP
     /// setBreakpoints is path-keyed, not id-keyed).
     breakpoints: HashMap<String, Vec<u32>>,
+    /// Accumulated function-breakpoint names. DAP `setFunctionBreakpoints`
+    /// replaces the whole set on each call, so we replay them all.
+    function_breakpoints: Vec<String>,
     /// True between `stopped` and the next `continue`/step.
     paused: bool,
     /// Flipped when the adapter disconnects or terminates.
@@ -119,6 +122,7 @@ impl State {
             call_frames: Vec::new(),
             pending_hit: None,
             breakpoints: HashMap::new(),
+            function_breakpoints: Vec::new(),
             paused: false,
             alive: true,
             initialized: false,
@@ -357,6 +361,23 @@ impl DapTransport {
         if trimmed == "locals" {
             return self.collect_locals(timeout);
         }
+        if trimmed == "threads" || trimmed == "thread list" {
+            return self.list_threads(timeout);
+        }
+        if let Some(rest) = trimmed.strip_prefix("thread ") {
+            if let Ok(n) = rest.trim().parse::<i64>() {
+                return self.set_thread(n);
+            }
+        }
+        if trimmed == "list" {
+            return self.list_source(None);
+        }
+        if let Some(loc) = trimmed.strip_prefix("list ") {
+            return self.list_source(Some(loc.trim()));
+        }
+        if let Some(name) = trimmed.strip_prefix("bfn ") {
+            return self.set_function_breakpoint(name.trim(), timeout);
+        }
         if let Some(spec) = parse_break(trimmed) {
             return self.set_breakpoint(&spec, timeout);
         }
@@ -396,6 +417,98 @@ impl DapTransport {
     fn current_thread(&self) -> Option<i64> {
         let (lock, _) = &*self.state;
         lock.lock().unwrap().current_thread
+    }
+
+    fn list_threads(&self, timeout: Duration) -> Result<String> {
+        let resp = self.call_blocking("threads", json!({}), timeout)?;
+        let arr = resp.get("threads").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+        if arr.is_empty() {
+            return Ok("(no threads)".into());
+        }
+        let current = self.current_thread();
+        let mut out = String::new();
+        for t in arr {
+            let id = t.get("id").and_then(|v| v.as_i64()).unwrap_or(0);
+            let name = t.get("name").and_then(|v| v.as_str()).unwrap_or("");
+            let marker = if Some(id) == current { "*" } else { " " };
+            out.push_str(&format!("{marker} {id}  {name}\n"));
+        }
+        Ok(out)
+    }
+
+    fn set_thread(&self, id: i64) -> Result<String> {
+        // DAP has no explicit "switch thread"; the threadId we pass to
+        // subsequent continue/next/step decides. Record it as current
+        // and refresh the stack view so backtrace/locals operate on the
+        // newly-selected thread.
+        {
+            let (lock, _) = &*self.state;
+            lock.lock().unwrap().current_thread = Some(id);
+        }
+        // Re-fetch stackTrace for the new thread so `where`/`locals` reflect it.
+        if let Ok(resp) = self.call_blocking("stackTrace", json!({ "threadId": id, "startFrame": 0, "levels": 20 }), Duration::from_secs(5)) {
+            if let Some(frames) = resp.get("stackFrames").and_then(|v| v.as_array()).cloned() {
+                let (lock, cvar) = &*self.state;
+                let mut s = lock.lock().unwrap();
+                s.top_frame = frames.first().cloned();
+                s.call_frames = frames;
+                cvar.notify_all();
+            }
+        }
+        Ok(format!("switched to thread {id}"))
+    }
+
+    fn list_source(&self, loc: Option<&str>) -> Result<String> {
+        // Resolve (path, line) — either from the argument or the top
+        // frame. DAP adapters do expose a `source` request, but for
+        // on-disk files it's strictly slower than reading the path
+        // directly. We only fall back to the adapter when no path is
+        // available (inline scripts, virtual sources).
+        let (path, line) = match loc {
+            Some(s) => {
+                let (p, l) = s.rsplit_once(':').ok_or_else(|| anyhow!("list: expected file:line"))?;
+                let line: u32 = l.trim().parse().context("list: invalid line number")?;
+                (p.trim().to_string(), line)
+            }
+            None => {
+                let (lock, _) = &*self.state;
+                let s = lock.lock().unwrap();
+                let f = s.call_frames.first().ok_or_else(|| anyhow!("list: no current frame"))?;
+                let path = f.get("source").and_then(|src| src.get("path")).and_then(|v| v.as_str())
+                    .ok_or_else(|| anyhow!("list: current frame has no source path"))?.to_string();
+                let line = f.get("line").and_then(|v| v.as_u64()).unwrap_or(1) as u32;
+                (path, line)
+            }
+        };
+        let text = std::fs::read_to_string(&path).with_context(|| format!("list: reading {path}"))?;
+        let lines: Vec<&str> = text.lines().collect();
+        let center = line as usize;
+        let start = center.saturating_sub(10).max(1);
+        let end = (center + 10).min(lines.len());
+        let mut out = String::new();
+        for (i, l) in lines.iter().enumerate().take(end).skip(start - 1) {
+            let n = i + 1;
+            let marker = if n == center { "->" } else { "  " };
+            out.push_str(&format!("{marker} {n:>5}  {l}\n"));
+        }
+        Ok(out)
+    }
+
+    fn set_function_breakpoint(&self, name: &str, timeout: Duration) -> Result<String> {
+        // DAP `setFunctionBreakpoints` replaces the whole set per call,
+        // same semantics as `setBreakpoints`. Accumulate in state so
+        // adding a second fn bp doesn't remove the first.
+        let all: Vec<String> = {
+            let (lock, _) = &*self.state;
+            let mut s = lock.lock().unwrap();
+            if !s.function_breakpoints.contains(&name.to_string()) {
+                s.function_breakpoints.push(name.to_string());
+            }
+            s.function_breakpoints.clone()
+        };
+        let fns: Vec<Value> = all.iter().map(|n| json!({ "name": n })).collect();
+        self.call_blocking("setFunctionBreakpoints", json!({ "breakpoints": fns }), timeout)?;
+        Ok(format!("Function breakpoint set: {name}"))
     }
 
     fn set_breakpoint(&self, spec: &BreakSpec, timeout: Duration) -> Result<String> {
@@ -474,6 +587,15 @@ impl DapTransport {
             let name = scope.get("name").and_then(|v| v.as_str()).unwrap_or("");
             // Skip globals/built-ins; agents want frame-local state.
             if name.eq_ignore_ascii_case("globals") || name.eq_ignore_ascii_case("global") {
+                continue;
+            }
+            // Skip register scopes (lldb-dap exposes "General Purpose
+            // Registers", "Floating Point Registers", etc. as top-level
+            // scopes). `presentationHint == "registers"` is the stable
+            // way to detect them; fall back to a name heuristic for
+            // adapters that don't set the hint.
+            let hint = scope.get("presentationHint").and_then(|v| v.as_str()).unwrap_or("");
+            if hint.eq_ignore_ascii_case("registers") || name.to_lowercase().contains("register") {
                 continue;
             }
             let var_ref = match scope.get("variablesReference").and_then(|v| v.as_i64()) {

@@ -10,7 +10,7 @@ use std::sync::OnceLock;
 use regex::Regex;
 use serde_json::{Value, json};
 
-use super::canonical::{BreakLoc, CanonicalOps, HitEvent, unsupported};
+use super::canonical::{BreakLoc, CanonicalOps, HitEvent};
 use super::{Backend, CleanResult, Dependency, DependencyCheck, SpawnConfig};
 
 pub struct NetCoreDbgProtoBackend;
@@ -152,12 +152,8 @@ impl CanonicalOps for NetCoreDbgProtoBackend {
     fn op_break(&self, loc: &BreakLoc) -> anyhow::Result<String> {
         Ok(match loc {
             BreakLoc::FileLine { file, line } => format!("break {file}:{line}"),
-            BreakLoc::Fqn(_) | BreakLoc::ModuleMethod { .. } => {
-                return Err(unsupported(
-                    "netcoredbg-proto",
-                    "symbol breakpoints (use file:line)",
-                ));
-            }
+            BreakLoc::Fqn(name) => format!("bfn {name}"),
+            BreakLoc::ModuleMethod { module, method } => format!("bfn {module}.{method}"),
         })
     }
     fn op_run(&self, _args: &[String]) -> anyhow::Result<String> {
@@ -187,8 +183,17 @@ impl CanonicalOps for NetCoreDbgProtoBackend {
     fn op_print(&self, expr: &str) -> anyhow::Result<String> {
         Ok(format!("print {expr}"))
     }
-    fn op_list(&self, _loc: Option<&str>) -> anyhow::Result<String> {
-        Err(unsupported("netcoredbg-proto", "list (follow-up)"))
+    fn op_list(&self, loc: Option<&str>) -> anyhow::Result<String> {
+        Ok(match loc {
+            Some(s) => format!("list {s}"),
+            None => "list".into(),
+        })
+    }
+    fn op_threads(&self) -> anyhow::Result<String> {
+        Ok("threads".into())
+    }
+    fn op_thread(&self, n: u32) -> anyhow::Result<String> {
+        Ok(format!("thread {n}"))
     }
     fn op_watch(&self, expr: &str) -> anyhow::Result<String> {
         Ok(format!("watch {expr}"))
