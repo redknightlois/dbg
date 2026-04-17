@@ -1,4 +1,5 @@
 pub mod canonical;
+pub mod debugpy_proto;
 pub mod delve;
 pub mod delve_proto;
 pub mod dotnettrace;
