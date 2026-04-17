@@ -300,6 +300,15 @@ pub fn run_daemon(backend: &dyn Backend, target: &str, args: &[String]) -> Resul
                 if cmd == "quit" {
                     let response = handle_quit(backend, session, child_pid);
                     let _ = stream.write_all(response.as_bytes());
+                    let _ = stream.flush();
+                    // Close the write half so the client's read_to_string
+                    // returns EOF cleanly before we drop the socket —
+                    // without this the client sees SIGPIPE/EPIPE and
+                    // exits 144.
+                    let _ = stream.shutdown(std::net::Shutdown::Write);
+                    // Give the kernel a brief moment to deliver the last
+                    // bytes to the client's socket buffer.
+                    std::thread::sleep(Duration::from_millis(20));
                     // Exit immediately — scoped threads would otherwise wait
                     // for any blocked command (e.g. `continue`) to finish.
                     cleanup_and_exit();
@@ -927,15 +936,26 @@ pub fn is_running() -> bool {
     false
 }
 
-/// Kill the running daemon.
+/// Kill the running daemon. Blocks until the process is gone and
+/// socket/pid files are cleared — callers that immediately spawn a
+/// new daemon need this to be synchronous.
 pub fn kill_daemon() -> Result<String> {
-    if is_running() {
-        send_command("quit")
-    } else {
+    if !is_running() {
         let _ = std::fs::remove_file(&socket_path());
         let _ = std::fs::remove_file(&pid_path());
-        Ok("stopped".into())
+        return Ok("stopped".into());
     }
+    let response = send_command("quit").unwrap_or_else(|_| "stopped".into());
+    // Wait for the pid to actually die. The daemon's quit handler
+    // releases the socket before exit but the kernel still needs a
+    // moment to reap the process.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while std::time::Instant::now() < deadline && is_running() {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let _ = std::fs::remove_file(&socket_path());
+    let _ = std::fs::remove_file(&pid_path());
+    Ok(response)
 }
 
 /// Wait for the socket file to appear.

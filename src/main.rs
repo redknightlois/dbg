@@ -207,11 +207,11 @@ fn cmd_start(registry: &Registry, args: &[String]) -> Result<()> {
         bail!("usage: dbg start <type> <target> [--break spec] [--args ...] [--run]");
     }
 
-    // Kill existing session
+    // Kill existing session — kill_daemon blocks until the pid dies
+    // and socket/pid files are cleared.
     if daemon::is_running() {
         eprintln!("stopping existing session...");
         daemon::kill_daemon()?;
-        std::thread::sleep(Duration::from_millis(300));
     }
 
     let backend_type = &args[0];
