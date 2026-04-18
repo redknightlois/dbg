@@ -1,0 +1,12 @@
+{
+  "version": 2,
+  "dgSpecHash": "oAZp5IMT7Ys=",
+  "success": true,
+  "projectFilePath": "/shared/disk2/src/dbg-gdbg-develop/examples/scenarios/04-jit-no-vectorize-csharp/Broken.csproj",
+  "expectedPackageFiles": [
+    "/home/redknightlois/.nuget/packages/microsoft.netcore.app.ref/8.0.26/microsoft.netcore.app.ref.8.0.26.nupkg.sha512",
+    "/home/redknightlois/.nuget/packages/microsoft.aspnetcore.app.ref/8.0.26/microsoft.aspnetcore.app.ref.8.0.26.nupkg.sha512",
+    "/home/redknightlois/.nuget/packages/microsoft.netcore.app.host.linux-x64/8.0.26/microsoft.netcore.app.host.linux-x64.8.0.26.nupkg.sha512"
+  ],
+  "logs": []
+}

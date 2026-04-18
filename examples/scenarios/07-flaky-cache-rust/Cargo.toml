@@ -1,0 +1,12 @@
+[package]
+name = "flaky-cache"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "broken"
+path = "src/main.rs"
+
+[profile.dev]
+debug = 2
+opt-level = 0
