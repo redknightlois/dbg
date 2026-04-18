@@ -24,7 +24,7 @@ pub fn resolve(backend_type: &str, target: &str) -> Result<String> {
         "python" | "py" => resolve_existing_file(target),
         "php" | "php-profile" => resolve_existing_file(target),
         "ruby" | "rb" | "ruby-profile" => resolve_existing_file(target),
-        "dotnet" | "csharp" | "fsharp" => resolve_dotnet(target),
+        "dotnet" | "csharp" | "fsharp" | "netcoredbg" | "netcoredbg-proto" => resolve_dotnet(target),
         "go" => resolve_go(target),
         "haskell" | "hs" | "haskell-profile" | "hs-profile" => resolve_existing_file(target),
         "ocaml" | "ml" => resolve_ocaml(target),

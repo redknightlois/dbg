@@ -248,6 +248,9 @@ fn cmd_replay(args: &[String]) -> Result<()> {
     if args.is_empty() {
         bail!("usage: dbg replay <label>  (see `dbg sessions` for labels)");
     }
+    // Reap stale pid/socket files from a crashed previous daemon so
+    // replay doesn't false-positive on "live session running".
+    daemon::clean_stale_runtime_files();
     if daemon::is_running() {
         bail!(
             "a live session is running in this cwd — `dbg kill` it first, then \
@@ -449,6 +452,10 @@ fn cmd_start(registry: &Registry, args: &[String]) -> Result<()> {
         eprintln!("stopping existing session...");
         daemon::kill_daemon()?;
     }
+    // Reap any orphaned pid/socket files from a crashed previous
+    // daemon. is_running() no longer does this itself (see its
+    // comment) so cmd_start owns the cleanup.
+    daemon::clean_stale_runtime_files();
 
     let backend_type = &args[0];
     let target_raw = &args[1];
@@ -503,7 +510,11 @@ fn cmd_start(registry: &Registry, args: &[String]) -> Result<()> {
         bail!("install missing dependencies and retry");
     }
 
-    // Parse flags
+    // Parse flags. Positional tokens that don't match a known flag
+    // are collected into run_args — this is what `dbg start jitdasm
+    // Broken.csproj 'Program:SumFast' --run` needs so the backend
+    // sees the pattern. Previously those tokens were silently
+    // dropped, so jitdasm's filter never reached the runtime.
     let mut breakpoints = Vec::new();
     let mut run_args = Vec::new();
     let mut do_run = false;
@@ -538,6 +549,10 @@ fn cmd_start(registry: &Registry, args: &[String]) -> Result<()> {
                 if i < args.len() {
                     attach_host_port = Some(args[i].clone());
                 }
+            }
+            other if !other.starts_with("--") => {
+                // Bare positional — forward to the backend.
+                run_args.push(other.to_string());
             }
             _ => {}
         }

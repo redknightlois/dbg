@@ -1235,28 +1235,41 @@ pub fn send_command(cmd: &str) -> Result<String> {
 
 /// Check if a daemon is running.
 pub fn is_running() -> bool {
+    // Purely observational — never mutates filesystem state. A
+    // previous version auto-deleted pid/socket files it judged
+    // stale, but that raced with our own daemon's startup (pid is
+    // written a few microseconds before `UnixListener::bind`; a
+    // concurrent `dbg status` would delete the pid in the gap and
+    // then every subsequent client saw "no session"). Orphan
+    // cleanup belongs in `dbg start`/`dbg kill`, not here.
     let Ok(pid_str) = std::fs::read_to_string(&pid_path()) else { return false };
     let Ok(pid) = pid_str.trim().parse::<i32>() else { return false };
     let alive = nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None).is_ok();
     if !alive {
-        // Orphaned pid file — clean up so the next `dbg start`/`dbg
-        // replay` doesn't fight it. Ignore errors (race with another
-        // process that may also be clearing it).
-        let _ = std::fs::remove_file(pid_path());
-        let _ = std::fs::remove_file(socket_path());
         return false;
     }
-    // A live pid is necessary but not sufficient — the kernel may
-    // have recycled the pid for an unrelated process after our
-    // daemon died uncleanly. Require the socket to exist too; the
-    // daemon unlinks it on graceful exit.
-    if !Path::new(&socket_path()).exists() {
-        // Pid is live but belongs to somebody else — drop the
-        // stale pid file.
-        let _ = std::fs::remove_file(pid_path());
-        return false;
+    // Require the socket too — the daemon unlinks it on graceful
+    // exit, so a live pid with no socket means the PID has been
+    // recycled for somebody else.
+    Path::new(&socket_path()).exists()
+}
+
+/// Clean up stale pid/socket files from a dead or foreign daemon.
+/// Safe to call before `dbg start` / `dbg replay` — those used to
+/// rely on `is_running()` doing it as a side-effect, which caused
+/// the race described above.
+pub fn clean_stale_runtime_files() {
+    if let Ok(pid_str) = std::fs::read_to_string(&pid_path()) {
+        if let Ok(pid) = pid_str.trim().parse::<i32>() {
+            if nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None).is_ok() {
+                if Path::new(&socket_path()).exists() {
+                    return; // Live, healthy — leave it alone.
+                }
+            }
+        }
     }
-    true
+    let _ = std::fs::remove_file(pid_path());
+    let _ = std::fs::remove_file(socket_path());
 }
 
 /// Kill the running daemon. Blocks until the process is gone and
@@ -1320,40 +1333,64 @@ mod tests {
         );
     }
 
+    // These tests mutate process-global env vars (XDG_RUNTIME_DIR +
+    // DBG_SESSION) to isolate pid/socket paths. Cargo runs tests in
+    // parallel threads that share the env, so serialize them with
+    // a shared Mutex or they'll stomp each other.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
-    fn is_running_clears_orphaned_pid_file() {
-        // Regression: `dbg replay` saw "live session running" after a
-        // crashed daemon left a pid file behind. is_running() must
-        // reap such orphans so subsequent commands work.
-        //
-        // Isolate the runtime dir so concurrent tests don't collide.
+    fn is_running_is_observational_only() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // Regression: earlier versions auto-deleted pid/socket files
+        // they judged stale, which raced with our own daemon's
+        // startup. is_running() must now be purely read-only.
         let tmp = TempDir::new().unwrap();
-        // Safety: tests are single-threaded with respect to env via
-        // `cargo test -- --test-threads=1` if needed; these tests
-        // don't run concurrently with anything reading these vars.
         unsafe {
             std::env::set_var("XDG_RUNTIME_DIR", tmp.path());
-            std::env::set_var("DBG_SESSION", "testorphan");
+            std::env::set_var("DBG_SESSION", "testobs");
         }
-        // Write a PID that cannot exist (the kernel never hands out 0).
-        std::fs::write(pid_path(), "2147483000").unwrap();
-        assert!(!is_running(), "dead PID should read as not running");
-        assert!(!pid_path().exists(), "orphan pid file should be cleaned up");
+        // Live PID (ourselves) without socket — is_running should
+        // return false but MUST NOT delete the pid file.
+        let my_pid = std::process::id();
+        std::fs::write(pid_path(), my_pid.to_string()).unwrap();
+        assert!(!is_running(), "live PID without socket should read false");
+        assert!(pid_path().exists(), "is_running must not mutate fs");
         unsafe { std::env::remove_var("DBG_SESSION"); }
     }
 
     #[test]
-    fn is_running_requires_socket_when_pid_live() {
+    fn clean_stale_runtime_files_reaps_orphans() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let tmp = TempDir::new().unwrap();
         unsafe {
             std::env::set_var("XDG_RUNTIME_DIR", tmp.path());
-            std::env::set_var("DBG_SESSION", "testlive");
+            std::env::set_var("DBG_SESSION", "testreap");
         }
+        // Dead PID + stray socket file from a crashed daemon.
+        std::fs::write(pid_path(), "2147483000").unwrap();
+        std::fs::write(socket_path(), "").unwrap();
+        clean_stale_runtime_files();
+        assert!(!pid_path().exists(), "dead-pid file should be reaped");
+        assert!(!socket_path().exists(), "stray socket file should be reaped");
+        unsafe { std::env::remove_var("DBG_SESSION"); }
+    }
+
+    #[test]
+    fn clean_stale_runtime_files_preserves_live_daemon() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = TempDir::new().unwrap();
+        unsafe {
+            std::env::set_var("XDG_RUNTIME_DIR", tmp.path());
+            std::env::set_var("DBG_SESSION", "testkeep");
+        }
+        // Simulate a healthy daemon: our own PID + socket present.
         let my_pid = std::process::id();
         std::fs::write(pid_path(), my_pid.to_string()).unwrap();
-        // No socket — our PID is "alive" but it's us, the test.
-        assert!(!is_running(), "live PID without socket shouldn't register as daemon");
-        assert!(!pid_path().exists(), "stale pid file should be cleaned up");
+        std::fs::write(socket_path(), "").unwrap();
+        clean_stale_runtime_files();
+        assert!(pid_path().exists(), "live daemon's pid file must survive");
+        assert!(socket_path().exists(), "live daemon's socket must survive");
         unsafe { std::env::remove_var("DBG_SESSION"); }
     }
 
