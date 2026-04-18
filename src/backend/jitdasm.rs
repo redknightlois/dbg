@@ -27,6 +27,29 @@ fn project_namespace(csproj_path: &str) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
+/// Derive a REPL-friendly substring from the user's JitDisasm
+/// pattern. The REPL matches against method-listing names like
+/// `Broken.Program:SumFast(int[])`, so we want the most specific
+/// token the user typed:
+///   * `Type:Method` → `:Method` (keeps the `:` as a strong anchor)
+///   * `Type`        → `Type`
+///   * `*` / ``      → no default filter
+fn repl_default_pattern(raw: &str) -> String {
+    let raw = raw.trim();
+    if raw.is_empty() || raw == "*" {
+        return String::new();
+    }
+    if let Some((type_part, method)) = raw.split_once(':') {
+        let m = method.trim_matches('*');
+        if !m.is_empty() {
+            return format!(":{m}");
+        }
+        let t = type_part.trim_matches('*');
+        return t.to_string();
+    }
+    raw.trim_matches('*').to_string()
+}
+
 /// Qualify a JitDisasm pattern with the project's namespace when the
 /// user supplied only `Type:Method` (no `.` in the type component).
 /// Leaves `*`, `Foo.Bar:Baz`, and already-qualified patterns alone.
@@ -115,8 +138,25 @@ impl Backend for JitDasmBackend {
             pattern, pattern, shell_escape(&project), extra, out_file_str
         );
 
-        // Replace the bash shell with our Rust REPL
-        let exec_repl = format!("exec {} --jitdasm-repl {}", dbg_bin, out_file_str);
+        // Replace the bash shell with our Rust REPL. Pass the raw
+        // (unqualified) pattern as the REPL's default filter so
+        // `stats`/`simd`/`hotspots` without an arg narrow to the
+        // user's methods instead of the whole capture. The env-var
+        // pattern is CLR-syntax (`Broken.Program:SumFast`) but the
+        // REPL does a substring match on the `; Assembly listing
+        // for method <name>` token, so we want the method-name part
+        // — strip any leading `Namespace.Type:` prefix and wildcards.
+        let repl_default = repl_default_pattern(&raw_pattern);
+        let exec_repl = if repl_default.is_empty() {
+            format!("exec {} --jitdasm-repl {}", dbg_bin, out_file_str)
+        } else {
+            format!(
+                "exec {} --jitdasm-repl {} --jitdasm-pattern {}",
+                dbg_bin,
+                out_file_str,
+                shell_escape(&repl_default),
+            )
+        };
 
         Ok(SpawnConfig {
             bin: "bash".into(),
@@ -238,6 +278,44 @@ mod tests {
     fn qualify_pattern_handles_type_only() {
         let got = qualify_pattern("Program", "/tmp/Broken.csproj");
         assert_eq!(got, "Broken.Program");
+    }
+
+    #[test]
+    fn repl_default_extracts_method_token() {
+        // Regression: `dbg start jitdasm foo.csproj Program:SumFast`
+        // left the REPL with no default filter, so `stats` (the
+        // default run_command) aggregated ~790 methods instead of
+        // the one the user asked about.
+        assert_eq!(repl_default_pattern("Program:SumFast"), ":SumFast");
+        assert_eq!(repl_default_pattern("SumFast"), "SumFast");
+        assert_eq!(repl_default_pattern("Program:*"), "Program");
+        assert_eq!(repl_default_pattern("*"), "");
+        assert_eq!(repl_default_pattern(""), "");
+    }
+
+    #[test]
+    fn spawn_config_forwards_pattern_to_repl() {
+        let cfg = JitDasmBackend
+            .spawn_config("myapp.csproj", &["Program:SumFast".into()])
+            .unwrap();
+        let exec_cmd = cfg.init_commands.last().expect("exec cmd");
+        assert!(
+            exec_cmd.contains("--jitdasm-pattern"),
+            "missing --jitdasm-pattern:\n{exec_cmd}"
+        );
+        assert!(exec_cmd.contains(":SumFast"), "missing :SumFast:\n{exec_cmd}");
+    }
+
+    #[test]
+    fn spawn_config_skips_pattern_for_wildcard() {
+        let cfg = JitDasmBackend
+            .spawn_config("myapp.csproj", &["*".into()])
+            .unwrap();
+        let exec_cmd = cfg.init_commands.last().expect("exec cmd");
+        assert!(
+            !exec_cmd.contains("--jitdasm-pattern"),
+            "wildcard shouldn't produce a default filter:\n{exec_cmd}"
+        );
     }
 
     #[test]

@@ -88,8 +88,27 @@ fn resolve_existing_file(target: &str) -> Result<String> {
 fn resolve_dotnet(target: &str) -> Result<String> {
     let path = Path::new(target);
 
-    // Existing file — prefer apphost over DLL
+    // Existing file.
     if path.is_file() {
+        // A `.csproj` is a build input, not a runnable artifact —
+        // netcoredbg rejects it with COR_E_FILENOTFOUND. Build the
+        // project and hand back the resulting DLL/apphost from the
+        // project's own bin/Debug/ tree (not the cwd's).
+        if path.extension().and_then(|s| s.to_str()) == Some("csproj") {
+            let name = path_stem_str(path)?;
+            let csproj_str = path.to_str().context("csproj path contains non-UTF8 characters")?;
+            eprintln!("building {name}...");
+            let status = Command::new("dotnet")
+                .args(["build", csproj_str, "-c", "Debug"])
+                .status()
+                .context("dotnet not found")?;
+            if !status.success() {
+                bail!("dotnet build failed");
+            }
+            let proj_dir = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
+            return find_dotnet_output(proj_dir, &name);
+        }
+        // Prefer apphost over DLL.
         if let Some(apphost) = target.strip_suffix(".dll") {
             let apphost_path = Path::new(apphost);
             if apphost_path.is_file() {
@@ -134,24 +153,51 @@ fn find_csproj(dir: &Path) -> Result<PathBuf> {
 }
 
 fn find_dotnet_output(dir: &Path, name: &str) -> Result<String> {
+    // `dotnet build` honors the csproj's `<AssemblyName>` / default
+    // output name, which can differ in case from the project stem
+    // (e.g. Broken.csproj → broken.dll when AssemblyName is lowercase).
+    // Check the obvious paths first, then fall back to a case-
+    // insensitive scan so we find the DLL regardless.
     let debug_dir = dir.join("bin/Debug");
-    if !debug_dir.exists() {
+    let release_dir = dir.join("bin/Release");
+    let candidates: Vec<PathBuf> = [&debug_dir, &release_dir]
+        .into_iter()
+        .filter(|d| d.exists())
+        .cloned()
+        .collect();
+    if candidates.is_empty() {
         bail!("bin/Debug not found after build");
     }
 
-    // Walk into framework subdirs (e.g., net10.0/)
-    for entry in std::fs::read_dir(&debug_dir)? {
-        let entry = entry?;
-        if entry.path().is_dir() {
-            // Prefer native apphost
+    let name_lc = name.to_ascii_lowercase();
+    for root in &candidates {
+        for entry in std::fs::read_dir(root)? {
+            let entry = entry?;
+            if !entry.path().is_dir() {
+                continue;
+            }
             let apphost = entry.path().join(name);
             if apphost.is_file() {
                 return Ok(apphost.display().to_string());
             }
-            // Fall back to DLL
             let dll = entry.path().join(format!("{name}.dll"));
             if dll.is_file() {
                 return Ok(dll.display().to_string());
+            }
+            // Case-insensitive fallback — scan the tfm directory for
+            // <name>.dll / <name> regardless of filename casing.
+            if let Ok(dir_iter) = std::fs::read_dir(entry.path()) {
+                for sub in dir_iter.flatten() {
+                    let p = sub.path();
+                    let Some(fname) = p.file_name().and_then(|s| s.to_str()) else { continue };
+                    let fname_lc = fname.to_ascii_lowercase();
+                    if fname_lc == format!("{name_lc}.dll") && p.is_file() {
+                        return Ok(p.display().to_string());
+                    }
+                    if fname_lc == name_lc && p.is_file() {
+                        return Ok(p.display().to_string());
+                    }
+                }
             }
         }
     }
@@ -312,6 +358,36 @@ fn resolve_go(target: &str) -> Result<String> {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn resolve_dotnet_csproj_returns_dll_not_project_file() {
+        // Regression: netcoredbg was getting launched with the .csproj
+        // path and crashing with COR_E_FILENOTFOUND. resolve_dotnet must
+        // build the project and hand back the produced DLL/apphost.
+        let tmp = TempDir::new().unwrap();
+        let proj = tmp.path().join("Demo.csproj");
+        std::fs::write(&proj, "dummy").unwrap();
+        // Pre-populate what `dotnet build` would have produced so the
+        // test doesn't depend on the dotnet toolchain. We short-circuit
+        // by invoking `find_dotnet_output` directly — that's the path
+        // that previously failed to handle lowercase AssemblyName.
+        let tfm = tmp.path().join("bin/Debug/net8.0");
+        std::fs::create_dir_all(&tfm).unwrap();
+        std::fs::write(tfm.join("demo.dll"), "").unwrap();
+        let got = find_dotnet_output(tmp.path(), "Demo").unwrap();
+        assert!(got.ends_with("demo.dll"), "got: {got}");
+        assert!(!got.ends_with(".csproj"), "must not return csproj: {got}");
+    }
+
+    #[test]
+    fn resolve_dotnet_csproj_finds_release_output() {
+        let tmp = TempDir::new().unwrap();
+        let tfm = tmp.path().join("bin/Release/net8.0");
+        std::fs::create_dir_all(&tfm).unwrap();
+        std::fs::write(tfm.join("Broken.dll"), "").unwrap();
+        let got = find_dotnet_output(tmp.path(), "Broken").unwrap();
+        assert!(got.ends_with("Broken.dll"), "got: {got}");
+    }
 
     #[test]
     fn resolve_go_builds_source_file() {

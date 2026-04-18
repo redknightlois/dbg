@@ -36,6 +36,13 @@ struct Cli {
     #[arg(long, hide = true)]
     jitdasm_repl: Option<String>,
 
+    /// Internal: default filter pattern for the jitdasm REPL —
+    /// remembers the `DOTNET_JitDisasm` filter so summary commands
+    /// (`stats`, `simd`, `hotspots`) narrow to the user's methods
+    /// by default instead of the whole capture.
+    #[arg(long, hide = true, default_value = "")]
+    jitdasm_pattern: String,
+
     /// Internal: run the profile REPL on a captured cachegrind file
     #[arg(long, hide = true)]
     phpprofile_repl: Option<String>,
@@ -88,7 +95,7 @@ fn main() -> Result<()> {
 
     // --jitdasm-repl (internal: launched by the jitdasm backend)
     if let Some(asm_path) = &cli.jitdasm_repl {
-        return jitdasm::run_repl(asm_path).map_err(Into::into);
+        return jitdasm::run_repl(asm_path, &cli.jitdasm_pattern).map_err(Into::into);
     }
 
     // --phpprofile-repl (internal: launched by profile backends)

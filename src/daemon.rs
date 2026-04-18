@@ -287,24 +287,27 @@ pub fn run_daemon(
     proc.wait_for_prompt(Duration::from_secs(120))
         .context("debugger did not produce prompt")?;
 
-    // Run init commands (PTY backends only; inspector has none).
-    for cmd in &init_commands {
-        proc.send_and_wait(cmd, CMD_TIMEOUT)?;
-    }
-
-    // Write PID file
+    // Publish pid + socket BEFORE running init commands. Backends
+    // like jitdasm have multi-minute init flows (dotnet build +
+    // disasm capture + exec-into-REPL); keeping pid/socket gated on
+    // init completion made `dbg status` lie ("no session") the whole
+    // time, and `dbg start` appeared to hang silently. With pid
+    // written and socket bound up-front, connections queue into the
+    // listener backlog and are served as soon as the accept loop
+    // below picks them up — which happens right after init finishes.
     std::fs::write(&pid_path(), std::process::id().to_string())?;
-
-    // Clean up stale socket
     let _ = std::fs::remove_file(&socket_path());
-
-    // Bind socket
     let listener = UnixListener::bind(&socket_path()).context("failed to bind socket")?;
 
     ctrlc::set_handler(move || {
         cleanup_and_exit();
     })
     .ok();
+
+    // Run init commands (PTY backends only; inspector has none).
+    for cmd in &init_commands {
+        proc.send_and_wait(cmd, CMD_TIMEOUT)?;
+    }
 
     // Cache help output now while the debugger is idle and responsive.
     // Stored outside the session mutex so it can be served even when
@@ -1291,6 +1294,28 @@ pub fn wait_for_socket(timeout: Duration) -> bool {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn pid_and_socket_bind_before_init_commands() {
+        // Regression: jitdasm (and any other backend with a long-init
+        // flow) made `dbg status` return "no session" and `dbg start`
+        // appear to hang for minutes, because pid_path + socket bind
+        // were gated on init_commands completing. Assert the source
+        // order here: pid write + socket bind must precede the
+        // `for cmd in &init_commands` loop inside run_daemon.
+        let src = include_str!("daemon.rs");
+        let pid_write = src.find("std::fs::write(&pid_path()").expect("pid_path write");
+        let bind = src.find("UnixListener::bind(&socket_path()").expect("socket bind");
+        let init_loop = src.find("for cmd in &init_commands").expect("init loop");
+        assert!(
+            pid_write < init_loop,
+            "pid file write must precede init_commands loop"
+        );
+        assert!(
+            bind < init_loop,
+            "socket bind must precede init_commands loop"
+        );
+    }
 
     #[test]
     fn is_running_clears_orphaned_pid_file() {

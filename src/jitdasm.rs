@@ -278,6 +278,12 @@ impl JitIndex {
 
     /// `simd` — find methods using SIMD instructions.
     pub fn cmd_simd(&self) -> String {
+        self.cmd_simd_filtered("")
+    }
+
+    /// `simd [pattern]` — find methods using SIMD instructions,
+    /// optionally scoped to a name-substring filter.
+    pub fn cmd_simd_filtered(&self, pattern: &str) -> String {
         const SIMD_PATTERNS: &[&str] = &[
             "vmovups", "vmovaps", "vmulps", "vaddps", "vfmadd", "vdpps",
             "vxorps", "vperm", "vbroadcast",
@@ -285,8 +291,9 @@ impl JitIndex {
             "ld1", "st1", "fmla", "fmul.v", "fadd.v",
         ];
 
+        let methods = self.filter(pattern);
         let mut out = String::new();
-        for m in &self.methods {
+        for m in &methods {
             let hits: Vec<&str> = m
                 .body
                 .lines()
@@ -310,7 +317,7 @@ impl JitIndex {
 }
 
 /// Run the interactive REPL. Reads commands from stdin, writes results to stdout.
-pub fn run_repl(asm_path: &str) -> io::Result<()> {
+pub fn run_repl(asm_path: &str, default_pattern: &str) -> io::Result<()> {
     let text = std::fs::read_to_string(asm_path)?;
     let index = JitIndex::parse(&text);
 
@@ -318,6 +325,12 @@ pub fn run_repl(asm_path: &str) -> io::Result<()> {
         "--- ready: {} methods captured ---",
         index.methods.len()
     );
+    if !default_pattern.is_empty() {
+        eprintln!(
+            "--- default filter: `{}` (stats/simd/hotspots narrow to this) ---",
+            default_pattern
+        );
+    }
     eprintln!("Type: help");
 
     let stdin = io::stdin();
@@ -343,22 +356,31 @@ pub fn run_repl(asm_path: &str) -> io::Result<()> {
 
         let pat = if arg2.is_empty() { arg1.to_string() } else { format!("{arg1} {arg2}") };
 
+        // Default summary-style commands to the session's pattern
+        // when the user didn't pass one. Explicit args always win.
+        let stats_arg = if arg1.is_empty() { default_pattern } else { arg1 };
+        let methods_arg = if arg1.is_empty() { default_pattern } else { arg1 };
+        let hotspots_arg = if arg2.is_empty() { default_pattern } else { arg2 };
+
         let result = match cmd {
-            "methods" => index.cmd_methods(arg1),
+            "methods" => index.cmd_methods(methods_arg),
+            "disasm" if arg1.is_empty() && !default_pattern.is_empty() => {
+                index.cmd_disasm(default_pattern)
+            }
             "disasm" if arg1.is_empty() => "usage: disasm <pattern>\n".into(),
             "disasm" => index.cmd_disasm(&pat),
             "search" if arg1.is_empty() => "usage: search <instruction>\n".into(),
             "search" => index.cmd_search(arg1),
-            "stats" => index.cmd_stats(arg1),
+            "stats" => index.cmd_stats(stats_arg),
             "calls" if arg1.is_empty() => "usage: calls <pattern>\n".into(),
             "calls" => index.cmd_calls(arg1),
             "callers" if arg1.is_empty() => "usage: callers <pattern>\n".into(),
             "callers" => index.cmd_callers(arg1),
             "hotspots" => {
                 let n: usize = arg1.parse().unwrap_or(10);
-                index.cmd_hotspots(n, arg2)
+                index.cmd_hotspots(n, hotspots_arg)
             }
-            "simd" => index.cmd_simd(),
+            "simd" => index.cmd_simd_filtered(default_pattern),
             "help" => {
                 "jitdasm commands:\n  \
                  methods [pattern]    list methods with code sizes (sorted by size)\n  \
@@ -431,6 +453,30 @@ mod tests {
         assert!(out.contains("96 bytes"));
         assert!(out.contains("64 bytes"));
         assert!(out.contains("48 bytes"));
+    }
+
+    #[test]
+    fn cmd_simd_filtered_narrows_to_pattern() {
+        // Regression: `simd` used to scan every captured method,
+        // so scoping it (via the REPL default pattern) was impossible.
+        let idx = JitIndex::parse(SAMPLE);
+        let narrow = idx.cmd_simd_filtered("DotProduct");
+        let wide = idx.cmd_simd_filtered("");
+        // Narrowed output must be a strict subset of the wide output.
+        assert!(wide.len() >= narrow.len(), "wide should be >= narrow");
+        // Narrow must not mention methods outside the filter.
+        assert!(!narrow.contains("Normalize"), "narrow leaked Normalize:\n{narrow}");
+        assert!(!narrow.contains("Pipeline:Run"), "narrow leaked Pipeline:\n{narrow}");
+    }
+
+    #[test]
+    fn cmd_stats_narrows_by_method_token() {
+        // `:DotProduct` should match only the SimdOps:DotProduct
+        // method listing, not ScalarDotProduct.
+        let idx = JitIndex::parse(SAMPLE);
+        let out = idx.cmd_stats(":DotProduct");
+        assert!(out.contains("filter:"), "expected filter label: {out}");
+        assert!(out.contains("Methods:       1"), "expected 1 method:\n{out}");
     }
 
     #[test]
