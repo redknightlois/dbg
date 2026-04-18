@@ -161,6 +161,20 @@ fn main() -> Result<()> {
             println!("{msg}");
             Ok(())
         }
+        "status" if !daemon::is_running() => {
+            println!("no session");
+            Ok(())
+        }
+        "sessions" if !daemon::is_running() => {
+            // Allow listing without a live daemon — same output as
+            // when live except no "* currently live" marker.
+            let cwd = std::env::current_dir()?;
+            let ctx = commands::lifecycle::LifeCtx { cwd: &cwd, active: None };
+            let l = commands::lifecycle::Lifecycle::Sessions { group_only: false };
+            println!("{}", commands::lifecycle::run(&l, &ctx));
+            Ok(())
+        }
+        "replay" => cmd_replay(&cli.args[1..]),
         "help" => {
             if cli.args.len() > 1 {
                 // dbg help <topic>
@@ -178,8 +192,12 @@ fn main() -> Result<()> {
                 println!("  dbg start <type> <target> [--break spec] [--args ...] [--run]");
                 println!("  dbg <any debugger command>");
                 println!("  dbg help            list available commands");
-                println!("  dbg help <command>   ask the debugger what a command does");
-                println!("  dbg kill\n");
+                println!("  dbg help <command>   help for a specific verb\n");
+                println!("session lifecycle:  start, run, continue, step, next, finish, kill, status, cancel");
+                println!("inspection:         break, locals, stack, print");
+                println!("crosstrack (DB):    hits, hit-diff, hit-trend, cross, disasm, source");
+                println!("persistence:        sessions, save, replay");
+                println!("timeline:           events\n");
                 println!("types: {}", registry.available_types().join(", "));
                 Ok(())
             }
@@ -195,6 +213,131 @@ fn main() -> Result<()> {
     }
 }
 
+/// Client-side `dbg replay <label>`: opens a persisted SessionDb
+/// read-only and runs a minimal crosstrack REPL against it. No live
+/// debugger, so only DB-backed verbs (hits, hit-diff, hit-trend,
+/// cross, disasm, source) are honored. All other verbs return a
+/// clear "live debugger not attached to a replay" error.
+fn cmd_replay(args: &[String]) -> Result<()> {
+    use std::io::{BufRead, Write};
+    if args.is_empty() {
+        bail!("usage: dbg replay <label>  (see `dbg sessions` for labels)");
+    }
+    if daemon::is_running() {
+        bail!(
+            "a live session is running in this cwd — `dbg kill` it first, then \
+             `dbg replay {}`",
+            args[0]
+        );
+    }
+    let cwd = std::env::current_dir()?;
+    let sessions_dir = dbg_cli::session_db::sessions_dir(&cwd);
+    let label = &args[0];
+    let path = if std::path::Path::new(label).exists() {
+        std::path::PathBuf::from(label)
+    } else {
+        sessions_dir.join(format!("{label}.db"))
+    };
+    if !path.exists() {
+        bail!("no session at {}", path.display());
+    }
+    let conn = rusqlite::Connection::open_with_flags(
+        &path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )?;
+    let v: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap_or(-1);
+    if v != dbg_cli::session_db::SCHEMA_VERSION {
+        bail!(
+            "session `{}` has schema_version={v}, expected {} — re-collect to replay",
+            path.display(),
+            dbg_cli::session_db::SCHEMA_VERSION
+        );
+    }
+    let db = dbg_cli::session_db::SessionDb::open(&path)?;
+
+    // Dump high-level info, then either execute a one-shot query from
+    // any trailing args or drop into a minimal REPL.
+    let (target, target_class): (String, String) = db
+        .conn()
+        .query_row(
+            "SELECT target, target_class FROM sessions LIMIT 1",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap_or_else(|_| ("?".into(), "?".into()));
+    eprintln!(
+        "replay `{label}` (target={target}, class={target_class}) — read-only crosstrack REPL"
+    );
+    eprintln!("supported: hits, hit-diff, hit-trend, cross, disasm, source, sessions");
+    eprintln!("type `quit` or EOF to exit");
+
+    use std::str::FromStr;
+    let target_class_enum = dbg_cli::session_db::TargetClass::from_str(&target_class)
+        .unwrap_or(dbg_cli::session_db::TargetClass::NativeCpu);
+
+    // One-shot mode: `dbg replay <label> hits foo:42`
+    if args.len() > 1 {
+        let cmd = args[1..].join(" ");
+        let out = replay_eval(&cmd, &db, &cwd, &target, target_class_enum);
+        println!("{out}");
+        return Ok(());
+    }
+
+    let stdin = std::io::stdin();
+    let mut stdout = std::io::stdout();
+    let mut line = String::new();
+    loop {
+        write!(stdout, "replay> ")?;
+        stdout.flush()?;
+        line.clear();
+        if stdin.lock().read_line(&mut line)? == 0 {
+            break;
+        }
+        let cmd = line.trim();
+        if cmd.is_empty() {
+            continue;
+        }
+        if matches!(cmd, "quit" | "exit" | "q") {
+            break;
+        }
+        let out = replay_eval(cmd, &db, &cwd, &target, target_class_enum);
+        println!("{out}");
+    }
+    Ok(())
+}
+
+fn replay_eval(
+    cmd: &str,
+    db: &dbg_cli::session_db::SessionDb,
+    cwd: &std::path::Path,
+    target: &str,
+    target_class: dbg_cli::session_db::TargetClass,
+) -> String {
+    match commands::dispatch_no_backend(cmd) {
+        Some(commands::Dispatched::Immediate(s)) => s,
+        Some(commands::Dispatched::Query(q)) => {
+            let ctx = commands::crosstrack::RunCtx {
+                target,
+                target_class,
+                cwd,
+                live: None,
+            };
+            commands::crosstrack::run(&q, db, &ctx)
+        }
+        Some(commands::Dispatched::Lifecycle(l)) => {
+            let ctx = commands::lifecycle::LifeCtx { cwd, active: Some(db) };
+            commands::lifecycle::run(&l, &ctx)
+        }
+        _ => {
+            "replay only supports crosstrack + lifecycle verbs (hits, hit-diff, \
+             hit-trend, cross, disasm, source, sessions, status). Live debugger \
+             verbs (step, continue, break, …) aren't available — start a new \
+             session with `dbg start` for those."
+                .to_string()
+        }
+    }
+}
+
 fn ensure_running() -> Result<()> {
     if !daemon::is_running() {
         bail!("no session running — use: dbg start <type> <target>");
@@ -202,7 +345,72 @@ fn ensure_running() -> Result<()> {
     Ok(())
 }
 
+/// Pick a backend from a target filename when the user omits the type.
+/// Unambiguous extensions only — binaries (no extension) and shared
+/// types (.cs can be script or project) still require an explicit type.
+fn autodetect_backend(target: &str) -> Option<&'static str> {
+    let lower = target.to_ascii_lowercase();
+    if lower.ends_with(".py") {
+        Some("pdb")
+    } else if lower.ends_with(".go") {
+        Some("delve")
+    } else if lower.ends_with(".java") {
+        Some("jdb")
+    } else if lower.ends_with(".rb") {
+        Some("rdbg")
+    } else if lower.ends_with(".php") {
+        Some("phpdbg")
+    } else if lower.ends_with(".csproj") {
+        Some("netcoredbg")
+    } else if lower.ends_with(".js") || lower.ends_with(".mjs") || lower.ends_with(".ts") {
+        Some("node-proto")
+    } else if lower.ends_with(".hs") {
+        Some("ghci")
+    } else if lower.ends_with(".ml") {
+        Some("ocamldebug")
+    } else {
+        None
+    }
+}
+
 fn cmd_start(registry: &Registry, args: &[String]) -> Result<()> {
+    if args.is_empty() {
+        bail!("usage: dbg start <type> <target> [--break spec] [--args ...] [--run]");
+    }
+
+    // Single-arg form: `dbg start <target>` — infer backend from the
+    // target's extension. Unambiguous only; unknown extensions bail
+    // with the standard usage. `dbg start <type> <target>` (two args)
+    // still takes the explicit path.
+    let args: Vec<String> = if args.len() == 1 {
+        match autodetect_backend(&args[0]) {
+            Some(t) => {
+                let mut v = vec![t.to_string()];
+                v.extend_from_slice(args);
+                v
+            }
+            None => bail!(
+                "usage: dbg start <type> <target> [--break spec] [--args ...] [--run]\n\
+                 (no type given and couldn't infer one from `{}` — supported extensions: \
+                 .py .go .java .rb .php .csproj .js .ts .hs .ml)",
+                args[0]
+            ),
+        }
+    } else if args.len() >= 2 && registry.get(&args[0]).is_none() {
+        // First token isn't a known backend — maybe the user omitted
+        // the type entirely and args[0] is the target path.
+        if let Some(t) = autodetect_backend(&args[0]) {
+            let mut v = vec![t.to_string()];
+            v.extend_from_slice(args);
+            v
+        } else {
+            args.to_vec()
+        }
+    } else {
+        args.to_vec()
+    };
+    let args = args.as_slice();
+
     if args.len() < 2 {
         bail!("usage: dbg start <type> <target> [--break spec] [--args ...] [--run]");
     }
@@ -244,6 +452,14 @@ fn cmd_start(registry: &Registry, args: &[String]) -> Result<()> {
                 registry.available_types().join(", ")
             )
         })?;
+
+    // Runtime preflight (kernel settings etc.) — separate from binary
+    // dependency checks. Surfaces clear, actionable errors before we
+    // fork the daemon; a silent daemon crash post-fork leaves the
+    // agent with an empty capture and no diagnostic.
+    if let Err(e) = backend.preflight() {
+        bail!(e);
+    }
 
     // Check dependencies before attempting to spawn
     let (results, _) = check::check_backends(registry, &[backend_type]);
@@ -318,13 +534,30 @@ fn cmd_start(registry: &Registry, args: &[String]) -> Result<()> {
     };
     eprintln!("target: {resolved}");
 
-    // Fork daemon
+    // Fork daemon. Redirect the child's stderr to a per-session log
+    // file so that when the daemon dies before publishing the socket
+    // (common when the backend spawn fails — silent until now) the
+    // parent can surface the captured message instead of just
+    // "daemon failed to start".
+    let log_path = daemon::startup_log_path();
+    let _ = std::fs::remove_file(&log_path);
     // Safety: fork duplicates the process
     let fork_result = unsafe { fork() }?;
     match fork_result {
         ForkResult::Child => {
             // Daemon process
             let _ = nix::unistd::setsid();
+            // Redirect stderr to the startup log so the parent can read
+            // it back if the daemon dies before binding the socket.
+            if let Ok(f) = std::fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(&log_path)
+            {
+                use std::os::unix::io::AsRawFd;
+                let _ = nix::unistd::dup2(f.as_raw_fd(), 2);
+            }
             if let Err(e) = daemon::run_daemon(backend, &resolved, &run_args, attach.as_ref()) {
                 eprintln!("daemon error: {e:#}");
                 std::process::exit(1);
@@ -334,14 +567,20 @@ fn cmd_start(registry: &Registry, args: &[String]) -> Result<()> {
         ForkResult::Parent { .. } => {
             // Wait for socket
             if !daemon::wait_for_socket(Duration::from_secs(120)) {
-                bail!("daemon failed to start");
+                let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+                if log.trim().is_empty() {
+                    bail!("daemon failed to start");
+                } else {
+                    bail!("daemon failed to start:\n{}", log.trim());
+                }
             }
 
-            // Set breakpoints — send through the canonical `break <spec>`
-            // vocabulary so the dispatcher routes via CanonicalOps (which
-            // handles jdb class-name extraction, ghci module inference,
-            // etc.). Falls back to format_breakpoint for backends without
-            // CanonicalOps.
+            // Set breakpoints FIRST — some adapters (delve, DAP) need
+            // every breakpoint registered before the program starts,
+            // otherwise they never fire. If any `--break` fails we
+            // refuse to auto-run to avoid the silent "ran past the
+            // breakpoint" failure mode.
+            let mut bp_ok = true;
             for bp in &breakpoints {
                 let cmd = if backend.canonical_ops().is_some() {
                     format!("break {bp}")
@@ -350,17 +589,36 @@ fn cmd_start(registry: &Registry, args: &[String]) -> Result<()> {
                 };
                 let resp = daemon::send_command(&cmd)?;
                 println!("{resp}");
+                let lc = resp.to_lowercase();
+                if lc.contains("[error")
+                    || lc.contains("could not")
+                    || lc.contains("cannot find")
+                    || lc.contains("no source")
+                    || lc.contains("unable to set")
+                {
+                    bp_ok = false;
+                }
             }
 
-            // Auto-run — use the canonical `run` verb when available.
+            // Auto-run — but only when every breakpoint stuck. --run
+            // means "start the debuggee (and let it stop at your
+            // breakpoints)", not "run past all breakpoints". See
+            // `dbg help start`.
             if do_run {
-                let cmd = if backend.canonical_ops().is_some() {
-                    "run".to_string()
+                if !bp_ok && !breakpoints.is_empty() {
+                    eprintln!(
+                        "dbg: skipping --run because a breakpoint failed to register. \
+                         Fix the breakpoint or omit --break and drive with `dbg run` manually."
+                    );
                 } else {
-                    backend.run_command().to_string()
-                };
-                let resp = daemon::send_command(&cmd)?;
-                println!("{resp}");
+                    let cmd = if backend.canonical_ops().is_some() {
+                        "run".to_string()
+                    } else {
+                        backend.run_command().to_string()
+                    };
+                    let resp = daemon::send_command(&cmd)?;
+                    println!("{resp}");
+                }
             }
 
             Ok(())
