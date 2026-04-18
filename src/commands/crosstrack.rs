@@ -101,7 +101,18 @@ pub fn try_dispatch(input: &str) -> Option<super::Dispatched> {
                             }
                         }
                     }
+                    "--help" | "-h" => {
+                        return Some(super::Dispatched::Immediate(
+                            "usage: dbg hits <loc> [--group-by FIELD] [--count-by FIELD --top N]\n\
+                             see `dbg help hits` for details".into(),
+                        ));
+                    }
                     _ => {
+                        if t.starts_with("--") {
+                            return Some(super::Dispatched::Immediate(
+                                format!("unknown flag `{t}` — supported: --group-by, --count-by, --top"),
+                            ));
+                        }
                         if loc.is_none() {
                             loc = Some(t.to_string());
                         }
@@ -401,7 +412,23 @@ fn cmd_hits_grouped(db: &SessionDb, loc: &str, field: &str, top: Option<usize>) 
         };
     }
     let mut pairs: Vec<(String, usize)> = counts.into_iter().collect();
-    pairs.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    // Sort by count descending, breaking ties numerically when every
+    // key parses as a number (`0, 13, 100, 102` instead of the
+    // lexicographic `0, 100, 102, 13`). Fall back to string order
+    // for non-numeric fields.
+    let all_numeric = pairs
+        .iter()
+        .all(|(v, _)| v.parse::<f64>().is_ok());
+    pairs.sort_by(|a, b| {
+        b.1.cmp(&a.1).then_with(|| {
+            if all_numeric {
+                let (na, nb) = (a.0.parse::<f64>().unwrap_or(0.0), b.0.parse::<f64>().unwrap_or(0.0));
+                na.partial_cmp(&nb).unwrap_or(std::cmp::Ordering::Equal)
+            } else {
+                a.0.cmp(&b.0)
+            }
+        })
+    });
     if let Some(n) = top {
         pairs.truncate(n);
     }
@@ -612,9 +639,16 @@ fn cmd_hit_trend(db: &SessionDb, loc: &str, field: &str) -> String {
         return if names.is_empty() {
             format!("field `{field}` not captured at {loc}")
         } else {
+            // Suggest `self.<field>` only when the user didn't
+            // already supply a dotted path — otherwise we'd emit
+            // nonsense like `self.self.x`.
+            let hint = if field.contains('.') {
+                "dotted paths supported".to_string()
+            } else {
+                format!("dotted paths supported (e.g. self.{field})")
+            };
             format!(
-                "field `{field}` not captured at {loc} (available: {}). \
-                 dotted paths supported (e.g. self.{field})",
+                "field `{field}` not captured at {loc} (available: {}). {hint}",
                 names.join(", ")
             )
         };
@@ -1317,6 +1351,60 @@ mod tests {
         assert_eq!(s.chars().count(), 8);
         assert_eq!(s.chars().next(), Some('▁'));
         assert_eq!(s.chars().last(), Some('█'));
+    }
+
+    // ---------- hits flag parsing regressions ----------
+
+    #[test]
+    fn hits_grouped_sorts_numeric_fields_numerically() {
+        // Regression: tie-broken alphabetic sort produced `0, 100,
+        // 102, 13, 15` for depth values. Fields whose values all
+        // parse as numbers should tie-break numerically.
+        let tmp = TempDir::new().unwrap();
+        let (db, _) = db_and_ctx(&tmp);
+        for (seq, d) in [(1i64, 0), (2, 13), (3, 100), (4, 102), (5, 15)].iter() {
+            insert_hit(&db, "f.py:1", *seq, &format!("{{\"d\":{d}}}"), None);
+        }
+        let out = cmd_hits_grouped(&db, "f.py:1", "d", None);
+        let i0 = out.find(" 0 ").or_else(|| out.find("  0 ")).unwrap();
+        let i13 = out.find("13").unwrap();
+        let i100 = out.find("100").unwrap();
+        assert!(i0 < i13 && i13 < i100, "not numeric-sorted:\n{out}");
+    }
+
+    #[test]
+    fn hits_rejects_help_flag_as_loc() {
+        // Regression: `--help` used to be stored as the location,
+        // producing "no hits at --help" instead of usage.
+        let d = try_dispatch("hits --help").expect("dispatch");
+        match d {
+            super::super::Dispatched::Immediate(s) => {
+                assert!(s.starts_with("usage:"), "got: {s}");
+            }
+            _ => panic!("expected Immediate usage string"),
+        }
+    }
+
+    #[test]
+    fn hits_rejects_unknown_flag() {
+        let d = try_dispatch("hits foo:10 --bogus").expect("dispatch");
+        match d {
+            super::super::Dispatched::Immediate(s) => {
+                assert!(s.contains("unknown flag"), "got: {s}");
+            }
+            _ => panic!("expected Immediate"),
+        }
+    }
+
+    #[test]
+    fn hit_trend_dotted_path_hint_no_double_self() {
+        // Regression: the error hint used to append `self.self.x`
+        // when the user already supplied a dotted path.
+        let tmp = TempDir::new().unwrap();
+        let (db, _) = db_and_ctx(&tmp);
+        insert_hit(&db, "foo.py:10", 1, r#"{"x":1}"#, None);
+        let out = cmd_hit_trend(&db, "foo.py:10", "self.missing");
+        assert!(!out.contains("self.self."), "double self in hint: {out}");
     }
 
     #[test]

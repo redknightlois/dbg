@@ -65,7 +65,36 @@ pub fn try_dispatch(input: &str) -> Option<super::Dispatched> {
             Lifecycle::Sessions { group_only }
         }
         "save" => {
-            let label = if rest.is_empty() { None } else { Some(rest.to_string()) };
+            // Accept both positional (`save mylabel`) and flagged
+            // (`save --label mylabel`) forms. Without this, the flag
+            // token was stored verbatim as the label ("--label mylabel").
+            let mut label: Option<String> = None;
+            let mut toks = rest.split_whitespace().peekable();
+            while let Some(t) = toks.next() {
+                match t {
+                    "--label" | "-l" => {
+                        if let Some(v) = toks.next() {
+                            label = Some(v.to_string());
+                        } else {
+                            return Some(super::Dispatched::Immediate(
+                                "--label needs a value".into(),
+                            ));
+                        }
+                    }
+                    "--help" | "-h" => {
+                        return Some(super::Dispatched::Immediate(
+                            "usage: dbg save [<label> | --label <label>]".into(),
+                        ));
+                    }
+                    _ if t.starts_with("--") => {
+                        return Some(super::Dispatched::Immediate(
+                            format!("unknown flag `{t}` — supported: --label"),
+                        ));
+                    }
+                    _ if label.is_none() => label = Some(t.to_string()),
+                    _ => {}
+                }
+            }
             Lifecycle::Save { label }
         }
         "prune" => {
@@ -230,6 +259,25 @@ fn cmd_sessions(ctx: &LifeCtx<'_>, group_only: bool) -> String {
         }
     }
 
+    let active_label: Option<String> = ctx.active.map(|db| db.label().to_string());
+
+    // The live session's DB isn't in .dbg/sessions/ until `dbg save`
+    // (or the daemon's exit handler) persists it. Synthesize a row
+    // for it so `dbg sessions` during a live session shows it,
+    // marked `*`, instead of omitting it entirely.
+    if let (Some(db), Some(label)) = (ctx.active, active_label.as_deref()) {
+        if !rows.iter().any(|r| r.label == label) {
+            rows.push(SessionListing {
+                label: label.to_string(),
+                kind: format!("{:?}", db.kind()).to_lowercase(),
+                target_class: db.target_class().as_str().to_string(),
+                created_by: "live".into(),
+                group_key: db.meta("session_group_key").ok().flatten(),
+                age_secs: 0,
+            });
+        }
+    }
+
     if rows.is_empty() {
         if group_only {
             return "no peers in the current session group".into();
@@ -239,8 +287,6 @@ fn cmd_sessions(ctx: &LifeCtx<'_>, group_only: bool) -> String {
 
     rows.sort_by(|a, b| b.age_secs.cmp(&a.age_secs)); // newest first — smaller age
     rows.sort_by_key(|r| r.age_secs);
-
-    let active_label: Option<String> = ctx.active.map(|db| db.label().to_string());
     let mut out = String::new();
     out.push_str("  label                                  kind     class           by    age\n");
     for r in &rows {
@@ -593,6 +639,36 @@ mod tests {
     fn try_dispatch_none_for_unrelated_verb() {
         assert!(try_dispatch("break main.c:42").is_none());
         assert!(try_dispatch("continue").is_none());
+    }
+
+    #[test]
+    fn save_accepts_label_flag() {
+        // Regression: `save --label foo` used to fold the flag into
+        // the label, producing a file named "--label foo.db".
+        match try_dispatch("save --label mylabel").unwrap() {
+            super::super::Dispatched::Lifecycle(Lifecycle::Save { label }) => {
+                assert_eq!(label.as_deref(), Some("mylabel"));
+            }
+            _ => panic!("expected Save"),
+        }
+    }
+
+    #[test]
+    fn save_rejects_unknown_flag() {
+        match try_dispatch("save --bogus").unwrap() {
+            super::super::Dispatched::Immediate(s) => assert!(s.contains("unknown flag"), "{s}"),
+            _ => panic!("expected Immediate"),
+        }
+    }
+
+    #[test]
+    fn save_positional_label_still_works() {
+        match try_dispatch("save mylabel").unwrap() {
+            super::super::Dispatched::Lifecycle(Lifecycle::Save { label }) => {
+                assert_eq!(label.as_deref(), Some("mylabel"));
+            }
+            _ => panic!("expected Save"),
+        }
     }
 
     #[test]

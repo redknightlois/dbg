@@ -243,6 +243,35 @@ fn resolve_ocaml(target: &str) -> Result<String> {
 }
 
 fn resolve_go(target: &str) -> Result<String> {
+    // `.go` source file — must be compiled before delve can `exec` it.
+    // Treating `broken.go` as a ready binary (the previous behavior)
+    // caused delve to exit immediately with "not an executable", and
+    // the daemon died before publishing the socket.
+    let p = Path::new(target);
+    if p.is_file() && p.extension().and_then(|s| s.to_str()) == Some("go") {
+        eprintln!("building {target}...");
+        let parent = p.parent().filter(|x| !x.as_os_str().is_empty()).unwrap_or(Path::new("."));
+        let stem = p.file_stem().and_then(|s| s.to_str()).unwrap_or("app");
+        let output_path = parent.join(stem);
+        let output_str = output_path.to_str().context("output path contains non-UTF8 characters")?;
+        let file_name = p.file_name().and_then(|s| s.to_str()).unwrap_or(target);
+        let status = Command::new("go")
+            .args([
+                "build",
+                "-gcflags=all=-N -l",
+                "-o",
+                output_str,
+                file_name,
+            ])
+            .current_dir(parent)
+            .status()
+            .context("go not found")?;
+        if !status.success() {
+            bail!("go build failed");
+        }
+        return Ok(output_path.display().to_string());
+    }
+
     // Existing binary
     if Path::new(target).is_file() {
         return Ok(target.to_string());
@@ -277,4 +306,26 @@ fn resolve_go(target: &str) -> Result<String> {
     }
 
     bail!("not found: {target}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    #[test]
+    fn resolve_go_builds_source_file() {
+        // Skip if go isn't installed in CI — the build path exists
+        // only when the toolchain is on PATH.
+        if Command::new("go").arg("version").output().is_err() {
+            return;
+        }
+        let tmp = TempDir::new().unwrap();
+        let src = tmp.path().join("hello.go");
+        std::fs::write(&src, "package main\nfunc main() {}\n").unwrap();
+        let out = resolve_go(src.to_str().unwrap()).expect("build should succeed");
+        // Output is the built binary sitting next to the source.
+        assert!(!out.ends_with(".go"), "should not return source path: {out}");
+        assert!(Path::new(&out).is_file(), "binary missing: {out}");
+    }
 }

@@ -655,7 +655,7 @@ fn log_command(session: &mut Session, input: &str, output: &str, canonical_op: O
 
 /// Help text for dbg-level verbs. Returns `None` when the verb is
 /// unknown — callers fall through to the backend's own help.
-fn dbg_verb_help(verb: &str) -> Option<&'static str> {
+pub fn dbg_verb_help(verb: &str) -> Option<&'static str> {
     Some(match verb {
         "start" => "\
 dbg start <type> <target> [--break SPEC] [--args ...] [--run]
@@ -1229,12 +1229,28 @@ pub fn send_command(cmd: &str) -> Result<String> {
 
 /// Check if a daemon is running.
 pub fn is_running() -> bool {
-    if let Ok(pid_str) = std::fs::read_to_string(&pid_path()) {
-        if let Ok(pid) = pid_str.trim().parse::<i32>() {
-            return nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None).is_ok();
-        }
+    let Ok(pid_str) = std::fs::read_to_string(&pid_path()) else { return false };
+    let Ok(pid) = pid_str.trim().parse::<i32>() else { return false };
+    let alive = nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None).is_ok();
+    if !alive {
+        // Orphaned pid file — clean up so the next `dbg start`/`dbg
+        // replay` doesn't fight it. Ignore errors (race with another
+        // process that may also be clearing it).
+        let _ = std::fs::remove_file(pid_path());
+        let _ = std::fs::remove_file(socket_path());
+        return false;
     }
-    false
+    // A live pid is necessary but not sufficient — the kernel may
+    // have recycled the pid for an unrelated process after our
+    // daemon died uncleanly. Require the socket to exist too; the
+    // daemon unlinks it on graceful exit.
+    if !Path::new(&socket_path()).exists() {
+        // Pid is live but belongs to somebody else — drop the
+        // stale pid file.
+        let _ = std::fs::remove_file(pid_path());
+        return false;
+    }
+    true
 }
 
 /// Kill the running daemon. Blocks until the process is gone and
@@ -1277,6 +1293,43 @@ mod tests {
     use tempfile::TempDir;
 
     #[test]
+    fn is_running_clears_orphaned_pid_file() {
+        // Regression: `dbg replay` saw "live session running" after a
+        // crashed daemon left a pid file behind. is_running() must
+        // reap such orphans so subsequent commands work.
+        //
+        // Isolate the runtime dir so concurrent tests don't collide.
+        let tmp = TempDir::new().unwrap();
+        // Safety: tests are single-threaded with respect to env via
+        // `cargo test -- --test-threads=1` if needed; these tests
+        // don't run concurrently with anything reading these vars.
+        unsafe {
+            std::env::set_var("XDG_RUNTIME_DIR", tmp.path());
+            std::env::set_var("DBG_SESSION", "testorphan");
+        }
+        // Write a PID that cannot exist (the kernel never hands out 0).
+        std::fs::write(pid_path(), "2147483000").unwrap();
+        assert!(!is_running(), "dead PID should read as not running");
+        assert!(!pid_path().exists(), "orphan pid file should be cleaned up");
+        unsafe { std::env::remove_var("DBG_SESSION"); }
+    }
+
+    #[test]
+    fn is_running_requires_socket_when_pid_live() {
+        let tmp = TempDir::new().unwrap();
+        unsafe {
+            std::env::set_var("XDG_RUNTIME_DIR", tmp.path());
+            std::env::set_var("DBG_SESSION", "testlive");
+        }
+        let my_pid = std::process::id();
+        std::fs::write(pid_path(), my_pid.to_string()).unwrap();
+        // No socket — our PID is "alive" but it's us, the test.
+        assert!(!is_running(), "live PID without socket shouldn't register as daemon");
+        assert!(!pid_path().exists(), "stale pid file should be cleaned up");
+        unsafe { std::env::remove_var("DBG_SESSION"); }
+    }
+
+#[test]
     fn backend_target_class_mapping() {
         assert_eq!(backend_target_class("lldb"), TargetClass::NativeCpu);
         assert_eq!(backend_target_class("delve"), TargetClass::NativeCpu);

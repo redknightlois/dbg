@@ -177,9 +177,16 @@ fn main() -> Result<()> {
         "replay" => cmd_replay(&cli.args[1..]),
         "help" => {
             if cli.args.len() > 1 {
-                // dbg help <topic>
-                ensure_running()?;
+                // dbg help <topic> — serve dbg-level verbs client-side
+                // so they work without a running daemon. Only fall
+                // through to the daemon (for backend-specific help)
+                // when the topic is *not* a known dbg verb.
                 let topic = cli.args[1..].join(" ");
+                if let Some(text) = daemon::dbg_verb_help(topic.trim()) {
+                    println!("{text}");
+                    return Ok(());
+                }
+                ensure_running()?;
                 let resp = daemon::send_command(&format!("help {topic}"))?;
                 println!("{resp}");
                 Ok(())
@@ -353,7 +360,10 @@ fn autodetect_backend(target: &str) -> Option<&'static str> {
     if lower.ends_with(".py") {
         Some("pdb")
     } else if lower.ends_with(".go") {
-        Some("delve")
+        // delve-proto (DAP) is the headless variant — delve without
+        // DAP needs an interactive TTY and doesn't work under our
+        // PTY transport when driven non-interactively.
+        Some("delve-proto")
     } else if lower.ends_with(".java") {
         Some("jdb")
     } else if lower.ends_with(".rb") {
@@ -566,12 +576,33 @@ fn cmd_start(registry: &Registry, args: &[String]) -> Result<()> {
         }
         ForkResult::Parent { .. } => {
             // Wait for socket
-            if !daemon::wait_for_socket(Duration::from_secs(120)) {
+            if !daemon::wait_for_socket(Duration::from_secs(30)) {
                 let log = std::fs::read_to_string(&log_path).unwrap_or_default();
                 if log.trim().is_empty() {
                     bail!("daemon failed to start");
                 } else {
                     bail!("daemon failed to start:\n{}", log.trim());
+                }
+            }
+
+            // The socket may be bound *before* the backend itself has
+            // produced a prompt — if the backend dies (delve bails on
+            // a bad exec target, dotnet build fails, …) we'd previously
+            // fall through and the agent would see a healthy-looking
+            // "target: foo" with no session actually listening. Give
+            // the daemon a short grace window and then ping it; if
+            // the ping fails (or the daemon process is gone), surface
+            // the captured startup log.
+            std::thread::sleep(Duration::from_millis(150));
+            let healthy = daemon::is_running()
+                && daemon::send_command("status").is_ok();
+            if !healthy {
+                let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+                let log = log.trim();
+                if log.is_empty() {
+                    bail!("daemon started but exited before the debugger was ready");
+                } else {
+                    bail!("daemon started but exited before the debugger was ready:\n{log}");
                 }
             }
 
@@ -623,5 +654,42 @@ fn cmd_start(registry: &Registry, args: &[String]) -> Result<()> {
 
             Ok(())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn autodetect_go_prefers_dap() {
+        // delve (PTY) needs a TTY and hangs under non-interactive
+        // drivers — auto-detect must route .go to the DAP variant.
+        assert_eq!(autodetect_backend("main.go"), Some("delve-proto"));
+        assert_eq!(autodetect_backend("MAIN.GO"), Some("delve-proto"));
+    }
+
+    #[test]
+    fn autodetect_unambiguous_extensions() {
+        assert_eq!(autodetect_backend("broken.py"), Some("pdb"));
+        assert_eq!(autodetect_backend("App.java"), Some("jdb"));
+        assert_eq!(autodetect_backend("script.rb"), Some("rdbg"));
+        assert_eq!(autodetect_backend("site.php"), Some("phpdbg"));
+        assert_eq!(autodetect_backend("proj.csproj"), Some("netcoredbg"));
+        assert_eq!(autodetect_backend("app.js"), Some("node-proto"));
+        assert_eq!(autodetect_backend("app.ts"), Some("node-proto"));
+        assert_eq!(autodetect_backend("foo.hs"), Some("ghci"));
+        assert_eq!(autodetect_backend("bin/no-ext"), None);
+    }
+
+    #[test]
+    fn dbg_verb_help_is_publicly_callable() {
+        // Regression: client-side `dbg help start` used to bail with
+        // "no session running" because the static help lived behind
+        // ensure_running(). Make sure the dispatch table is reachable
+        // from main via the public daemon re-export.
+        assert!(daemon::dbg_verb_help("start").is_some());
+        assert!(daemon::dbg_verb_help("replay").is_some());
+        assert!(daemon::dbg_verb_help("not-a-verb").is_none());
     }
 }
