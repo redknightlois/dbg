@@ -754,8 +754,11 @@ dbg events [--since=SEQ] [--tail=N] [--kind=stop,stdout,...] [--wait=MS]
   Live-tail the session's PTY event log. Does not touch the session
   mutex, so it works while a `continue` is blocked.",
         "save" => "\
-dbg save [--label NAME]
-  Persist the current session DB to .dbg/sessions/<label>.db.",
+dbg save [<label> | --label <label>]
+  Copy the live session DB to .dbg/sessions/<label>.db so it
+  survives `dbg kill` and can be reopened with `dbg replay`.
+  Without a label, uses the session's auto-label (see `dbg status`).
+  Marks the persisted DB as user-owned so `dbg prune` won't reap it.",
         "cancel" => "\
 dbg cancel
   Interrupt the currently-running debugger command without tearing

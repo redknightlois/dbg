@@ -161,6 +161,17 @@ fn main() -> Result<()> {
 
     let first = cli.args[0].as_str();
 
+    // `dbg <verb> --help` / `-h` — serve the static verb help before
+    // any daemon check, so it works whether or not a session is live.
+    // `dbg help <verb>` already does this; users also naturally reach
+    // for `--help`, and that used to bail with "no session running".
+    if cli.args.iter().any(|a| a == "--help" || a == "-h") {
+        if let Some(text) = daemon::dbg_verb_help(first) {
+            println!("{text}");
+            return Ok(());
+        }
+    }
+
     match first {
         "start" => cmd_start(&registry, &cli.args[1..]),
         "kill" => {
@@ -687,6 +698,20 @@ mod tests {
         assert_eq!(autodetect_backend("app.ts"), Some("node-proto"));
         assert_eq!(autodetect_backend("foo.hs"), Some("ghci"));
         assert_eq!(autodetect_backend("bin/no-ext"), None);
+    }
+
+    #[test]
+    fn help_flag_short_circuits_on_known_verb() {
+        // Regression: `dbg hits --help` without a live session used
+        // to bail with "no session running" before reaching the help
+        // intercept. The static dispatch table must be reachable for
+        // every dbg-level verb so `--help`/`-h` always work.
+        for verb in ["hits", "start", "replay", "save"] {
+            assert!(
+                daemon::dbg_verb_help(verb).is_some(),
+                "dbg_verb_help missing entry for `{verb}`"
+            );
+        }
     }
 
     #[test]

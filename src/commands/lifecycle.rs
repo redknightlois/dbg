@@ -230,7 +230,11 @@ fn cmd_replay_info(_ctx: &LifeCtx<'_>, label: &str) -> String {
 
 fn cmd_sessions(ctx: &LifeCtx<'_>, group_only: bool) -> String {
     let dir = sessions_dir(ctx.cwd);
-    if !dir.exists() {
+    // When the directory doesn't exist yet, still synthesize a row
+    // for the live session — otherwise `dbg sessions` during an
+    // active session before the first `dbg save` returns "no saved
+    // sessions" and hides the running session entirely.
+    if !dir.exists() && ctx.active.is_none() {
         return "no saved sessions (nothing under .dbg/sessions/)".into();
     }
     let group_key = if group_only {
@@ -240,22 +244,24 @@ fn cmd_sessions(ctx: &LifeCtx<'_>, group_only: bool) -> String {
     };
 
     let mut rows: Vec<SessionListing> = Vec::new();
-    let entries = match fs::read_dir(&dir) {
-        Ok(e) => e,
-        Err(e) => return format!("[error reading {}: {e}]", dir.display()),
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.extension().and_then(|s| s.to_str()) != Some("db") {
-            continue;
-        }
-        if let Some(listing) = read_listing(&path) {
-            if let Some(ref needed) = group_key {
-                if listing.group_key.as_ref() != Some(needed) {
-                    continue;
-                }
+    if dir.exists() {
+        let entries = match fs::read_dir(&dir) {
+            Ok(e) => e,
+            Err(e) => return format!("[error reading {}: {e}]", dir.display()),
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|s| s.to_str()) != Some("db") {
+                continue;
             }
-            rows.push(listing);
+            if let Some(listing) = read_listing(&path) {
+                if let Some(ref needed) = group_key {
+                    if listing.group_key.as_ref() != Some(needed) {
+                        continue;
+                    }
+                }
+                rows.push(listing);
+            }
         }
     }
 
@@ -386,36 +392,38 @@ fn truncate(s: &str, max: usize) -> String {
 }
 
 fn cmd_save(ctx: &LifeCtx<'_>, label: Option<&str>) -> String {
-    match label {
-        None => match ctx.active {
-            Some(db) => match db.promote_to_user() {
-                Ok(_) => format!(
-                    "promoted active session `{}` to created_by=user (won't be pruned)",
-                    db.label()
-                ),
-                Err(e) => format!("[error: {e}]"),
-            },
-            None => "no active session to save (start one with `dbg start`)".into(),
-        },
-        Some(lbl) => {
-            let path = sessions_dir(ctx.cwd).join(format!("{lbl}.db"));
-            if !path.exists() {
-                return format!("no saved session named `{lbl}` under {}", path.display());
-            }
-            let conn = match rusqlite::Connection::open(&path) {
-                Ok(c) => c,
-                Err(e) => return format!("[error opening {}: {e}]", path.display()),
-            };
-            match conn.execute(
-                "UPDATE sessions SET created_by='user' WHERE created_by='auto'",
-                [],
-            ) {
-                Ok(n) if n > 0 => format!("promoted `{lbl}` to created_by=user"),
-                Ok(_) => format!("`{lbl}` was already user-owned"),
-                Err(e) => format!("[error: {e}]"),
-            }
+    // Both `dbg save` and `dbg save <label>` mean the same thing:
+    // persist the current live session DB into .dbg/sessions/. The
+    // only difference is the filename — `save` uses the session's
+    // auto-label, `save foo` uses `foo.db`. This used to be a
+    // "promote existing saved DB" verb, which nobody actually wanted
+    // (promotion alone never wrote the DB to disk, so replay never
+    // worked after a kill).
+    let Some(db) = ctx.active else {
+        return "no active session to save (start one with `dbg start`)".into();
+    };
+    let lbl = label.unwrap_or_else(|| db.label());
+    let path = sessions_dir(ctx.cwd).join(format!("{lbl}.db"));
+    if let Some(parent) = path.parent() {
+        if let Err(e) = std::fs::create_dir_all(parent) {
+            return format!("[error creating {}: {e}]", parent.display());
         }
     }
+    if let Err(e) = db.save_to(&path) {
+        return format!("[error writing {}: {e}]", path.display());
+    }
+    // Also promote in-memory so subsequent `save` calls don't
+    // surprise the user by re-marking as auto.
+    let _ = db.promote_to_user();
+    // Stamp created_by=user on the persisted DB too so a later
+    // `prune` won't reap it.
+    if let Ok(conn) = rusqlite::Connection::open(&path) {
+        let _ = conn.execute(
+            "UPDATE sessions SET created_by='user'",
+            [],
+        );
+    }
+    format!("saved `{lbl}` to {}", path.display())
 }
 
 fn cmd_prune(ctx: &LifeCtx<'_>, older_than: Duration, policy: PrunePolicy) -> String {
@@ -705,32 +713,18 @@ mod tests {
     }
 
     #[test]
-    fn save_promotes_active_session() {
+    fn save_writes_active_session_to_disk() {
+        // Regression: `dbg save` used to only flip created_by=user in
+        // memory and never write the DB, so `dbg replay` after a kill
+        // found nothing.
         let tmp = TempDir::new().unwrap();
         let db = mk_db(&tmp, "active");
         let ctx = LifeCtx { cwd: tmp.path(), active: Some(&db) };
         let out = cmd_save(&ctx, None);
-        assert!(out.contains("created_by=user"));
-        let cb: String = db.conn().query_row(
-            "SELECT created_by FROM sessions",
-            [],
-            |r| r.get(0),
-        ).unwrap();
-        assert_eq!(cb, "user");
-    }
-
-    #[test]
-    fn save_named_promotes_file() {
-        let tmp = TempDir::new().unwrap();
-        let db = mk_db(&tmp, "named");
-        let p = sessions_dir(tmp.path()).join("named.db");
-        db.save_to(&p).unwrap();
-
-        let ctx = LifeCtx { cwd: tmp.path(), active: None };
-        let out = cmd_save(&ctx, Some("named"));
-        assert!(out.contains("promoted") || out.contains("already"));
-
-        let conn = rusqlite::Connection::open(&p).unwrap();
+        assert!(out.contains("saved"), "{out}");
+        let expected = sessions_dir(tmp.path()).join("active.db");
+        assert!(expected.exists(), "missing {}", expected.display());
+        let conn = rusqlite::Connection::open(&expected).unwrap();
         let cb: String = conn
             .query_row("SELECT created_by FROM sessions", [], |r| r.get(0))
             .unwrap();
@@ -738,11 +732,41 @@ mod tests {
     }
 
     #[test]
-    fn save_missing_label_reports() {
+    fn save_writes_labeled_copy() {
+        // Regression: `dbg save mylabel` looked up an existing DB
+        // instead of copying the live session. Now it always
+        // produces `.dbg/sessions/mylabel.db`.
+        let tmp = TempDir::new().unwrap();
+        let db = mk_db(&tmp, "active");
+        let ctx = LifeCtx { cwd: tmp.path(), active: Some(&db) };
+        let out = cmd_save(&ctx, Some("mybug"));
+        assert!(out.contains("saved `mybug`"), "{out}");
+        let expected = sessions_dir(tmp.path()).join("mybug.db");
+        assert!(expected.exists(), "missing {}", expected.display());
+    }
+
+    #[test]
+    fn save_without_active_session_errors() {
         let tmp = TempDir::new().unwrap();
         let ctx = LifeCtx { cwd: tmp.path(), active: None };
-        let out = cmd_save(&ctx, Some("does-not-exist"));
-        assert!(out.contains("no saved session"));
+        let out = cmd_save(&ctx, Some("anything"));
+        assert!(out.contains("no active session"), "{out}");
+    }
+
+    #[test]
+    fn sessions_shows_live_when_sessions_dir_missing() {
+        // Regression: `dbg sessions` with an active session but no
+        // .dbg/sessions/ directory on disk returned "no saved
+        // sessions", hiding the running session entirely.
+        let tmp = TempDir::new().unwrap();
+        let db = mk_db(&tmp, "live");
+        let ctx = LifeCtx { cwd: tmp.path(), active: Some(&db) };
+        // Don't create .dbg/sessions/ — the synthesize-live branch
+        // should still fire.
+        assert!(!sessions_dir(tmp.path()).exists());
+        let out = cmd_sessions(&ctx, false);
+        assert!(out.contains("live"), "missing live entry:\n{out}");
+        assert!(out.contains("* = currently live session"), "missing * marker:\n{out}");
     }
 
     #[test]
