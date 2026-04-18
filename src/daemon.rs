@@ -256,6 +256,22 @@ pub fn run_daemon(
         (Box::new(p), config.init_commands)
     };
 
+    // Publish the jitdasm capture path so on-demand collectors (which
+    // live in the lib crate and can't reach `daemon::session_tmp`) can
+    // serve `dbg disasm` from the pre-captured file rather than
+    // re-spawning dotnet on every call.
+    if backend.name() == "jitdasm" {
+        // SAFETY: set_var is only unsafe in multi-threaded contexts due
+        // to libc env races. We're still single-threaded here — this
+        // runs before the socket listener spawns request handlers.
+        unsafe {
+            std::env::set_var(
+                "DBG_JITDASM_CAPTURE",
+                session_tmp("jitdasm").join("capture.asm"),
+            );
+        }
+    }
+
     // Expose the child PID outside the session mutex so the quit handler
     // can SIGINT the child to interrupt a blocked `send_and_wait` (e.g.
     // jdb waiting on a `continue` that hasn't hit a breakpoint yet).

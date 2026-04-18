@@ -115,35 +115,34 @@ impl OnDemandCollector for JitDasmCollector {
         matches!(class, TargetClass::ManagedDotnet)
     }
 
-    /// jitdasm always spawns a *fresh* `dotnet <target>` — never reuses
-    /// the live debug session, because `DOTNET_JitDisasm` must be set
-    /// in the environment before the runtime starts. The live session
-    /// is untouched.
+    /// Prefers the `jitdasm` backend's pre-captured `capture.asm` (the
+    /// backend ran `DOTNET_JitDisasm='*'` once at session start and
+    /// dumped every method to a file). When that file is missing —
+    /// e.g. the session was started with a different .NET backend —
+    /// falls back to spawning a fresh `dotnet` with `DOTNET_JitDisasm`
+    /// scoped to the requested symbol. The live debug session is
+    /// untouched either way.
     fn collect(
         &self,
         ctx: &CollectCtx<'_>,
         _live: Option<&dyn LiveDebugger>,
     ) -> Result<DisasmOutput> {
-        let dotnet = std::env::var("DOTNET").unwrap_or_else(|_| "dotnet".into());
-        // JitDisasm accepts a wildcard-free method-name substring match.
-        // We pass the caller's symbol verbatim.
-        let output = Command::new(&dotnet)
-            .arg(ctx.target)
-            .env("DOTNET_JitDisasm", ctx.symbol)
-            .env("DOTNET_TieredCompilation", "0") // deterministic tier
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .output()
-            .with_context(|| format!("invoking {dotnet} for jitdasm"))?;
-        // JitDisasm writes to stderr; target program may also emit
-        // normal stdout we want to ignore.
-        let text = String::from_utf8_lossy(&output.stderr).to_string();
+        let capture = std::env::var_os("DBG_JITDASM_CAPTURE").map(std::path::PathBuf::from);
+        let (text, source_desc) = match capture.as_ref().filter(|p| p.is_file()) {
+            Some(p) => (
+                std::fs::read_to_string(p)
+                    .with_context(|| format!("reading {}", p.display()))?,
+                p.display().to_string(),
+            ),
+            None => (run_jitdasm_fresh(ctx.target, ctx.symbol)?, "fresh dotnet run".into()),
+        };
         let asm_text = extract_jitdasm_section(&text, ctx.symbol);
         if asm_text.is_empty() {
             bail!(
-                "jitdasm produced no assembly for {} (dotnet exit {})",
+                "jitdasm produced no assembly for {} (no matching `; Assembly listing for method ...{}...` header in {})",
                 ctx.symbol,
-                output.status
+                ctx.symbol,
+                source_desc,
             );
         }
         let tier = parse_jitdasm_tier(&asm_text);
@@ -155,6 +154,37 @@ impl OnDemandCollector for JitDasmCollector {
             asm_lines_json: None,
         })
     }
+}
+
+/// Fallback when no pre-captured `capture.asm` is available. Mirrors
+/// the invocation form used by `backend::jitdasm` so a `.csproj`
+/// target works (`dotnet run --project ...`) instead of being passed
+/// to `dotnet` as a positional arg, which fails.
+fn run_jitdasm_fresh(target: &str, symbol: &str) -> Result<String> {
+    let dotnet = std::env::var("DOTNET").unwrap_or_else(|_| "dotnet".into());
+    let mut cmd = Command::new(&dotnet);
+    if target.ends_with(".csproj") || target.ends_with(".fsproj") {
+        cmd.args(["run", "--project", target, "-c", "Release"]);
+    } else {
+        cmd.arg(target);
+    }
+    let output = cmd
+        .env("DOTNET_JitDisasm", symbol)
+        .env("DOTNET_TieredCompilation", "0") // deterministic tier
+        .env("DOTNET_JitDiffableDasm", "1")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .with_context(|| format!("invoking {dotnet} for jitdasm"))?;
+    // JitDisasm writes to stdout under `dotnet run` (stderr-vs-stdout
+    // varies by host); concatenate both so the parser sees everything.
+    let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
+    text.push('\n');
+    text.push_str(&String::from_utf8_lossy(&output.stderr));
+    if text.trim().is_empty() {
+        bail!("dotnet exited {} with no output", output.status);
+    }
+    Ok(text)
 }
 
 /// jitdasm writes one method listing at a time, each starting with a
