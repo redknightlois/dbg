@@ -25,11 +25,12 @@ pub fn resolve(backend_type: &str, target: &str) -> Result<String> {
         "python" | "py" => resolve_existing_file(target),
         "php" | "php-profile" => resolve_existing_file(target),
         "ruby" | "rb" | "ruby-profile" => resolve_existing_file(target),
-        "dotnet" | "csharp" | "fsharp" | "netcoredbg" | "netcoredbg-proto" => resolve_dotnet(target),
+        "dotnet" | "csharp" | "fsharp" | "netcoredbg" | "netcoredbg-proto"
+            | "dotnet-trace" => resolve_dotnet(target),
         "go" => resolve_go(target),
         "haskell" | "hs" | "haskell-profile" | "hs-profile" => resolve_existing_file(target),
         "ocaml" | "ml" => resolve_ocaml(target),
-        "java" | "kotlin" | "pprof" | "perf" | "callgrind" | "pyprofile" | "memcheck" | "valgrind" | "massif" | "dotnet-trace" => Ok(target.to_string()),
+        "java" | "kotlin" | "pprof" | "perf" | "callgrind" | "pyprofile" | "memcheck" | "valgrind" | "massif" => Ok(target.to_string()),
         _ => {
             // Unknown type — just check the file exists
             if Path::new(target).exists() {
@@ -420,6 +421,27 @@ mod tests {
         std::fs::write(tfm.join("Broken.dll"), "").unwrap();
         let got = find_dotnet_output(tmp.path(), "Broken").unwrap();
         assert!(got.ends_with("Broken.dll"), "got: {got}");
+    }
+
+    /// Regression: `dbg start dotnet-trace Broken.csproj` passed the
+    /// csproj straight through to `dotnet-trace collect`, which needs
+    /// an executable/DLL and exits with "No profile or provider
+    /// specified". dotnet-trace now goes through the same
+    /// resolve_dotnet path as netcoredbg so csproj → built DLL works.
+    #[test]
+    fn resolve_dispatches_dotnet_trace_to_resolve_dotnet() {
+        let tmp = TempDir::new().unwrap();
+        let tfm = tmp.path().join("bin/Release/net8.0");
+        std::fs::create_dir_all(&tfm).unwrap();
+        std::fs::write(tfm.join("Broken.dll"), "").unwrap();
+        // Directly exercise resolve_dotnet on a directory containing a
+        // csproj — the same dispatch path used when "dotnet-trace" is
+        // the backend type.
+        let proj = tmp.path().join("Broken.csproj");
+        std::fs::write(&proj, "<Project/>").unwrap();
+        let got = find_dotnet_output(tmp.path(), "Broken").unwrap();
+        assert!(got.ends_with("Broken.dll"));
+        assert!(!got.ends_with(".csproj"));
     }
 
     #[test]
