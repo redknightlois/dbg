@@ -78,11 +78,23 @@ impl Backend for JdbBackend {
     fn clean(&self, _cmd: &str, output: &str) -> CleanResult {
         let mut events = Vec::new();
         let mut lines = Vec::new();
+        let mut saw_deferred_bp = false;
+        let mut saw_bp_hit = false;
+        let mut saw_exit = false;
         for line in output.lines() {
             let trimmed = line.trim();
             if trimmed.starts_with("Set breakpoint") || trimmed.starts_with("Deferring breakpoint") {
+                saw_deferred_bp = true;
                 events.push(trimmed.to_string());
                 continue;
+            }
+            if trimmed.starts_with("Breakpoint hit") {
+                saw_bp_hit = true;
+            }
+            if trimmed.starts_with("The application exited")
+                || trimmed.starts_with("The application has been disconnected")
+            {
+                saw_exit = true;
             }
             if trimmed.contains("thread") && (trimmed.contains("started") || trimmed.contains("died")) {
                 events.push(trimmed.to_string());
@@ -90,8 +102,24 @@ impl Backend for JdbBackend {
             }
             lines.push(line);
         }
+        let mut out = lines.join("\n");
+        // Regression hint: jdb compiled without `-g` runs the program to
+        // completion without firing any deferred breakpoint, leaving an
+        // empty-looking output that gives no reason why. Surface a
+        // concrete hint when we see exit-without-hit.
+        if saw_deferred_bp && saw_exit && !saw_bp_hit {
+            if !out.ends_with('\n') && !out.is_empty() {
+                out.push('\n');
+            }
+            out.push_str(
+                "[hint] breakpoint did not fire before the program exited. \
+                 Verify the class:line is reachable, or — if the class was \
+                 compiled without debug info — recompile with `javac -g` \
+                 so jdb can resolve line numbers.",
+            );
+        }
         CleanResult {
-            output: lines.join("\n"),
+            output: out,
             events,
         }
     }
@@ -233,6 +261,43 @@ mod tests {
         let r = JdbBackend.clean("stop at Main:10", input);
         assert_eq!(r.output, "normal output");
         assert_eq!(r.events.len(), 2);
+    }
+
+    /// Regression: a `.class` compiled without `-g` has no
+    /// LineNumberTable, so jdb can't resolve file:line breakpoints and
+    /// silently runs the program to completion. The output as-cleaned
+    /// showed nothing — no reason for the missing stop. We now append
+    /// a `[hint]` line whenever we see deferred-bp + exit + no-hit.
+    #[test]
+    fn clean_hints_at_missing_g_when_program_exits_without_hit() {
+        let input = "\
+Deferring breakpoint Broken:40\n\
+It will be set after the class is loaded.\n\
+...\n\
+The application exited";
+        let r = JdbBackend.clean("run", input);
+        assert!(
+            r.output.to_lowercase().contains("javac -g")
+                || r.output.to_lowercase().contains("debug info"),
+            "expected -g hint when bp didn't fire before exit, got: {}",
+            r.output
+        );
+    }
+
+    /// When a breakpoint DID fire, the hint must not appear.
+    #[test]
+    fn clean_no_hint_when_breakpoint_fired() {
+        let input = "\
+Deferring breakpoint Broken:40\n\
+It will be set after the class is loaded.\n\
+Breakpoint hit: \"thread=main\", Broken.main(), line=40 bci=0\n\
+The application exited";
+        let r = JdbBackend.clean("run", input);
+        assert!(
+            !r.output.to_lowercase().contains("javac -g"),
+            "hint must not fire when a breakpoint was hit: {}",
+            r.output
+        );
     }
 
     #[test]
