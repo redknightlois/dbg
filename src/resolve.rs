@@ -16,7 +16,8 @@ fn path_stem_str(p: &Path) -> Result<String> {
 /// Builds if needed, returns the path to the binary/script.
 pub fn resolve(backend_type: &str, target: &str) -> Result<String> {
     match backend_type {
-        "rust" | "c" | "cpp" | "zig" => resolve_native(target),
+        // `gdb` is an alias for the lldb/native backend.
+        "rust" | "c" | "cpp" | "zig" | "gdb" => resolve_native(target),
         "d" => resolve_d(target),
         "nim" => resolve_nim(target),
         "node" | "nodejs" | "js" | "javascript" | "ts" | "typescript" | "bun" | "deno"

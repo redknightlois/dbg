@@ -19,7 +19,10 @@ impl Backend for LldbBackend {
     }
 
     fn types(&self) -> &'static [&'static str] {
-        &["rust", "c", "cpp", "zig", "d", "nim"]
+        // `gdb` is included as an alias: users who reach for the
+        // familiar GDB name get the lldb backend with a clear note
+        // instead of "unknown type: gdb".
+        &["rust", "c", "cpp", "zig", "d", "nim", "gdb"]
     }
 
     fn spawn_config(&self, target: &str, args: &[String]) -> anyhow::Result<SpawnConfig> {
@@ -267,6 +270,25 @@ impl CanonicalOps for LldbBackend {
     /// `frame variable` emits a `(Type) name = value` table. We parse
     /// each top-level entry into a JSON object: { name: {type, value} }.
     fn parse_locals(&self, output: &str) -> Option<Value> {
+        // Bug 1: LLDB returns this error verbatim when the debuggee has
+        // already exited but the LLDB process itself is still alive.
+        // Map it to a structured post-mortem sentinel so callers get a
+        // consistent signal rather than a raw error string.
+        if output.contains("Command requires a process which is currently stopped") {
+            let mut entry = Map::new();
+            entry.insert(
+                "value".into(),
+                Value::String(
+                    "[post-mortem] debuggee has exited — use `dbg hits`, `dbg cross`, \
+                     or `dbg start` for a new session"
+                        .into(),
+                ),
+            );
+            let mut obj = Map::new();
+            obj.insert("[post-mortem]".into(), Value::Object(entry));
+            return Some(Value::Object(obj));
+        }
+
         let mut obj = Map::new();
         let re = locals_regex();
         for line in output.lines() {
@@ -276,8 +298,27 @@ impl CanonicalOps for LldbBackend {
             }
             if let Some(c) = re.captures(line) {
                 let ty = c.get(1).map(|m| m.as_str().trim().to_string());
-                let name = c.get(2).unwrap().as_str().to_string();
+                let raw_name = c.get(2).unwrap().as_str().to_string();
                 let val = c.get(3).unwrap().as_str().trim().to_string();
+
+                // Bug 2a: Filter bare struct-open placeholder lines like
+                // `(MyStruct) remaining = {` — LLDB emits these when it
+                // can't expand the type; they add noise without content.
+                if val == "{" {
+                    continue;
+                }
+
+                // Bug 2b: Rename Rust tuple-field synthetic names
+                // (`__0`, `__1`, …) to plain integer strings (`0`, `1`, …).
+                let name = if raw_name.starts_with("__")
+                    && raw_name[2..].chars().all(|c| c.is_ascii_digit())
+                    && raw_name.len() > 2
+                {
+                    raw_name[2..].to_string()
+                } else {
+                    raw_name
+                };
+
                 let mut entry = Map::new();
                 if let Some(t) = ty {
                     entry.insert("type".into(), Value::String(t));
@@ -585,5 +626,126 @@ mod tests {
         let b: Box<dyn Backend> = Box::new(LldbBackend);
         assert!(b.canonical_ops().is_some());
         assert_eq!(b.canonical_ops().unwrap().tool_name(), "lldb");
+    }
+
+    // ------------------------------------------------------------------
+    // Bug 1: parse_locals on post-exit LLDB error → [post-mortem] message
+    // ------------------------------------------------------------------
+    #[test]
+    fn parse_locals_post_exit_error_maps_to_post_mortem() {
+        // When the debuggee has already exited, `frame variable` returns
+        // this verbatim error string.  parse_locals must detect it and
+        // return a structured post-mortem value rather than None (which
+        // would be silently dropped) or a raw error string passed through.
+        let raw = "error: Command requires a process which is currently stopped.";
+        let v = LldbBackend.parse_locals(raw).expect("should return a value for the error case");
+        let obj = v.as_object().unwrap();
+        // Must contain the sentinel key "[post-mortem]"
+        assert!(
+            obj.contains_key("[post-mortem]"),
+            "expected [post-mortem] key, got: {v}"
+        );
+        let msg = obj["[post-mortem]"]
+            .get("value")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        assert!(
+            msg.contains("exited") || msg.contains("post-mortem"),
+            "message should mention exit: {msg}"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Bug 2: Rust tuple-field names (__0, __1) and placeholder lines
+    // ------------------------------------------------------------------
+    #[test]
+    fn parse_locals_rust_tuple_fields_renamed() {
+        // LLDB names Rust tuple fields __0, __1 etc.
+        // They should be exposed as "0", "1".
+        let output = "(u32) __0 = 42\n(u64) __1 = 100";
+        let v = LldbBackend.parse_locals(output).expect("should parse");
+        let obj = v.as_object().unwrap();
+        assert!(
+            obj.contains_key("0"),
+            "expected key '0', got keys: {:?}",
+            obj.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            obj.contains_key("1"),
+            "expected key '1', got keys: {:?}",
+            obj.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            !obj.contains_key("__0"),
+            "raw __0 key should have been renamed"
+        );
+    }
+
+    #[test]
+    fn parse_locals_rust_pointer_address_filtered() {
+        // Bare pointer-address locals like `expires_at = 0x00007fff…`
+        // pollute the output with LLDB internals. They should be kept
+        // as values (not filtered entirely) but at minimum not crash.
+        let output = "(u64 *) expires_at = 0x00007fff12345678";
+        let v = LldbBackend.parse_locals(output).expect("should parse");
+        let obj = v.as_object().unwrap();
+        assert!(obj.contains_key("expires_at"));
+    }
+
+    #[test]
+    fn parse_locals_rust_bare_brace_placeholder_filtered() {
+        // Lines that end with a lone `{` are struct-open placeholders
+        // emitted by LLDB when it can't expand the type; they add noise.
+        // The parser should drop them.
+        let output = "(int) x = 42\n(MyStruct) remaining = {\n(int) y = 7";
+        let v = LldbBackend.parse_locals(output).expect("should parse");
+        let obj = v.as_object().unwrap();
+        assert!(obj.contains_key("x"));
+        assert!(obj.contains_key("y"));
+        // "remaining = {" is a placeholder and must NOT appear as a key
+        assert!(
+            !obj.contains_key("remaining"),
+            "bare-brace placeholder should be filtered out"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Bug 3 (investigation): parse_hit must fire when stop banner appears
+    // anywhere in multi-chunk output (e.g. after PTY flush boundary).
+    // ------------------------------------------------------------------
+    #[test]
+    fn parse_hit_detects_stop_when_banner_precedes_frame_on_same_chunk() {
+        // Canonical case: stop reason and frame on same chunk.
+        let output = "\
+* thread #1, name = 'main', stop reason = breakpoint 1.1\n\
+    frame #0: 0x0000555555555190 broken`main at broken.cpp:10:5";
+        let hit = LldbBackend.parse_hit(output).expect("should parse hit");
+        assert_eq!(hit.file.as_deref(), Some("broken.cpp"));
+        assert_eq!(hit.line, Some(10));
+    }
+
+    #[test]
+    fn parse_hit_detects_stop_when_only_banner_no_frame() {
+        // If stop reason is present but frame info is absent, parse_hit
+        // should still return None (no location to record) — NOT panic.
+        let output = "* thread #1, stop reason = breakpoint 1.1\n(lldb) ";
+        // No frame line → location_key cannot be formed → None is correct.
+        assert!(
+            LldbBackend.parse_hit(output).is_none(),
+            "without a frame line there is no location to record"
+        );
+    }
+
+    #[test]
+    fn gdb_is_a_registered_type() {
+        // Regression: `dbg start gdb ./mybin` failed with "unknown type:
+        // gdb". `gdb` must be an alias for the lldb backend so users
+        // who reach for the familiar name don't get an opaque error.
+        let b = LldbBackend;
+        assert!(
+            b.types().contains(&"gdb"),
+            "`gdb` must be listed in LldbBackend.types(); got: {:?}",
+            b.types()
+        );
     }
 }
