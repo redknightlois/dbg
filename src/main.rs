@@ -347,9 +347,23 @@ fn cmd_replay(args: &[String]) -> Result<()> {
     } else {
         sessions_dir.join(format!("{label}.db"))
     };
-    if !path.exists() {
-        bail!("no session at {}", path.display());
-    }
+    // Fall back to matching on the DB's stored `sessions.label` column
+    // when the filename-stem lookup misses. `dbg sessions` prints the
+    // stored label (e.g. `broken-20260419-154358`) but files are named
+    // by their filename stem (e.g. `session-10.db`); copy-pasting what
+    // `dbg sessions` showed would otherwise fail with "no session at …".
+    let path = if path.exists() {
+        path
+    } else if let Some(by_label) = find_session_by_label(&sessions_dir, label) {
+        by_label
+    } else {
+        bail!(
+            "no session matching `{label}` — got neither a file `{}` nor any \
+             saved DB whose `label` column matches. `dbg sessions` lists \
+             what's available.",
+            path.display()
+        );
+    };
     let conn = rusqlite::Connection::open_with_flags(
         &path,
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
@@ -445,6 +459,35 @@ fn replay_eval(
                 .to_string()
         }
     }
+}
+
+/// Search `.dbg/sessions/` for a DB whose `sessions.label` column
+/// matches `label`, returning its file path. Falls back for `dbg replay`
+/// when the user copied a label from `dbg sessions` (which shows the
+/// stored label, not the filename stem).
+fn find_session_by_label(dir: &std::path::Path, label: &str) -> Option<std::path::PathBuf> {
+    if !dir.exists() {
+        return None;
+    }
+    for entry in std::fs::read_dir(dir).ok()?.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|s| s.to_str()) != Some("db") {
+            continue;
+        }
+        let conn = match rusqlite::Connection::open_with_flags(
+            &path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        ) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+        let got: Result<String, _> =
+            conn.query_row("SELECT label FROM sessions LIMIT 1", [], |r| r.get(0));
+        if got.ok().as_deref() == Some(label) {
+            return Some(path);
+        }
+    }
+    None
 }
 
 fn ensure_running() -> Result<()> {
@@ -858,6 +901,36 @@ mod tests {
                 "`{non_alias}` must not be treated as kill"
             );
         }
+    }
+
+    /// Regression: `dbg sessions` prints the DB's stored label
+    /// (e.g. `broken-20260419-154358`), but on disk sessions are named
+    /// after a filename stem (e.g. `session-10.db`). Users copying the
+    /// label into `dbg replay` hit "no session at …/broken-…-.db".
+    /// `find_session_by_label` walks the sessions dir and matches on
+    /// the DB's `sessions.label` column so the copy-paste workflow
+    /// works.
+    #[test]
+    fn find_session_by_label_matches_stored_label_not_filename_stem() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path();
+        // Create a DB whose filename stem (`session-10`) differs from
+        // its stored `sessions.label` value (`broken-20260419-154358`).
+        let path = dir.join("session-10.db");
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute("CREATE TABLE sessions (label TEXT)", []).unwrap();
+        conn.execute(
+            "INSERT INTO sessions (label) VALUES (?1)",
+            ["broken-20260419-154358"],
+        )
+        .unwrap();
+        drop(conn);
+
+        let got = find_session_by_label(dir, "broken-20260419-154358");
+        assert_eq!(got.as_deref(), Some(path.as_path()));
+
+        // A non-existent label returns None, not a bogus match.
+        assert!(find_session_by_label(dir, "nope").is_none());
     }
 
     #[test]
