@@ -142,11 +142,26 @@ pub fn cmd_stats(db: &GpuDb) {
     println!("GPU Profile Summary");
     println!("  Target:       {target}");
     if !device.is_empty() { println!("  Device:       {device}"); }
-    println!("  Wall time:    {}", fmt_us(wall_us));
-    let pct = |v: f64| if wall_us > 0.0 { v / wall_us * 100.0 } else { 0.0 };
-    println!("  Kernel time:  {} ({:.1}% of wall)", fmt_us(gpu_us), pct(gpu_us));
+    // When wall_time_us is missing / zero, the underlying collection
+    // failed (e.g. nsys import errored out). Printing "0.0us" and
+    // "0.0% of wall" for every row made broken sessions look merely
+    // quiet. Surface the absence explicitly so agents don't draw
+    // wrong conclusions from phantom percentages.
+    if wall_us > 0.0 {
+        println!("  Wall time:    {}", fmt_us(wall_us));
+    } else {
+        println!("  Wall time:    N/A (nsys did not record — re-run `gdbg collect`)");
+    }
+    let fmt_pct = |v: f64| {
+        if wall_us > 0.0 {
+            format!("{:.1}% of wall", v / wall_us * 100.0)
+        } else {
+            "wall=N/A".to_string()
+        }
+    };
+    println!("  Kernel time:  {} ({})", fmt_us(gpu_us), fmt_pct(gpu_us));
     if xfer_us > 0.0 {
-        println!("  Transfer time: {} ({:.1}% of wall)", fmt_us(xfer_us), pct(xfer_us));
+        println!("  Transfer time: {} ({})", fmt_us(xfer_us), fmt_pct(xfer_us));
     }
 
     // Efficiency = GPU-not-idle wall time / program wall time.
