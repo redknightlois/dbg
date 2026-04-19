@@ -9,6 +9,15 @@ fn is_source_extension(lower: &str) -> bool {
     )
 }
 
+/// Return true if the path starts with the ELF magic bytes `\x7fELF`.
+fn is_elf_binary(path: &str) -> bool {
+    use std::io::Read;
+    let mut buf = [0u8; 4];
+    let Ok(mut f) = std::fs::File::open(path) else { return false };
+    if f.read_exact(&mut buf).is_err() { return false }
+    buf == [0x7f, b'E', b'L', b'F']
+}
+
 pub struct PprofBackend;
 
 impl Backend for PprofBackend {
@@ -43,10 +52,10 @@ impl Backend for PprofBackend {
         }
         positional.extend(args.iter().cloned());
 
-        // pprof only ingests profile files — source files hit
-        // `go tool pprof` as an unknown format and the PTY exits
-        // before printing a prompt, which surfaces as
-        // "debugger did not produce prompt" with no hint.
+        // pprof only ingests profile files — source files and ELF
+        // binaries both cause `go tool pprof` to exit before printing
+        // a prompt, surfacing an opaque "debugger did not produce
+        // prompt" error with no actionable hint.
         for p in &positional {
             let lower = p.to_ascii_lowercase();
             if is_source_extension(&lower) {
@@ -54,6 +63,13 @@ impl Backend for PprofBackend {
                     "pprof needs a profile file (.prof / cpu.prof / mem.prof), \
                      got `{p}` — generate one with `go test -cpuprofile` or \
                      `runtime/pprof` and pass that instead"
+                );
+            }
+            if is_elf_binary(p) {
+                anyhow::bail!(
+                    "pprof needs a recorded profile (.prof), not an ELF binary — \
+                     profile first with `go test -cpuprofile cpu.prof ./...` or \
+                     `perf record` and pass the resulting .prof file instead"
                 );
             }
         }
@@ -166,6 +182,37 @@ mod tests {
                 "error should name the expected profile-file format, got: {err}"
             );
         }
+    }
+
+    #[test]
+    fn spawn_config_rejects_elf_binary() {
+        // Regression: `dbg start pprof ./broken` (an ELF binary, not a
+        // profile) used to pass the binary straight to `go tool pprof`,
+        // which exited before printing a prompt, surfacing an opaque
+        // "debugger did not produce prompt" error with no hint.
+        // ELF magic (\x7fELF) must be detected and a clear message
+        // shown naming the required profile format.
+        use std::io::Write;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let elf_path = tmp.path().join("broken");
+        {
+            let mut f = std::fs::File::create(&elf_path).unwrap();
+            f.write_all(&[0x7f, b'E', b'L', b'F', 0, 0, 0, 0]).unwrap();
+        }
+        let path_str = elf_path.to_str().unwrap();
+        let err = match PprofBackend.spawn_config(path_str, &[]) {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("pprof accepted ELF binary `{path_str}`"),
+        };
+        assert!(
+            err.to_lowercase().contains(".prof")
+                || err.to_lowercase().contains("profile"),
+            "error should mention profile format, got: {err}"
+        );
+        assert!(
+            err.to_lowercase().contains("elf") || err.to_lowercase().contains("binary"),
+            "error should mention ELF or binary, got: {err}"
+        );
     }
 
     #[test]
