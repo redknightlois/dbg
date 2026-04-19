@@ -285,7 +285,13 @@ fn collect_nsys(
         target_hash,
     )?;
 
-    parsers::nsys::import_nsys_rep(&db.conn, &sqlite_path, layer_id)?;
+    // Roll back the empty layer on import failure, otherwise
+    // `has_layer("nsys")` returns true and the session summary
+    // falsely prints `Layers: nsys + ncu` with zero-everything data.
+    if let Err(e) = parsers::nsys::import_nsys_rep(&db.conn, &sqlite_path, layer_id) {
+        let _ = db.remove_layer(layer_id);
+        return Err(e);
+    }
 
     eprintln!("  nsys done in {elapsed:.1}s ({} kernels, {} launches)",
         db.unique_kernel_count(), db.total_launch_count());

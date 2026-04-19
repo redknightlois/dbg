@@ -202,6 +202,16 @@ impl GpuDb {
         Ok(self.conn.last_insert_rowid())
     }
 
+    /// Undo an `add_layer` when a downstream import fails. Without
+    /// this, a failed nsys/ncu import leaves an empty layer row that
+    /// makes `has_layer("nsys")` return true and the session summary
+    /// falsely claim both layers are present.
+    pub fn remove_layer(&self, layer_id: i64) -> Result<()> {
+        self.conn
+            .execute("DELETE FROM layers WHERE id = ?1", params![layer_id])?;
+        Ok(())
+    }
+
     /// Execute a query and collect all rows via a mapping function.
     /// Returns an empty Vec on any error (safe for diagnostic/display code).
     pub fn query_vec<T>(
@@ -701,6 +711,24 @@ mod tests {
         assert!(db.has_layer("nsys"));
         assert!(!db.has_layer("ncu"));
         assert_eq!(db.layer_names(), vec!["nsys"]);
+    }
+
+    /// Regression: when the nsys import failed (nsys 2023 schema
+    /// mismatch, for example), the layer row inserted before the
+    /// import persisted and `has_layer("nsys")` returned true for an
+    /// empty layer — causing the session summary to claim `Layers:
+    /// nsys + ncu` with zero data. `remove_layer` lets the collector
+    /// roll back the row on error.
+    #[test]
+    fn remove_layer_restores_has_layer_to_false() {
+        let db = temp_db();
+        let id = db
+            .add_layer("nsys", "/tmp/trace.nsys-rep", None, None, None)
+            .unwrap();
+        assert!(db.has_layer("nsys"));
+        db.remove_layer(id).unwrap();
+        assert!(!db.has_layer("nsys"), "layer row must be gone after remove");
+        assert!(db.layer_names().is_empty());
     }
 
     #[test]
