@@ -316,9 +316,12 @@ impl CanonicalOps for PdbBackend {
                 let line_no: u32 = c[2].parse().ok()?;
                 let func = c[3].to_string();
                 // Skip synthetic stops at module load — pdb pauses at
-                // the first line of the module before any breakpoint is
-                // reached. These are not real breakpoint hits.
-                if func == "<module>" {
+                // line 1 of the module before any breakpoint is reached.
+                // That initial stop is not a real breakpoint hit.
+                // Bug 2 fix: only skip the very first line (line_no == 1);
+                // a user breakpoint at module-level line N > 1 IS a real
+                // hit and must be captured.
+                if func == "<module>" && line_no <= 1 {
                     continue;
                 }
                 return Some(HitEvent {
@@ -360,6 +363,14 @@ impl CanonicalOps for PdbBackend {
             // Strip the surrounding quotes from the key.
             let key = key.trim_matches(|c| c == '\'' || c == '"');
             if key.is_empty() {
+                continue;
+            }
+            // Bug 1 fix: at module-level, `locals()` returns the entire
+            // module namespace — hundreds of dunder entries (`__name__`,
+            // `__builtins__`, `__file__`, …) plus every imported name.
+            // These are noise for an agent inspecting user variables.
+            // Filter out any key that starts and ends with `__`.
+            if key.starts_with("__") && key.ends_with("__") {
                 continue;
             }
             let mut entry = Map::new();
@@ -651,9 +662,10 @@ mod tests {
 
     #[test]
     fn parse_hit_skips_module_load_stop() {
-        // pdb stops at the first line of the module before any breakpoint.
-        let out = "> /app/main.py(2)<module>()\n-> \"\"\"Algorithms.\"\"\"\n(Pdb) ";
-        assert!(PdbBackend.parse_hit(out).is_none(), "should skip <module> stop");
+        // pdb stops at the very first line of the module (line 1) before any
+        // breakpoint fires. That synthetic stop must be skipped.
+        let out = "> /app/main.py(1)<module>()\n-> \"\"\"Algorithms.\"\"\"\n(Pdb) ";
+        assert!(PdbBackend.parse_hit(out).is_none(), "should skip <module> stop at line 1");
     }
 
     #[test]
@@ -701,5 +713,84 @@ mod tests {
         let b: Box<dyn Backend> = Box::new(PdbBackend);
         assert!(b.canonical_ops().is_some());
         assert_eq!(b.canonical_ops().unwrap().tool_name(), "pdb");
+    }
+
+    // ----------------------------------------------------------------
+    // Bug 1: parse_locals at module-level must filter dunder keys
+    // ----------------------------------------------------------------
+
+    /// Regression: `dbg locals` at a `<module>` stop (before any user
+    /// breakpoint fires) returns `locals()` which is the module's global
+    /// namespace — hundreds of dunder keys like `__builtins__`, `__file__`,
+    /// `__spec__` plus every builtin function. `parse_locals` must discard
+    /// keys that start and end with `__` so agents only see user variables.
+    #[test]
+    fn parse_locals_filters_dunder_keys() {
+        let out = "{'__name__': '__main__', '__file__': 'broken.py', \
+                   '__builtins__': <module 'builtins'>, 'x': 42, 'items': [1, 2, 3]}";
+        let v = PdbBackend.parse_locals(out).expect("should parse");
+        let obj = v.as_object().unwrap();
+        // Dunder keys must be absent.
+        assert!(
+            !obj.contains_key("__name__"),
+            "__name__ must be filtered out, got keys: {:?}",
+            obj.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            !obj.contains_key("__file__"),
+            "__file__ must be filtered out"
+        );
+        assert!(
+            !obj.contains_key("__builtins__"),
+            "__builtins__ must be filtered out"
+        );
+        // User variables must remain.
+        assert!(obj.contains_key("x"), "x must be present");
+        assert!(obj.contains_key("items"), "items must be present");
+    }
+
+    /// When ALL keys are dunders (pure module-level namespace), `parse_locals`
+    /// should return `None` (nothing useful to show) rather than an empty dict.
+    #[test]
+    fn parse_locals_all_dunders_returns_none() {
+        let out = "{'__name__': '__main__', '__doc__': None, '__builtins__': <module 'builtins'>}";
+        let v = PdbBackend.parse_locals(out);
+        assert!(
+            v.is_none(),
+            "all-dunder dict should yield None, got: {v:?}"
+        );
+    }
+
+    // ----------------------------------------------------------------
+    // Bug 2: parse_hit must NOT skip <module> stops beyond line 1
+    // ----------------------------------------------------------------
+
+    /// Regression: when a user sets a breakpoint at a module-level line
+    /// (not inside a function), pdb reports `> file.py(26)<module>()`.
+    /// The old code skipped ALL `<module>` stops so this hit was silently
+    /// dropped and never recorded. Only the synthetic line-1 stop should
+    /// be ignored.
+    #[test]
+    fn parse_hit_captures_module_level_breakpoint_beyond_line_1() {
+        // Breakpoint at line 26 in module scope — must be captured.
+        let out = "> /app/broken.py(26)<module>()\n-> result = compute()\n(Pdb) ";
+        let hit = PdbBackend.parse_hit(out);
+        assert!(
+            hit.is_some(),
+            "module-level breakpoint hit at line 26 must be captured, got None"
+        );
+        let h = hit.unwrap();
+        assert_eq!(h.line, Some(26));
+        assert_eq!(h.file.as_deref(), Some("/app/broken.py"));
+    }
+
+    /// The synthetic module-load stop at line 1 must still be skipped.
+    #[test]
+    fn parse_hit_still_skips_synthetic_module_load_at_line_1() {
+        let out = "> /app/broken.py(1)<module>()\n-> \"\"\"Module docstring.\"\"\"\n(Pdb) ";
+        assert!(
+            PdbBackend.parse_hit(out).is_none(),
+            "line-1 <module> stop is synthetic and must be skipped"
+        );
     }
 }

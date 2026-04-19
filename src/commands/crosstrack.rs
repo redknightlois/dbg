@@ -399,12 +399,18 @@ fn cmd_hits_grouped(db: &SessionDb, loc: &str, field: &str, top: Option<usize>) 
     let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
     let mut with_locals = 0;
     let mut matched = 0;
+    let mut repr_hint: Option<String> = None;
     for locals in rows.into_iter().flatten() {
         with_locals += 1;
         let Ok(v) = serde_json::from_str::<Value>(&locals) else { continue };
-        let Some(val) = lookup_field(&v, field) else { continue };
-        matched += 1;
-        *counts.entry(val).or_insert(0) += 1;
+        if let Some(val) = lookup_field(&v, field) {
+            matched += 1;
+            *counts.entry(val).or_insert(0) += 1;
+        } else if repr_hint.is_none() {
+            // Bug 3 fix: check whether the miss is because pdb stored
+            // the parent object as a repr string, not a traversable dict.
+            repr_hint = repr_traverse_hint(&v, field);
+        }
     }
     if counts.is_empty() {
         if with_locals == 0 {
@@ -412,6 +418,10 @@ fn cmd_hits_grouped(db: &SessionDb, loc: &str, field: &str, top: Option<usize>) 
                 "no locals captured at {loc} — run `dbg locals` at a hit to populate, \
                  or enable auto-capture for the backend"
             );
+        }
+        // Bug 3: emit repr-traverse hint when applicable.
+        if let Some(hint) = repr_hint {
+            return hint;
         }
         // Enumerate captured field names to help the agent pick a real one.
         let names = collect_captured_names(db, loc);
@@ -473,6 +483,32 @@ fn lookup_field(locals: &Value, field: &str) -> Option<String> {
         Some(s.to_string())
     } else {
         Some(cur.to_string())
+    }
+}
+
+/// Bug 3 fix: when a dotted path like `self.page` fails, detect whether
+/// the first segment (`self`) exists but its value is a repr string
+/// (pdb stores complex objects as `repr(obj)`, not as nested JSON).
+/// Returns a targeted hint message, or `None` if this isn't the cause.
+fn repr_traverse_hint(locals: &Value, field: &str) -> Option<String> {
+    if !field.contains('.') {
+        return None;
+    }
+    let (first, rest) = field.split_once('.')?;
+    // Check whether the first segment exists and its captured value
+    // looks like a Python repr string (starts with `<`, which is the
+    // canonical marker for `<ClassName object at 0x…>` reprs).
+    let parent = locals.get(first)?;
+    let repr_val = parent.get("value").and_then(|v| v.as_str())?;
+    if repr_val.starts_with('<') || !repr_val.starts_with('{') {
+        Some(format!(
+            "cannot traverse into `{field}`: pdb stores objects as repr strings \
+             (`{first}` = `{repr_val}`). \
+             Capture the field directly with `break … log {rest}` or add \
+             `{rest} = self.{rest}` as a local variable instead.",
+        ))
+    } else {
+        None
     }
 }
 
@@ -674,22 +710,31 @@ fn cmd_hit_trend(db: &SessionDb, loc: &str, field: &str) -> String {
     }
 
     let mut have_any_locals = false;
-    let values: Vec<(i64, String)> = rows
-        .into_iter()
-        .filter_map(|(seq, locals)| {
-            let locals = locals.as_deref()?;
-            have_any_locals = true;
-            let v: Value = serde_json::from_str(locals).ok()?;
-            let raw = lookup_field(&v, field)?;
-            Some((seq, raw))
-        })
-        .collect();
+    // Bug 3 fix: keep first parsed locals that missed the field lookup,
+    // so we can check for the repr-traverse case in the error path.
+    let mut first_miss: Option<Value> = None;
+    let mut values: Vec<(i64, String)> = Vec::new();
+    for (seq, locals_opt) in rows {
+        let Some(locals) = locals_opt else { continue };
+        have_any_locals = true;
+        let Ok(v) = serde_json::from_str::<Value>(&locals) else { continue };
+        if let Some(raw) = lookup_field(&v, field) {
+            values.push((seq, raw));
+        } else if first_miss.is_none() {
+            first_miss = Some(v);
+        }
+    }
     if values.is_empty() {
         if !have_any_locals {
             return format!(
                 "no locals captured at {loc} — run `dbg locals` at a hit to populate, \
                  or enable auto-capture for the backend"
             );
+        }
+        // Bug 3: detect repr-traverse failure before falling back to
+        // generic "not captured" message.
+        if let Some(hint) = first_miss.as_ref().and_then(|v| repr_traverse_hint(v, field)) {
+            return hint;
         }
         let names = collect_captured_names(db, loc);
         return if names.is_empty() {
@@ -1500,5 +1545,65 @@ mod tests {
         // All the same value — all the same bar.
         let first = s.chars().next().unwrap();
         assert!(s.chars().all(|c| c == first));
+    }
+
+    // ----------------------------------------------------------------
+    // Bug 3: --group-by / hit-trend with dotted path into repr string
+    // ----------------------------------------------------------------
+
+    /// Regression: pdb stores complex objects (e.g. `self`) as their
+    /// `repr()` string — `{"self": {"value": "<Obj object at 0x1a2b>"}}`.
+    /// Traversing `self.page` fails silently because the JSON has no
+    /// nested `page` key. The error message must explicitly tell the
+    /// user that pdb stores objects as repr strings, not traversable
+    /// JSON, and suggest capturing the field directly.
+    #[test]
+    fn hits_grouped_dotted_path_into_repr_gives_clear_error() {
+        let tmp = TempDir::new().unwrap();
+        let (db, _) = db_and_ctx(&tmp);
+        // pdb stores `self` as its repr string, not as a nested dict.
+        insert_hit(
+            &db,
+            "broken.py:26",
+            1,
+            r#"{"self": {"value": "<Paginator object at 0x7f1234>"},
+                "page": {"value": "3"}}"#,
+            None,
+        );
+        let out = cmd_hits_grouped(&db, "broken.py:26", "self.page", None);
+        // Must NOT render as a grouped-result table (no `count` header, no
+        // count lines). The repr hint has prose, not tabular output.
+        assert!(
+            !out.contains("count"),
+            "must not produce a grouped-result table — got: {out}"
+        );
+        // Must include a helpful message about repr strings.
+        assert!(
+            out.to_lowercase().contains("repr")
+                || out.contains("repr string")
+                || out.contains("cannot traverse"),
+            "expected repr-string hint in error, got: {out}"
+        );
+    }
+
+    #[test]
+    fn hit_trend_dotted_path_into_repr_gives_clear_error() {
+        let tmp = TempDir::new().unwrap();
+        let (db, _) = db_and_ctx(&tmp);
+        insert_hit(
+            &db,
+            "broken.py:26",
+            1,
+            r#"{"self": {"value": "<Paginator object at 0x7f1234>"},
+                "page": {"value": "3"}}"#,
+            None,
+        );
+        let out = cmd_hit_trend(&db, "broken.py:26", "self.page");
+        assert!(
+            out.to_lowercase().contains("repr")
+                || out.contains("repr string")
+                || out.contains("cannot traverse"),
+            "expected repr-string hint in error, got: {out}"
+        );
     }
 }
