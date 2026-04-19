@@ -328,6 +328,30 @@ fn command_may_stop(cmd: &str) -> bool {
     )
 }
 
+/// Verbs owned by the in-memory Profile REPL (see `ProfileData::handle_command`).
+/// Used to decide whether a command during a profile-mode session should
+/// be handled by the profile REPL or fall through to the normal dispatch
+/// path — meta verbs like `sessions`, `status`, `save`, `kill`, `replay`
+/// must still work during a profile session.
+fn is_profile_repl_verb(cmd: &str) -> bool {
+    let first = cmd.trim().split_whitespace().next().unwrap_or("");
+    matches!(
+        first,
+        "top"
+            | "callers"
+            | "callees"
+            | "traces"
+            | "tree"
+            | "hotpath"
+            | "threads"
+            | "stats"
+            | "search"
+            | "focus"
+            | "ignore"
+            | "reset"
+    )
+}
+
 /// Start the daemon: spawn the debugger, listen on socket.
 /// This function does NOT return on success — it runs the event loop.
 pub fn run_daemon(
@@ -606,8 +630,13 @@ fn handle_command(
         return handle_events(cmd, log_handle);
     }
 
-    // Profile mode: handle commands from in-memory profile data
-    {
+    // Profile mode: handle commands from in-memory profile data.
+    // Only intercept verbs the profile REPL actually owns — meta-commands
+    // (sessions/status/save/kill/replay/…) and crosstrack verbs
+    // (hits/cross/…) must still reach the normal dispatcher. Previously
+    // `profile.handle_command` caught every command and returned
+    // "unknown command: sessions" for meta verbs during a profile session.
+    if is_profile_repl_verb(cmd) {
         let mut guard = lock_session(session);
         if let Some(ref mut profile) = guard.profile {
             return profile.handle_command(cmd);
@@ -1656,6 +1685,37 @@ mod tests {
         let peers = live_slugs_in_cwd();
         assert!(peers.contains(&a), "missing {a}: {peers:?}");
         assert!(peers.contains(&b), "missing {b}: {peers:?}");
+    }
+
+    /// Regression: during a profile-mode session (nodeprof/pprof/…),
+    /// the daemon routed every command to `ProfileData::handle_command`,
+    /// which returned "unknown command: sessions" for meta verbs like
+    /// `sessions`, `status`, `save`, `kill`, `replay`. The dispatcher
+    /// now checks `is_profile_repl_verb` first so only profile verbs
+    /// are intercepted; everything else falls through to normal
+    /// dispatch.
+    #[test]
+    fn profile_verbs_intercepted_meta_verbs_fall_through() {
+        for v in [
+            "top", "callers compute", "callees main", "traces 5",
+            "tree", "hotpath", "threads", "stats", "search sort",
+            "focus sort", "ignore gc", "reset",
+        ] {
+            assert!(
+                is_profile_repl_verb(v),
+                "`{v}` must route to the profile REPL"
+            );
+        }
+        for v in [
+            "sessions", "status", "save", "kill", "replay session-1",
+            "hits main.py:1", "cross foo", "disasm main", "help",
+            "break main.py:1",
+        ] {
+            assert!(
+                !is_profile_repl_verb(v),
+                "`{v}` must NOT be intercepted by the profile REPL"
+            );
+        }
     }
 
     #[test]
