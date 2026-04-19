@@ -699,7 +699,7 @@ fn handle_command(
                     let result = backend.clean(&native_cmd, &raw);
                     let mut cleaned = result.output;
                     if decorate {
-                        cleaned = debug_cmds::decorate_output(backend, &cleaned);
+                        cleaned = debug_cmds::decorate_output_for_op(backend, canonical_op, &cleaned);
                     }
                     log_command(&mut guard, cmd, &cleaned, Some(canonical_op));
                     cleaned

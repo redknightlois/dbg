@@ -165,8 +165,52 @@ impl Backend for PdbBackend {
     }
 }
 
+/// Remove the internal `exec(cmd, globals, locals)` dispatcher frame
+/// that pdb's `where` emits at the bottom of every stack. pdb prints
+/// frames as two-line pairs:
+///
+///   ```text
+///     /path/file.py(42)func()
+///   -> some_line_of_source
+///   ```
+///
+/// When the daemon drives pdb it ends up executing user commands via
+/// Python's `exec(...)`, which leaves a frame like
+/// `  <string>(1)<module>()` with `-> exec(cmd, globals, locals)` at
+/// the very top of the walk. That frame is noise to the agent and
+/// steals the slot where the real top frame belongs.
+pub(crate) fn filter_pdb_where(raw: &str) -> String {
+    let lines: Vec<&str> = raw.lines().collect();
+    let mut keep = vec![true; lines.len()];
+    for i in 0..lines.len() {
+        let cur = lines[i].trim_start();
+        if cur.starts_with("-> exec(cmd, globals, locals)") {
+            keep[i] = false;
+            // The `->` line is always preceded by its frame header;
+            // drop that too so we don't leave an orphaned path line.
+            if i > 0 {
+                keep[i - 1] = false;
+            }
+        }
+    }
+    lines
+        .iter()
+        .zip(keep.iter())
+        .filter(|(_, k)| **k)
+        .map(|(l, _)| *l)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 impl CanonicalOps for PdbBackend {
     fn tool_name(&self) -> &'static str { "pdb" }
+
+    fn postprocess_output(&self, canonical_op: &str, out: &str) -> String {
+        match canonical_op {
+            "stack" => filter_pdb_where(out),
+            _ => out.to_string(),
+        }
+    }
 
     fn tool_version(&self) -> Option<String> {
         static V: OnceLock<Option<String>> = OnceLock::new();
@@ -411,6 +455,56 @@ mod tests {
     #[test]
     fn format_breakpoint() {
         assert_eq!(PdbBackend.format_breakpoint("test.py:10"), "break test.py:10");
+    }
+
+    #[test]
+    fn filter_pdb_where_strips_exec_dispatcher_frame() {
+        // Regression: pdb's `where` walk includes the daemon's
+        // `exec(cmd, globals, locals)` frame at the bottom of every
+        // stack. That frame is internal plumbing — reporting it as
+        // the top of the user's stack misleads agents about what is
+        // actually running.
+        let raw = "  <string>(1)<module>()\n\
+                   -> exec(cmd, globals, locals)\n\
+                   > /tmp/broken.py(25)fetch_page()\n\
+                   -> start = (page - 1) * per_page\n\
+                   > /tmp/broken.py(40)<module>()\n\
+                   -> print(list(paginate(items, 3, 3)))\n";
+        let got = filter_pdb_where(raw);
+        assert!(
+            !got.contains("exec(cmd, globals, locals)"),
+            "exec dispatcher frame leaked:\n{got}"
+        );
+        assert!(
+            !got.contains("<string>(1)<module>()"),
+            "orphaned `<string>(1)` frame header not dropped:\n{got}"
+        );
+        // The real user frames must still be present.
+        assert!(got.contains("broken.py(25)fetch_page()"));
+        assert!(got.contains("start = (page - 1) * per_page"));
+        assert!(got.contains("broken.py(40)<module>()"));
+    }
+
+    #[test]
+    fn filter_pdb_where_preserves_real_stacks() {
+        // Real user stacks must pass through untouched.
+        let raw = "  /a/b.py(10)run()\n\
+                   -> step()\n\
+                   > /a/b.py(22)step()\n\
+                   -> x = 1\n";
+        assert_eq!(filter_pdb_where(raw), raw.trim_end());
+    }
+
+    #[test]
+    fn postprocess_output_only_fires_on_stack_op() {
+        // Regression guard: the filter must be scoped to the stack op.
+        // Other ops ship their own formatting (locals, print, …) and
+        // must not be touched even if an `exec(...)` line coincidentally
+        // appears in them (e.g. a printed local whose repr contains it).
+        let weird_locals_dump =
+            "{'code': '-> exec(cmd, globals, locals)', 'n': 3}";
+        let got = PdbBackend.postprocess_output("locals", weird_locals_dump);
+        assert_eq!(got, weird_locals_dump);
     }
 
     #[test]

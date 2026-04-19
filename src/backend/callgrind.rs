@@ -3,6 +3,19 @@ use crate::daemon::session_tmp;
 
 pub struct CallgrindBackend;
 
+fn is_existing_callgrind_profile(target: &str) -> bool {
+    let name = std::path::Path::new(target)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    // Well-known valgrind output names + the generic ".out" extension
+    // agents and CI pipelines produce.
+    name.starts_with("callgrind.out")
+        || name.contains(".callgrind.out")
+        || name.ends_with(".out")
+}
+
 impl Backend for CallgrindBackend {
     fn name(&self) -> &'static str {
         "callgrind"
@@ -17,6 +30,29 @@ impl Backend for CallgrindBackend {
     }
 
     fn spawn_config(&self, target: &str, args: &[String]) -> anyhow::Result<SpawnConfig> {
+        let dbg_bin = super::self_exe();
+        let path = std::path::Path::new(target);
+
+        // If the caller pointed at an existing callgrind profile
+        // (`callgrind.out.<pid>`, `*.callgrind.out`, or any `*.out`)
+        // we skip the re-profile step and open it directly in the
+        // REPL. The previous behaviour was to hand the .out to
+        // valgrind as a binary, which always failed and left the
+        // session looking "live" but unusable.
+        if path.is_file() && is_existing_callgrind_profile(target) {
+            let exec_repl = format!(
+                "exec {} --phpprofile-repl {} --profile-prompt 'callgrind> '",
+                dbg_bin,
+                shell_escape(target),
+            );
+            return Ok(SpawnConfig {
+                bin: "bash".into(),
+                args: vec!["--norc".into(), "--noprofile".into()],
+                env: vec![("PS1".into(), "callgrind> ".into())],
+                init_commands: vec![exec_repl],
+            });
+        }
+
         let out_file = session_tmp("callgrind.out");
         let out_str = out_file.display().to_string();
 
@@ -28,8 +64,6 @@ impl Backend for CallgrindBackend {
             valgrind_cmd.push(' ');
             valgrind_cmd.push_str(&shell_escape(a));
         }
-
-        let dbg_bin = super::self_exe();
 
         let exec_repl = format!(
             "exec {} --phpprofile-repl {} --profile-prompt 'callgrind> '",
@@ -135,6 +169,34 @@ mod tests {
             .unwrap();
         let cmd = &cfg.init_commands[0];
         assert!(cmd.contains("'--dir=/my path'"), "arg with space not escaped: {cmd}");
+    }
+
+    #[test]
+    fn spawn_config_loads_existing_callgrind_out() {
+        // Regression: pointing `dbg start callgrind` at an existing
+        // profile file (`cg_out.1234`, `foo.callgrind.out`, or any
+        // `*.out`) used to re-run valgrind on the .out file itself,
+        // which always fails because it is not an executable. The
+        // session then appears "live" but every REPL command returns
+        // "debuggee has exited". Existing profile files must be loaded
+        // directly into the REPL instead of being re-profiled.
+        let tmp = tempfile::NamedTempFile::with_suffix(".out").unwrap();
+        let path = tmp.path().to_string_lossy().to_string();
+        std::fs::write(&path, b"version: 1\ncmd: fake\n").unwrap();
+        let cfg = CallgrindBackend.spawn_config(&path, &[]).unwrap();
+        let joined = cfg.init_commands.join(" ; ");
+        assert!(
+            !joined.contains("--tool=callgrind"),
+            "existing .out must not be re-profiled:\n{joined}"
+        );
+        assert!(
+            cfg.init_commands.iter().any(|c| c.contains("--phpprofile-repl")),
+            "REPL must still open on the existing profile:\n{joined}"
+        );
+        assert!(
+            joined.contains(&path),
+            "REPL command must reference the supplied profile path:\n{joined}"
+        );
     }
 
     #[test]

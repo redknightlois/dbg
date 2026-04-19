@@ -16,6 +16,31 @@ pub struct JitMethod {
     pub body: String,
 }
 
+/// The .NET JIT emits `vxorps reg, reg, reg` (and `vpxor`, `xorps`, …)
+/// purely to zero a register before scalar work. Counting it as a SIMD
+/// hit in `simd` output turned scalar methods into false positives,
+/// defeating the point of the command. The check is intentionally
+/// narrow: a same-register xor is the only form treated as zero-init.
+fn is_zero_init_xor(line: &str) -> bool {
+    let lower = line.to_ascii_lowercase();
+    let (mnemonic, operands) = match lower
+        .trim()
+        .split_once(|c: char| c.is_ascii_whitespace())
+    {
+        Some(pair) => pair,
+        None => return false,
+    };
+    if !matches!(mnemonic, "vxorps" | "vxorpd" | "vpxor" | "xorps" | "pxor") {
+        return false;
+    }
+    let ops: Vec<&str> = operands
+        .split(',')
+        .map(|t| t.split(';').next().unwrap_or("").trim())
+        .filter(|t| !t.is_empty())
+        .collect();
+    !ops.is_empty() && ops.iter().all(|r| *r == ops[0])
+}
+
 /// Parsed index of all methods in a JIT disassembly file.
 pub struct JitIndex {
     pub methods: Vec<JitMethod>,
@@ -300,6 +325,7 @@ impl JitIndex {
                 .filter(|l| {
                     !l.starts_with(';')
                         && SIMD_PATTERNS.iter().any(|p| l.contains(p))
+                        && !is_zero_init_xor(l)
                 })
                 .collect();
             if !hits.is_empty() {
@@ -561,6 +587,42 @@ mod tests {
         assert!(out.contains("DotProduct"));
         assert!(out.contains("vmovups"));
         assert!(out.contains("vmulps"));
+    }
+
+    #[test]
+    fn cmd_simd_ignores_vxorps_zero_init_idiom() {
+        // Regression: `vxorps xmm0, xmm0, xmm0` is the .NET JIT's
+        // standard zero-initialization preamble — it doesn't imply the
+        // method is vectorized. Counting it as a SIMD hit made scalar
+        // methods look indistinguishable from AVX hot loops in `simd`
+        // output, which was the opposite of the command's purpose.
+        let asm = "\
+; Assembly listing for method Broken.Program:SumSlow(System.Int32[]):int (Tier1)
+G_M1_IG01:
+            vxorps   xmm0, xmm0, xmm0
+            xor      eax, eax
+            mov      edx, dword ptr [rcx+0x08]
+            test     edx, edx
+            jle      SHORT G_M1_IG03
+G_M1_IG02:
+            add      eax, dword ptr [rcx+4*r8+0x10]
+            inc      r8d
+            cmp      r9d, r8d
+            jl       SHORT G_M1_IG02
+G_M1_IG03:
+            ret
+
+; Total bytes of code: 40
+";
+        let idx = JitIndex::parse(asm);
+        let out = idx.cmd_simd();
+        assert!(
+            out.contains("no SIMD instructions found"),
+            "vxorps zero-init should not count as SIMD, got:\n{out}"
+        );
+        // The generic xmm-register counter on `stats` is still fine
+        // showing xmm usage, but the top-level SIMD hit list must be
+        // limited to *real* vector compute/IO.
     }
 
     // --- calls / callers ---

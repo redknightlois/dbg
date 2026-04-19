@@ -192,6 +192,10 @@ fn run_jitdasm_fresh(target: &str, symbol: &str) -> Result<String> {
 /// keep everything from the first header that mentions our symbol up
 /// to the next header (or end).
 fn extract_jitdasm_section(stderr: &str, symbol: &str) -> String {
+    // .NET jitdasm headers use a single colon between type and method
+    // (`Namespace.Type:Method`). Accept the common C++/docs-style
+    // `Namespace.Type::Method` input by normalising both sides.
+    let needle = symbol.replace("::", ":");
     let mut out = Vec::new();
     let mut capturing = false;
     for line in stderr.lines() {
@@ -199,7 +203,7 @@ fn extract_jitdasm_section(stderr: &str, symbol: &str) -> String {
             if capturing {
                 break;
             }
-            if line.contains(symbol) {
+            if line.contains(&needle) {
                 capturing = true;
                 out.push(line);
             }
@@ -290,6 +294,24 @@ Hello from pre-JIT chatter.
         assert!(got.contains("MyApp.Foo:Bar"));
         assert!(got.contains("mov rax, rbx"));
         assert!(!got.contains("MyApp.Baz:Qux"));
+    }
+
+    #[test]
+    fn extract_jitdasm_normalizes_double_colon() {
+        // Callers (and human intuition) often write C++/docs-style
+        // `Namespace::Type::Method`; the .NET jitdasm header uses a
+        // single `:` between type and method. The extractor must
+        // match both spellings so `dbg disasm "Broken.Program::Foo"`
+        // works when the header says `Broken.Program:Foo`.
+        let stderr = "\
+; Assembly listing for method Broken.Program:SumFast(System.Int32[]):int (Tier1)
+ vaddps ymm0, ymm0, ymm1
+ ret";
+        let got = extract_jitdasm_section(stderr, "Broken.Program::SumFast");
+        assert!(
+            got.contains("vaddps"),
+            "double-colon form did not match single-colon header: got={got:?}"
+        );
     }
 
     #[test]

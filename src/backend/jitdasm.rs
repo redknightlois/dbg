@@ -91,6 +91,21 @@ impl Backend for JitDasmBackend {
     }
 
     fn spawn_config(&self, target: &str, args: &[String]) -> anyhow::Result<SpawnConfig> {
+        // jitdasm drives `dotnet run --project <target>`, which only
+        // accepts MSBuild project files. A bare `.dll` or `.exe`
+        // reaches dotnet as an invalid --project argument; the error
+        // lands in the capture file and the REPL happily loads the
+        // host runtime's JIT noise instead. Catch the misuse up front.
+        let lower = target.to_ascii_lowercase();
+        if !(lower.ends_with(".csproj")
+            || lower.ends_with(".fsproj")
+            || lower.ends_with(".vbproj"))
+        {
+            anyhow::bail!(
+                "jitdasm needs a project file (.csproj/.fsproj/.vbproj), got `{target}` — \
+                 point at the source project, not a built binary"
+            );
+        }
         let project = target.to_string();
         let out_dir = session_tmp("jitdasm");
         let out_dir_str = out_dir.display().to_string();
@@ -316,6 +331,40 @@ mod tests {
             !exec_cmd.contains("--jitdasm-pattern"),
             "wildcard shouldn't produce a default filter:\n{exec_cmd}"
         );
+    }
+
+    #[test]
+    fn spawn_config_rejects_dll_target() {
+        // Regression: `dbg start jitdasm broken.dll` used to proceed
+        // silently — the generated `dotnet run --project broken.dll`
+        // fails (dll is not a project file) but the error landed in
+        // the capture file; `dbg methods` then returned host-runtime
+        // methods only, with no indication that the user-supplied
+        // target was rejected. jitdasm must refuse non-project files
+        // up front so the misuse is caught at session start.
+        let err = match JitDasmBackend.spawn_config("bin/Release/net8.0/broken.dll", &[]) {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("jitdasm accepted a .dll target"),
+        };
+        assert!(
+            err.contains(".csproj") || err.contains(".fsproj"),
+            "expected project-file hint, got: {err}"
+        );
+        assert!(
+            err.to_lowercase().contains("jitdasm"),
+            "error should mention the jitdasm backend, got: {err}"
+        );
+    }
+
+    #[test]
+    fn spawn_config_accepts_project_targets() {
+        // Sanity: project files must still spawn cleanly.
+        JitDasmBackend
+            .spawn_config("app.csproj", &[])
+            .expect("csproj must be accepted");
+        JitDasmBackend
+            .spawn_config("app.fsproj", &[])
+            .expect("fsproj must be accepted");
     }
 
     #[test]

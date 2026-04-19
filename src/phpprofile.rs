@@ -700,14 +700,45 @@ impl ProfileIndex {
                 out.push_str(&format!("{}  (recursive)\n", indent));
                 break;
             }
-            // Follow the callee with the highest time (among filtered functions)
-            let hottest_call = current
+            // Follow the callee with the highest *callee* inclusive
+            // time — not the per-call `c.time` the parser recorded.
+            // Native callgrind attributes almost no time to pseudo-
+            // frames (`(below main)`, stub PLT entries) even though
+            // their descendants dominate runtime, so picking by
+            // `c.time` stalls the walk one level deep. Picking by
+            // `callee.inclusive_time` follows the time wherever it
+            // actually lives.
+            //
+            // Cross-recursion subtlety: when a caller's hottest edge
+            // points back at an already-visited frame (A → B → A, or
+            // direct self-recursion), let the walk descend to that
+            // visited frame so the next iteration triggers the
+            // `(recursive)` banner. If a non-visited sibling carries
+            // within 50 % of the visited winner's time, prefer it so
+            // mutual-recursion (A ↔ B) still shows both legs before
+            // terminating on the cycle — without this bias, a
+            // dominant self-loop on A would swallow B entirely.
+            let max_callee = current
                 .calls
                 .iter()
-                .filter(|c| fn_map.contains_key(c.callee.as_str()))
-                .max_by_key(|c| c.time);
-            if let Some(hottest_call) = hottest_call {
-                current = fn_map[hottest_call.callee.as_str()];
+                .filter_map(|c| fn_map.get(c.callee.as_str()).copied())
+                .max_by_key(|callee| callee.inclusive_time);
+            let hottest_callee = match max_callee {
+                Some(winner) if visited.contains(winner.name.as_str()) => {
+                    let winner_t = winner.inclusive_time;
+                    current
+                        .calls
+                        .iter()
+                        .filter_map(|c| fn_map.get(c.callee.as_str()).copied())
+                        .filter(|callee| !visited.contains(callee.name.as_str()))
+                        .filter(|callee| callee.inclusive_time * 2 >= winner_t)
+                        .max_by_key(|callee| callee.inclusive_time)
+                        .or(Some(winner))
+                }
+                other => other,
+            };
+            if let Some(next) = hottest_callee {
+                current = next;
                 depth += 1;
             } else {
                 break;
@@ -743,6 +774,55 @@ fn parse_id_assignment<'a>(
     Some((id, name))
 }
 
+/// Derive the `help` header label from the REPL prompt. The phpprofile
+/// REPL is shared by callgrind / xdebug / stackprof backends — each
+/// passes its own prompt (`callgrind> `, `xdebug> `, …), so stripping
+/// the trailing `> ` gives the right backend name. The old code
+/// hardcoded `"php-profile commands:"` for every caller, which made
+/// `dbg help` on a callgrind session start with a PHP label.
+pub fn help_label(prompt: &str) -> &str {
+    let trimmed = prompt.trim_end_matches(char::is_whitespace);
+    let trimmed = trimmed.trim_end_matches('>');
+    let trimmed = trimmed.trim();
+    if trimmed.is_empty() {
+        "php-profile"
+    } else {
+        trimmed
+    }
+}
+
+/// Parse the tail of a `hotspots`-family REPL command into
+/// `(limit, pattern)`. Accepts `N [pat]`, `--top N [pat]`, `-n N [pat]`,
+/// or just `[pat]`.
+///
+/// Before this was factored out, the match arm did
+/// `arg1.parse().unwrap_or(default)` which silently swallowed flag
+/// spellings: `hotspots --top 3` parsed `--top` as the limit (fell
+/// back to default 10) and treated `3` as a pattern filter.
+pub fn parse_top_n_args(rest: &str, default: usize) -> (usize, String) {
+    let toks: Vec<&str> = rest.split_whitespace().collect();
+    if toks.is_empty() {
+        return (default, String::new());
+    }
+    let (n, pat_toks) = match toks[0] {
+        "--top" | "-n" | "-N" => {
+            if toks.len() >= 2 {
+                match toks[1].parse::<usize>() {
+                    Ok(v) => (v, &toks[2..]),
+                    Err(_) => (default, &toks[1..]),
+                }
+            } else {
+                (default, &toks[1..])
+            }
+        }
+        _ => match toks[0].parse::<usize>() {
+            Ok(v) => (v, &toks[1..]),
+            Err(_) => (default, &toks[..]),
+        },
+    };
+    (n, pat_toks.join(" "))
+}
+
 /// Run the interactive REPL. Reads commands from stdin, writes results to stdout.
 pub fn run_repl(cachegrind_path: &str, prompt: &str) -> io::Result<()> {
     let text = std::fs::read_to_string(cachegrind_path)?;
@@ -770,22 +850,23 @@ pub fn run_repl(cachegrind_path: &str, prompt: &str) -> io::Result<()> {
             continue;
         }
 
-        let parts: Vec<&str> = line.splitn(3, ' ').collect();
-        let cmd = parts[0];
-        let arg1 = parts.get(1).copied().unwrap_or("");
-        let arg2 = parts.get(2).copied().unwrap_or("");
-
-        // Join arg1 and arg2 into a single pattern string
+        let (cmd, rest) = match line.split_once(char::is_whitespace) {
+            Some((c, r)) => (c, r.trim()),
+            None => (line, ""),
+        };
+        let parts: Vec<&str> = rest.splitn(2, ' ').collect();
+        let arg1 = parts.first().copied().unwrap_or("");
+        let arg2 = parts.get(1).copied().unwrap_or("");
         let pat = if arg2.is_empty() { arg1.to_string() } else { format!("{arg1} {arg2}") };
 
         let result = match cmd {
             "hotspots" => {
-                let n: usize = arg1.parse().unwrap_or(10);
-                index.cmd_hotspots(n, arg2)
+                let (n, pattern) = parse_top_n_args(rest, 10);
+                index.cmd_hotspots(n, &pattern)
             }
             "flat" => {
-                let n: usize = arg1.parse().unwrap_or(20);
-                index.cmd_flat(n, arg2)
+                let (n, pattern) = parse_top_n_args(rest, 20);
+                index.cmd_flat(n, &pattern)
             }
             "calls" if arg1.is_empty() => "usage: calls <pattern>\n".into(),
             "calls" => index.cmd_calls(&pat),
@@ -795,13 +876,13 @@ pub fn run_repl(cachegrind_path: &str, prompt: &str) -> io::Result<()> {
             "inspect" => index.cmd_inspect(&pat),
             "stats" => index.cmd_stats(arg1),
             "memory" => {
-                let n: usize = arg1.parse().unwrap_or(10);
-                index.cmd_memory(n, arg2)
+                let (n, pattern) = parse_top_n_args(rest, 10);
+                index.cmd_memory(n, &pattern)
             }
             "search" if arg1.is_empty() => "usage: search <pattern>\n".into(),
             "search" => index.cmd_search(&pat),
             "tree" => {
-                let n: usize = arg1.parse().unwrap_or(10);
+                let (n, _) = parse_top_n_args(rest, 10);
                 index.cmd_tree(n)
             }
             "hotpath" => index.cmd_hotpath(),
@@ -820,8 +901,8 @@ pub fn run_repl(cachegrind_path: &str, prompt: &str) -> io::Result<()> {
                 index.ignore = None;
                 "filters cleared\n".into()
             }
-            "help" => {
-                "php-profile commands:\n  \
+            "help" => format!(
+                "{label} commands:\n  \
                  hotspots [N] [pat]   top N functions by inclusive time (default 10)\n  \
                  flat [N] [pat]       top N functions by self time (default 20)\n  \
                  calls <pattern>      what does this function call?\n  \
@@ -836,9 +917,9 @@ pub fn run_repl(cachegrind_path: &str, prompt: &str) -> io::Result<()> {
                  ignore <pattern>     exclude matching functions from all commands\n  \
                  reset                clear focus/ignore filters\n  \
                  help                 show this help\n  \
-                 exit                 quit\n"
-                    .into()
-            }
+                 exit                 quit\n",
+                label = help_label(prompt),
+            ),
             "exit" | "quit" => break,
             _ => format!(
                 "unknown command: {}. Type 'help' for available commands.\n",
@@ -858,6 +939,50 @@ mod tests {
     use super::*;
 
     const SAMPLE: &str = include_str!("../tests/fixtures/xdebug_cachegrind_sample.out");
+
+    #[test]
+    fn help_label_tracks_prompt_not_hardcoded() {
+        // Regression: the help header was hardcoded to
+        // `"php-profile commands:"` inside `run_repl`, so a callgrind
+        // session typing `help` saw PHP-labelled output. The label
+        // must follow whichever prompt the hosting backend supplied.
+        assert_eq!(help_label("callgrind> "), "callgrind");
+        assert_eq!(help_label("xdebug> "), "xdebug");
+        assert_eq!(help_label("stackprof> "), "stackprof");
+        assert_eq!(help_label("php-profile> "), "php-profile");
+        // Prompts without a trailing `>` still work.
+        assert_eq!(help_label("callgrind "), "callgrind");
+        // Empty / weird prompts fall back to the historical label.
+        assert_eq!(help_label(""), "php-profile");
+        assert_eq!(help_label(">"), "php-profile");
+    }
+
+    #[test]
+    fn parse_top_n_flag_and_positional_and_pattern() {
+        // Regression: the hotspots/flat/memory REPL verbs used
+        // `arg1.parse().unwrap_or(default)`, so `--top N` fell back
+        // to the default while the actual number got treated as a
+        // pattern filter. `hotspots --top 3` returned 10 rows.
+        assert_eq!(parse_top_n_args("--top 3", 10), (3, String::new()));
+        assert_eq!(parse_top_n_args("-n 7 Matrix", 10), (7, "Matrix".into()));
+        // Plain positional form still works.
+        assert_eq!(parse_top_n_args("5 Matrix", 10), (5, "Matrix".into()));
+        assert_eq!(parse_top_n_args("5", 10), (5, String::new()));
+        // Empty → default, no pattern.
+        assert_eq!(parse_top_n_args("", 10), (10, String::new()));
+        // Leading pattern, no number → default, pattern preserved.
+        assert_eq!(parse_top_n_args("Matrix", 10), (10, "Matrix".into()));
+        // Pattern spanning multiple words survives.
+        assert_eq!(
+            parse_top_n_args("--top 4 foo bar", 10),
+            (4, "foo bar".into())
+        );
+        // Bogus value after --top → default, token stays in pattern.
+        assert_eq!(
+            parse_top_n_args("--top nope Matrix", 10),
+            (10, "nope Matrix".into())
+        );
+    }
 
     #[test]
     fn parse_finds_all_functions() {
@@ -1065,6 +1190,100 @@ mod tests {
         let out = idx.cmd_tree(5);
         assert!(out.contains("{main}"));
         assert!(out.contains("main"));
+    }
+
+    #[test]
+    fn cmd_hotpath_prefers_callee_inclusive_time_over_call_record_time() {
+        // Regression: when a caller has two callees and the parser
+        // recorded the *bigger* callee with a smaller per-call time
+        // (pseudo-frames, stub PLT entries, and split cost blocks all
+        // produce this shape), the traversal used to pick the
+        // small-but-well-attributed callee and miss the hot leaf
+        // entirely. Picking by the callee's own inclusive_time
+        // follows the time regardless of how it was recorded on the
+        // edge.
+        let cg = "\
+events: Time Memory
+summary: 1000 0
+
+fl=(1) app
+fn=(1) main
+1 10 0
+cfn=(2) cheap_but_well_attributed
+calls=1 1
+1 50 0
+cfn=(3) hot_but_poorly_attributed
+calls=1 1
+1 5 0
+
+fl=(1)
+fn=(2) cheap_but_well_attributed
+1 50 0
+
+fl=(1)
+fn=(3) hot_but_poorly_attributed
+1 935 0
+";
+        let idx = ProfileIndex::parse(cg);
+        let out = idx.cmd_hotpath();
+        assert!(
+            out.contains("hot_but_poorly_attributed"),
+            "hotpath must follow callee inclusive_time, not the call-edge \
+             attribution; got:\n{out}"
+        );
+        assert!(
+            !out.contains("cheap_but_well_attributed"),
+            "hotpath walked the wrong branch:\n{out}"
+        );
+    }
+
+    #[test]
+    fn cmd_hotpath_descends_through_pseudo_frames() {
+        // Regression: callgrind output produced by perf/native tools
+        // often has pseudo-frames like `(below main)` whose explicit
+        // call record has near-zero time attribution even though the
+        // callee accounts for 99.9% of the program. When choosing the
+        // "hottest" callee by the recorded call time, the algorithm
+        // stalled one level deep on the low-time pseudo-call and never
+        // reached the actual hot leaf. The traversal must prefer the
+        // callee whose *own* inclusive_time dominates.
+        let cg = "\
+events: Time Memory
+summary: 3062000000 0
+
+fl=(1) /bin/prog
+fn=(1) 0x23140
+1 230 0
+cfn=(2) (below main)
+calls=1 1
+1 60 0
+
+fl=(1)
+fn=(2) (below main)
+1 60 0
+cfn=(3) main
+calls=1 1
+1 3061999940 0
+
+fl=(1)
+fn=(3) main
+1 100 0
+cfn=(4) rand
+calls=1000 1
+1 3061999840 0
+
+fl=(1)
+fn=(4) rand
+1 3061999840 0
+";
+        let idx = ProfileIndex::parse(cg);
+        let out = idx.cmd_hotpath();
+        assert!(
+            out.contains("rand"),
+            "hotpath must descend past `(below main)` to the real \
+             hot leaf; got:\n{out}"
+        );
+        assert!(out.contains("main"), "main frame dropped:\n{out}");
     }
 
     #[test]

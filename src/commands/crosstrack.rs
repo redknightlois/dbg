@@ -71,7 +71,8 @@ pub fn try_dispatch(input: &str) -> Option<super::Dispatched> {
         "hits" => {
             if rest.is_empty() {
                 return Some(super::Dispatched::Immediate(
-                    "usage: dbg hits <loc> [--group-by FIELD] [--count-by FIELD --top N]".into(),
+                    "usage: dbg hits <loc> [--group-by FIELD] [--count-by FIELD --top N]\n  \
+                     <loc> is file:line (e.g. broken.py:26), not a function name".into(),
                 ));
             }
             let mut loc: Option<String> = None;
@@ -122,16 +123,25 @@ pub fn try_dispatch(input: &str) -> Option<super::Dispatched> {
             let loc = match loc {
                 Some(l) => l,
                 None => return Some(super::Dispatched::Immediate(
-                    "usage: dbg hits <loc> [--group-by FIELD] [--count-by FIELD --top N]".into(),
+                    "usage: dbg hits <loc> [--group-by FIELD] [--count-by FIELD --top N]\n  \
+                     <loc> is file:line (e.g. broken.py:26), not a function name".into(),
                 )),
             };
+            if top.is_some() && group_by.is_none() {
+                return Some(super::Dispatched::Immediate(
+                    "--top only applies with --group-by / --count-by\n  \
+                     example: dbg hits broken.py:26 --group-by page --top 5".into(),
+                ));
+            }
             Query::Hits { loc, group_by, top }
         }
         "hit-diff" => {
             let parts: Vec<&str> = rest.split_whitespace().collect();
             if parts.len() != 3 {
                 return Some(super::Dispatched::Immediate(
-                    "usage: dbg hit-diff <loc> <seq_a> <seq_b>".into(),
+                    "usage: dbg hit-diff <loc> <seq_a> <seq_b>\n  \
+                     <loc> is file:line (e.g. broken.py:26), not a function name\n  \
+                     example: dbg hit-diff broken.py:26 1 3".into(),
                 ));
             }
             match (parts[1].parse::<u32>(), parts[2].parse::<u32>()) {
@@ -147,7 +157,10 @@ pub fn try_dispatch(input: &str) -> Option<super::Dispatched> {
             let parts: Vec<&str> = rest.splitn(2, char::is_whitespace).collect();
             if parts.len() != 2 {
                 return Some(super::Dispatched::Immediate(
-                    "usage: dbg hit-trend <loc> <field>".into(),
+                    "usage: dbg hit-trend <loc> <field>\n  \
+                     <loc> is file:line (e.g. broken.py:26), not a function name\n  \
+                     <field> is a locals name, optionally dotted (e.g. self.page)\n  \
+                     example: dbg hit-trend broken.py:26 start".into(),
                 ));
             }
             Query::HitTrend {
@@ -341,7 +354,7 @@ fn cmd_hits(db: &SessionDb, loc: &str) -> String {
         Err(e) => return format!("[error: {e}]"),
     };
     if rows.is_empty() {
-        return format!("no captured hits at {loc}");
+        return no_hits_message(db, loc, "hits");
     }
     let mut out = String::new();
     out.push_str(&format!("{loc} — {} hit(s)\n", rows.len()));
@@ -379,7 +392,7 @@ fn cmd_hits_grouped(db: &SessionDb, loc: &str, field: &str, top: Option<usize>) 
         .and_then(|it| it.collect::<Result<Vec<_>, _>>())
         .unwrap_or_default();
     if rows.is_empty() {
-        return format!("no captured hits at {loc}");
+        return no_hits_message(db, loc, "hits --group-by");
     }
 
     let total = rows.len();
@@ -461,6 +474,49 @@ fn lookup_field(locals: &Value, field: &str) -> Option<String> {
     } else {
         Some(cur.to_string())
     }
+}
+
+/// Enumerate distinct `location_key` values in the DB — used to steer
+/// users who passed a function name or a stale file:line toward a real
+/// captured location. Bounded so the error stays readable.
+fn available_locations(db: &SessionDb, limit: usize) -> Vec<String> {
+    let Ok(mut stmt) = db.conn().prepare(
+        "SELECT location_key, COUNT(*) AS n
+         FROM breakpoint_hits
+         GROUP BY location_key
+         ORDER BY n DESC, location_key ASC",
+    ) else {
+        return Vec::new();
+    };
+    let rows: Vec<String> = stmt
+        .query_map([], |r| r.get::<_, String>(0))
+        .and_then(|it| it.collect::<Result<Vec<_>, _>>())
+        .unwrap_or_default();
+    rows.into_iter().take(limit).collect()
+}
+
+/// Explain a miss on `loc` — distinguishes "you passed a function name,
+/// not a file:line" from "no hits recorded yet at that file:line", and
+/// lists what *is* captured so the user can fix the query.
+fn no_hits_message(db: &SessionDb, loc: &str, verb: &str) -> String {
+    let looks_like_symbol = !loc.contains(':');
+    let available = available_locations(db, 8);
+    let mut msg = if looks_like_symbol {
+        format!(
+            "no hits at `{loc}` — `{verb}` matches on file:line, not function names. \
+             Set the breakpoint by symbol (e.g. `dbg break {loc}`) then query the \
+             file:line it actually hit."
+        )
+    } else {
+        format!("no hits at {loc}")
+    };
+    if !available.is_empty() {
+        msg.push_str("\n  captured locations: ");
+        msg.push_str(&available.join(", "));
+    } else {
+        msg.push_str("\n  (no breakpoint hits recorded yet — run the program under `dbg` first)");
+    }
+    msg
 }
 
 /// Collect the set of captured locals field names across all hits at
@@ -614,7 +670,7 @@ fn cmd_hit_trend(db: &SessionDb, loc: &str, field: &str) -> String {
         .and_then(|it| it.collect::<Result<Vec<_>, _>>())
         .unwrap_or_default();
     if rows.is_empty() {
-        return format!("no hits at {loc}");
+        return no_hits_message(db, loc, "hit-trend");
     }
 
     let mut have_any_locals = false;
@@ -976,7 +1032,7 @@ fn cmd_cross(db: &SessionDb, symbol: &str) -> String {
             |r| r.get(0),
         )
         .unwrap_or(0);
-    out.push_str(&format!("  source snapshots:{snaps}\n"));
+    out.push_str(&format!("  source snapshots: {snaps}\n"));
 
     out
 }
@@ -1269,6 +1325,17 @@ mod tests {
         assert!(out.contains("breakpoint hits: 2"), "{out}");
         assert!(out.contains("profile samples: 0"));
         assert!(out.contains("disassembly:     0 row(s)"));
+        // Regression: the source-snapshots line used to render as
+        // `source snapshots:0` with no space after the colon, breaking
+        // the aligned layout used by every other row.
+        assert!(
+            out.contains("source snapshots: 0"),
+            "missing space after 'source snapshots:' — got:\n{out}"
+        );
+        assert!(
+            !out.contains("source snapshots:0"),
+            "source-snapshots line regressed to the unspaced form:\n{out}"
+        );
     }
 
     // Regression for X1: the indexer may store a fully-qualified name
@@ -1382,6 +1449,24 @@ mod tests {
                 assert!(s.starts_with("usage:"), "got: {s}");
             }
             _ => panic!("expected Immediate usage string"),
+        }
+    }
+
+    #[test]
+    fn hits_rejects_top_without_group_by() {
+        // Regression: `--top N` with no `--group-by` / `--count-by`
+        // used to be accepted and silently dropped at render time, so
+        // agents would get the full ungrouped listing back without
+        // any indication the flag did nothing.
+        let d = try_dispatch("hits foo:10 --top 3").expect("dispatch");
+        match d {
+            super::super::Dispatched::Immediate(s) => {
+                assert!(
+                    s.contains("--top") && s.to_lowercase().contains("--group-by"),
+                    "expected `--top requires --group-by` hint, got: {s}"
+                );
+            }
+            _ => panic!("expected Immediate usage error for --top without --group-by"),
         }
     }
 

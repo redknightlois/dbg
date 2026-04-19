@@ -50,9 +50,22 @@ pub fn dispatch_to(input: &str, backend: &dyn Backend) -> Dispatched {
         "breaks" => one_arg_native(ops.op_breaks(), "breaks"),
         "run" => dispatch_run(ops, rest),
         "continue" => one_arg_native(ops.op_continue(), "continue"),
-        "step" => one_arg_native(ops.op_step(), "step"),
-        "next" => one_arg_native(ops.op_next(), "next"),
-        "finish" => one_arg_native(ops.op_finish(), "finish"),
+        // `step-into`, `step-in`, `stepi` are the spellings agents
+        // reach for when they don't know a given backend's preferred
+        // verb — all of them mean "step into the call at this
+        // line", which is exactly what canonical `step` does.
+        "step" | "step-into" | "step-in" | "stepi" => {
+            one_arg_native(ops.op_step(), "step")
+        }
+        // `step-over` / `stepover` consistently mean "next" across
+        // IDEs; route them accordingly so scenario instructions that
+        // use the IDE spellings don't bounce off the dispatcher.
+        "next" | "step-over" | "stepover" => {
+            one_arg_native(ops.op_next(), "next")
+        }
+        "finish" | "step-out" | "stepout" => {
+            one_arg_native(ops.op_finish(), "finish")
+        }
         "pause" => one_arg_native(ops.op_pause(), "pause"),
         "restart" => one_arg_native(ops.op_restart(), "restart"),
         "stack" => dispatch_stack(ops, rest),
@@ -289,17 +302,29 @@ fn dispatch_catch(ops: &dyn CanonicalOps, rest: &str) -> Dispatched {
 }
 
 /// Given the canonical-op name the daemon stamped on the response,
-/// prepend a `[via <tool> <version>]` header to `output`.
+/// run the backend's per-op postprocess hook and prepend a
+/// `[via <tool> <version>]` header.
 pub fn decorate_output(backend: &dyn Backend, output: &str) -> String {
+    // Kept for call sites that don't yet know the canonical op.
+    // New call sites should prefer `decorate_output_for_op`.
+    decorate_output_for_op(backend, "", output)
+}
+
+pub fn decorate_output_for_op(
+    backend: &dyn Backend,
+    canonical_op: &str,
+    output: &str,
+) -> String {
     let Some(ops) = backend.canonical_ops() else {
         return output.to_string();
     };
+    let processed = ops.postprocess_output(canonical_op, output);
     let name = ops.tool_name();
     let header = match ops.tool_version() {
         Some(v) => format!("[via {name} {v}]\n"),
         None => format!("[via {name}]\n"),
     };
-    format!("{header}{output}")
+    format!("{header}{processed}")
 }
 
 #[cfg(test)]
@@ -422,6 +447,28 @@ mod tests {
             let (op, cmd, _) = native_of(dispatch_to(verb, &b));
             assert_eq!(op, verb);
             assert_eq!(cmd, expected, "{verb}");
+        }
+    }
+
+    #[test]
+    fn ide_style_step_aliases_route_to_canonical() {
+        // Regression: adapter docs and scenario instructions used
+        // IDE-standard spellings (`step-into`, `step-over`,
+        // `step-out`) that bounced off the dispatcher as "unknown
+        // command", forcing users to know each backend's native verb.
+        let b = lldb();
+        for (alias, canonical_op, expected_cmd) in [
+            ("step-into", "step", "thread step-in"),
+            ("step-in", "step", "thread step-in"),
+            ("stepi", "step", "thread step-in"),
+            ("step-over", "next", "thread step-over"),
+            ("stepover", "next", "thread step-over"),
+            ("step-out", "finish", "thread step-out"),
+            ("stepout", "finish", "thread step-out"),
+        ] {
+            let (op, cmd, _) = native_of(dispatch_to(alias, &b));
+            assert_eq!(op, canonical_op, "alias {alias} routed to wrong op");
+            assert_eq!(cmd, expected_cmd, "alias {alias} produced wrong native cmd");
         }
     }
 

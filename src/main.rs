@@ -21,8 +21,53 @@ use nix::unistd::{ForkResult, fork};
 
 use backend::Registry;
 
+/// Subcommands are not modeled as clap subcommands because the client
+/// forwards most verbs to a long-lived daemon. The top-level `--help`
+/// therefore listed only the global flags, leaving agents with no way
+/// to enumerate what the tool actually supports. This block is shown
+/// under clap's `after_help` so `dbg --help` stays self-documenting.
+const SUBCOMMAND_HELP: &str = "\
+Common commands (forwarded to the session daemon):
+
+  Session lifecycle:
+    start <type> <target>   Launch a debugger/profiler session
+    status                  Show active session details
+    kill                    Stop the active session
+    sessions [--group]      List saved / live sessions
+    save [label]            Persist the active session to .dbg/sessions/
+    replay <label>          Re-open a saved session read-only
+    prune [--older-than D]  Delete auto-saved sessions past age D
+    diff <other>            Compare active session against another
+    cross <symbol>          Aggregate all captured evidence for a symbol
+
+  Debugger control:
+    break <loc> [if <cond>] [log <msg>]
+    continue | step | next | finish | pause | restart
+    run [args...]
+    stack | frame <n> | locals | print <expr> | set <lval> <expr>
+    threads | thread <n> | watch <expr> | list [loc] | catch <evt>
+
+  Captured evidence (works live or in replay):
+    hits <loc> [--group-by F] [--count-by F --top N]
+    hit-diff <loc> <a> <b>
+    hit-trend <loc> <field>
+    source <symbol> [radius]
+    disasm <symbol> [--refresh]
+    disasm-diff <a> <b>
+
+  Adapter escape hatch:
+    raw <native-command>    Send a literal command to the underlying tool
+    tool                    Print which underlying tool is driving the session
+
+Run `dbg help <verb>` inside a session for backend-specific details.";
+
 #[derive(Parser)]
-#[command(name = "dbg", version, about = "AI can read your code. Now it can live debug it too.")]
+#[command(
+    name = "dbg",
+    version,
+    about = "AI can read your code. Now it can live debug it too.",
+    after_help = SUBCOMMAND_HELP,
+)]
 struct Cli {
     /// Initialize for an AI agent: claude, codex
     #[arg(long)]
@@ -58,6 +103,15 @@ struct Cli {
     /// All remaining arguments
     #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
     args: Vec<String>,
+}
+
+/// Top-level verbs that end the active session. `kill` is the
+/// canonical spelling; `stop`/`quit`/`exit` are the words every other
+/// dev tool uses for the same action, and users/agents reach for them
+/// first. Before the alias existed, `dbg stop` reached the debugger
+/// as raw input and surfaced as a cryptic pdb/lldb parse error.
+fn is_kill_alias(verb: &str) -> bool {
+    matches!(verb, "kill" | "stop" | "quit" | "exit")
 }
 
 fn main() -> Result<()> {
@@ -187,7 +241,11 @@ fn main() -> Result<()> {
             );
             std::process::exit(2);
         }
-        "kill" => {
+        // `stop` is the verb every other dev tool uses to end a
+        // session — users reach for it before `kill`. Previously it
+        // was forwarded to the debugger, where pdb/lldb/jdb report it
+        // as an unknown command with no hint that `dbg kill` exists.
+        v if is_kill_alias(v) => {
             let msg = daemon::kill_daemon()?;
             println!("{msg}");
             Ok(())
@@ -782,6 +840,47 @@ mod tests {
         assert_eq!(autodetect_backend("app.ts"), Some("node-proto"));
         assert_eq!(autodetect_backend("foo.hs"), Some("ghci"));
         assert_eq!(autodetect_backend("bin/no-ext"), None);
+    }
+
+    #[test]
+    fn kill_aliases_cover_common_stop_verbs() {
+        // Regression: `dbg stop` used to reach the debugger as raw
+        // input (pdb/lldb reported "*** NameError: name 'stop' is
+        // not defined"). Every dev tool uses `stop`/`quit`/`exit` as
+        // end-session verbs; the dispatcher must treat all four as
+        // aliases for `kill` so the agent never has to guess.
+        for alias in ["kill", "stop", "quit", "exit"] {
+            assert!(is_kill_alias(alias), "`{alias}` must end the session");
+        }
+        for non_alias in ["start", "break", "sessions", "hits", "continue"] {
+            assert!(
+                !is_kill_alias(non_alias),
+                "`{non_alias}` must not be treated as kill"
+            );
+        }
+    }
+
+    #[test]
+    fn top_level_help_lists_subcommand_vocabulary() {
+        // Regression: `dbg --help` used to show only the global flags
+        // (`--init`, `--backend`, `-h`, `-V`), leaving agents and new
+        // users no way to enumerate the 30+ verbs forwarded to the
+        // daemon. The after_help block must name the core verbs so
+        // cold-start discovery works.
+        use clap::CommandFactory;
+        let rendered = Cli::command().render_help().to_string();
+        for verb in [
+            "start", "kill", "sessions", "replay",
+            "break", "continue", "stack", "locals",
+            "hits", "hit-diff", "hit-trend",
+            "cross", "disasm", "raw",
+        ] {
+            assert!(
+                rendered.contains(verb),
+                "`dbg --help` is missing `{verb}` — the after_help \
+                 subcommand listing regressed:\n{rendered}"
+            );
+        }
     }
 
     #[test]

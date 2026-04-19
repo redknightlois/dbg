@@ -237,6 +237,13 @@ fn cmd_sessions(ctx: &LifeCtx<'_>, group_only: bool) -> String {
     if !dir.exists() && ctx.active.is_none() {
         return "no saved sessions (nothing under .dbg/sessions/)".into();
     }
+    if group_only && ctx.active.is_none() {
+        // Without a live session we have no group key to match on —
+        // falling through would silently drop the filter and list
+        // every saved DB, which is indistinguishable from plain
+        // `dbg sessions` and misleads the caller.
+        return "no active session — cannot filter by group (run `dbg sessions` for the full list)".into();
+    }
     let group_key = if group_only {
         ctx.active.and_then(|db| db.meta("session_group_key").ok().flatten())
     } else {
@@ -266,15 +273,19 @@ fn cmd_sessions(ctx: &LifeCtx<'_>, group_only: bool) -> String {
     }
 
     let active_label: Option<String> = ctx.active.map(|db| db.label().to_string());
+    let active_id: Option<String> = ctx.active.map(|db| db.session_id().to_string());
 
     // The live session's DB isn't in .dbg/sessions/ until `dbg save`
     // (or the daemon's exit handler) persists it. Synthesize a row
     // for it so `dbg sessions` during a live session shows it,
-    // marked `*`, instead of omitting it entirely.
-    if let (Some(db), Some(label)) = (ctx.active, active_label.as_deref()) {
-        if !rows.iter().any(|r| r.label == label) {
+    // marked `*`, instead of omitting it entirely. Dedupe on
+    // session_id (stable), not label (which a later `save --label`
+    // can change out from under us and break the `*` marker).
+    if let (Some(db), Some(id)) = (ctx.active, active_id.as_deref()) {
+        if !rows.iter().any(|r| r.session_id == id) {
             rows.push(SessionListing {
-                label: label.to_string(),
+                label: db.label().to_string(),
+                session_id: id.to_string(),
                 kind: format!("{:?}", db.kind()).to_lowercase(),
                 target_class: db.target_class().as_str().to_string(),
                 created_by: "live".into(),
@@ -291,14 +302,21 @@ fn cmd_sessions(ctx: &LifeCtx<'_>, group_only: bool) -> String {
         return format!("no sessions under {}", dir.display());
     }
 
-    rows.sort_by(|a, b| b.age_secs.cmp(&a.age_secs)); // newest first — smaller age
+    // Sort newest first: smaller age_secs first.
     rows.sort_by_key(|r| r.age_secs);
     let mut out = String::new();
     out.push_str("  label                                  kind     class           by    age\n");
+    let mut marked_any = false;
     for r in &rows {
-        let live_mark = match &active_label {
-            Some(l) if *l == r.label => "*",
-            _ => " ",
+        let is_live = match &active_id {
+            Some(id) if *id == r.session_id => true,
+            _ => false,
+        };
+        let live_mark = if is_live {
+            marked_any = true;
+            "*"
+        } else {
+            " "
         };
         out.push_str(&format!(
             "{live_mark} {:<38} {:<8} {:<15} {:<5} {}\n",
@@ -309,14 +327,22 @@ fn cmd_sessions(ctx: &LifeCtx<'_>, group_only: bool) -> String {
             humanize_secs(r.age_secs),
         ));
     }
-    if active_label.is_some() {
+    if marked_any {
         out.push_str("\n* = currently live session\n");
+    } else if active_label.is_some() {
+        // A live session exists but its row didn't match any listed
+        // entry — surface that state instead of a misleading legend.
+        out.push_str(&format!(
+            "\n(live session `{}` is running but not listed here)\n",
+            active_label.unwrap()
+        ));
     }
     out
 }
 
 struct SessionListing {
     label: String,
+    session_id: String,
     kind: String,
     target_class: String,
     created_by: String,
@@ -334,11 +360,11 @@ fn read_listing(path: &Path) -> Option<SessionListing> {
     if v != dbg_cli::session_db::SCHEMA_VERSION {
         return None;
     }
-    let (label, kind, tc, created_by): (String, String, String, String) = conn
+    let (label, session_id, kind, tc, created_by): (String, String, String, String, String) = conn
         .query_row(
-            "SELECT label, kind, target_class, created_by FROM sessions LIMIT 1",
+            "SELECT label, id, kind, target_class, created_by FROM sessions LIMIT 1",
             [],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
         )
         .ok()?;
     let group_key: Option<String> = conn
@@ -359,6 +385,7 @@ fn read_listing(path: &Path) -> Option<SessionListing> {
         .unwrap_or(0);
     Some(SessionListing {
         label,
+        session_id,
         kind,
         target_class: tc,
         created_by,
@@ -710,6 +737,59 @@ mod tests {
         let out = cmd_sessions(&ctx, false);
         assert!(out.contains("first"));
         assert!(out.contains("native-cpu"));
+    }
+
+    #[test]
+    fn sessions_sorted_newest_first() {
+        // Regression: `cmd_sessions` used to apply two sort calls back
+        // to back — the first one commented "newest first" actually
+        // sorted oldest-first, and a trailing `sort_by_key(age_secs)`
+        // overwrote it. A refactor that removes the trailing sort must
+        // not silently flip the displayed order.
+        let tmp = TempDir::new().unwrap();
+        let older = mk_db(&tmp, "older");
+        older
+            .save_to(&sessions_dir(tmp.path()).join("older.db"))
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+        let newer = mk_db(&tmp, "newer");
+        newer
+            .save_to(&sessions_dir(tmp.path()).join("newer.db"))
+            .unwrap();
+
+        let ctx = LifeCtx { cwd: tmp.path(), active: None };
+        let out = cmd_sessions(&ctx, false);
+        let newer_pos = out.find("newer").expect("newer missing");
+        let older_pos = out.find("older").expect("older missing");
+        assert!(
+            newer_pos < older_pos,
+            "expected newer listed before older:\n{out}"
+        );
+    }
+
+    #[test]
+    fn sessions_group_without_active_errors() {
+        // Regression: `dbg sessions --group` with no active session
+        // used to silently become a no-op filter and return *all*
+        // saved sessions, which is what `dbg sessions` (no flag)
+        // already does and hides the fact that grouping is impossible
+        // without a live session to read the group key from.
+        let tmp = TempDir::new().unwrap();
+        // Save one DB so the empty-dir early return can't mask the bug.
+        let db = mk_db(&tmp, "peer");
+        db.save_to(&sessions_dir(tmp.path()).join("peer.db"))
+            .unwrap();
+        let ctx = LifeCtx { cwd: tmp.path(), active: None };
+        let out = cmd_sessions(&ctx, true);
+        assert!(
+            !out.contains("peer"),
+            "--group leaked unrelated session when no active session exists:\n{out}"
+        );
+        assert!(
+            out.to_lowercase().contains("no active session")
+                || out.to_lowercase().contains("no peers"),
+            "expected a clear no-active / no-peers message, got:\n{out}"
+        );
     }
 
     #[test]

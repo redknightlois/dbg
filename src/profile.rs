@@ -672,6 +672,20 @@ impl ProfileData {
         visited.remove(&idx);
     }
 
+    /// Pseudo-frame names emitted by V8 (`(root)`, `(program)`,
+    /// `(idle)`, `(garbage collector)`) and some Speedscope producers.
+    /// A stack consisting only of these is not a call path — it's
+    /// runtime overhead.
+    fn is_trivial_pseudo_stack(&self, stack: &[usize]) -> bool {
+        stack.iter().all(|&i| {
+            let n = self.frames.get(i).map(|f| f.name.as_str()).unwrap_or("");
+            matches!(
+                n,
+                "(root)" | "(program)" | "(idle)" | "(garbage collector)"
+            )
+        })
+    }
+
     fn cmd_hotpath(&self) -> String {
         // Find the stack with the most time
         if self.stacks.is_empty() {
@@ -683,7 +697,18 @@ impl ProfileData {
             *aggregated.entry(stack.clone()).or_default() += time;
         }
 
-        let hottest = aggregated.iter().max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal));
+        // V8 cpuprofiles dump an enormous amount of "idle" time against
+        // a single `(root)` / `(program)` / `(idle)` pseudo-frame — in
+        // a sync-I/O-blocked scenario that aggregate dominates every
+        // real call stack, so "hottest path" used to collapse to just
+        // `→ (root)` even though the actual work was deeper. Drop
+        // single-frame pseudo-stacks so the walk picks the hottest
+        // real call chain instead.
+        let hottest = aggregated
+            .iter()
+            .filter(|(stack, _)| !self.is_trivial_pseudo_stack(stack))
+            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
+            .or_else(|| aggregated.iter().max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal)));
 
         match hottest {
             Some((stack, time)) => {
@@ -905,6 +930,62 @@ mod tests {
         let mut p = load_sample();
         let out = p.handle_command("hotpath");
         assert!(out.contains("main"));
+    }
+
+    #[test]
+    fn cmd_hotpath_skips_v8_pseudo_root_stack() {
+        // Regression: V8 cpuprofile samples attributed to the
+        // `(root)` / `(program)` pseudo-nodes often aggregate to more
+        // time than any real call stack — especially under sync I/O
+        // where JS is blocked. `hotpath` used to collapse to
+        // `→ (root)` even when a real chain like
+        // `resolveConfig → readFileSync` held most of the time.
+        // Trivial pseudo-stacks must be excluded so the walk picks
+        // the hottest real call chain instead.
+        let dir = std::env::temp_dir().join("dbg-test-profile-pseudo");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("t.speedscope.json");
+        let doc = r#"{
+            "$schema": "https://www.speedscope.app/file-format-schema.json",
+            "shared": {
+                "frames": [
+                    {"name": "(root)"},
+                    {"name": "main"},
+                    {"name": "readFileSync"}
+                ]
+            },
+            "profiles": [{
+                "type": "evented",
+                "name": "p",
+                "unit": "milliseconds",
+                "startValue": 0,
+                "endValue": 20,
+                "events": [
+                    {"type": "O", "at": 0.0, "frame": 0},
+                    {"type": "C", "at": 50.0, "frame": 0},
+                    {"type": "O", "at": 50.0, "frame": 1},
+                    {"type": "O", "at": 50.1, "frame": 2},
+                    {"type": "C", "at": 60.0, "frame": 2},
+                    {"type": "C", "at": 60.1, "frame": 1}
+                ]
+            }]
+        }"#;
+        std::fs::write(&path, doc).unwrap();
+        let mut p = ProfileData::load(&path).unwrap();
+        let out = p.handle_command("hotpath");
+        // The `(root)` pseudo-stack aggregated to 50ms while the real
+        // `main`-rooted stacks totalled ~10ms — before the filter,
+        // `(root)` would win outright and the output would be just
+        // `→ (root)`. With the filter, a real frame must appear.
+        assert!(
+            out.contains("main"),
+            "hotpath must escape the pseudo-root pileup and reach \
+             real call frames; got:\n{out}"
+        );
+        assert!(
+            !out.lines().any(|l| l.trim() == "→ (root)"),
+            "hotpath collapsed to pseudo `(root)` stack:\n{out}"
+        );
     }
 
     #[test]

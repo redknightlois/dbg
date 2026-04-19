@@ -204,6 +204,21 @@ pub trait CanonicalOps: Send + Sync {
     fn op_stack(&self, _n: Option<u32>) -> anyhow::Result<String> {
         Ok("backtrace".into())
     }
+
+    /// Per-op output post-processor. Runs *after* the backend's
+    /// generic `clean(...)` pass and *before* the `[via <tool>]`
+    /// decoration. Defaults to the identity transform — backends
+    /// override this to drop noise that is specific to a single op
+    /// (e.g. the internal `exec(...)` frame that pdb's `where` leaks
+    /// at the bottom of every stack walk).
+    ///
+    /// The `canonical_op` argument is the daemon's stamp (`"stack"`,
+    /// `"locals"`, …); backends dispatch on it so one override can
+    /// cover several ops. No wiring change is required at call
+    /// sites — the default is a no-op.
+    fn postprocess_output(&self, _canonical_op: &str, out: &str) -> String {
+        out.to_string()
+    }
     fn op_frame(&self, n: u32) -> anyhow::Result<String> {
         Ok(format!("frame {n}"))
     }
