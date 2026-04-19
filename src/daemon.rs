@@ -444,8 +444,12 @@ pub fn run_daemon(
     .ok();
 
     // Run init commands (PTY backends only; inspector has none).
+    // Profiling backends (pstats, massif, …) may wrap a target that
+    // takes minutes to finish, so the backend's `init_timeout()`
+    // overrides the default CMD_TIMEOUT here.
+    let init_deadline = backend.init_timeout();
     for cmd in &init_commands {
-        proc.send_and_wait(cmd, CMD_TIMEOUT)?;
+        proc.send_and_wait(cmd, init_deadline)?;
     }
 
     // Cache help output now while the debugger is idle and responsive.

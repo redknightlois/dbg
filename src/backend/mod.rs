@@ -105,6 +105,15 @@ pub trait Backend: Send + Sync {
         None
     }
 
+    /// Wall-clock deadline for each init command (see `SpawnConfig::init_commands`).
+    /// Defaults to the daemon's `CMD_TIMEOUT` (60s). Profiling backends that
+    /// wrap a slow child (cProfile, massif on a heavy program, …) override
+    /// this with a longer budget so the session doesn't die with
+    /// "Connection reset by peer" before the underlying tool finishes.
+    fn init_timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(60)
+    }
+
     /// Clean noise from command output.
     fn clean(&self, cmd: &str, output: &str) -> CleanResult {
         let _ = cmd;

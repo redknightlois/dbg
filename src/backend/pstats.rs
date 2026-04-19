@@ -81,6 +81,15 @@ impl Backend for PstatsBackend {
         "sort cumulative\nstats 20"
     }
 
+    /// cProfile runs the target script to completion before pstats
+    /// opens. Real programs easily exceed the 60s default (scenario 15
+    /// does ~200k regex compiles and takes minutes). Give init a 10-
+    /// minute budget so the session doesn't die with "Connection reset
+    /// by peer" mid-profile.
+    fn init_timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(600)
+    }
+
     fn quit_command(&self) -> &'static str {
         "quit"
     }
@@ -115,6 +124,21 @@ impl Backend for PstatsBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Regression: cProfile runs the target to completion before
+    /// pstats opens; scenario 15 (200 × 1000 regex compiles) takes
+    /// longer than the daemon's 60s CMD_TIMEOUT and the session died
+    /// with "Connection reset by peer" before pstats' prompt appeared.
+    /// The backend now declares a 10-minute init deadline — must be
+    /// strictly longer than the default so init_commands can finish.
+    #[test]
+    fn init_timeout_is_long_enough_for_slow_cprofile_runs() {
+        let t = PstatsBackend.init_timeout();
+        assert!(
+            t >= std::time::Duration::from_secs(300),
+            "pstats init_timeout must allow slow cProfile runs, got {t:?}"
+        );
+    }
 
     #[test]
     fn clean_filters_welcome_and_goodbye() {
