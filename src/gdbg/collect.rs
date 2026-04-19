@@ -438,7 +438,7 @@ fn compile_cuda(source: &str) -> Result<String> {
     let output_str = output.display().to_string();
 
     let status = Command::new("nvcc")
-        .args(["-g", "-G", "-lineinfo", "-o", &output_str, source])
+        .args(cuda_compile_flags(&output_str, source))
         .status()
         .context("nvcc not found — install CUDA toolkit")?;
 
@@ -446,4 +446,36 @@ fn compile_cuda(source: &str) -> Result<String> {
         bail!("nvcc compilation failed for {source}");
     }
     Ok(output_str)
+}
+
+/// Flags for the `nvcc` invocation. `-G` (full device debug) already
+/// implies line-number info, and passing it alongside `-lineinfo`
+/// makes nvcc+ptxas print "Conflicting options" warnings on every
+/// build. Keep `-G` — gdbg needs device-side symbols for kernel
+/// attribution — and drop the redundant `-lineinfo`.
+pub(crate) fn cuda_compile_flags<'a>(output: &'a str, source: &'a str) -> [&'a str; 5] {
+    ["-g", "-G", "-o", output, source]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression: nvcc+ptxas printed "Conflicting options specified:
+    /// --device-debug --generate-line-info" on every build because
+    /// both `-G` and `-lineinfo` were passed. `-G` already implies
+    /// line info, so drop `-lineinfo` to silence the warning without
+    /// losing debug information.
+    #[test]
+    fn cuda_compile_flags_does_not_pass_lineinfo_with_capital_g() {
+        let flags = cuda_compile_flags("out", "in.cu");
+        assert!(
+            flags.contains(&"-G"),
+            "-G must stay — gdbg needs device symbols: {flags:?}"
+        );
+        assert!(
+            !flags.contains(&"-lineinfo"),
+            "-lineinfo must be dropped when -G is present: {flags:?}"
+        );
+    }
 }
