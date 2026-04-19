@@ -342,6 +342,18 @@ impl JitIndex {
     }
 }
 
+/// Normalize user-typed verb to the REPL's canonical form. `jitdasm`
+/// is a documented synonym for `disasm`: the scenario instructions and
+/// the top-level `dbg jitdasm <pattern>` command line mirror the
+/// session type, and users followed that naming into the REPL where
+/// only `disasm` was recognized.
+pub(crate) fn canonical_verb(cmd: &str) -> &str {
+    match cmd {
+        "jitdasm" => "disasm",
+        other => other,
+    }
+}
+
 /// Run the interactive REPL. Reads commands from stdin, writes results to stdout.
 pub fn run_repl(asm_path: &str, default_pattern: &str) -> io::Result<()> {
     let text = std::fs::read_to_string(asm_path)?;
@@ -387,6 +399,8 @@ pub fn run_repl(asm_path: &str, default_pattern: &str) -> io::Result<()> {
         let stats_arg = if arg1.is_empty() { default_pattern } else { arg1 };
         let methods_arg = if arg1.is_empty() { default_pattern } else { arg1 };
         let hotspots_arg = if arg2.is_empty() { default_pattern } else { arg2 };
+
+        let cmd = canonical_verb(cmd);
 
         let result = match cmd {
             "methods" => index.cmd_methods(methods_arg),
@@ -437,6 +451,19 @@ mod tests {
     use super::*;
 
     const SAMPLE: &str = include_str!("../tests/fixtures/jitdasm_sample.asm");
+
+    /// Regression: `dbg jitdasm <pattern>` inside a jitdasm session
+    /// returned "unknown command" because the REPL only recognised
+    /// `disasm`. The scenario instructions and top-level `dbg jitdasm`
+    /// verb both suggest the user-facing name, so the REPL now accepts
+    /// `jitdasm` as a synonym.
+    #[test]
+    fn canonical_verb_maps_jitdasm_to_disasm() {
+        assert_eq!(canonical_verb("jitdasm"), "disasm");
+        assert_eq!(canonical_verb("disasm"), "disasm");
+        assert_eq!(canonical_verb("methods"), "methods");
+        assert_eq!(canonical_verb("garbage"), "garbage");
+    }
 
     #[test]
     fn parse_finds_all_methods() {

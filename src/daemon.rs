@@ -734,7 +734,21 @@ fn handle_command(
             let mut guard = lock_session(session);
             drain_pending_events(&mut guard, backend);
 
-            match guard.proc.send_and_wait(cmd, CMD_TIMEOUT) {
+            // For profiling backends (massif/memcheck/pprof/…) which
+            // lack canonical_ops and run atop a bash PTY, `dbg run`
+            // reaches the shell as the literal word `run` → "command
+            // not found". Translate the bare `run` verb into the
+            // backend-declared recipe (e.g. `ms_print $MASSIF_OUT`)
+            // when one is available. Any other verb falls through
+            // unchanged.
+            let effective_cmd: String = if cmd.trim() == "run" {
+                let recipe = backend.run_command();
+                if recipe.is_empty() { cmd.to_string() } else { recipe.to_string() }
+            } else {
+                cmd.to_string()
+            };
+
+            match guard.proc.send_and_wait(&effective_cmd, CMD_TIMEOUT) {
                 Ok(raw) => {
                     if command_may_stop(cmd) {
                         capture_hit_if_stopped(&mut guard, backend, &raw);

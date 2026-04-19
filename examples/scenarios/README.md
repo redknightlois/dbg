@@ -23,7 +23,7 @@ Self-contained "broken" programs paired with an `instructions.md` describing the
 
 | # | Scenario | Language | Profiler surface |
 |---|---|---|---|
-| 13 | Hot dedup loop, accidentally O(n²) | Rust | perf / flamegraph |
+| 13 | Hot dedup loop, accidentally O(n²) | Rust | perf (CPU sampling, flamegraph view) |
 | 14 | Branch-mispredict hotspot in a classifier | C | callgrind (cycle/branch counters) |
 | 15 | Renderer setup dominates request time | Python | pstats / cumulative time |
 | 16 | Unbounded cache leaks RSS | C | massif (heap-over-time) |
