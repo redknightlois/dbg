@@ -44,6 +44,13 @@ pub fn resolve(backend_type: &str, target: &str) -> Result<String> {
 fn resolve_native(target: &str) -> Result<String> {
     // Existing file
     if Path::new(target).is_file() {
+        // Reject source files early — lldb/gdb expect a compiled binary,
+        // and if we pass a .rs/.c/.cpp file through, the debugger exits
+        // with an opaque error that gets surfaced as "debugger did not
+        // produce prompt". Point the user at the likely build command.
+        if let Some(hint) = source_file_hint(target) {
+            bail!("{hint}");
+        }
         return Ok(target.to_string());
     }
 
@@ -76,6 +83,31 @@ fn resolve_native(target: &str) -> Result<String> {
     }
 
     bail!("cannot find binary for {target} after build")
+}
+
+/// Detect common C/C++/Rust source extensions. If the user passed a
+/// source file to a native-debugger start command, we refuse with a
+/// concrete build hint rather than handing the file to lldb and
+/// surfacing its opaque "invalid target" error.
+fn source_file_hint(target: &str) -> Option<String> {
+    let ext = Path::new(target).extension()?.to_str()?.to_ascii_lowercase();
+    let (lang, build) = match ext.as_str() {
+        "rs" => ("rust", "cargo build  # then pass ./target/debug/<name>"),
+        "c" => ("C", "cc -g <file> -o <name>  # then pass ./<name>"),
+        "cpp" | "cxx" | "cc" => (
+            "C++",
+            "c++ -g <file> -o <name>  # then pass ./<name>",
+        ),
+        "h" | "hpp" => (
+            "header",
+            "pass the compiled binary you want to debug, not a header",
+        ),
+        _ => return None,
+    };
+    Some(format!(
+        "{target} is a {lang} source file — native debuggers expect a \
+         compiled binary. Build first: {build}"
+    ))
 }
 
 fn resolve_existing_file(target: &str) -> Result<String> {
@@ -404,5 +436,41 @@ mod tests {
         // Output is the built binary sitting next to the source.
         assert!(!out.ends_with(".go"), "should not return source path: {out}");
         assert!(Path::new(&out).is_file(), "binary missing: {out}");
+    }
+
+    /// Regression: `dbg start rust src/main.rs` (source file, not compiled
+    /// binary) silently exited with no user-facing error because lldb
+    /// accepted the path and then failed internally. `resolve_native`
+    /// must refuse source files up front with a concrete build hint.
+    #[test]
+    fn resolve_native_rejects_rust_source_file() {
+        let tmp = TempDir::new().unwrap();
+        let src = tmp.path().join("main.rs");
+        std::fs::write(&src, "fn main(){}").unwrap();
+        let err = resolve_native(src.to_str().unwrap())
+            .err()
+            .expect("should error on .rs source");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("source") && (msg.contains("cargo build") || msg.contains("compiled binary")),
+            "hint must mention source + build: {msg}"
+        );
+    }
+
+    #[test]
+    fn resolve_native_rejects_c_and_cpp_source_files() {
+        let tmp = TempDir::new().unwrap();
+        for ext in ["c", "cpp", "cxx", "cc", "h"] {
+            let src = tmp.path().join(format!("a.{ext}"));
+            std::fs::write(&src, "").unwrap();
+            let err = resolve_native(src.to_str().unwrap())
+                .err()
+                .unwrap_or_else(|| panic!(".{ext} must be rejected"));
+            assert!(
+                err.to_string().to_lowercase().contains("source")
+                    || err.to_string().to_lowercase().contains("header"),
+                "wrong hint for .{ext}: {err}"
+            );
+        }
     }
 }
