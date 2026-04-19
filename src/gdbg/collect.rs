@@ -145,6 +145,31 @@ pub fn collect_all(db: &GpuDb, target: &str, args: &[String]) -> Result<()> {
     let target = effective_target.as_str();
     let target_hash = hash_target(target);
 
+    // Pre-flight: for Python targets, verify the required deps import
+    // before handing the script to nsys. Without this, missing torch
+    // or triton surfaces as nsys hanging on a Python child that
+    // ModuleNotFoundError'd immediately — no timeout, no message.
+    if let Some(module) = python_preflight_module(kind) {
+        let out = Command::new("python3")
+            .args(["-c", &format!("import {module}")])
+            .output();
+        match out {
+            Ok(o) if !o.status.success() => {
+                bail!(
+                    "`python3 -c \"import {module}\"` failed — gdbg would have \
+                     hung in nsys waiting on a crashing child. Install the \
+                     dependency (e.g. `pip install {module}`) and retry.\n\
+                     stderr: {}",
+                    String::from_utf8_lossy(&o.stderr).trim(),
+                );
+            }
+            Err(e) => {
+                bail!("python3 not available for pre-flight check: {e}");
+            }
+            _ => {}
+        }
+    }
+
     // Runs a collection phase, recording failures without aborting.
     let run_phase = |phase: &str, f: &dyn Fn() -> Result<()>| {
         if let Err(e) = f() {
@@ -463,6 +488,19 @@ pub(crate) fn cuda_compile_flags<'a>(output: &'a str, source: &'a str) -> [&'a s
     ["-g", "-G", "-o", output, source]
 }
 
+/// Which Python module, if any, we should verify importable before
+/// handing a script to nsys. Returning None means no pre-flight check
+/// (plain Python and non-Python targets). Keeping this as a pure
+/// function makes it trivially unit-testable without touching
+/// subprocess execution.
+pub(crate) fn python_preflight_module(kind: TargetKind) -> Option<&'static str> {
+    match kind {
+        TargetKind::PythonTorch => Some("torch"),
+        TargetKind::PythonTriton => Some("triton"),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -483,5 +521,22 @@ mod tests {
             !flags.contains(&"-lineinfo"),
             "-lineinfo must be dropped when -G is present: {flags:?}"
         );
+    }
+
+    /// Regression: when torch/triton weren't installed, gdbg hung in
+    /// nsys waiting on a Python child that crashed immediately with
+    /// ModuleNotFoundError. collect_all now pre-flights the required
+    /// import; python_preflight_module declares what each TargetKind
+    /// needs.
+    #[test]
+    fn python_preflight_module_matches_target_kind() {
+        assert_eq!(python_preflight_module(TargetKind::PythonTorch), Some("torch"));
+        assert_eq!(python_preflight_module(TargetKind::PythonTriton), Some("triton"));
+        // Plain Python and non-Python targets: no pre-flight — the
+        // script either runs under nsys directly or there's no Python
+        // dep to verify.
+        assert_eq!(python_preflight_module(TargetKind::Python), None);
+        assert_eq!(python_preflight_module(TargetKind::Binary), None);
+        assert_eq!(python_preflight_module(TargetKind::CudaSource), None);
     }
 }
