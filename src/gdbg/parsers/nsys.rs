@@ -176,8 +176,17 @@ fn import_allocations(dest: &Connection, src: &Connection, layer_id: i64) -> Res
         Err(_) => return Ok(()),
     };
 
+    // nsys 2023.x exports lack the `streamId` column; 2024+ added it.
+    // Probe the schema and fall back to NULL when it's absent so the
+    // import proceeds instead of erroring out with
+    // "no such column: streamId".
+    let select_sid = if has_column(src, &table, "streamId") {
+        "streamId"
+    } else {
+        "NULL"
+    };
     let mut read = src.prepare(&format!(
-        "SELECT start, memoryOperationType, address, bytes, streamId FROM {table} ORDER BY start"
+        "SELECT start, memoryOperationType, address, bytes, {select_sid} FROM {table} ORDER BY start"
     ))?;
 
     let mut write = dest.prepare(
@@ -406,6 +415,20 @@ fn find_table(conn: &Connection, candidates: &[&str]) -> Result<String> {
     bail!("no matching table (tried: {})", candidates.join(", "))
 }
 
+/// Return true when `table` declares a column named `column`.
+/// Used to gate `SELECT`s whose columns vary across nsys versions.
+fn has_column(conn: &Connection, table: &str, column: &str) -> bool {
+    let sql = format!("PRAGMA table_info({table})");
+    let Ok(mut stmt) = conn.prepare(&sql) else { return false };
+    let rows = stmt.query_map([], |row| row.get::<_, String>(1));
+    match rows {
+        Ok(rows) => rows
+            .flatten()
+            .any(|name| name.eq_ignore_ascii_case(column)),
+        Err(_) => false,
+    }
+}
+
 /// Check whether a column is declared as INTEGER in the table schema.
 /// Used to detect nsys schema changes (e.g. demangledName: TEXT vs INTEGER FK).
 fn is_column_integer(conn: &Connection, table: &str, column: &str) -> bool {
@@ -442,6 +465,84 @@ mod tests {
     fn find_table_missing() {
         let conn = Connection::open_in_memory().unwrap();
         assert!(find_table(&conn, &["NOPE"]).is_err());
+    }
+
+    /// Regression: nsys 2023.x exports `CUDA_GPU_MEMORY_USAGE_EVENTS`
+    /// without a `streamId` column. The importer used to SELECT it
+    /// unconditionally and fail with "no such column: streamId",
+    /// killing the entire nsys import. Probe the schema and verify
+    /// the SELECT composed at runtime accepts the legacy shape.
+    #[test]
+    fn select_for_allocations_omits_stream_id_when_absent() {
+        let src = Connection::open_in_memory().unwrap();
+        // nsys 2023 schema: no streamId column.
+        src.execute_batch(
+            "CREATE TABLE CUDA_GPU_MEMORY_USAGE_EVENTS (
+                start INTEGER,
+                memoryOperationType INTEGER,
+                address INTEGER,
+                bytes INTEGER
+            );
+            INSERT INTO CUDA_GPU_MEMORY_USAGE_EVENTS VALUES (100, 0, 1, 4096);",
+        )
+        .unwrap();
+        assert!(!has_column(&src, "CUDA_GPU_MEMORY_USAGE_EVENTS", "streamId"));
+
+        // Synthesize the exact SELECT import_allocations builds and
+        // confirm sqlite accepts it against the legacy schema.
+        let select_sid = if has_column(&src, "CUDA_GPU_MEMORY_USAGE_EVENTS", "streamId") {
+            "streamId"
+        } else {
+            "NULL"
+        };
+        let sql = format!(
+            "SELECT start, memoryOperationType, address, bytes, {select_sid} \
+             FROM CUDA_GPU_MEMORY_USAGE_EVENTS ORDER BY start"
+        );
+        let mut stmt = src.prepare(&sql).expect("SELECT must compile");
+        let got: Option<u32> = stmt
+            .query_row([], |r| r.get::<_, Option<u32>>(4))
+            .unwrap();
+        assert!(got.is_none(), "stream_id must be NULL on 2023 schema");
+    }
+
+    /// Counterpart: on a 2024+ schema with streamId present, the
+    /// importer must use the real column value.
+    #[test]
+    fn select_for_allocations_uses_stream_id_when_present() {
+        let src = Connection::open_in_memory().unwrap();
+        src.execute_batch(
+            "CREATE TABLE CUDA_GPU_MEMORY_USAGE_EVENTS (
+                start INTEGER,
+                memoryOperationType INTEGER,
+                address INTEGER,
+                bytes INTEGER,
+                streamId INTEGER
+            );
+            INSERT INTO CUDA_GPU_MEMORY_USAGE_EVENTS VALUES (100, 0, 1, 4096, 7);",
+        )
+        .unwrap();
+        assert!(has_column(&src, "CUDA_GPU_MEMORY_USAGE_EVENTS", "streamId"));
+        let select_sid = "streamId"; // mirrors the branch we take
+        let sql = format!(
+            "SELECT start, memoryOperationType, address, bytes, {select_sid} \
+             FROM CUDA_GPU_MEMORY_USAGE_EVENTS"
+        );
+        let got: u32 = src
+            .prepare(&sql)
+            .unwrap()
+            .query_row([], |r| r.get(4))
+            .unwrap();
+        assert_eq!(got, 7);
+    }
+
+    #[test]
+    fn has_column_detects_presence_and_absence() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE t (a INTEGER, b TEXT)").unwrap();
+        assert!(has_column(&conn, "t", "a"));
+        assert!(has_column(&conn, "t", "B")); // case-insensitive
+        assert!(!has_column(&conn, "t", "c"));
     }
 
     #[test]
