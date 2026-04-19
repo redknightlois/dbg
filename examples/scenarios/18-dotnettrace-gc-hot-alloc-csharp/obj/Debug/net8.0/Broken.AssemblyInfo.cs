@@ -11,9 +11,9 @@ using System;
 using System.Reflection;
 
 [assembly: System.Reflection.AssemblyCompanyAttribute("broken")]
-[assembly: System.Reflection.AssemblyConfigurationAttribute("Release")]
+[assembly: System.Reflection.AssemblyConfigurationAttribute("Debug")]
 [assembly: System.Reflection.AssemblyFileVersionAttribute("1.0.0.0")]
-[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0+f6ae5d61ca751086996dc7e03cc94688bc604d58")]
+[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0+4be1c2348c313098ae5fffa3ed2dc4c6d8e72c1a")]
 [assembly: System.Reflection.AssemblyProductAttribute("broken")]
 [assembly: System.Reflection.AssemblyTitleAttribute("broken")]
 [assembly: System.Reflection.AssemblyVersionAttribute("1.0.0.0")]

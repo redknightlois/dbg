@@ -4,7 +4,7 @@ QA opened a ticket: walking every page of our paginated search no longer round-t
 
 ```
 $ python3 broken.py
-AssertionError: pagination drift: duplicated=[5, 11, 17] missing=[]
+AssertionError: pagination drift: duplicated=[5, 10, 15, 20] missing=[]
 ```
 
 Constraints:

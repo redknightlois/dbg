@@ -1,11 +1,11 @@
 # Fuel calculator off by a constant factor
 
-QA filed a ticket: our fuel calculator overestimates every leg by roughly the same factor. For Boston→Denver (~1750 statute miles, 30 kt headwind) we report ~5630 L; the reference value is ~3500 L. The ratio (~1.6x) is suspicious — it's almost exactly 1.151, which any ex-pilot will recognize.
+QA filed a ticket: our fuel calculator overestimates every leg by roughly the same factor. For Boston→Denver (~1750 statute miles, 30 kt headwind) we report ~4025 L; the reference value is ~3500 L. The ratio (~1.151x) is suspicious — any ex-pilot will recognize it.
 
 ```
 $ python3 broken.py
-Boston→Denver: 5630 L
-AssertionError: fuel estimate 5630 L outside reasonable range — check unit conversions
+Boston→Denver: 4025 L
+AssertionError: fuel estimate 4025 L outside reasonable range — check unit conversions
 ```
 
 Find the bug, fix it, get the OK line.

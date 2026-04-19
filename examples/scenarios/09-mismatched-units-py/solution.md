@@ -10,4 +10,4 @@ The inputs are statute miles, the burn table is per nautical mile. 1 statute mil
 distance_nm = distance_miles * 0.8689762
 ```
 
-Now Boston→Denver returns ~3500 L instead of ~5630 L.
+Now Boston→Denver returns ~3500 L instead of ~4025 L.

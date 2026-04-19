@@ -1,0 +1,11 @@
+[package]
+name = "broken"
+version = "0.0.0"
+edition = "2021"
+
+[[bin]]
+name = "broken"
+path = "src/broken.rs"
+
+[profile.release]
+debug = true

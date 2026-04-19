@@ -6,7 +6,7 @@ reference table inside, but the answers it produces are off by a
 constant factor that varies by leg. QA reports:
 
     expected ~3500 L for the Boston→Denver leg
-    we report  ~5630 L
+    we report  ~4025 L
 
 It's wrong by exactly the same ratio every time. Find it.
 """
@@ -16,7 +16,7 @@ LITERS_PER_NM_AT_ZERO_WIND = 2.17
 
 def fuel_for_leg(distance_miles: float, headwind_kts: float) -> float:
     # Convert distance to nautical miles for the burn table.
-    distance_nm = distance_miles * 0.868976  # statute miles → nautical miles
+    distance_nm = distance_miles  # TODO: convert statute miles to nautical miles
     # Headwind penalty: 1% extra burn per 5 kts of headwind.
     penalty = 1.0 + (headwind_kts / 5.0) * 0.01
     return distance_nm * LITERS_PER_NM_AT_ZERO_WIND * penalty

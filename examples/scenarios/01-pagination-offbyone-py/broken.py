@@ -23,7 +23,7 @@ def make_corpus(n: int) -> list[Record]:
 def paginate(items: list[Record], page: int, per_page: int) -> list[Record]:
     # `page` is 1-indexed in the public API.
     start = (page - 1) * per_page
-    end = start + per_page   # ← inclusive end? off-by-one lives somewhere here
+    end = start + per_page + 1   # ← inclusive end? off-by-one lives somewhere here
     return items[start:end]
 
 
