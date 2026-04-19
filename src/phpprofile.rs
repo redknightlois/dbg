@@ -38,6 +38,11 @@ pub struct PhpFunction {
     pub call_count: u64,
     /// Functions called by this one.
     pub calls: Vec<CallRecord>,
+    /// Extra event counters beyond the first two (indexed by position in
+    /// the `events:` header after skipping the first two columns). Used
+    /// to surface native callgrind events like Bcm (branch mispredictions),
+    /// Bi (indirect branches), Bim, etc.
+    pub extra_self: Vec<u64>,
 }
 
 /// Parsed index of all functions in a cachegrind profile.
@@ -49,6 +54,12 @@ pub struct ProfileIndex {
     pub total_memory: i64,
     /// Profiled script.
     pub command: String,
+    /// Event column names from the `events:` header (e.g. ["Ir", "Bc", "Bcm", "Bi", "Bim"]).
+    /// Empty for PHP/Xdebug profiles which don't emit `events:`.
+    pub event_names: Vec<String>,
+    /// Total counters for each event column, parallel to `event_names`.
+    /// Populated from the `summary:` line.
+    pub event_totals: Vec<u64>,
     /// Focus filter (function name substring).
     focus: Option<String>,
     /// Ignore filter (function name substring).
@@ -68,6 +79,8 @@ impl ProfileIndex {
         let mut fn_call_count: HashMap<u32, u64> = HashMap::new();
         let mut fn_file: HashMap<u32, u32> = HashMap::new();
         let mut fn_calls: HashMap<u32, Vec<CallRecord>> = HashMap::new();
+        // Extra per-function counters beyond time+memory (columns 3+)
+        let mut fn_extra_self: HashMap<u32, Vec<u64>> = HashMap::new();
 
         let mut current_fl: u32 = 0;
         let mut current_fn: u32 = 0;
@@ -77,6 +90,10 @@ impl ProfileIndex {
         let mut total_time: u64 = 0;
         let mut total_memory: i64 = 0;
         let mut command = String::new();
+        // Event column names from `events:` header
+        let mut event_names: Vec<String> = Vec::new();
+        // Total counters from `summary:` line
+        let mut event_totals: Vec<u64> = Vec::new();
 
         // Registry for bare-name callgrind format (e.g. stackprof output)
         let mut bare_name_ids: HashMap<String, u32> = HashMap::new();
@@ -97,12 +114,21 @@ impl ProfileIndex {
                 || line.starts_with("creator:")
                 || line.starts_with("part:")
                 || line.starts_with("positions:")
-                || line.starts_with("events:")
             {
                 continue;
             }
+            // `events:` — capture column names for native callgrind profiles
+            // (e.g. "Ir Bc Bcm Bi Bim"). PHP/Xdebug profiles use longer names
+            // like "Time_(10ns) Memory_(bytes)" and may also emit this line.
+            if let Some(rest) = line.strip_prefix("events:") {
+                event_names = rest
+                    .split_whitespace()
+                    .map(str::to_string)
+                    .collect();
+                continue;
+            }
 
-            // Summary line
+            // Summary line — capture ALL event totals (not just first two)
             if let Some(rest) = line.strip_prefix("summary: ") {
                 let parts: Vec<&str> = rest.split_whitespace().collect();
                 if let Some(t) = parts.first() {
@@ -111,6 +137,11 @@ impl ProfileIndex {
                 if let Some(m) = parts.get(1) {
                     total_memory = m.parse().unwrap_or(0);
                 }
+                // Capture all columns for later display
+                event_totals = parts
+                    .iter()
+                    .filter_map(|s| s.parse::<u64>().ok())
+                    .collect();
                 continue;
             }
 
@@ -171,35 +202,77 @@ impl ProfileIndex {
                 continue;
             }
 
-            // Cost line: line_number time memory
-            if line.chars().next().map_or(false, |c| c.is_ascii_digit()) {
-                let parts: Vec<&str> = line.split_whitespace().collect();
-                if parts.len() >= 2 {
-                    let time: u64 = parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(0);
-                    let memory: i64 = parts.get(2).and_then(|s| s.parse().ok()).unwrap_or(0);
-
-                    if pending_call_count > 0 {
-                        // This is a callee cost line — use ID placeholder, resolved after parsing
-                        let callee_name = format!("__id_{}__", current_cfn);
-                        let calls = fn_calls.entry(current_fn).or_default();
-                        // Merge with existing call to same target
-                        if let Some(existing) = calls.iter_mut().find(|c| c.callee == callee_name) {
-                            existing.call_count += pending_call_count;
-                            existing.time += time;
-                            existing.memory += memory;
-                        } else {
-                            calls.push(CallRecord {
-                                callee: callee_name,
-                                call_count: pending_call_count,
-                                time,
-                                memory,
-                            });
-                        }
-                        pending_call_count = 0;
+            // Cost line: line_number time memory [extra...]
+            // Native callgrind also uses `+N` (relative offset) and `*` prefixes;
+            // we handle the absolute-address form that starts with a digit here.
+            // Relative-offset lines (`+N ...`) are handled below.
+            let cost_parts_opt: Option<Vec<&str>> = if line
+                .chars()
+                .next()
+                .map_or(false, |c| c.is_ascii_digit())
+            {
+                let p: Vec<&str> = line.split_whitespace().collect();
+                if p.len() >= 2 { Some(p) } else { None }
+            } else if line.starts_with('+') || line.starts_with('*') {
+                // Relative-offset format: `+N time [extra...]` or `* line time [extra...]`
+                let p: Vec<&str> = line.split_whitespace().collect();
+                // For `+N` lines, col[0]="+N", col[1..] are counters.
+                // For `* line` lines, col[0]="*", col[1]=line, col[2..] are counters.
+                // In both cases we treat col[1] as time and col[2] as memory.
+                if p.len() >= 2 { Some(p) } else { None }
+            } else {
+                None
+            };
+            if let Some(parts) = cost_parts_opt {
+                let (time_idx, mem_idx, extra_start): (usize, usize, usize) =
+                    if line.starts_with('*') {
+                        (2, 3, 4) // * line time memory extra...
                     } else {
-                        // Self cost line
-                        *fn_self_time.entry(current_fn).or_insert(0) += time;
-                        *fn_self_memory.entry(current_fn).or_insert(0) += memory;
+                        (1, 2, 3) // N time memory extra...  or  +N time memory extra...
+                    };
+                let time: u64 = parts.get(time_idx).and_then(|s| s.parse().ok()).unwrap_or(0);
+                let memory: i64 = parts.get(mem_idx).and_then(|s| s.parse().ok()).unwrap_or(0);
+                // Extra counters (Bcm etc.)
+                let n_extra = event_names.len().saturating_sub(2);
+                let extra: Vec<u64> = (0..n_extra)
+                    .map(|i| {
+                        parts
+                            .get(extra_start + i)
+                            .and_then(|s| s.parse::<u64>().ok())
+                            .unwrap_or(0)
+                    })
+                    .collect();
+
+                if pending_call_count > 0 {
+                    // This is a callee cost line — use ID placeholder, resolved after parsing
+                    let callee_name = format!("__id_{}__", current_cfn);
+                    let calls = fn_calls.entry(current_fn).or_default();
+                    // Merge with existing call to same target
+                    if let Some(existing) = calls.iter_mut().find(|c| c.callee == callee_name) {
+                        existing.call_count += pending_call_count;
+                        existing.time += time;
+                        existing.memory += memory;
+                    } else {
+                        calls.push(CallRecord {
+                            callee: callee_name,
+                            call_count: pending_call_count,
+                            time,
+                            memory,
+                        });
+                    }
+                    pending_call_count = 0;
+                } else {
+                    // Self cost line
+                    *fn_self_time.entry(current_fn).or_insert(0) += time;
+                    *fn_self_memory.entry(current_fn).or_insert(0) += memory;
+                    // Accumulate extra counters
+                    if !extra.is_empty() {
+                        let slot = fn_extra_self.entry(current_fn).or_insert_with(|| vec![0u64; n_extra]);
+                        for (i, v) in extra.iter().enumerate() {
+                            if i < slot.len() {
+                                slot[i] += v;
+                            }
+                        }
                     }
                 }
             }
@@ -239,6 +312,7 @@ impl ProfileIndex {
         let mut functions = Vec::new();
         let mut all_fn_ids: Vec<u32> = fn_names.keys().copied().collect();
         all_fn_ids.sort();
+        let n_extra = event_names.len().saturating_sub(2);
 
         for id in all_fn_ids {
             let name = fn_names.get(&id).cloned().unwrap_or_else(|| format!("fn#{}", id));
@@ -252,6 +326,10 @@ impl ProfileIndex {
             let calls = fn_calls.get(&id).cloned().unwrap_or_default();
             let callee_time: u64 = calls.iter().map(|c| c.time).sum();
             let callee_memory: i64 = calls.iter().map(|c| c.memory).sum();
+            let extra_self = fn_extra_self
+                .get(&id)
+                .cloned()
+                .unwrap_or_else(|| vec![0u64; n_extra]);
 
             functions.push(PhpFunction {
                 name,
@@ -262,6 +340,7 @@ impl ProfileIndex {
                 inclusive_memory: self_memory + callee_memory,
                 call_count: fn_call_count.get(&id).copied().unwrap_or(1),
                 calls,
+                extra_self,
             });
         }
 
@@ -270,6 +349,8 @@ impl ProfileIndex {
             total_time,
             total_memory,
             command,
+            event_names,
+            event_totals,
             focus: None,
             ignore: None,
         }
@@ -472,6 +553,35 @@ impl ProfileIndex {
                 Self::format_memory(self.total_memory)
             ));
         }
+        // Surface native callgrind counters (Bcm = branch mispredictions, etc.)
+        // when the `events:` header declared more than the standard two columns.
+        if self.event_names.len() > 2 && !self.event_totals.is_empty() {
+            out.push_str("\nHardware counters (from callgrind):\n");
+            for (i, name) in self.event_names.iter().enumerate() {
+                if let Some(&total) = self.event_totals.get(i) {
+                    let label = match name.as_str() {
+                        "Ir"  => "Instr refs",
+                        "Bc"  => "Branch cond",
+                        "Bcm" => "Branch mispred",
+                        "Bi"  => "Indirect br",
+                        "Bim" => "Indir br mispred",
+                        other => other,
+                    };
+                    out.push_str(&format!("  {:<20} {:>14}\n", label, total));
+                }
+            }
+            // Compute misprediction rate when both Bc and Bcm are present
+            let bcm_idx = self.event_names.iter().position(|n| n == "Bcm");
+            let bc_idx  = self.event_names.iter().position(|n| n == "Bc");
+            if let (Some(bcm_i), Some(bc_i)) = (bcm_idx, bc_idx) {
+                if let (Some(&bcm), Some(&bc)) = (self.event_totals.get(bcm_i), self.event_totals.get(bc_i)) {
+                    if bc > 0 {
+                        let pct = bcm as f64 / bc as f64 * 100.0;
+                        out.push_str(&format!("  {:<20} {:>13.1}%\n", "Branch mispredict%", pct));
+                    }
+                }
+            }
+        }
         out
     }
 
@@ -497,6 +607,27 @@ impl ProfileIndex {
                 Self::format_memory(f.inclusive_memory)
             ));
             out.push_str(&format!("  Calls:     {}x\n", f.call_count));
+            // Surface per-function hardware counters when available
+            if self.event_names.len() > 2 && !f.extra_self.is_empty() {
+                let has_nonzero = f.extra_self.iter().any(|&v| v > 0);
+                if has_nonzero {
+                    out.push_str("  HW counters (self):\n");
+                    for (i, name) in self.event_names.iter().skip(2).enumerate() {
+                        if let Some(&v) = f.extra_self.get(i) {
+                            if v > 0 {
+                                let label = match name.as_str() {
+                                    "Bcm" => "Branch mispred",
+                                    "Bc"  => "Branch cond",
+                                    "Bi"  => "Indirect br",
+                                    "Bim" => "Indir br mispred",
+                                    other => other,
+                                };
+                                out.push_str(&format!("    {:<20} {:>12}\n", label, v));
+                            }
+                        }
+                    }
+                }
+            }
             if !f.calls.is_empty() {
                 out.push_str("  Callees:\n");
                 let mut sorted = f.calls.clone();
@@ -1708,6 +1839,112 @@ calls=100 1
             let lines = out.lines().count();
             // Should follow at least 2 levels deep
             assert!(lines >= 3, "hotpath too shallow ({}): {}", lines, out);
+        }
+    }
+
+    // =========================================================================
+    // Callgrind with multiple hardware counters (Ir Bc Bcm Bi Bim)
+    // =========================================================================
+    mod callgrind_branch_counters {
+        use super::*;
+
+        /// Minimal callgrind profile with 5-event columns: Ir Bc Bcm Bi Bim.
+        /// Exercises the branch-misprediction surfacing added for scenario 14.
+        const MULTI_EVENT: &str = "\
+version: 1
+creator: callgrind-3.25.1
+pid: 999
+cmd: ./bench
+part: 1
+positions: line
+
+events: Ir Bc Bcm Bi Bim
+
+fl=(1) /tmp/bench.c
+fn=(1) classify
+10 1000000 500000 50000 100 5
++1 200000 100 10 0 0
+
+fl=(1)
+fn=(2) main
+30 5000 100 2 50 1
+
+summary: 1205000 600200 50012 150 6
+";
+
+        #[test]
+        fn parse_event_names() {
+            let idx = ProfileIndex::parse(MULTI_EVENT);
+            assert_eq!(
+                idx.event_names,
+                vec!["Ir", "Bc", "Bcm", "Bi", "Bim"],
+                "event_names must reflect the events: header"
+            );
+        }
+
+        #[test]
+        fn parse_event_totals_from_summary() {
+            let idx = ProfileIndex::parse(MULTI_EVENT);
+            assert_eq!(
+                idx.event_totals,
+                vec![1205000, 600200, 50012, 150, 6],
+                "event_totals must reflect all 5 summary columns"
+            );
+        }
+
+        #[test]
+        fn cmd_stats_surfaces_branch_mispred() {
+            let idx = ProfileIndex::parse(MULTI_EVENT);
+            let out = idx.cmd_stats("");
+            assert!(
+                out.contains("Branch mispred"),
+                "cmd_stats must show branch mispredictions when Bcm is present:\n{out}"
+            );
+            // Total Bcm from summary line is 50012
+            assert!(
+                out.contains("50012"),
+                "cmd_stats must include the total Bcm count (50012):\n{out}"
+            );
+        }
+
+        #[test]
+        fn cmd_stats_shows_mispredict_rate() {
+            let idx = ProfileIndex::parse(MULTI_EVENT);
+            let out = idx.cmd_stats("");
+            assert!(
+                out.contains("Branch mispredict%"),
+                "cmd_stats must show mispredict % when both Bc and Bcm are present:\n{out}"
+            );
+        }
+
+        #[test]
+        fn per_function_bcm_surfaced_in_inspect() {
+            let idx = ProfileIndex::parse(MULTI_EVENT);
+            let out = idx.cmd_inspect("classify");
+            assert!(
+                out.contains("Branch mispred"),
+                "cmd_inspect must show per-function Bcm when non-zero:\n{out}"
+            );
+            // The classify function has Bcm=50000+10=50010 from its two cost lines
+            assert!(
+                out.contains("50010") || out.contains("50000"),
+                "cmd_inspect must show a Bcm value near 50000 for classify:\n{out}"
+            );
+        }
+
+        #[test]
+        fn stats_no_hw_section_for_standard_php_profile() {
+            // PHP/Xdebug profiles emit events: Time_(10ns) Memory_(bytes).
+            // They have exactly 2 columns — the HW counters section must NOT appear.
+            let php = "events: Time_(10ns) Memory_(bytes)\n\
+                       fl=(1) /app/index.php\nfn=(1) main\n1 5000 1024\n\
+                       summary: 5000 1024\n";
+            let idx = ProfileIndex::parse(php);
+            let out = idx.cmd_stats("");
+            assert!(
+                !out.contains("Hardware counters"),
+                "PHP profiles must not show a hardware-counters section:\n{out}"
+            );
         }
     }
 
