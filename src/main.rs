@@ -174,6 +174,19 @@ fn main() -> Result<()> {
 
     match first {
         "start" => cmd_start(&registry, &cli.args[1..]),
+        "attach" => {
+            // Intercept client-side: `dbg attach` is not a verb. Without
+            // this the arg falls through to the debugger backend (pdb
+            // etc.) and surfaces as a cryptic `*** SyntaxError: invalid
+            // syntax`, because pdb tries to parse `attach <label>` as
+            // Python.
+            eprintln!(
+                "`dbg attach` is not a verb. Did you mean:\n  \
+                 dbg start <type> <target> --attach-pid <PID>   (attach live to a process)\n  \
+                 dbg replay <label>                             (re-open a saved session; see `dbg sessions`)"
+            );
+            std::process::exit(2);
+        }
         "kill" => {
             let msg = daemon::kill_daemon()?;
             println!("{msg}");
@@ -185,11 +198,21 @@ fn main() -> Result<()> {
         }
         "sessions" if !daemon::is_running() => {
             // Allow listing without a live daemon — same output as
-            // when live except no "* currently live" marker.
+            // when live except no "* currently live" marker. Show
+            // peer daemons first (the bare cwd slot may be empty but
+            // other pid-suffixed daemons can still be running).
+            print_live_daemon_peers();
             let cwd = std::env::current_dir()?;
             let ctx = commands::lifecycle::LifeCtx { cwd: &cwd, active: None };
             let l = commands::lifecycle::Lifecycle::Sessions { group_only: false };
             println!("{}", commands::lifecycle::run(&l, &ctx));
+            Ok(())
+        }
+        "sessions" => {
+            print_live_daemon_peers();
+            let cmd = cli.args.join(" ");
+            let resp = daemon::send_command(&cmd)?;
+            println!("{resp}");
             Ok(())
         }
         "replay" => cmd_replay(&cli.args[1..]),
@@ -373,6 +396,30 @@ fn ensure_running() -> Result<()> {
     Ok(())
 }
 
+/// Emit a header listing every live daemon in the current cwd, with a
+/// `*` next to the one the current process resolves to. Suppressed
+/// entirely when only one (or zero) live daemons exist — the normal
+/// case. Used at the top of `dbg sessions`.
+fn print_live_daemon_peers() {
+    let peers = daemon::live_slugs_in_cwd();
+    if peers.len() <= 1 {
+        return;
+    }
+    let active = std::env::var("DBG_SESSION")
+        .ok()
+        .or_else(|| {
+            std::fs::read_to_string(daemon::latest_pointer_path())
+                .ok()
+                .map(|s| s.trim().to_string())
+        });
+    println!("live daemons in this cwd:");
+    for slug in &peers {
+        let marker = if active.as_deref() == Some(slug.as_str()) { "*" } else { " " };
+        println!("  {marker} {slug}");
+    }
+    println!("  (set DBG_SESSION=<slug> to target a specific one)\n");
+}
+
 /// Pick a backend from a target filename when the user omits the type.
 /// Unambiguous extensions only — binaries (no extension) and shared
 /// types (.cs can be script or project) still require an explicit type.
@@ -446,16 +493,31 @@ fn cmd_start(registry: &Registry, args: &[String]) -> Result<()> {
         bail!("usage: dbg start <type> <target> [--break spec] [--args ...] [--run]");
     }
 
-    // Kill existing session — kill_daemon blocks until the pid dies
-    // and socket/pid files are cleared.
-    if daemon::is_running() {
-        eprintln!("stopping existing session...");
-        daemon::kill_daemon()?;
-    }
-    // Reap any orphaned pid/socket files from a crashed previous
-    // daemon. is_running() no longer does this itself (see its
-    // comment) so cmd_start owns the cleanup.
+    // Reap orphaned pid/socket files from a crashed previous daemon
+    // so allocate_slug doesn't treat a dead socket as "live".
     daemon::clean_stale_runtime_files();
+
+    // Allocate a slug for this session. If another daemon already
+    // owns the bare cwd slot, we coexist by appending our pid rather
+    // than evicting the existing daemon. Explicit DBG_SESSION names
+    // that collide fail loudly so named-slot semantics stay honest.
+    let slug = daemon::allocate_slug()?;
+    // SAFETY: set_var is unsafe in threaded contexts. cmd_start is
+    // still single-threaded at this point (fork hasn't happened).
+    unsafe { std::env::set_var("DBG_SESSION", &slug); }
+    // Publish this as the newest daemon in the cwd so env-less
+    // clients in other shells find it by default.
+    daemon::write_latest_pointer(&slug);
+    let peers = daemon::live_slugs_in_cwd();
+    if !peers.is_empty() {
+        eprintln!(
+            "session: {slug}  (coexisting with: {})",
+            peers.iter().filter(|s| *s != &slug).cloned().collect::<Vec<_>>().join(", "),
+        );
+        eprintln!("  other shells: set DBG_SESSION={slug} to target this session");
+    } else {
+        eprintln!("session: {slug}");
+    }
 
     let backend_type = &args[0];
     let target_raw = &args[1];
@@ -659,8 +721,15 @@ fn cmd_start(registry: &Registry, args: &[String]) -> Result<()> {
                     || lc.contains("cannot find")
                     || lc.contains("no source")
                     || lc.contains("unable to set")
+                    || lc.contains("blank or comment")
                 {
                     bp_ok = false;
+                    if lc.contains("blank or comment") {
+                        eprintln!(
+                            "dbg: `{bp}` points at a blank/comment line — pdb won't stop there. \
+                             Pick an executable line (or use `--break <function_name>`)."
+                        );
+                    }
                 }
             }
 

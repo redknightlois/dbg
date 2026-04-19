@@ -19,8 +19,17 @@ use dbg_cli::session_db::LiveDebugger;
 const CMD_TIMEOUT: Duration = Duration::from_secs(60);
 
 fn cleanup_and_exit() -> ! {
+    let me = session_slug();
     let _ = std::fs::remove_file(socket_path());
     let _ = std::fs::remove_file(pid_path());
+    // Clear the "latest" pointer only if it still names us — another
+    // daemon may have become the newest since we started, and we
+    // mustn't blow away its pointer.
+    if let Ok(contents) = std::fs::read_to_string(latest_pointer_path()) {
+        if contents.trim() == me {
+            let _ = std::fs::remove_file(latest_pointer_path());
+        }
+    }
     let session_dir = session_tmp_dir();
     let _ = std::fs::remove_dir_all(&session_dir);
     std::process::exit(0);
@@ -76,21 +85,17 @@ fn runtime_dir() -> PathBuf {
     dir
 }
 
-/// Stable per-working-directory slug used to scope the daemon socket
-/// and pid file. Two agents running `dbg start` in different cwds get
-/// different sockets and don't stomp each other. `DBG_SESSION` env var
-/// overrides the cwd hash — useful for tests and for explicit
-/// multi-session workflows within a single cwd.
-fn session_slug() -> String {
-    if let Ok(v) = std::env::var("DBG_SESSION") {
-        let safe: String = v
-            .chars()
-            .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
-            .collect();
-        if !safe.is_empty() {
-            return safe;
-        }
-    }
+/// Sanitize a user-supplied `DBG_SESSION` value to the slug charset.
+fn sanitize_slug(v: &str) -> String {
+    v.chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .collect()
+}
+
+/// Stable hash of the current working directory. Every slug in a given
+/// cwd starts with this prefix, so scanning the runtime dir for peers
+/// is a simple `starts_with` check.
+fn cwd_base_slug() -> String {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
@@ -99,12 +104,117 @@ fn session_slug() -> String {
     format!("{:016x}", h.finish())
 }
 
+/// Path to the "most recent daemon for this cwd" pointer.
+/// Clients with no `DBG_SESSION` read this to find a live daemon.
+pub fn latest_pointer_path() -> PathBuf {
+    runtime_dir().join(format!("dbg-{}.latest", cwd_base_slug()))
+}
+
+/// Update the pointer to name `slug` as the newest daemon for this cwd.
+pub fn write_latest_pointer(slug: &str) {
+    let _ = std::fs::write(latest_pointer_path(), slug);
+}
+
+/// Read the pointer. Returns `None` if missing, empty, or pointing at
+/// a daemon that is no longer alive.
+fn read_live_pointer() -> Option<String> {
+    let raw = std::fs::read_to_string(latest_pointer_path()).ok()?;
+    let slug = raw.trim();
+    if slug.is_empty() { return None; }
+    if !is_slug_live(slug) { return None; }
+    Some(slug.to_string())
+}
+
+/// Slug the current process should act on. Priority:
+///   1. `DBG_SESSION` env var (explicit caller choice)
+///   2. `.latest` pointer file (newest live daemon in this cwd)
+///   3. Bare `cwd_base_slug()` (legacy fallback; also the slug the
+///      very first daemon in a fresh cwd gets)
+fn session_slug() -> String {
+    if let Ok(v) = std::env::var("DBG_SESSION") {
+        let safe = sanitize_slug(&v);
+        if !safe.is_empty() {
+            return safe;
+        }
+    }
+    if let Some(s) = read_live_pointer() {
+        return s;
+    }
+    cwd_base_slug()
+}
+
+pub fn socket_path_for(slug: &str) -> PathBuf {
+    runtime_dir().join(format!("dbg-{slug}.sock"))
+}
+
+pub fn pid_path_for(slug: &str) -> PathBuf {
+    runtime_dir().join(format!("dbg-{slug}.pid"))
+}
+
 fn socket_path() -> PathBuf {
-    runtime_dir().join(format!("dbg-{}.sock", session_slug()))
+    socket_path_for(&session_slug())
 }
 
 fn pid_path() -> PathBuf {
-    runtime_dir().join(format!("dbg-{}.pid", session_slug()))
+    pid_path_for(&session_slug())
+}
+
+/// Same liveness check as `is_running`, scoped to a specific slug.
+pub fn is_slug_live(slug: &str) -> bool {
+    let Ok(pid_str) = std::fs::read_to_string(pid_path_for(slug)) else { return false };
+    let Ok(pid) = pid_str.trim().parse::<i32>() else { return false };
+    if nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None).is_err() {
+        return false;
+    }
+    socket_path_for(slug).exists()
+}
+
+/// Pick a slug for a new daemon. With `DBG_SESSION` set we honor the
+/// explicit choice and fail loudly on collision — the user asked for a
+/// named slot. Without `DBG_SESSION` we prefer the bare cwd slug and,
+/// if that slot is busy, append `-<pid>` to coexist with the existing
+/// daemon rather than evict it.
+pub fn allocate_slug() -> Result<String> {
+    let explicit = std::env::var("DBG_SESSION")
+        .ok()
+        .map(|v| sanitize_slug(&v))
+        .filter(|s| !s.is_empty());
+    if let Some(name) = explicit {
+        if is_slug_live(&name) {
+            anyhow::bail!(
+                "DBG_SESSION={name} is already live — pick another name or \
+                 `DBG_SESSION={name} dbg kill` first"
+            );
+        }
+        return Ok(name);
+    }
+    let base = cwd_base_slug();
+    if is_slug_live(&base) {
+        Ok(format!("{base}-{}", std::process::id()))
+    } else {
+        Ok(base)
+    }
+}
+
+/// Every slug that currently has a live daemon whose pid file lives in
+/// `runtime_dir()` and whose slug begins with the current cwd's base.
+/// Used by `dbg sessions` to enumerate peer daemons.
+pub fn live_slugs_in_cwd() -> Vec<String> {
+    let base = cwd_base_slug();
+    let Ok(entries) = std::fs::read_dir(runtime_dir()) else { return Vec::new() };
+    let mut out = Vec::new();
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        let Some(rest) = name.strip_prefix("dbg-") else { continue };
+        let Some(slug) = rest.strip_suffix(".pid") else { continue };
+        if !slug.starts_with(&base) { continue; }
+        if is_slug_live(slug) {
+            out.push(slug.to_string());
+        }
+    }
+    out.sort();
+    out
 }
 
 /// File the forked daemon's stderr is redirected to during startup.
@@ -298,6 +408,11 @@ pub fn run_daemon(
     std::fs::write(&pid_path(), std::process::id().to_string())?;
     let _ = std::fs::remove_file(&socket_path());
     let listener = UnixListener::bind(&socket_path()).context("failed to bind socket")?;
+    // Point the cwd's "latest" pointer at ourselves so env-less clients
+    // in other shells find this daemon by default. Parent also writes
+    // this pre-fork; re-asserting here is idempotent and covers the
+    // case where the parent's write was lost/raced.
+    write_latest_pointer(&session_slug());
 
     ctrlc::set_handler(move || {
         cleanup_and_exit();
@@ -1218,11 +1333,19 @@ fn persist_session_on_exit(session: &mut Session) {
 }
 
 /// Send a command to a running daemon. Returns the response.
+///
+/// Retries the initial connect a few times over ~150ms. This masks a
+/// short-lived race immediately after `dbg start ... --run` returns:
+/// the socket is bound before the first in-flight command finishes,
+/// but a follow-up client invocation issued microseconds later can
+/// still see the listener in a transient not-accepting state (seen on
+/// short-lived targets where the backend's program thread is racing
+/// with our accept loop). Without retry the second call surfaces as
+/// a misleading "no session running".
 pub fn send_command(cmd: &str) -> Result<String> {
     use std::os::unix::net::UnixStream;
 
-    let mut stream =
-        UnixStream::connect(&socket_path()).context("no session running — use: dbg start")?;
+    let mut stream = connect_with_retry()?;
     stream.set_read_timeout(Some(CMD_TIMEOUT))?;
 
     stream.write_all(format!("{cmd}\n").as_bytes())?;
@@ -1231,6 +1354,66 @@ pub fn send_command(cmd: &str) -> Result<String> {
     let mut response = String::new();
     stream.read_to_string(&mut response)?;
     Ok(response)
+}
+
+fn connect_with_retry() -> Result<std::os::unix::net::UnixStream> {
+    use std::os::unix::net::UnixStream;
+    let mut attempts = 0;
+    loop {
+        match UnixStream::connect(&socket_path()) {
+            Ok(s) => return Ok(s),
+            Err(e) => {
+                // Only retry if the daemon *appears* to exist; fail
+                // fast otherwise so genuine "no session" stays instant.
+                if !is_running() || attempts >= 5 {
+                    let hint = foreign_daemon_hint();
+                    return Err(e).context(format!(
+                        "no session running — use: dbg start{hint}"
+                    ));
+                }
+                attempts += 1;
+                std::thread::sleep(Duration::from_millis(30));
+            }
+        }
+    }
+}
+
+/// When the resolved slug has no live daemon but *other* daemons are
+/// reachable, surface them so the caller can pick one. Distinguishes
+/// peers in the same cwd (matching `cwd_base_slug()` prefix — the user
+/// likely wants one of these) from daemons in other cwds (same user,
+/// different bucket — usually a shell that cd'd away).
+fn foreign_daemon_hint() -> String {
+    let peers = live_slugs_in_cwd();
+    if !peers.is_empty() {
+        let list = peers.join(", ");
+        return format!(
+            "\n  (peers in this cwd: {list} — select with DBG_SESSION=<slug>)"
+        );
+    }
+    let dir = runtime_dir();
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(e) => e,
+        Err(_) => return String::new(),
+    };
+    let other_count = entries
+        .flatten()
+        .filter(|e| {
+            e.path()
+                .extension()
+                .and_then(|s| s.to_str())
+                == Some("sock")
+        })
+        .count();
+    if other_count == 0 {
+        String::new()
+    } else {
+        format!(
+            "\n  (note: {other_count} daemon socket(s) exist in {} for other cwds \
+             — `dbg` is cwd-scoped; run from the same directory where you did `dbg start`)",
+            dir.display(),
+        )
+    }
 }
 
 /// Check if a daemon is running.
@@ -1276,21 +1459,24 @@ pub fn clean_stale_runtime_files() {
 /// socket/pid files are cleared — callers that immediately spawn a
 /// new daemon need this to be synchronous.
 pub fn kill_daemon() -> Result<String> {
-    if !is_running() {
-        let _ = std::fs::remove_file(&socket_path());
-        let _ = std::fs::remove_file(&pid_path());
+    // Resolve the target slug *once* up front. The daemon's own
+    // cleanup clears the `.latest` pointer on graceful exit, so
+    // subsequent re-evaluations of `session_slug()` would fall through
+    // to the bare cwd slug — and nuke the pid/socket of a *different*
+    // peer daemon coexisting in the same cwd.
+    let slug = session_slug();
+    if !is_slug_live(&slug) {
+        let _ = std::fs::remove_file(socket_path_for(&slug));
+        let _ = std::fs::remove_file(pid_path_for(&slug));
         return Ok("stopped".into());
     }
     let response = send_command("quit").unwrap_or_else(|_| "stopped".into());
-    // Wait for the pid to actually die. The daemon's quit handler
-    // releases the socket before exit but the kernel still needs a
-    // moment to reap the process.
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    while std::time::Instant::now() < deadline && is_running() {
+    while std::time::Instant::now() < deadline && is_slug_live(&slug) {
         std::thread::sleep(Duration::from_millis(20));
     }
-    let _ = std::fs::remove_file(&socket_path());
-    let _ = std::fs::remove_file(&pid_path());
+    let _ = std::fs::remove_file(socket_path_for(&slug));
+    let _ = std::fs::remove_file(pid_path_for(&slug));
     Ok(response)
 }
 
@@ -1374,6 +1560,88 @@ mod tests {
         assert!(!pid_path().exists(), "dead-pid file should be reaped");
         assert!(!socket_path().exists(), "stray socket file should be reaped");
         unsafe { std::env::remove_var("DBG_SESSION"); }
+    }
+
+    #[test]
+    fn allocate_slug_uses_bare_when_free() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = TempDir::new().unwrap();
+        unsafe {
+            std::env::set_var("XDG_RUNTIME_DIR", tmp.path());
+            std::env::remove_var("DBG_SESSION");
+        }
+        let base = cwd_base_slug();
+        let got = allocate_slug().unwrap();
+        assert_eq!(got, base, "free slot should return bare cwd slug");
+    }
+
+    #[test]
+    fn allocate_slug_appends_pid_when_bare_is_live() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = TempDir::new().unwrap();
+        unsafe {
+            std::env::set_var("XDG_RUNTIME_DIR", tmp.path());
+            std::env::remove_var("DBG_SESSION");
+        }
+        // Plant a live daemon at the bare slug (our own pid + socket).
+        let base = cwd_base_slug();
+        std::fs::write(pid_path_for(&base), std::process::id().to_string()).unwrap();
+        std::fs::write(socket_path_for(&base), "").unwrap();
+        let got = allocate_slug().unwrap();
+        assert!(got.starts_with(&base), "allocated slug should share cwd prefix: {got}");
+        assert_ne!(got, base, "must not reuse the busy bare slot");
+        assert!(got.contains('-'), "pid-suffixed slug expected: {got}");
+    }
+
+    #[test]
+    fn allocate_slug_fails_on_explicit_collision() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = TempDir::new().unwrap();
+        unsafe {
+            std::env::set_var("XDG_RUNTIME_DIR", tmp.path());
+            std::env::set_var("DBG_SESSION", "named-slot");
+        }
+        std::fs::write(pid_path_for("named-slot"), std::process::id().to_string()).unwrap();
+        std::fs::write(socket_path_for("named-slot"), "").unwrap();
+        let err = allocate_slug().unwrap_err();
+        assert!(err.to_string().contains("already live"), "{err}");
+        unsafe { std::env::remove_var("DBG_SESSION"); }
+    }
+
+    #[test]
+    fn pointer_file_is_honored_when_live() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = TempDir::new().unwrap();
+        unsafe {
+            std::env::set_var("XDG_RUNTIME_DIR", tmp.path());
+            std::env::remove_var("DBG_SESSION");
+        }
+        let base = cwd_base_slug();
+        let pid_slug = format!("{base}-9999999");
+        std::fs::write(pid_path_for(&pid_slug), std::process::id().to_string()).unwrap();
+        std::fs::write(socket_path_for(&pid_slug), "").unwrap();
+        write_latest_pointer(&pid_slug);
+        assert_eq!(session_slug(), pid_slug, "pointer should win over bare fallback");
+    }
+
+    #[test]
+    fn live_slugs_in_cwd_enumerates_peers() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = TempDir::new().unwrap();
+        unsafe {
+            std::env::set_var("XDG_RUNTIME_DIR", tmp.path());
+            std::env::remove_var("DBG_SESSION");
+        }
+        let base = cwd_base_slug();
+        let a = base.clone();
+        let b = format!("{base}-111");
+        for s in [&a, &b] {
+            std::fs::write(pid_path_for(s), std::process::id().to_string()).unwrap();
+            std::fs::write(socket_path_for(s), "").unwrap();
+        }
+        let peers = live_slugs_in_cwd();
+        assert!(peers.contains(&a), "missing {a}: {peers:?}");
+        assert!(peers.contains(&b), "missing {b}: {peers:?}");
     }
 
     #[test]
