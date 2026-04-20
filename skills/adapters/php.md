@@ -1,4 +1,9 @@
-# PHP Adapter (phpdbg)
+# PHP Adapter
+
+For canonical commands and the investigation taxonomy see
+[`_canonical-commands.md`](./_canonical-commands.md) and
+[`_taxonomy-debug.md`](./_taxonomy-debug.md). This file covers only the
+PHP / phpdbg specifics. For profiling see `php-profile.md`.
 
 ## CLI
 
@@ -12,76 +17,37 @@ Start: `dbg start php <script.php> [--break file.php:line] [--args ...] [--run]`
 | PHP 8.0+ | `php --version` | `sudo apt install php` or `brew install php` |
 | phpdbg | `which phpdbg` | Bundled with PHP since 5.6 |
 
-## Build
+Verify the right PHP: `which php`. The daemon inherits env from `dbg start` — do not prepend env vars per command.
 
-None. Scripts run directly. Verify correct PHP: `which php`, `php --version`.
+## Backend: phpdbg
 
-## Breakpoint Patterns
+Canonical commands translate to phpdbg — see `_canonical-commands.md`. `dbg print <expr>` runs PHP in the current scope (maps to phpdbg's `ev`).
 
-| Pattern | When |
-|---------|------|
-| `file.php:42` | File and line |
-| `my_function` | Function entry |
-| `MyClass::method` | Method entry |
-| `0x<address>` | Opline address |
+## PHP-specific breakpoints
 
-phpdbg starts paused before execution. Use `--run` to continue to first breakpoint.
+| Canonical form | When |
+|---|---|
+| `dbg break file.php:42` | File and line |
+| `dbg break my_function` | Function entry |
+| `dbg break MyClass::method` | Method entry |
+| `dbg break <loc> if <expr>` | Conditional |
 
-## Key Commands
+## Type display
 
-| Command | Alias | What it does |
-|---------|-------|-------------|
-| `run` | `r` | Start/restart execution |
-| `step` | `s` | Step into (enters functions) |
-| `next` | `n` | Step over |
-| `continue` | `c` | Continue to next breakpoint |
-| `finish` | `F` | Run to end of current function |
-| `leave` | `L` | Run to return of current function |
-| `until` | `u` | Continue past current line |
-| `break` | `b` | Set breakpoint |
-| `ev <expr>` | — | Evaluate PHP expression in current scope |
-| `back` | `t` | Show backtrace |
-| `frame <n>` | — | Select stack frame |
-| `info` | `i` | Show debug info (`info break`, `info locals`) |
-| `list` | `l` | Display source code |
-| `print` | `p` | Print opcodes |
-| `watch` | `w` | Set watchpoint on variable |
-| `clear` | — | Clear all breakpoints |
+- **Arrays**: `dbg print print_r($array, true)` or `dbg print var_export($array, true)`.
+- **Objects**: `dbg print get_object_vars($obj)` or `dbg print var_export($obj, true)`.
+- **Large data**: `dbg print array_slice($big_array, 0, 5, true)`.
+- **Class info**: `dbg print get_class($obj)`, `dbg print get_class_methods($obj)`.
+- **Type check**: `dbg print get_debug_type($var)`.
 
-## Key Differences from PDB/LLDB
+Opcodes: `dbg raw print exec` shows opcodes for the current file — rarely needed.
 
-- Evaluate expressions: `ev $variable` (not `p $variable`)
-- Backtrace: `back` or `t` (not `bt` or `where`)
-- Step out: `finish` / `F` (not `return`)
-- Locals: `info locals` (not `locals()`)
-- Opcodes: `print exec` shows opcodes for the current file
-- No `!` prefix — `ev` handles all expression evaluation
-
-## In-Process Execution
-
-The `ev` command runs arbitrary PHP in the current scope:
-```
-ev $x + $y
-ev var_dump($object)
-ev array_keys($config)
-ev count($items)
-ev json_encode($data, JSON_PRETTY_PRINT)
-```
-
-## Type Display
-
-- **Arrays**: `ev print_r($array)` or `ev var_dump($array)`
-- **Objects**: `ev var_dump($obj)` or `ev get_object_vars($obj)`
-- **Large data**: `ev array_slice($big_array, 0, 5)`
-- **Class info**: `ev get_class($obj)` and `ev get_class_methods($obj)`
-- **Type check**: `ev gettype($var)` or `ev get_debug_type($var)`
-
-## Common Failures
+## Known blind spots
 
 | Symptom | Fix |
 |---------|-----|
-| `phpdbg` not found | Install PHP — phpdbg ships with standard PHP packages |
-| Breakpoint not hit | Check file path — use path relative to execution dir |
-| `ev` shows opcodes instead of value | Use `ev var_dump($x)` for complex types |
-| Extensions missing | Check `php -m` for loaded extensions |
-| Segfault on startup | Try `phpdbg -n -e script.php` to disable extensions |
+| `phpdbg` not found | Install PHP — phpdbg ships with standard PHP packages. |
+| Breakpoint not hit | Path mismatch — use absolute paths. |
+| `dbg print` returns opcodes | Wrap with `var_dump`/`var_export` for complex types. |
+| Missing extensions | `php -m` to list; add `dl()` or config before `dbg start`. |
+| Segfault on startup | `phpdbg -n` disables extensions — test in isolation. |

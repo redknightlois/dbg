@@ -1,5 +1,7 @@
 # .NET JIT Disassembly Adapter
 
+For canonical cross-track queries see [`_canonical-commands.md`](./_canonical-commands.md). `dbg disasm <sym>` inside any .NET debug session will serve pre-captured jitdasm output when available; `dbg disasm-diff <sym_a> <sym_b>` highlights tier-0 vs tier-1 codegen differences across runs.
+
 ## CLI
 
 ```
@@ -7,7 +9,7 @@ dbg start jitdasm <project.csproj> --args <method-pattern>
 dbg start jitdasm <project.csproj>                          # captures ALL methods
 ```
 
-The session builds the project, captures JIT disassembly, indexes it, and drops you into an interactive shell with query commands.
+The session builds the project, captures JIT disassembly, indexes it, and drops you into an interactive shell with query commands. The indexed data is also written to the SessionDb, so downstream `dbg cross <sym>` queries pick it up.
 
 ## Preconditions
 
@@ -77,6 +79,13 @@ The .NET JIT uses **single colon** `Class:Method` notation, NOT C++ double-colon
 | `CORINFO_HELP_RNGCHKFAIL` | Bounds check — possible missed optimization |
 | `vzeroupper` missing | AVX/SSE transition penalty risk |
 | `mov [rsp+...]` | Stack spill — register pressure |
+
+## Workflow with a debug session
+
+1. `dbg start jitdasm myapp.csproj` — capture codegen for everything.
+2. `dbg kill`, then `dbg start dotnet myapp.csproj --break File.cs:42 --run`.
+3. At the hit: `dbg at-hit disasm` serves the pre-captured jitdasm for the current frame; `dbg cross <sym>` joins hits + disasm + source.
+4. Run a second baseline (before an optimization): `dbg save before`. After changes: `dbg diff before` shows hit-count deltas, and `dbg disasm-diff <sym_a> <sym_b>` shows the codegen shift.
 
 ## Common Failures
 

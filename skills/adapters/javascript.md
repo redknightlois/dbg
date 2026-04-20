@@ -1,10 +1,17 @@
 # JavaScript / TypeScript Adapter
 
+For canonical commands and the investigation taxonomy see
+[`_canonical-commands.md`](./_canonical-commands.md) and
+[`_taxonomy-debug.md`](./_taxonomy-debug.md). This file covers only the
+Node / V8 Inspector specifics. For CPU profiling see `js-profile.md`.
+
 ## CLI
 
 Start: `dbg start node <script.js> [--break file.js:line] [--args ...] [--run]`
 
-Also works with: `dbg start js`, `dbg start typescript`, `dbg start ts`
+Aliases: `js`, `javascript`, `ts`, `typescript`, `nodejs`, `bun`, `deno`. Auto-detect picks this adapter from `.js`/`.mjs`/`.ts` extensions.
+
+Attach mode: `dbg start node --attach-port <PORT>` connects to an already-running Node process started with `--inspect=<PORT>`.
 
 ## Preconditions
 
@@ -13,82 +20,50 @@ Also works with: `dbg start js`, `dbg start typescript`, `dbg start ts`
 | `dbg` | `which dbg` | `cargo install dbg-cli` — ensure `~/.cargo/bin` is in PATH |
 | Node.js 18+ | `node --version` | https://nodejs.org or `nvm install --lts` |
 
-## Build
+For TypeScript: compile with source maps (`tsc --sourceMap`) or run under `tsx`. Without maps, `dbg list` shows transpiled JS.
 
-None. Scripts run directly. For TypeScript, compile first with `tsc` or use `tsx`.
+## Backend: node-proto (V8 Inspector)
 
-## Breakpoint Patterns
+The old PTY-based `node-inspect` REPL is retired; every Node alias now routes through the V8 Inspector transport. Canonical commands translate to Inspector RPCs — translation table in `_canonical-commands.md`. `dbg raw <native-cmd>` sends directly to the Inspector (not the dying `node inspect` CLI).
 
-| Pattern | When |
-|---------|------|
-| `file.js:42` | File and line |
-| `42` | Line in current file |
-| `functionName` | Function entry |
+## JS/TS-specific breakpoints
 
-The debugger starts paused at line 1. Use `--run` to continue to first breakpoint.
+| Canonical form | When |
+|---|---|
+| `dbg break file.js:42` | File and line |
+| `dbg break functionName` | Function entry (script-scope) |
+| `dbg break file.js:42 if <expr>` | Conditional (evaluated in V8) |
+| `dbg break file.js:42 log "x={x}"` | Logpoint (no stop) |
+| `dbg catch uncaught` | Pause on uncaught exceptions |
+| `dbg catch all` | Pause on every thrown exception |
 
-## Key Commands
+## Type display
 
-| Command | Alias | What it does |
-|---------|-------|-------------|
-| `cont` | `c` | Continue to next breakpoint |
-| `next` | `n` | Step over |
-| `step` | `s` | Step into |
-| `out` | `o` | Step out of current function |
-| `bt` | — | Show backtrace |
-| `list(N)` | — | Show N lines of surrounding source |
-| `sb('file', line)` | — | Set breakpoint |
-| `cb('file', line)` | — | Clear breakpoint |
-| `breakpoints` | — | List all breakpoints |
-| `watch('expr')` | — | Watch an expression |
-| `unwatch('expr')` | — | Remove watch |
-| `repl` | — | Enter REPL in current frame |
-| `exec <expr>` | — | Evaluate expression in current frame |
-| `.exit` | — | Quit debugger |
-
-## Key Differences from PDB/LLDB
-
-- Continue: `cont` or `c` (not `continue`)
-- Step out: `out` or `o` (not `finish` or `return`)
-- Backtrace: `bt` (like LLDB, not `where` like PDB)
-- Set breakpoint: `sb('file.js', line)` (function call syntax, not `break file:line`)
-- Evaluate: `exec expression` or enter `repl` mode (not `p` or `!`)
-
-## REPL Mode
-
-Type `repl` to enter a full JavaScript REPL in the current frame context:
-```
-repl
-> variableName
-> obj.method()
-> require('util').inspect(deepObj, {depth: null})
-```
-Press Ctrl+C to return to debugger.
-
-## Type Display
-
-- **Objects**: `exec JSON.stringify(obj, null, 2)` or `repl` then inspect directly
-- **Arrays**: `exec arr.length` and `exec arr.slice(0, 5)`
-- **Maps/Sets**: `exec [...myMap.entries()]` or `exec [...mySet]`
-- **Buffers**: `exec buf.toString('hex')` or `exec buf.toString('utf8')`
-- **Promises**: `exec p.then(v => console.log(v))`
-- **Classes**: `exec Object.getOwnPropertyNames(obj)` for all properties
-- **Errors**: `exec err.stack`
+- **Objects**: `dbg print JSON.stringify(obj, null, 2)` for a printable form.
+- **Arrays**: `dbg print arr.length`, `dbg print arr.slice(0, 5)`.
+- **Maps/Sets**: `dbg print [...myMap.entries()]`, `dbg print [...mySet]`.
+- **Buffers**: `dbg print buf.toString('utf8')` (or `'hex'`).
+- **Promises**: `dbg print await p` (V8 supports top-level await in eval).
+- **Errors**: `dbg print err.stack`.
 
 ## Async / Promises
 
-- Backtrace may show internal V8 frames for async code
-- Use `exec` to inspect promise state
-- Breakpoints work in `async` functions and `.then()` callbacks
-- `await` expressions can be evaluated in `repl` mode
+- `dbg stack` may include internal V8 async frames — filter to your files with `dbg frame <n>`.
+- Breakpoints fire in `async` functions, `.then()` callbacks, and async generators.
+- Set variables with `dbg set <name>=<expr>` (Inspector `Runtime.evaluate`).
 
-## Common Failures
+## TypeScript source maps
+
+- With valid source maps, `dbg break file.ts:42` resolves to the compiled location automatically.
+- Without source maps, breakpoints must target the compiled `.js`. `dbg list` reflects whatever V8 loaded.
+
+## Known blind spots
 
 | Symptom | Fix |
 |---------|-----|
-| `Cannot find module` | Wrong working directory — check `exec process.cwd()` |
-| Breakpoint not hit | File path mismatch — use path relative to entry script |
-| TypeScript source not shown | Compile with source maps (`tsc --sourceMap`) or use `tsx` |
-| `EADDRINUSE` | Port conflict — kill previous debugger: `dbg kill` |
-| Variables show `undefined` | Step past the declaration line — V8 hoists but doesn't initialize |
-| Stuck after `cont` | Program may have exited — check output for completion message |
+| `Cannot find module` | Wrong working directory — `dbg print process.cwd()`. |
+| Breakpoint not hit | Path mismatch — use absolute paths or the path V8 reports in `dbg stack`. |
+| TypeScript source not shown | Compile with source maps or use `tsx`. |
+| `EADDRINUSE` on attach | Previous Inspector didn't release the port — `dbg kill` before retrying. |
+| Variables `undefined` | Step past the declaration line — V8 hoists but doesn't initialize. |
+| Bun/Deno target quirks | They speak the Inspector protocol but with gaps — fall back to `dbg raw` if a canonical op errors. |

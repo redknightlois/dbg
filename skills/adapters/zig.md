@@ -1,5 +1,10 @@
 # Zig Adapter
 
+For canonical commands and the investigation taxonomy see
+[`_canonical-commands.md`](./_canonical-commands.md) and
+[`_taxonomy-debug.md`](./_taxonomy-debug.md). This file covers only the
+Zig / LLDB specifics.
+
 ## CLI
 
 `dbg start zig <binary> [--break file.zig:line] [--run]`
@@ -11,7 +16,7 @@
 | `dbg` | `which dbg` | `cargo install dbg-cli` — ensure `~/.cargo/bin` is in PATH |
 | `lldb` | `which lldb-20 \|\| which lldb` | `sudo apt install lldb-20` |
 
-Build with debug info: `zig build` (default Debug mode includes symbols).
+Build in Debug mode (default) for usable locals: `zig build`.
 
 ## Build
 
@@ -20,26 +25,30 @@ zig build                    # Debug mode (default)
 zig build-exe src/main.zig   # single file
 ```
 
-## Breakpoint Patterns
+## Backend: LLDB
 
-| Pattern | When |
-|---------|------|
-| `file.zig:42` | File and line |
-| `main` | Entry point |
-| `@panic` | Catch Zig panics |
+Canonical commands translate to standard LLDB vocabulary — see the mapping table in `_canonical-commands.md`.
 
-## Type Display
+## Zig-specific breakpoints
 
-- **Slices**: Shows `ptr` and `len`. Use `memory read` on ptr for raw data.
-- **Optionals** (`?T`): Similar to Rust `Option` — discriminant + value.
-- **Error unions** (`!T`): Shows error code or payload.
-- **Strings** (`[]const u8`): Slice of bytes — `ptr` field shows content.
-- **Packed structs**: May show unexpected layout — field order matches declaration.
+| Canonical form | When |
+|---|---|
+| `dbg break file.zig:42` | File and line |
+| `dbg break main` | Entry point |
+| `dbg break std.debug.panic` | Catch Zig panics |
 
-## Common Failures
+## Type display under LLDB
+
+- **Slices** (`[]T`): `ptr` + `len`. Use `dbg raw memory read <ptr>` for raw bytes.
+- **Optionals** (`?T`): discriminant + value, similar to Rust `Option`.
+- **Error unions** (`!T`): error code or payload.
+- **Strings** (`[]const u8`): slice of bytes — `ptr` shows content.
+- **Packed structs**: field order matches declaration; layout may surprise.
+
+## Known blind spots
 
 | Symptom | Fix |
 |---------|-----|
-| Variables optimized out | Build in Debug mode (`zig build` default) |
-| No source for std | Zig std is precompiled — breakpoint on your code instead |
-| Mangled names | Zig uses its own mangling — look for your module name in bt |
+| Variables optimized out | Build in Debug mode (`zig build` default). |
+| No source for std | Zig std is precompiled — break on your code. |
+| Mangled names | Zig mangling differs from C++; look for your module prefix. |

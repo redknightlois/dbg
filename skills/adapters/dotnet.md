@@ -1,8 +1,16 @@
 # .NET Adapter
 
+For canonical commands and the investigation taxonomy see
+[`_canonical-commands.md`](./_canonical-commands.md) and
+[`_taxonomy-debug.md`](./_taxonomy-debug.md). This file covers only the
+.NET / netcoredbg specifics. For .NET JIT disassembly see `jitdasm.md`;
+for CPU profiling see `dotnet-trace.md`.
+
 ## CLI
 
-Start: `dbg start dotnet <exe-or-dll-or-dir> [--break File.cs:line] [--args ...] [--run]`
+`dbg start dotnet <exe-or-dll-or-project-or-csproj> [--break File.cs:line] [--args ...] [--run]`
+
+Aliases: `csharp`, `fsharp`. The CLI prefers the apphost over `.dll`. `.csproj` targets are built automatically before launch. Source files (`.cs`) are rejected with a hint to build first.
 
 ## Preconditions
 
@@ -19,44 +27,43 @@ curl -sL https://github.com/Samsung/netcoredbg/releases/latest/download/netcored
 export NETCOREDBG=~/.local/share/netcoredbg/netcoredbg/netcoredbg
 ```
 
-If `DOTNET_ROOT` is needed (homebrew, custom installs), tell the user to add it to their shell profile (`~/.bashrc` or `~/.zshrc`) rather than setting it per-command. The daemon inherits the environment from `dbg start` — do NOT prepend env vars to every `dbg` command.
+If `DOTNET_ROOT` is required (homebrew, custom installs), add it to the user's shell profile — not per-command. The daemon inherits env from `dbg start`.
 
-## Build
+## Backend: netcoredbg-proto (DAP)
 
-```bash
-dotnet build -c Debug
-```
+Canonical commands translate through netcoredbg's DAP adapter. Translation table in `_canonical-commands.md`. `watch` is unsupported on netcoredbg — use `dbg catch` for exceptions and conditional breaks for state changes.
 
-Target resolution: pass a native executable (preferred), `.dll`, project directory, or `.csproj`. The CLI prefers the apphost over `.dll`.
+## .NET-specific breakpoints
 
-## Breakpoint Patterns
+| Canonical form | When |
+|---|---|
+| `dbg break File.cs:42` | File and line |
+| `dbg break Namespace.Class.Method` | Fully qualified method |
+| `dbg break Module!Namespace.Class.Method` | Method in a specific assembly |
+| `dbg catch System.NullReferenceException` | Exception breakpoint |
+| `dbg catch System.Exception` | All exceptions |
+| `dbg break <loc> if <expr>` | Conditional |
+| `dbg break <loc> log "x={x}"` | Logpoint (no stop) |
 
-| Pattern | When |
-|---------|------|
-| `File.cs:42` | File and line |
-| `Namespace.Class.Method` | Fully qualified method |
-| `catch System.NullReferenceException` | Exception breakpoint |
-| `catch System.Exception` | All exceptions |
+Breakpoints are **pending** until the assembly loads — this is normal; `dbg run` resolves them.
 
-Breakpoints are **pending** until `run` loads the assembly. This is normal.
+## Type display
 
-## Type Display
+- **Collections**: full internals dumped — focus on `Count`; use `dbg print dict[key]`.
+- **Strings**: printed directly.
+- **`Nullable<T>`**: `HasValue` + `Value` fields.
+- **Async state machines**: `dbg stack` shows `MoveNext()` frames; locals appear as state-machine fields and may hop threads between awaits.
 
-- **Collections**: Dumps all internals. Focus on `Count`, use `print dict[key]` for values
-- **Strings**: Printed directly as values
-- **Nullable<T>**: Shows `HasValue` and `Value`
+## Cross-track with jitdasm
 
-## Async / Task
+After a hit, `dbg at-hit disasm` captures the current frame's JIT'd code into the SessionDb. `dbg disasm-diff <sym_a> <sym_b>` highlights tier-0 vs tier-1 codegen differences.
 
-- Backtrace shows `MoveNext()` frames (state machine steps)
-- Locals may appear as state machine fields
-- Tasks can hop threads
-
-## Common Failures
+## Known blind spots
 
 | Symptom | Fix |
 |---------|-----|
-| `COR_E_FILENOTFOUND` | Set `DOTNET_ROOT` |
-| Breakpoint stays pending | Normal until `run` loads the module |
-| `.dll` fails to launch | Use the native executable instead |
-| `list` shows no source | Add `<EmbedAllSources>true</EmbedAllSources>` to csproj |
+| `COR_E_FILENOTFOUND` | Set `DOTNET_ROOT` in shell profile. |
+| Breakpoint stays pending | Normal until `dbg run` loads the module. |
+| `.dll` fails to launch | Pass the native apphost executable instead. |
+| `dbg list` shows no source | Add `<EmbedAllSources>true</EmbedAllSources>` to csproj. |
+| BenchmarkDotNet target | Not supported — BDN spawns isolated child processes. Write a standalone driver. |

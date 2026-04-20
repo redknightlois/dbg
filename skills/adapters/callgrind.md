@@ -1,5 +1,7 @@
 # Callgrind Adapter (Valgrind)
 
+For the taxonomy see [`_taxonomy-debug.md`](./_taxonomy-debug.md). The callgrind REPL is profile-only (no debug track), so canonical debug ops don't apply here — but profile samples get written into the SessionDb and correlate with any debug-track `dbg cross <sym>` query run on the same binary.
+
 ## CLI
 
 `dbg start callgrind <binary> [--args ...]`
@@ -8,7 +10,9 @@
 
 Callgrind profiles **any native binary** — C, C++, Rust, Zig, Go, anything compiled to machine code. It simulates the CPU and counts every instruction executed. No kernel support needed, no sampling — exact, deterministic instruction counts. Same input always produces the same profile.
 
-**Good at:** function-level instruction cost, finding hot paths deterministically, call graph analysis with exact call counts.
+With branch-prediction simulation enabled (default), callgrind also tracks `Bi` (branches issued) and `Bcm` (branch mispredicts) per function — surfaced in the profile output for finding mispredict hotspots.
+
+**Good at:** function-level instruction cost, finding hot paths deterministically, call graph analysis with exact call counts, branch-mispredict hunting.
 
 **Cannot do:** interpreted languages (Python, Java — it profiles the interpreter, not your code), wall-clock time (measures instructions, not real time — I/O-bound programs look fast), production profiling (20-50x slowdown makes it lab-only).
 
@@ -51,6 +55,7 @@ Callgrind runs the binary under Valgrind's instrumentation. After the program fi
 5. Call graph: `dbg calls <function>` and `dbg callers <function>`
 6. Hot path: `dbg hotpath` — most expensive call chain
 7. Focus: `dbg focus <pattern>` — zoom into a subsystem
+8. Cross-track: run a debug session on the same binary (e.g. `dbg start cpp ./binary`) and query `dbg cross <hot_func>` to join profile samples with captured debug hits and disassembly.
 
 ## Common Failures
 
@@ -59,3 +64,4 @@ Callgrind runs the binary under Valgrind's instrumentation. After the program fi
 | Too slow | Use a minimal test case — callgrind instruments every instruction |
 | No source file info | Compile with `-g`, ensure source is accessible at same path |
 | All time in interpreter | Callgrind profiles native code only — use language-specific profilers for Python/Java |
+| `Bcm` column always zero | Branch-prediction sim disabled — rerun without `--branch-sim=no` (default is on) |

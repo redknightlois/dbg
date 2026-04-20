@@ -62,3 +62,4 @@ curl -o heap.prof http://localhost:6060/debug/pprof/heap
 | No samples | Benchmark ran too briefly — increase `-benchtime` |
 | `<unknown>` functions | Binary stripped — rebuild without `-ldflags=-s -w` |
 | All time in runtime.* | No user code in hot path — profile is accurate, optimize elsewhere |
+| `dbg start pprof <binary>` hangs / prompt timeout | You passed a raw binary instead of a `profile.prof`. `dbg` now detects ELF magic and surfaces this explicitly — pass the generated `.prof` file. |

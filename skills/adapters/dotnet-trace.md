@@ -1,8 +1,12 @@
 # .NET Trace Adapter (dotnet-trace)
 
+For the profiling taxonomy see [`_taxonomy-debug.md`](./_taxonomy-debug.md). Profile samples feed the SessionDb, so `dbg cross <sym>` from a debug session on the same binary joins CPU samples with captured hits.
+
 ## CLI
 
-`dbg start dotnet-trace <binary> [--args ...]`
+`dbg start dotnet-trace <exe-or-dll-or-csproj> [--args ...]`
+
+Pass a `.csproj` and `dbg` builds it before tracing (routed through `resolve_dotnet`).
 
 ## What It Profiles
 
