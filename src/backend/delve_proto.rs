@@ -5,12 +5,9 @@
 //! then the shared `DapTransport` handles the rest of the handshake
 //! (initialize / launch / configurationDone).
 
-use std::sync::OnceLock;
-
-use regex::Regex;
 use serde_json::{Value, json};
 
-use super::canonical::{BreakLoc, CanonicalOps, HitEvent};
+use super::canonical::{BreakLoc, CanonicalOps};
 use super::{Backend, CleanResult, Dependency, DependencyCheck, SpawnConfig};
 
 pub struct DelveProtoBackend;

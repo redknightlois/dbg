@@ -301,11 +301,6 @@ impl JitIndex {
         out
     }
 
-    /// `simd` — find methods using SIMD instructions.
-    pub fn cmd_simd(&self) -> String {
-        self.cmd_simd_filtered("")
-    }
-
     /// `simd [pattern]` — find methods using SIMD instructions,
     /// optionally scoped to a name-substring filter.
     pub fn cmd_simd_filtered(&self, pattern: &str) -> String {
@@ -610,7 +605,7 @@ mod tests {
     #[test]
     fn cmd_simd_finds_vectorized() {
         let idx = JitIndex::parse(SAMPLE);
-        let out = idx.cmd_simd();
+        let out = idx.cmd_simd_filtered("");
         assert!(out.contains("DotProduct"));
         assert!(out.contains("vmovups"));
         assert!(out.contains("vmulps"));
@@ -642,7 +637,7 @@ G_M1_IG03:
 ; Total bytes of code: 40
 ";
         let idx = JitIndex::parse(asm);
-        let out = idx.cmd_simd();
+        let out = idx.cmd_simd_filtered("");
         assert!(
             out.contains("no SIMD instructions found"),
             "vxorps zero-init should not count as SIMD, got:\n{out}"

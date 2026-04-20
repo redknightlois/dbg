@@ -5,12 +5,9 @@
 //! and pass it via `--server=<port>`. The shared `DapTransport`
 //! handles the rest.
 
-use std::sync::OnceLock;
-
-use regex::Regex;
 use serde_json::{Value, json};
 
-use super::canonical::{BreakLoc, CanonicalOps, HitEvent};
+use super::canonical::{BreakLoc, CanonicalOps};
 use super::{Backend, CleanResult, Dependency, DependencyCheck, SpawnConfig};
 
 pub struct NetCoreDbgProtoBackend;

@@ -64,6 +64,7 @@ impl BreakLoc {
     /// The string we store under `breakpoint_hits.location_key`. Same
     /// key is produced whether a hit came from a `file:line` breakpoint
     /// or a symbol one — stable for cross-session diffing.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn location_key(&self) -> String {
         match self {
             BreakLoc::FileLine { file, line } => format!("{file}:{line}"),

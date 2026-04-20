@@ -547,7 +547,7 @@ mod tests {
 
     #[test]
     fn import_wall_time_empty() {
-        let db = GpuDb::create(&tempfile::tempdir().unwrap().into_path().join("t.db")).unwrap();
+        let db = GpuDb::create(&tempfile::tempdir().unwrap().keep().join("t.db")).unwrap();
         import_wall_time(&db.conn).unwrap();
         assert_eq!(db.meta("wall_time_us"), "0");
     }

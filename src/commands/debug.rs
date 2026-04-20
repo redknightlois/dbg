@@ -304,12 +304,6 @@ fn dispatch_catch(ops: &dyn CanonicalOps, rest: &str) -> Dispatched {
 /// Given the canonical-op name the daemon stamped on the response,
 /// run the backend's per-op postprocess hook and prepend a
 /// `[via <tool> <version>]` header.
-pub fn decorate_output(backend: &dyn Backend, output: &str) -> String {
-    // Kept for call sites that don't yet know the canonical op.
-    // New call sites should prefer `decorate_output_for_op`.
-    decorate_output_for_op(backend, "", output)
-}
-
 pub fn decorate_output_for_op(
     backend: &dyn Backend,
     canonical_op: &str,
@@ -596,14 +590,14 @@ mod tests {
 
     #[test]
     fn decorate_prepends_via_header_when_ops_available() {
-        let out = decorate_output(&lldb(), "hello\n");
+        let out = decorate_output_for_op(&lldb(), "", "hello\n");
         assert!(out.starts_with("[via lldb"));
         assert!(out.contains("\nhello\n"));
     }
 
     #[test]
     fn decorate_passthrough_on_backend_without_ops() {
-        let out = decorate_output(&PerfBackend, "unchanged");
+        let out = decorate_output_for_op(&PerfBackend, "", "unchanged");
         assert_eq!(out, "unchanged");
     }
 

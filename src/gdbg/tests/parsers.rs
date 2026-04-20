@@ -54,7 +54,7 @@ fn ncu_csv_edge_cases() {
     use crate::db::GpuDb;
     use crate::parsers::ncu::import_ncu_csv;
 
-    let db = GpuDb::create(&tempfile::tempdir().unwrap().into_path().join("csv_edge.db")).unwrap();
+    let db = GpuDb::create(&tempfile::tempdir().unwrap().keep().join("csv_edge.db")).unwrap();
     let lid = db.add_layer("ncu", "test.csv", None, None, None).unwrap();
 
     let mut tmp = tempfile::NamedTempFile::new().unwrap();
@@ -230,7 +230,7 @@ fn diff_identical_sessions() {
 #[test]
 fn ncu_launches_excluded_from_timeline() {
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.into_path().join("ncu_tl.gpu.db");
+    let path = dir.keep().join("ncu_tl.gpu.db");
     let db = GpuDb::create(&path).unwrap();
 
     // nsys layer with 1 launch
@@ -287,7 +287,7 @@ fn recompute_with_no_ops() {
 #[test]
 fn recompute_with_no_launches() {
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.into_path().join("empty_recompute.gpu.db");
+    let path = dir.keep().join("empty_recompute.gpu.db");
     let db = GpuDb::create(&path).unwrap();
     // No layers, no launches, no ops — should not panic
     db.recompute_op_gpu_times();
@@ -300,7 +300,7 @@ fn recompute_with_no_launches() {
 #[test]
 fn negative_duration_does_not_corrupt() {
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.into_path().join("neg_dur.gpu.db");
+    let path = dir.keep().join("neg_dur.gpu.db");
     let db = GpuDb::create(&path).unwrap();
     let lid = db.add_layer("nsys", "t", None, None, None).unwrap();
 
@@ -336,7 +336,7 @@ fn negative_duration_does_not_corrupt() {
 #[test]
 fn sql_injection_in_kernel_name() {
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.into_path().join("inject.gpu.db");
+    let path = dir.keep().join("inject.gpu.db");
     let mut db = GpuDb::create(&path).unwrap();
     let lid = db.add_layer("nsys", "t", None, None, None).unwrap();
 
@@ -424,7 +424,7 @@ fn chrome_trace_op_cpu_time_aggregation() {
     use crate::db::GpuDb;
     use crate::parsers::chrome_trace::import_chrome_trace;
 
-    let db = GpuDb::create(&tempfile::tempdir().unwrap().into_path().join("ct.db")).unwrap();
+    let db = GpuDb::create(&tempfile::tempdir().unwrap().keep().join("ct.db")).unwrap();
     let lid = db.add_layer("torch", "trace.json", None, None, None).unwrap();
 
     // Minimal chrome trace with two invocations of the same op
@@ -487,7 +487,7 @@ fn chrome_trace_innermost_op_wins() {
     use crate::db::GpuDb;
     use crate::parsers::chrome_trace::import_chrome_trace;
 
-    let db = GpuDb::create(&tempfile::tempdir().unwrap().into_path().join("nested.db")).unwrap();
+    let db = GpuDb::create(&tempfile::tempdir().unwrap().keep().join("nested.db")).unwrap();
     let lid = db.add_layer("torch", "trace.json", None, None, None).unwrap();
 
     // Outer op contains inner op contains kernel

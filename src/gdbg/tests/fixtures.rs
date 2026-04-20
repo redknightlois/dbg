@@ -18,7 +18,7 @@ use rusqlite::params;
 ///   - Varying launch configs, small kernels, high-variance kernels
 pub(super) fn build_session() -> GpuDb {
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.into_path().join("session.gpu.db");
+    let path = dir.keep().join("session.gpu.db");
     let db = GpuDb::create(&path).unwrap();
 
     db.set_meta("target", "train.py").unwrap();
@@ -283,7 +283,7 @@ pub(super) fn build_session() -> GpuDb {
 
 pub(super) fn build_cuda_only_session() -> GpuDb {
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.into_path().join("cuda_only.gpu.db");
+    let path = dir.keep().join("cuda_only.gpu.db");
     let db = GpuDb::create(&path).unwrap();
 
     db.set_meta("target", "matmul.cu").unwrap();
@@ -358,7 +358,7 @@ pub(super) fn build_cuda_only_session() -> GpuDb {
 
 pub(super) fn build_triton_inference_session() -> GpuDb {
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.into_path().join("triton_inf.gpu.db");
+    let path = dir.keep().join("triton_inf.gpu.db");
     let db = GpuDb::create(&path).unwrap();
 
     db.set_meta("target", "serve.py").unwrap();
@@ -469,7 +469,7 @@ pub(super) fn build_triton_inference_session() -> GpuDb {
 
 pub(super) fn build_multi_stream_session() -> GpuDb {
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.into_path().join("multi_stream.gpu.db");
+    let path = dir.keep().join("multi_stream.gpu.db");
     let db = GpuDb::create(&path).unwrap();
 
     db.set_meta("target", "pipeline.py").unwrap();

@@ -177,9 +177,6 @@ pub struct DapTransport {
     state: Arc<(Mutex<State>, Condvar)>,
     shutdown: Arc<AtomicBool>,
     driver: Mutex<Option<JoinHandle<()>>>,
-    /// Absolute path of the program being debugged, for
-    /// `setBreakpoints` path resolution.
-    target_path: String,
 }
 
 impl DapTransport {
@@ -188,7 +185,7 @@ impl DapTransport {
     /// transport positioned just before the first `stopped` event.
     /// Callers that need `stopOnEntry=true` behaviour bake it into
     /// `launch_args`; the transport doesn't assume either way.
-    pub fn spawn(target: &str, cfg: DapLaunchConfig) -> Result<Self> {
+    pub fn spawn(cfg: DapLaunchConfig) -> Result<Self> {
         let mut cmd = Command::new(&cfg.bin);
         cmd.args(&cfg.args)
             .stdin(Stdio::null())
@@ -271,9 +268,6 @@ impl DapTransport {
             state,
             shutdown,
             driver: Mutex::new(Some(driver)),
-            target_path: std::fs::canonicalize(target)
-                .map(|p| p.display().to_string())
-                .unwrap_or_else(|_| target.to_string()),
         };
 
         // DAP handshake.

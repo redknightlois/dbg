@@ -5,12 +5,9 @@
 //! shared `DapTransport`. Launch config tells the adapter to
 //! start the target Python script in the adapter's own subprocess.
 
-use std::sync::OnceLock;
-
-use regex::Regex;
 use serde_json::{Value, json};
 
-use super::canonical::{BreakLoc, CanonicalOps, HitEvent};
+use super::canonical::{BreakLoc, CanonicalOps};
 use super::{Backend, CleanResult, Dependency, DependencyCheck, SpawnConfig};
 
 pub struct DebugpyProtoBackend;

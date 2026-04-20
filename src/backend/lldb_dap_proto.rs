@@ -2,12 +2,9 @@
 //! adapter. Layers over the shared `DapTransport`; this backend just
 //! supplies the spawn command and launch config.
 
-use std::sync::OnceLock;
-
-use regex::Regex;
 use serde_json::{Value, json};
 
-use super::canonical::{BreakLoc, CanonicalOps, HitEvent};
+use super::canonical::{BreakLoc, CanonicalOps};
 use super::{Backend, CleanResult, Dependency, DependencyCheck, SpawnConfig};
 
 pub struct LldbDapProtoBackend;

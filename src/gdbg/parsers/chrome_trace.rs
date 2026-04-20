@@ -241,7 +241,7 @@ mod tests {
 
     #[test]
     fn import_chrome_trace_basic() {
-        let db = GpuDb::create(&tempfile::tempdir().unwrap().into_path().join("t.db")).unwrap();
+        let db = GpuDb::create(&tempfile::tempdir().unwrap().keep().join("t.db")).unwrap();
         let lid = db.add_layer("torch", "test.json", None, None, None).unwrap();
 
         let trace = r#"{

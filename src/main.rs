@@ -682,7 +682,6 @@ fn cmd_start(registry: &Registry, args: &[String]) -> Result<()> {
     let mut run_args = Vec::new();
     let mut do_run = false;
     let mut attach_pid: Option<u32> = None;
-    let mut attach_host_port: Option<String> = None;
     let mut i = 2;
     while i < args.len() {
         match args[i].as_str() {
@@ -707,12 +706,6 @@ fn cmd_start(registry: &Registry, args: &[String]) -> Result<()> {
                     attach_pid = args[i].parse().ok();
                 }
             }
-            "--attach-port" => {
-                i += 1;
-                if i < args.len() {
-                    attach_host_port = Some(args[i].clone());
-                }
-            }
             other if !other.starts_with("--") => {
                 // Bare positional — forward to the backend.
                 run_args.push(other.to_string());
@@ -721,14 +714,7 @@ fn cmd_start(registry: &Registry, args: &[String]) -> Result<()> {
         }
         i += 1;
     }
-    let attach = if attach_pid.is_some() || attach_host_port.is_some() {
-        Some(backend::AttachSpec {
-            pid: attach_pid,
-            host_port: attach_host_port,
-        })
-    } else {
-        None
-    };
+    let attach = attach_pid.map(|pid| backend::AttachSpec { pid: Some(pid) });
 
     // Resolve target. Attach mode doesn't need a local target file —
     // the debuggee is already running — so skip resolution and pass

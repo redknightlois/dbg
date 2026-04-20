@@ -203,7 +203,7 @@ mod tests {
     fn import_ncu_csv_basic() {
         use crate::db::GpuDb;
 
-        let db = GpuDb::create(&tempfile::tempdir().unwrap().into_path().join("t.db")).unwrap();
+        let db = GpuDb::create(&tempfile::tempdir().unwrap().keep().join("t.db")).unwrap();
         let lid = db.add_layer("ncu", "test.csv", None, None, None).unwrap();
 
         let mut tmp = tempfile::NamedTempFile::new().unwrap();

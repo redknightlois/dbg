@@ -4,8 +4,6 @@
 //! are mathematically consistent with each other.
 
 use super::fixtures::*;
-use crate::commands;
-use crate::db::GpuDb;
 use rusqlite::params;
 
 // -----------------------------------------------------------------------

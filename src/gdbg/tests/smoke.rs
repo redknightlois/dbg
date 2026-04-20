@@ -168,7 +168,7 @@ fn breakdown_no_double_count() {
 #[test]
 fn gaps_handles_overlapping_streams() {
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.into_path().join("gaps.gpu.db");
+    let path = dir.keep().join("gaps.gpu.db");
     let db = GpuDb::create(&path).unwrap();
     db.set_meta("wall_time_us", "1000").unwrap();
 
@@ -221,7 +221,7 @@ fn gaps_handles_overlapping_streams() {
     // where the old code would produce a false positive:
 
     let dir2 = tempfile::tempdir().unwrap();
-    let path2 = dir2.into_path().join("gaps2.gpu.db");
+    let path2 = dir2.keep().join("gaps2.gpu.db");
     let db2 = GpuDb::create(&path2).unwrap();
     let lid2 = db2.add_layer("nsys", "test", None, None, None).unwrap();
     db2.set_meta("wall_time_us", "2000").unwrap();
@@ -300,7 +300,7 @@ fn gaps_handles_overlapping_streams() {
 fn gap_merge_correctness() {
     // Direct test of the interval merge logic (same as compute_gpu_gaps)
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.into_path().join("gm.gpu.db");
+    let path = dir.keep().join("gm.gpu.db");
     let db = GpuDb::create(&path).unwrap();
     let lid = db.add_layer("nsys", "t", None, None, None).unwrap();
 
@@ -392,7 +392,7 @@ fn region_filter_restricts_launches() {
 #[test]
 fn empty_db_no_panic() {
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.into_path().join("empty.gpu.db");
+    let path = dir.keep().join("empty.gpu.db");
     let mut db = GpuDb::create(&path).unwrap();
 
     commands::cmd_stats(&db);
@@ -467,7 +467,7 @@ fn inspect_multiple_matches() {
 #[test]
 fn variance_single_launch() {
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.into_path().join("var.gpu.db");
+    let path = dir.keep().join("var.gpu.db");
     let db = GpuDb::create(&path).unwrap();
     let lid = db.add_layer("nsys", "t", None, None, None).unwrap();
 
@@ -632,7 +632,7 @@ fn multi_stream_gaps_account_for_overlap() {
 #[test]
 fn ncu_only_session_no_panic() {
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.into_path().join("ncu_only.gpu.db");
+    let path = dir.keep().join("ncu_only.gpu.db");
     let mut db = GpuDb::create(&path).unwrap();
 
     db.set_meta("target", "kernel.cu").unwrap();
@@ -737,7 +737,7 @@ fn multi_layer_kernels_use_timeline_filter() {
 #[test]
 fn variance_math_correctness() {
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.into_path().join("var_math.gpu.db");
+    let path = dir.keep().join("var_math.gpu.db");
     let db = GpuDb::create(&path).unwrap();
     let lid = db.add_layer("nsys", "t", None, None, None).unwrap();
 
@@ -860,15 +860,6 @@ fn breakdown_sums_consistent_with_top_ops() {
 #[test]
 fn focus_filter_restricts_small_command() {
     let mut db = build_cuda_only_session();
-
-    // Without focus, "small" finds memcpy_kernel (avg ~51us, actually above 10us threshold)
-    // Let's check the actual small kernels
-    let small_count_all: i64 = db.conn.query_row(
-        "SELECT COUNT(DISTINCT kernel_name) FROM launches
-         GROUP BY kernel_name HAVING AVG(duration_us) < 10.0",
-        [],
-        |row| row.get(0),
-    ).unwrap_or(0);
 
     // Focus on sgemm — no sgemm kernels are < 10us, so cmd_small should find nothing
     commands::cmd_focus(&mut db, &["sgemm"]);

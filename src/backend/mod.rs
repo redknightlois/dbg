@@ -35,6 +35,7 @@ pub use canonical::{BreakId, BreakLoc, CanonicalOps, CanonicalReq};
 /// Result of cleaning debugger output.
 pub struct CleanResult {
     pub output: String,
+    #[cfg_attr(not(test), allow(dead_code))]
     pub events: Vec<String>,
 }
 
@@ -162,12 +163,10 @@ pub trait Backend: Send + Sync {
     }
 }
 
-/// How to locate a running debuggee for attach mode. Adapters take
-/// different identifiers — some want a pid, some a host:port.
+/// How to locate a running debuggee for attach mode.
 #[derive(Clone, Debug, Default)]
 pub struct AttachSpec {
     pub pid: Option<u32>,
-    pub host_port: Option<String>,
 }
 
 /// Path to the current dbg binary, for exec-ing into sub-REPLs.

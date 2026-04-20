@@ -689,7 +689,7 @@ mod tests {
 
     fn temp_db() -> GpuDb {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.into_path().join("test.gpu.db");
+        let path = dir.keep().join("test.gpu.db");
         GpuDb::create(&path).unwrap()
     }
 

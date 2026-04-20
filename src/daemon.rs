@@ -375,7 +375,7 @@ pub fn run_daemon(
             Some(spec) => backend.dap_attach(spec)?,
             None => backend.dap_launch(target, args)?,
         };
-        let t = crate::dap::DapTransport::spawn(target, cfg)
+        let t = crate::dap::DapTransport::spawn(cfg)
             .context("failed to spawn DAP transport")?;
         (Box::new(t), Vec::new())
     } else {
@@ -1390,8 +1390,6 @@ fn persist_session_on_exit(session: &mut Session) {
 /// with our accept loop). Without retry the second call surfaces as
 /// a misleading "no session running".
 pub fn send_command(cmd: &str) -> Result<String> {
-    use std::os::unix::net::UnixStream;
-
     let mut stream = connect_with_retry()?;
     stream.set_read_timeout(Some(CMD_TIMEOUT))?;
 

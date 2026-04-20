@@ -1188,7 +1188,7 @@ fn build_hit_event(frames: &[Value], state: &Arc<(Mutex<State>, Condvar)>) -> Hi
 enum ParsedSb {
     FileLine { file: String, line: u32 },
     Line(u32),
-    Name(String),
+    Name(#[cfg_attr(not(test), allow(dead_code))] String),
 }
 
 fn parse_sb(cmd: &str) -> Option<(ParsedSb, Option<String>)> {
