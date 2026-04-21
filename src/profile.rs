@@ -32,12 +32,15 @@ pub struct ProfileData {
     total_time: f64,
     /// Number of threads
     thread_count: usize,
-    /// Per-thread: frames seen in that thread + its root-close duration sum.
-    /// Used by `filtered_total()` to re-baseline percentages so an entire
-    /// idle thread drops from the denominator when its frames match `ignore`.
-    threads: Vec<(HashSet<usize>, f64)>,
-    /// Close events, each carrying the thread, open/close timestamps, and
-    /// full stack path (root → innermost). Drives time-window queries.
+    /// Per root-invocation: the set of every frame that appeared inside
+    /// its subtree. Lets filters drop a whole root (and all its child
+    /// events) when any descendant matches — the right semantic for both
+    /// "idle thread: root wraps semaphore wait" and pprof "each sample
+    /// is its own invocation". Without this, the root-level close event
+    /// has a minimal path that escapes a path-only filter.
+    root_subtrees: Vec<HashSet<usize>>,
+    /// Close events, each carrying the thread, open/close timestamps,
+    /// full stack path (root → innermost), and the root-invocation index.
     events: Vec<StackEvent>,
     /// Focus filter (frame name substring)
     focus: Option<String>,
@@ -58,6 +61,9 @@ struct StackEvent {
     close_at: f64,
     /// Stack path from root (index 0) to the frame that just closed (last).
     path: Vec<usize>,
+    /// Which root invocation (index into `root_subtrees`) this event
+    /// belongs to. Enables subtree-level filtering.
+    root_idx: usize,
 }
 
 #[derive(Deserialize)]
@@ -182,13 +188,16 @@ impl ProfileData {
         let mut stacks: Vec<(Vec<usize>, f64)> = Vec::new();
         let mut total_time = 0.0f64;
         let thread_count = file.profiles.len();
-        let mut threads: Vec<(HashSet<usize>, f64)> = Vec::with_capacity(thread_count);
         let mut events: Vec<StackEvent> = Vec::new();
+        let mut root_subtrees: Vec<HashSet<usize>> = Vec::new();
 
         for (thread_idx, profile) in file.profiles.iter().enumerate() {
             let mut stack: Vec<(usize, f64)> = Vec::new(); // (frame_idx, open_time)
-            let mut seen: HashSet<usize> = HashSet::new();
-            let mut thread_total = 0.0f64;
+            // Buffer events for the current root invocation so we can
+            // backfill their root_idx once we know which subtree they
+            // belong to. The root subtree set is built up as frames open.
+            let mut current_root_idx: Option<usize> = None;
+            let mut pending_events: Vec<StackEvent> = Vec::new();
 
             for event in &profile.events {
                 let idx = event.frame;
@@ -198,17 +207,21 @@ impl ProfileData {
 
                 match event.event_type.as_str() {
                     "O" => {
+                        if stack.is_empty() {
+                            // Starting a new root invocation.
+                            current_root_idx = Some(root_subtrees.len());
+                            root_subtrees.push(HashSet::new());
+                        }
                         stack.push((idx, event.at));
-                        seen.insert(idx);
+                        if let Some(ri) = current_root_idx {
+                            root_subtrees[ri].insert(idx);
+                        }
                     }
                     "C" => {
                         if let Some((opened_idx, opened_at)) = stack.pop() {
                             let duration = event.at - opened_at;
                             if duration > 0.0 {
                                 inclusive[opened_idx] += duration;
-
-                                // Exclusive: subtract children's time
-                                // (we'll compute this after)
 
                                 // Record parent-child
                                 if let Some(&(parent_idx, _)) = stack.last() {
@@ -227,17 +240,21 @@ impl ProfileData {
                                     stack.iter().map(|(idx, _)| *idx).collect();
                                 trace.push(opened_idx);
                                 stacks.push((trace.clone(), duration));
-                                events.push(StackEvent {
+                                pending_events.push(StackEvent {
                                     thread: thread_idx,
                                     open_at: opened_at,
                                     close_at: event.at,
                                     path: trace,
+                                    root_idx: current_root_idx.unwrap_or(0),
                                 });
 
                                 // Track total from root frames
                                 if stack.is_empty() {
                                     total_time += duration;
-                                    thread_total += duration;
+                                    // Root just closed — flush buffered
+                                    // events; their root_idx is final.
+                                    events.append(&mut pending_events);
+                                    current_root_idx = None;
                                 }
                             }
                         }
@@ -245,7 +262,8 @@ impl ProfileData {
                     _ => {}
                 }
             }
-            threads.push((seen, thread_total));
+            // Partial (unclosed) trees at end of profile — still emit.
+            events.append(&mut pending_events);
         }
 
         // Compute exclusive = inclusive - sum(children inclusive)
@@ -266,7 +284,7 @@ impl ProfileData {
             stacks,
             total_time,
             thread_count,
-            threads,
+            root_subtrees,
             events,
             focus: None,
             ignore: None,
@@ -402,8 +420,11 @@ impl ProfileData {
         let mut parents: HashMap<usize, Vec<(usize, f64)>> = HashMap::new();
         let mut stacks: Vec<(Vec<usize>, f64)> = Vec::new();
         let mut stack_events: Vec<StackEvent> = Vec::new();
+        let mut root_subtrees: Vec<HashSet<usize>> = Vec::new();
         let mut total_time = 0.0f64;
         let mut seen: HashSet<usize> = HashSet::new();
+        let mut current_root_idx: Option<usize> = None;
+        let mut pending_events: Vec<StackEvent> = Vec::new();
 
         let mut stack: Vec<(usize, f64)> = Vec::new();
         for event in &events {
@@ -413,8 +434,15 @@ impl ProfileData {
             }
             match event.event_type.as_str() {
                 "O" => {
+                    if stack.is_empty() {
+                        current_root_idx = Some(root_subtrees.len());
+                        root_subtrees.push(HashSet::new());
+                    }
                     stack.push((idx, event.at));
                     seen.insert(idx);
+                    if let Some(ri) = current_root_idx {
+                        root_subtrees[ri].insert(idx);
+                    }
                 }
                 "C" => {
                     if let Some((opened_idx, opened_at)) = stack.pop() {
@@ -435,14 +463,17 @@ impl ProfileData {
                                 stack.iter().map(|(idx, _)| *idx).collect();
                             trace.push(opened_idx);
                             stacks.push((trace.clone(), duration));
-                            stack_events.push(StackEvent {
+                            pending_events.push(StackEvent {
                                 thread: 0,
                                 open_at: opened_at,
                                 close_at: event.at,
                                 path: trace,
+                                root_idx: current_root_idx.unwrap_or(0),
                             });
                             if stack.is_empty() {
                                 total_time += duration;
+                                stack_events.append(&mut pending_events);
+                                current_root_idx = None;
                             }
                         }
                     }
@@ -450,6 +481,7 @@ impl ProfileData {
                 _ => {}
             }
         }
+        stack_events.append(&mut pending_events);
 
         // Compute exclusive = inclusive - sum(children inclusive)
         for i in 0..n {
@@ -469,7 +501,7 @@ impl ProfileData {
             stacks,
             total_time,
             thread_count: 1,
-            threads: vec![(seen, total_time)],
+            root_subtrees,
             events: stack_events,
             focus: None,
             ignore: None,
@@ -490,38 +522,44 @@ impl ProfileData {
         if self.window.is_none() && self.focus.is_none() && self.ignore.is_none() {
             return self.total_time;
         }
-        if self.window.is_none() {
-            let mut total = 0.0;
-            for (seen, dur) in &self.threads {
-                if self.thread_passes(seen) {
-                    total += dur;
-                }
-            }
-            return total;
-        }
-        // Window active: sum root-level event overlap with [t0, t1).
+        // Same per-stack rule whether or not a window is active. The
+        // window is just a wide-open range when unset.
         self.window_metrics().1
     }
 
-    fn thread_passes(&self, seen: &HashSet<usize>) -> bool {
-        let focus_ok = match self.focus.as_deref() {
-            Some(f) => seen.iter().any(|&i| self.frames[i].name.contains(f)),
-            None => true,
+    /// Does this root invocation's subtree satisfy both focus and ignore?
+    ///
+    /// The check is over the UNION of every frame seen inside that root
+    /// call — not just the single closing frame at the event. This is
+    /// what makes `ignore LowLevelLifoSemaphore` drop the whole idle
+    /// thread even though the root close event's own path is just
+    /// `[ThreadPoolWorker]`; the subtree union includes the semaphore
+    /// frame. For pprof (1 root per sample) the subtree collapses to
+    /// the sample's stack. For multi-invocation general profiles each
+    /// root invocation is evaluated independently — sibling subtrees
+    /// survive even when one is filtered out.
+    fn root_passes(&self, root_idx: usize) -> bool {
+        let Some(subtree) = self.root_subtrees.get(root_idx) else {
+            return true;
         };
-        let ignore_ok = match self.ignore.as_deref() {
-            Some(ig) => !seen.iter().any(|&i| self.frames[i].name.contains(ig)),
-            None => true,
-        };
-        focus_ok && ignore_ok
+        if let Some(f) = self.focus.as_deref() {
+            if !subtree.iter().any(|&i| self.frames[i].name.contains(f)) {
+                return false;
+            }
+        }
+        if let Some(ig) = self.ignore.as_deref() {
+            if subtree.iter().any(|&i| self.frames[i].name.contains(ig)) {
+                return false;
+            }
+        }
+        true
     }
 
     /// Per-frame inclusive within the current window (plus baseline).
     ///
-    /// For each stack event, the overlap with `[t0, t1)` is credited to
-    /// every frame in its path; root events additionally drive the
-    /// baseline. Events from threads that fail the focus/ignore predicate
-    /// are dropped entirely — this preserves the "idle thread disappears"
-    /// semantic under windowed queries.
+    /// Events belonging to a dropped root invocation are skipped
+    /// entirely — so when a root is filtered, none of its descendants
+    /// leak through as ghost rows.
     fn window_metrics(&self) -> (Vec<f64>, f64) {
         let (t0, t1) = self.window.unwrap_or((f64::NEG_INFINITY, f64::INFINITY));
         let mut inc = vec![0.0f64; self.frames.len()];
@@ -530,23 +568,16 @@ impl ProfileData {
             if ev.close_at <= t0 || ev.open_at >= t1 {
                 continue;
             }
-            // Filter by thread membership (same predicate as filtered_total).
-            if self.focus.is_some() || self.ignore.is_some() {
-                let Some((seen, _)) = self.threads.get(ev.thread) else {
-                    continue;
-                };
-                if !self.thread_passes(seen) {
-                    continue;
-                }
+            if !self.root_passes(ev.root_idx) {
+                continue;
             }
             let overlap = ev.close_at.min(t1) - ev.open_at.max(t0);
             if overlap <= 0.0 {
                 continue;
             }
-            // Each frame's own close event accounts for its full inclusive
-            // time, so crediting only the innermost frame avoids the
-            // double-count we'd get from also crediting ancestors (whose
-            // own close events contribute their own inclusive separately).
+            // Each frame's own close event accounts for its full
+            // inclusive time, so crediting only the innermost frame
+            // avoids double-count with ancestor close events.
             if let Some(&fidx) = ev.path.last() {
                 inc[fidx] += overlap;
             }
@@ -705,15 +736,30 @@ impl ProfileData {
     }
 
     fn cmd_top(&self, n: usize) -> String {
-        // Under a time window we re-derive inclusive from event overlaps;
-        // exclusive is not meaningful in that regime without redoing the
+        // Under any active filter we recompute inclusive from event
+        // overlaps — otherwise the numerator leaks counts from dropped
+        // samples (a timer frame from an ignored stack would still show
+        // up at its pre-filter percentage against a reduced baseline).
+        // Exclusive isn't meaningful in that regime without re-doing the
         // children subtraction, so we omit it and show only inclusive.
-        let (inclusive, exclusive_available, total) = if self.window.is_some() {
+        let any_filter = self.window.is_some() || self.focus.is_some() || self.ignore.is_some();
+        let (inclusive, exclusive_available, total) = if any_filter {
             let (inc, base) = self.window_metrics();
             (inc, false, base)
         } else {
             (self.inclusive.clone(), true, self.filtered_total())
         };
+
+        // If filters eliminated the entire baseline we can't produce
+        // meaningful percentages — surface that instead of dividing by
+        // ~0 and printing millions-of-percent garbage.
+        if total <= 0.01 {
+            let active_filters = self.focus.is_some() || self.ignore.is_some() || self.window.is_some();
+            if active_filters {
+                return "(baseline is empty under current filters — nothing matched; try `reset` or a narrower ignore pattern)\n"
+                    .to_string();
+            }
+        }
 
         let mut entries: Vec<(usize, f64, f64)> = (0..self.frames.len())
             .filter(|&i| self.matches_filter(i))
@@ -975,7 +1021,7 @@ impl ProfileData {
             None => String::new(),
         };
         format!(
-            "total time: {:.2}ms\nframes: {} ({} active)\nthreads: {}\nstacks: {}\nfocus: {}\nignore: {}{}{}",
+            "total time: {:.2}ms\nframes: {} ({} active)\nprofiles: {}\nstacks: {}\nfocus: {}\nignore: {}{}{}",
             self.total_time,
             self.frames.len(),
             active_frames,
@@ -1866,6 +1912,99 @@ Duration: 1s
         );
     }
 
+    /// Regression: a frame that lived in an *ignored* sample used to
+    /// still show up in `top` output with its pre-filter inclusive
+    /// count. The baseline correctly dropped the sample's time, but
+    /// the numerator was pulled from the raw un-filtered inclusive[]
+    /// vector, so ghost frames from dropped samples kept appearing
+    /// with a non-zero percentage. After fix, any filter causes `top`
+    /// to recompute inclusive from events with the same drop rule.
+    #[test]
+    fn ignore_drops_ghost_frames_from_filtered_samples() {
+        // Mirror the shape of pprof traces: sample A = real work only,
+        // sample B = a timer stack where `park_m` appears together with
+        // `timer_clean`. Ignoring `park_m` must make both frames in the
+        // timer stack disappear — not just park_m itself.
+        let text = "\
+File: myapp
+Type: cpu
+Duration: 1s
+-----------+-------------------------------------------------------
+      630ms  main.realWork
+             main.main
+-----------+-------------------------------------------------------
+      10ms   runtime.timer_clean
+             runtime.park_m
+             runtime.mcall
+";
+        let dir = std::env::temp_dir().join("dbg-test-ghost-frames");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("t.traces.txt");
+        std::fs::write(&path, text).unwrap();
+        let mut p = ProfileData::load(&path).unwrap();
+
+        // Baseline sanity: unfiltered `top` shows the timer frame.
+        let before = p.handle_command("top");
+        assert!(before.contains("timer_clean"), "setup: {before}");
+
+        // Filter out park_m. The timer_clean frame lives in the SAME
+        // sample as park_m, so it must also vanish from top output.
+        p.handle_command("ignore park_m");
+        let after = p.handle_command("top");
+        assert!(
+            !after.contains("timer_clean"),
+            "timer_clean survived as a ghost frame from a dropped sample:\n{after}"
+        );
+        assert!(
+            !after.contains("park_m"),
+            "park_m itself must be gone too:\n{after}"
+        );
+        // realWork is in the unfiltered sample and should remain at 100%
+        // of the re-baselined denominator.
+        assert!(
+            after.contains("realWork") && after.contains("100.0%"),
+            "realWork should re-baseline to 100%:\n{after}"
+        );
+    }
+
+    /// Regression: when an ignore pattern matches every sample the
+    /// baseline goes to zero. We must NOT divide numerator/~0 and
+    /// print millions-of-percent garbage — instead surface a clear
+    /// "nothing matched" message so the user knows to widen the
+    /// pattern or reset.
+    #[test]
+    fn top_empty_baseline_reports_cleanly() {
+        let text = "\
+File: myapp
+Type: cpu
+Duration: 1s
+-----------+-------------------------------------------------------
+      10ms   main.hotWork
+             main.main
+-----------+-------------------------------------------------------
+      20ms   main.hotWork
+             main.other
+";
+        let dir = std::env::temp_dir().join("dbg-test-empty-baseline");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("t.traces.txt");
+        std::fs::write(&path, text).unwrap();
+        let mut p = ProfileData::load(&path).unwrap();
+
+        // `hotWork` is in every sample — ignoring it drops everything.
+        p.handle_command("ignore hotWork");
+        let out = p.handle_command("top");
+        assert!(
+            out.contains("baseline is empty"),
+            "expected empty-baseline hint, got:\n{out}"
+        );
+        // And crucially: no absurd percentages leak through.
+        assert!(
+            !out.contains("000000.0%") && !out.contains("0000.0%"),
+            "exploded percentages leaked through:\n{out}"
+        );
+    }
+
     #[test]
     fn pprof_traces_empty_errors() {
         let err = pprof_traces_to_speedscope("File: x\nType: cpu")
@@ -2009,7 +2148,7 @@ Duration: 1s
         let out = p.handle_command("stats");
         assert!(out.contains("total time:"));
         assert!(out.contains("frames: 4"));
-        assert!(out.contains("threads: 1"));
+        assert!(out.contains("profiles: 1"));
     }
 
     #[test]
@@ -2044,12 +2183,56 @@ Duration: 1s
     }
 
     #[test]
-    fn cmd_ignore_filters_top() {
+    fn cmd_ignore_drops_subtree_and_rebaselines() {
+        // `ignore` applies at the root-invocation granularity: if any
+        // frame in a root's subtree matches, the whole invocation
+        // drops (including main/compute/alloc here, even though they
+        // don't match the pattern themselves). This is the right
+        // semantic for real profiles — dotnet-trace idle threads and
+        // pprof samples both collapse cleanly — but it means the
+        // sample fixture, which has a single root invocation covering
+        // every frame, ends up entirely dropped when any child is
+        // ignored. Verify the user-facing signal is the empty-baseline
+        // hint rather than a silently-broken percentage.
         let mut p = load_sample();
         p.handle_command("ignore sort");
         let out = p.handle_command("top");
         assert!(!out.contains("sort"));
-        assert!(out.contains("main"));
+        assert!(
+            out.contains("baseline is empty"),
+            "expected empty-baseline hint when ignore drops the sole root: {out}"
+        );
+    }
+
+    #[test]
+    fn cmd_ignore_spares_sibling_roots() {
+        // Same data shape but with two separate root invocations: one
+        // runs `hot`, the other `idle`. Ignoring `idle` must keep the
+        // hot invocation intact at 100% of the rebaselined denominator.
+        let json = r#"{
+            "shared": {"frames": [{"name": "hot"}, {"name": "idle"}, {"name": "noise"}]},
+            "profiles": [{
+                "name": "t0",
+                "events": [
+                    {"type":"O","at":0.0,"frame":0},
+                    {"type":"C","at":10.0,"frame":0},
+                    {"type":"O","at":10.0,"frame":1},
+                    {"type":"O","at":10.0,"frame":2},
+                    {"type":"C","at":20.0,"frame":2},
+                    {"type":"C","at":20.0,"frame":1}
+                ]
+            }]
+        }"#;
+        let dir = std::env::temp_dir().join("dbg-test-sibling-roots");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("t.speedscope.json");
+        std::fs::write(&path, json).unwrap();
+        let mut p = ProfileData::load(&path).unwrap();
+        p.handle_command("ignore idle");
+        let out = p.handle_command("top");
+        assert!(out.contains("hot") && out.contains("100.0%"), "{out}");
+        assert!(!out.contains("idle"), "{out}");
+        assert!(!out.contains("noise"), "noise was under idle's subtree: {out}");
     }
 
     #[test]
@@ -2152,7 +2335,7 @@ Duration: 1s
             stacks,
             total_time: 10.0,
             thread_count: 1,
-            threads: vec![(HashSet::from([0usize, 1]), 10.0)],
+            root_subtrees: Vec::new(),
             events: Vec::new(),
             focus: None,
             ignore: None,

@@ -84,18 +84,20 @@ impl Backend for PprofBackend {
         // prompt, never bash.
         let traces_out = session_tmp("pprof.traces.txt");
         let traces_str = traces_out.display().to_string();
-        let pprof_args: Vec<String> = [vec!["tool".into(), "pprof".into()], positional.clone()]
-            .concat();
-        let quoted_args = pprof_args
+        let quoted_positional = positional
             .iter()
             .map(|a| shell_escape(a))
             .collect::<Vec<_>>()
             .join(" ");
+        // `-traces` must come before the profile positionals; pprof
+        // otherwise interprets it as another profile file to merge
+        // and silently falls back to an interactive session, yielding
+        // a near-empty traces file.
         let shell_cmd = format!(
-            "go {} -traces > {} 2>/dev/null || true; exec go {}",
-            quoted_args.clone(),
+            "go tool pprof -traces {} > {} 2>/dev/null || true; exec go tool pprof {}",
+            quoted_positional,
             shell_escape(&traces_str),
-            quoted_args,
+            quoted_positional,
         );
 
         Ok(SpawnConfig {
