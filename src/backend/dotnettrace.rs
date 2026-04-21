@@ -67,6 +67,14 @@ impl Backend for DotnetTraceBackend {
         r"\$ $"
     }
 
+    // `dotnet-trace collect -- <target>` blocks until the target exits.
+    // Real benchmarks routinely run several minutes, so the 60s default
+    // aborts start_daemon mid-collect, leaving the speedscope orphaned
+    // and `dbg status` reporting no session.
+    fn init_timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(3600)
+    }
+
     fn dependencies(&self) -> Vec<Dependency> {
         vec![
             Dependency {
@@ -99,7 +107,7 @@ impl Backend for DotnetTraceBackend {
     }
 
     fn parse_help(&self, _raw: &str) -> String {
-        "commands: top [N], callers <func>, callees <func>, traces [N], tree [N], hotpath, threads, stats, search <pattern>, focus <func>, ignore <func>, reset".to_string()
+        "commands: top [N] [--no-idle], callers <func>, callees <func>, traces [N], tree [N], hotpath, threads, stats, search <pattern>, focus <func>, ignore <func> | ignore preset <name>, window <t0> <t1> | window clear, phase add <name> <t0> <t1> | phase use <name> | phase list | phase clear, marks [threshold_ms], reset".to_string()
     }
 
     fn profile_output(&self) -> Option<String> {

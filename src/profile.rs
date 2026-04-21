@@ -1,5 +1,16 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
+
+/// Named ignore presets — expand to a concrete substring pattern.
+fn ignore_preset(name: &str) -> Option<&'static str> {
+    match name {
+        // .NET thread-pool workers parked on the lifo semaphore dominate
+        // dotnet-trace samples and drown the actual work. Matching any of
+        // these frames excludes the whole thread from the baseline.
+        "dotnet-idle" => Some("LowLevelLifoSemaphore"),
+        _ => None,
+    }
+}
 
 use anyhow::{Context, Result};
 use serde::Deserialize;
@@ -21,10 +32,32 @@ pub struct ProfileData {
     total_time: f64,
     /// Number of threads
     thread_count: usize,
+    /// Per-thread: frames seen in that thread + its root-close duration sum.
+    /// Used by `filtered_total()` to re-baseline percentages so an entire
+    /// idle thread drops from the denominator when its frames match `ignore`.
+    threads: Vec<(HashSet<usize>, f64)>,
+    /// Close events, each carrying the thread, open/close timestamps, and
+    /// full stack path (root → innermost). Drives time-window queries.
+    events: Vec<StackEvent>,
     /// Focus filter (frame name substring)
     focus: Option<String>,
     /// Ignore filter (frame name substring)
     ignore: Option<String>,
+    /// Time window (ms) — when set, top/stats restrict to events
+    /// overlapping [t0, t1) and re-derive inclusive and baseline.
+    window: Option<(f64, f64)>,
+    /// Named windows so a user can define insert/query/truth once and
+    /// switch between them with `phase use <name>`.
+    phases: HashMap<String, (f64, f64)>,
+}
+
+#[derive(Clone)]
+struct StackEvent {
+    thread: usize,
+    open_at: f64,
+    close_at: f64,
+    /// Stack path from root (index 0) to the frame that just closed (last).
+    path: Vec<usize>,
 }
 
 #[derive(Deserialize)]
@@ -126,9 +159,13 @@ impl ProfileData {
         let mut stacks: Vec<(Vec<usize>, f64)> = Vec::new();
         let mut total_time = 0.0f64;
         let thread_count = file.profiles.len();
+        let mut threads: Vec<(HashSet<usize>, f64)> = Vec::with_capacity(thread_count);
+        let mut events: Vec<StackEvent> = Vec::new();
 
-        for profile in &file.profiles {
+        for (thread_idx, profile) in file.profiles.iter().enumerate() {
             let mut stack: Vec<(usize, f64)> = Vec::new(); // (frame_idx, open_time)
+            let mut seen: HashSet<usize> = HashSet::new();
+            let mut thread_total = 0.0f64;
 
             for event in &profile.events {
                 let idx = event.frame;
@@ -139,6 +176,7 @@ impl ProfileData {
                 match event.event_type.as_str() {
                     "O" => {
                         stack.push((idx, event.at));
+                        seen.insert(idx);
                     }
                     "C" => {
                         if let Some((opened_idx, opened_at)) = stack.pop() {
@@ -165,11 +203,18 @@ impl ProfileData {
                                 let mut trace: Vec<usize> =
                                     stack.iter().map(|(idx, _)| *idx).collect();
                                 trace.push(opened_idx);
-                                stacks.push((trace, duration));
+                                stacks.push((trace.clone(), duration));
+                                events.push(StackEvent {
+                                    thread: thread_idx,
+                                    open_at: opened_at,
+                                    close_at: event.at,
+                                    path: trace,
+                                });
 
                                 // Track total from root frames
                                 if stack.is_empty() {
                                     total_time += duration;
+                                    thread_total += duration;
                                 }
                             }
                         }
@@ -177,6 +222,7 @@ impl ProfileData {
                     _ => {}
                 }
             }
+            threads.push((seen, thread_total));
         }
 
         // Compute exclusive = inclusive - sum(children inclusive)
@@ -197,8 +243,12 @@ impl ProfileData {
             stacks,
             total_time,
             thread_count,
+            threads,
+            events,
             focus: None,
             ignore: None,
+            window: None,
+            phases: HashMap::new(),
         })
     }
 
@@ -328,7 +378,9 @@ impl ProfileData {
         let mut children: HashMap<usize, Vec<(usize, f64)>> = HashMap::new();
         let mut parents: HashMap<usize, Vec<(usize, f64)>> = HashMap::new();
         let mut stacks: Vec<(Vec<usize>, f64)> = Vec::new();
+        let mut stack_events: Vec<StackEvent> = Vec::new();
         let mut total_time = 0.0f64;
+        let mut seen: HashSet<usize> = HashSet::new();
 
         let mut stack: Vec<(usize, f64)> = Vec::new();
         for event in &events {
@@ -339,6 +391,7 @@ impl ProfileData {
             match event.event_type.as_str() {
                 "O" => {
                     stack.push((idx, event.at));
+                    seen.insert(idx);
                 }
                 "C" => {
                     if let Some((opened_idx, opened_at)) = stack.pop() {
@@ -358,7 +411,13 @@ impl ProfileData {
                             let mut trace: Vec<usize> =
                                 stack.iter().map(|(idx, _)| *idx).collect();
                             trace.push(opened_idx);
-                            stacks.push((trace, duration));
+                            stacks.push((trace.clone(), duration));
+                            stack_events.push(StackEvent {
+                                thread: 0,
+                                open_at: opened_at,
+                                close_at: event.at,
+                                path: trace,
+                            });
                             if stack.is_empty() {
                                 total_time += duration;
                             }
@@ -387,9 +446,92 @@ impl ProfileData {
             stacks,
             total_time,
             thread_count: 1,
+            threads: vec![(seen, total_time)],
+            events: stack_events,
             focus: None,
             ignore: None,
+            window: None,
+            phases: HashMap::new(),
         })
+    }
+
+    /// Baseline wall-time to normalize percentages against.
+    ///
+    /// With no filters: equals `total_time`. With `focus`/`ignore` active,
+    /// we drop any thread whose frame set doesn't satisfy both predicates —
+    /// this is what makes an idle thread-pool worker disappear from the
+    /// denominator when `ignore LowLevelLifoSemaphore` is set. With a time
+    /// window active, it is the overlapped wall-time of qualifying threads
+    /// within the window.
+    fn filtered_total(&self) -> f64 {
+        if self.window.is_none() && self.focus.is_none() && self.ignore.is_none() {
+            return self.total_time;
+        }
+        if self.window.is_none() {
+            let mut total = 0.0;
+            for (seen, dur) in &self.threads {
+                if self.thread_passes(seen) {
+                    total += dur;
+                }
+            }
+            return total;
+        }
+        // Window active: sum root-level event overlap with [t0, t1).
+        self.window_metrics().1
+    }
+
+    fn thread_passes(&self, seen: &HashSet<usize>) -> bool {
+        let focus_ok = match self.focus.as_deref() {
+            Some(f) => seen.iter().any(|&i| self.frames[i].name.contains(f)),
+            None => true,
+        };
+        let ignore_ok = match self.ignore.as_deref() {
+            Some(ig) => !seen.iter().any(|&i| self.frames[i].name.contains(ig)),
+            None => true,
+        };
+        focus_ok && ignore_ok
+    }
+
+    /// Per-frame inclusive within the current window (plus baseline).
+    ///
+    /// For each stack event, the overlap with `[t0, t1)` is credited to
+    /// every frame in its path; root events additionally drive the
+    /// baseline. Events from threads that fail the focus/ignore predicate
+    /// are dropped entirely — this preserves the "idle thread disappears"
+    /// semantic under windowed queries.
+    fn window_metrics(&self) -> (Vec<f64>, f64) {
+        let (t0, t1) = self.window.unwrap_or((f64::NEG_INFINITY, f64::INFINITY));
+        let mut inc = vec![0.0f64; self.frames.len()];
+        let mut baseline = 0.0f64;
+        for ev in &self.events {
+            if ev.close_at <= t0 || ev.open_at >= t1 {
+                continue;
+            }
+            // Filter by thread membership (same predicate as filtered_total).
+            if self.focus.is_some() || self.ignore.is_some() {
+                let Some((seen, _)) = self.threads.get(ev.thread) else {
+                    continue;
+                };
+                if !self.thread_passes(seen) {
+                    continue;
+                }
+            }
+            let overlap = ev.close_at.min(t1) - ev.open_at.max(t0);
+            if overlap <= 0.0 {
+                continue;
+            }
+            // Each frame's own close event accounts for its full inclusive
+            // time, so crediting only the innermost frame avoids the
+            // double-count we'd get from also crediting ancestors (whose
+            // own close events contribute their own inclusive separately).
+            if let Some(&fidx) = ev.path.last() {
+                inc[fidx] += overlap;
+            }
+            if ev.path.len() == 1 {
+                baseline += overlap;
+            }
+        }
+        (inc, baseline)
     }
 
     pub fn handle_command(&mut self, cmd: &str) -> String {
@@ -400,8 +542,27 @@ impl ProfileData {
 
         match parts[0] {
             "top" => {
-                let n: usize = parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(20);
-                self.cmd_top(n)
+                // Flags: --no-idle applies the dotnet-idle ignore preset for
+                // this invocation without mutating state. Any non-flag token
+                // is the row count.
+                let mut n: usize = 20;
+                let mut no_idle = false;
+                for tok in &parts[1..] {
+                    if *tok == "--no-idle" {
+                        no_idle = true;
+                    } else if let Ok(v) = tok.parse::<usize>() {
+                        n = v;
+                    }
+                }
+                if no_idle {
+                    let prev = self.ignore.clone();
+                    self.ignore = Some(ignore_preset("dotnet-idle").unwrap().to_string());
+                    let out = self.cmd_top(n);
+                    self.ignore = prev;
+                    out
+                } else {
+                    self.cmd_top(n)
+                }
             }
             "callers" => {
                 let pattern = parts[1..].join(" ");
@@ -444,16 +605,40 @@ impl ProfileData {
                 format!("focus set: {pattern}")
             }
             "ignore" => {
+                // `ignore preset <name>` expands a named preset (e.g.
+                // `dotnet-idle` → "LowLevelLifoSemaphore") so the user
+                // doesn't have to memorize the frame name.
+                if parts.get(1) == Some(&"preset") {
+                    let Some(name) = parts.get(2) else {
+                        return "usage: ignore preset <name>  (presets: dotnet-idle)".to_string();
+                    };
+                    let Some(pat) = ignore_preset(name) else {
+                        return format!("unknown preset '{name}' (known: dotnet-idle)");
+                    };
+                    self.ignore = Some(pat.to_string());
+                    return format!("ignore set: {pat} (preset {name})");
+                }
                 let pattern = parts[1..].join(" ");
                 if pattern.is_empty() {
-                    return "usage: ignore <function-name>".to_string();
+                    return "usage: ignore <function-name> | ignore preset <name>".to_string();
                 }
                 self.ignore = Some(pattern.clone());
                 format!("ignore set: {pattern}")
             }
+            "window" => self.cmd_window(&parts[1..]),
+            "phase" => self.cmd_phase(&parts[1..]),
+            "phases" => self.cmd_phase_list(),
+            "marks" => {
+                let threshold: f64 = parts
+                    .get(1)
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(50.0);
+                self.cmd_marks(threshold)
+            }
             "reset" => {
                 self.focus = None;
                 self.ignore = None;
+                self.window = None;
                 "filters cleared".to_string()
             }
             "help" => self.cmd_help(),
@@ -497,28 +682,47 @@ impl ProfileData {
     }
 
     fn cmd_top(&self, n: usize) -> String {
+        // Under a time window we re-derive inclusive from event overlaps;
+        // exclusive is not meaningful in that regime without redoing the
+        // children subtraction, so we omit it and show only inclusive.
+        let (inclusive, exclusive_available, total) = if self.window.is_some() {
+            let (inc, base) = self.window_metrics();
+            (inc, false, base)
+        } else {
+            (self.inclusive.clone(), true, self.filtered_total())
+        };
+
         let mut entries: Vec<(usize, f64, f64)> = (0..self.frames.len())
             .filter(|&i| self.matches_filter(i))
-            .filter(|&i| self.inclusive[i] > 0.0)
-            .map(|i| (i, self.inclusive[i], self.exclusive[i]))
+            .filter(|&i| inclusive[i] > 0.0)
+            .map(|i| (i, inclusive[i], if exclusive_available { self.exclusive[i] } else { 0.0 }))
             .collect();
 
         entries.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         entries.truncate(n);
 
-        let total = self.total_time.max(0.001);
-        let mut out = format!(
-            "{:<60} {:>10} {:>10}\n",
-            "Function", "Inclusive", "Exclusive"
-        );
+        let total = total.max(0.001);
+        let mut out = if exclusive_available {
+            format!("{:<60} {:>10} {:>10}\n", "Function", "Inclusive", "Exclusive")
+        } else {
+            format!("{:<60} {:>10}\n", "Function", "Inclusive")
+        };
         for (idx, inc, exc) in entries {
             let name = shorten(&self.frames[idx].name, 58);
-            out.push_str(&format!(
-                "{:<60} {:>9.1}% {:>9.1}%\n",
-                name,
-                inc / total * 100.0,
-                exc / total * 100.0
-            ));
+            if exclusive_available {
+                out.push_str(&format!(
+                    "{:<60} {:>9.1}% {:>9.1}%\n",
+                    name,
+                    inc / total * 100.0,
+                    exc / total * 100.0
+                ));
+            } else {
+                out.push_str(&format!(
+                    "{:<60} {:>9.1}%\n",
+                    name,
+                    inc / total * 100.0
+                ));
+            }
         }
         out
     }
@@ -733,8 +937,22 @@ impl ProfileData {
 
     fn cmd_stats(&self) -> String {
         let active_frames = self.inclusive.iter().filter(|&&t| t > 0.0).count();
+        let baseline = self.filtered_total();
+        let baseline_line = if (baseline - self.total_time).abs() > 0.001 {
+            format!(
+                "\nbaseline: {:.2}ms ({:.1}% of total, filters re-normalized)",
+                baseline,
+                baseline / self.total_time.max(0.001) * 100.0
+            )
+        } else {
+            String::new()
+        };
+        let window_line = match self.window {
+            Some((t0, t1)) => format!("\nwindow: [{t0:.2}ms, {t1:.2}ms)"),
+            None => String::new(),
+        };
         format!(
-            "total time: {:.2}ms\nframes: {} ({} active)\nthreads: {}\nstacks: {}\nfocus: {}\nignore: {}",
+            "total time: {:.2}ms\nframes: {} ({} active)\nthreads: {}\nstacks: {}\nfocus: {}\nignore: {}{}{}",
             self.total_time,
             self.frames.len(),
             active_frames,
@@ -742,6 +960,8 @@ impl ProfileData {
             self.stacks.len(),
             self.focus.as_deref().unwrap_or("(none)"),
             self.ignore.as_deref().unwrap_or("(none)"),
+            window_line,
+            baseline_line,
         )
     }
 
@@ -759,7 +979,7 @@ impl ProfileData {
             return format!("no functions matching '{pattern}'");
         }
 
-        let total = self.total_time.max(0.001);
+        let total = self.filtered_total().max(0.001);
         let mut out = format!("{} matches:\n", matches.len());
         for (idx, frame) in matches.iter().take(30) {
             out.push_str(&format!(
@@ -771,8 +991,133 @@ impl ProfileData {
         out
     }
 
+    fn cmd_window(&mut self, args: &[&str]) -> String {
+        if args.is_empty() {
+            return match self.window {
+                Some((t0, t1)) => format!("window: [{t0:.2}ms, {t1:.2}ms)"),
+                None => "window: (none). usage: window <t0_ms> <t1_ms> | window clear".to_string(),
+            };
+        }
+        if args[0] == "clear" {
+            self.window = None;
+            return "window cleared".to_string();
+        }
+        if args.len() < 2 {
+            return "usage: window <t0_ms> <t1_ms> | window clear".to_string();
+        }
+        let (Ok(t0), Ok(t1)) = (args[0].parse::<f64>(), args[1].parse::<f64>()) else {
+            return "usage: window <t0_ms> <t1_ms> — both args must be numbers".to_string();
+        };
+        if t1 <= t0 {
+            return format!("invalid window: t1 ({t1}) must be > t0 ({t0})");
+        }
+        self.window = Some((t0, t1));
+        format!("window set: [{t0:.2}ms, {t1:.2}ms)")
+    }
+
+    fn cmd_phase(&mut self, args: &[&str]) -> String {
+        match args.first().copied() {
+            Some("add") => {
+                if args.len() < 4 {
+                    return "usage: phase add <name> <t0_ms> <t1_ms>".to_string();
+                }
+                let name = args[1].to_string();
+                let (Ok(t0), Ok(t1)) = (args[2].parse::<f64>(), args[3].parse::<f64>()) else {
+                    return "phase add: t0 and t1 must be numbers".to_string();
+                };
+                if t1 <= t0 {
+                    return format!("invalid phase: t1 ({t1}) must be > t0 ({t0})");
+                }
+                self.phases.insert(name.clone(), (t0, t1));
+                format!("phase '{name}' = [{t0:.2}ms, {t1:.2}ms)")
+            }
+            Some("use") => {
+                let Some(name) = args.get(1) else {
+                    return "usage: phase use <name>".to_string();
+                };
+                let Some(&(t0, t1)) = self.phases.get(*name) else {
+                    return format!("no phase named '{name}' (see `phases`)");
+                };
+                self.window = Some((t0, t1));
+                format!("window set from phase '{name}': [{t0:.2}ms, {t1:.2}ms)")
+            }
+            Some("clear") => {
+                self.phases.clear();
+                self.window = None;
+                "phases cleared".to_string()
+            }
+            Some("list") | None => self.cmd_phase_list(),
+            Some(other) => format!("unknown: phase {other}  (add|use|list|clear)"),
+        }
+    }
+
+    fn cmd_phase_list(&self) -> String {
+        if self.phases.is_empty() {
+            return "no phases defined (use `phase add <name> <t0> <t1>`)".to_string();
+        }
+        let mut names: Vec<&String> = self.phases.keys().collect();
+        names.sort();
+        let mut out = String::new();
+        for name in names {
+            let (t0, t1) = self.phases[name];
+            out.push_str(&format!("  {name:<16} [{t0:>10.2}ms, {t1:>10.2}ms)\n"));
+        }
+        out
+    }
+
+    /// Suggest phase boundaries by finding quiet gaps on any thread —
+    /// stretches with no stack activity longer than `threshold_ms`. Useful
+    /// when the user hasn't emitted explicit markers: long pauses usually
+    /// separate logical workload phases (insert → query → truth).
+    fn cmd_marks(&self, threshold_ms: f64) -> String {
+        // Bucket event intervals per thread, sort by open, then walk to find
+        // gaps between end-of-previous-max-close and next-open.
+        let mut per_thread: HashMap<usize, Vec<(f64, f64)>> = HashMap::new();
+        for ev in &self.events {
+            per_thread
+                .entry(ev.thread)
+                .or_default()
+                .push((ev.open_at, ev.close_at));
+        }
+        let mut gaps: Vec<(usize, f64, f64)> = Vec::new();
+        for (tid, mut ivals) in per_thread {
+            ivals.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+            let mut cover_end = f64::NEG_INFINITY;
+            for (o, c) in ivals {
+                if o - cover_end >= threshold_ms && cover_end.is_finite() {
+                    gaps.push((tid, cover_end, o));
+                }
+                if c > cover_end {
+                    cover_end = c;
+                }
+            }
+        }
+        if gaps.is_empty() {
+            return format!("no gaps >= {threshold_ms:.1}ms on any thread");
+        }
+        gaps.sort_by(|a, b| {
+            let la = a.2 - a.1;
+            let lb = b.2 - b.1;
+            lb.partial_cmp(&la).unwrap_or(std::cmp::Ordering::Equal)
+        });
+        let mut out = format!(
+            "{} gap(s) >= {:.1}ms (sorted by length):\n",
+            gaps.len(),
+            threshold_ms
+        );
+        for (tid, a, b) in gaps.iter().take(20) {
+            out.push_str(&format!(
+                "  thread {tid:<3}  {:>10.2}ms  →  {:>10.2}ms   ({:.2}ms)\n",
+                a,
+                b,
+                b - a
+            ));
+        }
+        out
+    }
+
     fn cmd_help(&self) -> String {
-        "commands: top [N], callers <func>, callees <func>, traces [N], tree [N], hotpath, threads, stats, search <pattern>, focus <func>, ignore <func>, reset".to_string()
+        "commands: top [N] [--no-idle], callers <func>, callees <func>, traces [N], tree [N], hotpath, threads, stats, search <pattern>, focus <func>, ignore <func> | ignore preset <name>, window <t0> <t1> | window clear, phase add <name> <t0> <t1> | phase use <name> | phase list | phase clear, marks [threshold_ms], reset".to_string()
     }
 
     fn find_frames(&self, pattern: &str) -> Vec<usize> {
@@ -868,6 +1213,245 @@ mod tests {
         assert!((p.exclusive[1] - 1.0).abs() < 0.01); // compute: 8 - 5 - 2 = 1
         assert!((p.exclusive[2] - 5.0).abs() < 0.01); // sort: leaf
         assert!((p.exclusive[3] - 2.0).abs() < 0.01); // alloc: leaf
+    }
+
+    /// Two-thread fixture: thread_0 runs `work` for 10ms, thread_1 parks in
+    /// LowLevelLifoSemaphore.WaitForSignal for 100ms. Total = 110ms; only
+    /// 10ms is real work, which is exactly the shape of the user's bench.
+    fn sample_speedscope_with_idle() -> String {
+        r#"{
+            "shared": {
+                "frames": [
+                    {"name": "work"},
+                    {"name": "hot_inner"},
+                    {"name": "ThreadPoolWorker"},
+                    {"name": "LowLevelLifoSemaphore.WaitForSignal"}
+                ]
+            },
+            "profiles": [
+                {
+                    "name": "worker_hot",
+                    "events": [
+                        {"type": "O", "at": 0.0, "frame": 0},
+                        {"type": "O", "at": 0.0, "frame": 1},
+                        {"type": "C", "at": 10.0, "frame": 1},
+                        {"type": "C", "at": 10.0, "frame": 0}
+                    ]
+                },
+                {
+                    "name": "worker_idle",
+                    "events": [
+                        {"type": "O", "at": 0.0, "frame": 2},
+                        {"type": "O", "at": 0.0, "frame": 3},
+                        {"type": "C", "at": 100.0, "frame": 3},
+                        {"type": "C", "at": 100.0, "frame": 2}
+                    ]
+                }
+            ]
+        }"#
+        .to_string()
+    }
+
+    fn load_idle_sample() -> ProfileData {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static COUNTER: AtomicU32 = AtomicU32::new(0);
+        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("dbg-test-profile-idle-{}", id));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("test.speedscope.json");
+        let mut f = std::fs::File::create(&path).unwrap();
+        f.write_all(sample_speedscope_with_idle().as_bytes())
+            .unwrap();
+        ProfileData::load(&path).unwrap()
+    }
+
+    #[test]
+    fn filtered_total_drops_idle_thread_under_ignore() {
+        let mut p = load_idle_sample();
+        assert!((p.total_time - 110.0).abs() < 0.01);
+        assert!((p.filtered_total() - 110.0).abs() < 0.01);
+        p.handle_command("ignore LowLevelLifoSemaphore");
+        // Idle thread contributed 100ms; only the 10ms hot thread remains.
+        assert!(
+            (p.filtered_total() - 10.0).abs() < 0.01,
+            "expected 10ms baseline, got {}",
+            p.filtered_total()
+        );
+    }
+
+    #[test]
+    fn top_rebaseline_elevates_hot_frame_after_ignore() {
+        let mut p = load_idle_sample();
+        let before = p.handle_command("top");
+        // hot_inner is 10/110 ≈ 9.1% before filtering
+        assert!(before.contains("hot_inner"));
+        p.handle_command("ignore LowLevelLifoSemaphore");
+        let after = p.handle_command("top");
+        // After filtering idle thread out, hot_inner becomes 10/10 = 100%
+        assert!(
+            after.contains("100.0%"),
+            "expected hot_inner at 100% post-filter, got:\n{after}"
+        );
+    }
+
+    #[test]
+    fn top_no_idle_flag_applies_preset_without_mutating_state() {
+        let mut p = load_idle_sample();
+        let out = p.handle_command("top --no-idle");
+        assert!(out.contains("100.0%"));
+        // Ignore state should not be persisted by the one-shot flag.
+        assert!(p.ignore.is_none(), "ignore should remain unset");
+    }
+
+    #[test]
+    fn ignore_preset_dotnet_idle_sets_pattern() {
+        let mut p = load_idle_sample();
+        let out = p.handle_command("ignore preset dotnet-idle");
+        assert!(out.contains("LowLevelLifoSemaphore"));
+        assert_eq!(p.ignore.as_deref(), Some("LowLevelLifoSemaphore"));
+    }
+
+    #[test]
+    fn ignore_preset_unknown_name_errors() {
+        let mut p = load_idle_sample();
+        let out = p.handle_command("ignore preset nope");
+        assert!(out.contains("unknown preset"));
+    }
+
+    /// Two-phase fixture on a single thread: `work_a` runs 0–10ms,
+    /// then a quiet gap until 100ms, then `work_b` runs 100–110ms.
+    /// Simulates insert/query phases separated by idle.
+    fn sample_speedscope_two_phases() -> String {
+        r#"{
+            "shared": {
+                "frames": [
+                    {"name": "main"},
+                    {"name": "work_a"},
+                    {"name": "work_b"}
+                ]
+            },
+            "profiles": [{
+                "name": "t0",
+                "events": [
+                    {"type": "O", "at": 0.0,   "frame": 0},
+                    {"type": "O", "at": 0.0,   "frame": 1},
+                    {"type": "C", "at": 10.0,  "frame": 1},
+                    {"type": "O", "at": 100.0, "frame": 2},
+                    {"type": "C", "at": 110.0, "frame": 2},
+                    {"type": "C", "at": 110.0, "frame": 0}
+                ]
+            }]
+        }"#
+        .to_string()
+    }
+
+    fn load_two_phase_sample() -> ProfileData {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static COUNTER: AtomicU32 = AtomicU32::new(0);
+        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("dbg-test-profile-phase-{}", id));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("test.speedscope.json");
+        let mut f = std::fs::File::create(&path).unwrap();
+        f.write_all(sample_speedscope_two_phases().as_bytes())
+            .unwrap();
+        ProfileData::load(&path).unwrap()
+    }
+
+    #[test]
+    fn window_restricts_top_to_phase() {
+        let mut p = load_two_phase_sample();
+        p.handle_command("window 0 50");
+        let out = p.handle_command("top");
+        assert!(out.contains("work_a"), "work_a should appear in phase A: {out}");
+        assert!(!out.contains("work_b"), "work_b must not appear: {out}");
+    }
+
+    #[test]
+    fn window_clear_restores_full_view() {
+        let mut p = load_two_phase_sample();
+        p.handle_command("window 0 50");
+        p.handle_command("window clear");
+        let out = p.handle_command("top");
+        assert!(out.contains("work_a"));
+        assert!(out.contains("work_b"));
+    }
+
+    #[test]
+    fn window_rejects_inverted() {
+        let mut p = load_two_phase_sample();
+        let out = p.handle_command("window 100 50");
+        assert!(out.contains("invalid"));
+        assert!(p.window.is_none());
+    }
+
+    #[test]
+    fn phase_add_and_use() {
+        let mut p = load_two_phase_sample();
+        p.handle_command("phase add insert 0 50");
+        p.handle_command("phase add query 100 200");
+        let list = p.handle_command("phases");
+        assert!(list.contains("insert") && list.contains("query"));
+        p.handle_command("phase use query");
+        let top = p.handle_command("top");
+        assert!(top.contains("work_b"), "expected work_b under query: {top}");
+        assert!(!top.contains("work_a"));
+    }
+
+    #[test]
+    fn phase_use_unknown_errors() {
+        let mut p = load_two_phase_sample();
+        let out = p.handle_command("phase use nope");
+        assert!(out.contains("no phase"));
+    }
+
+    #[test]
+    fn marks_detects_quiet_gap() {
+        let p = load_two_phase_sample();
+        let out = p.cmd_marks(50.0);
+        // The 90ms gap between work_a (close at 10) and work_b (open at 100)
+        // is on thread 0; `main` is still open, though — so the gap is NOT
+        // quiet from the root's perspective. We expect no gap here since
+        // `main` covers the whole interval. Validate that reality explicitly.
+        assert!(
+            out.contains("no gaps"),
+            "main covers the interval; expected no gaps: {out}"
+        );
+    }
+
+    #[test]
+    fn marks_detects_gap_when_root_closes() {
+        // Distinct fixture: two separate root invocations with a gap.
+        let json = r#"{
+            "shared": {"frames": [{"name": "a"}, {"name": "b"}]},
+            "profiles": [{
+                "name": "t0",
+                "events": [
+                    {"type": "O", "at": 0.0, "frame": 0},
+                    {"type": "C", "at": 5.0, "frame": 0},
+                    {"type": "O", "at": 100.0, "frame": 1},
+                    {"type": "C", "at": 105.0, "frame": 1}
+                ]
+            }]
+        }"#;
+        let dir = std::env::temp_dir().join("dbg-test-profile-marks-gap");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("t.speedscope.json");
+        std::fs::write(&path, json).unwrap();
+        let p = ProfileData::load(&path).unwrap();
+        let out = p.cmd_marks(50.0);
+        assert!(out.contains("95.00ms"), "expected 95ms gap: {out}");
+    }
+
+    #[test]
+    fn stats_surfaces_rebaselined_denominator() {
+        let mut p = load_idle_sample();
+        p.handle_command("ignore LowLevelLifoSemaphore");
+        let out = p.handle_command("stats");
+        assert!(
+            out.contains("baseline:"),
+            "stats should surface new baseline when filter is active: {out}"
+        );
     }
 
     #[test]
@@ -1137,8 +1721,12 @@ mod tests {
             stacks,
             total_time: 10.0,
             thread_count: 1,
+            threads: vec![(HashSet::from([0usize, 1]), 10.0)],
+            events: Vec::new(),
             focus: None,
             ignore: None,
+            window: None,
+            phases: HashMap::new(),
         };
         // This must not stack overflow — cycle detection prevents infinite recursion
         let out = p.handle_command("tree");

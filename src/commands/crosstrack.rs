@@ -1231,7 +1231,11 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let (db, _) = db_and_ctx(&tmp);
         let out = cmd_hits(&db, "main.c:1");
-        assert!(out.contains("no captured hits"));
+        assert!(out.contains("no hits at main.c:1"), "{out}");
+        assert!(
+            out.contains("no breakpoint hits recorded yet"),
+            "empty DB should surface the hint: {out}"
+        );
     }
 
     #[test]
