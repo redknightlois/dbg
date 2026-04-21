@@ -1,4 +1,5 @@
 use super::{Backend, CleanResult, Dependency, DependencyCheck, SpawnConfig, shell_escape};
+use crate::daemon::session_tmp;
 
 pub struct PerfBackend;
 
@@ -20,19 +21,27 @@ impl Backend for PerfBackend {
         // 1. "perf.data" or path to existing perf data → open perf report
         // 2. binary path → perf record -g ./binary, then perf report
         let path = std::path::Path::new(target);
+        let script_out = session_tmp("perf.script.txt");
+        let script_str = script_out.display().to_string();
 
         if path.is_file() && (target.contains("perf") || target.ends_with(".data")) {
-            // Existing perf data — go straight to report in bash
+            // Existing perf data — emit script text for ProfileData, then
+            // run the native report.
             Ok(SpawnConfig {
                 bin: "bash".into(),
                 args: vec!["--norc".into(), "--noprofile".into()],
                 env: vec![("PS1".into(), "perf> ".into())],
                 init_commands: vec![
+                    format!(
+                        "perf script -F comm,tid,time,ip,sym,dso -i {} > {} 2>/dev/null || true",
+                        shell_escape(target),
+                        shell_escape(&script_str),
+                    ),
                     format!("perf report --stdio -i {}", shell_escape(target)),
                 ],
             })
         } else {
-            // Record then report
+            // Record then emit script + report
             let mut record_cmd = format!(
                 "perf record -g -- {}",
                 shell_escape(target)
@@ -48,10 +57,25 @@ impl Backend for PerfBackend {
                 env: vec![("PS1".into(), "perf> ".into())],
                 init_commands: vec![
                     record_cmd,
+                    format!(
+                        "perf script -F comm,tid,time,ip,sym,dso > {} 2>/dev/null || true",
+                        shell_escape(&script_str),
+                    ),
                     "perf report --stdio".into(),
                 ],
             })
         }
+    }
+
+    // `perf record` runs the target to completion (can be many minutes
+    // for a realistic workload). The 60s default kills the session
+    // mid-record; bump to an hour like the other profiling backends.
+    fn init_timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(3600)
+    }
+
+    fn profile_output(&self) -> Option<String> {
+        Some(session_tmp("perf.script.txt").display().to_string())
     }
 
     fn prompt_pattern(&self) -> &str {
@@ -158,7 +182,14 @@ mod tests {
             .spawn_config(tmp.to_str().unwrap(), &[])
             .unwrap();
         assert_eq!(cfg.bin, "bash");
-        assert!(cfg.init_commands[0].contains("perf report --stdio"));
+        assert!(
+            cfg.init_commands.iter().any(|c| c.contains("perf report --stdio")),
+            "missing report: {:?}", cfg.init_commands
+        );
+        assert!(
+            cfg.init_commands.iter().any(|c| c.contains("perf script")),
+            "missing script step: {:?}", cfg.init_commands
+        );
         let _ = std::fs::remove_file(&tmp);
     }
 
@@ -168,7 +199,20 @@ mod tests {
         assert_eq!(cfg.bin, "bash");
         assert!(cfg.init_commands[0].contains("perf record -g"));
         assert!(cfg.init_commands[0].contains("./myapp"));
-        assert!(cfg.init_commands[1].contains("perf report --stdio"));
+        assert!(
+            cfg.init_commands.iter().any(|c| c.contains("perf script")),
+            "missing script step: {:?}", cfg.init_commands
+        );
+        assert!(
+            cfg.init_commands.iter().any(|c| c.contains("perf report --stdio")),
+            "missing report: {:?}", cfg.init_commands
+        );
+    }
+
+    #[test]
+    fn profile_output_points_to_script_file() {
+        let out = PerfBackend.profile_output().unwrap();
+        assert!(out.ends_with("perf.script.txt"), "unexpected: {out}");
     }
 
     #[test]

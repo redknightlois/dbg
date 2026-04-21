@@ -1,4 +1,5 @@
-use super::{Backend, Dependency, DependencyCheck, SpawnConfig};
+use super::{Backend, Dependency, DependencyCheck, SpawnConfig, shell_escape};
+use crate::daemon::session_tmp;
 
 fn is_source_extension(lower: &str) -> bool {
     matches!(
@@ -74,12 +75,39 @@ impl Backend for PprofBackend {
             }
         }
 
+        // Pre-run `go tool pprof -traces` to a side file so ProfileData
+        // can load the profile as if it were evented speedscope; then
+        // `exec` into the interactive REPL so users still get pprof's
+        // native commands (top, list, web, peek). Running the conversion
+        // and the exec in a single `bash -c` keeps the whole thing as
+        // one PTY-controlled process — the daemon sees only the pprof
+        // prompt, never bash.
+        let traces_out = session_tmp("pprof.traces.txt");
+        let traces_str = traces_out.display().to_string();
+        let pprof_args: Vec<String> = [vec!["tool".into(), "pprof".into()], positional.clone()]
+            .concat();
+        let quoted_args = pprof_args
+            .iter()
+            .map(|a| shell_escape(a))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let shell_cmd = format!(
+            "go {} -traces > {} 2>/dev/null || true; exec go {}",
+            quoted_args.clone(),
+            shell_escape(&traces_str),
+            quoted_args,
+        );
+
         Ok(SpawnConfig {
-            bin: "go".into(),
-            args: [vec!["tool".into(), "pprof".into()], positional].concat(),
+            bin: "bash".into(),
+            args: vec!["-c".into(), shell_cmd],
             env: vec![],
             init_commands: vec![],
         })
+    }
+
+    fn profile_output(&self) -> Option<String> {
+        Some(session_tmp("pprof.traces.txt").display().to_string())
     }
 
     fn prompt_pattern(&self) -> &str {
@@ -132,10 +160,19 @@ impl Backend for PprofBackend {
 mod tests {
     use super::*;
 
+    fn shell_script(cfg: &SpawnConfig) -> &str {
+        assert_eq!(cfg.bin, "bash");
+        assert_eq!(cfg.args.first().map(|s| s.as_str()), Some("-c"));
+        cfg.args.get(1).expect("shell script arg").as_str()
+    }
+
     #[test]
     fn spawn_config_single_profile() {
         let cfg = PprofBackend.spawn_config("cpu.prof", &[]).unwrap();
-        assert_eq!(cfg.args, vec!["tool", "pprof", "cpu.prof"]);
+        let script = shell_script(&cfg);
+        assert!(script.contains("go tool pprof cpu.prof"), "{script}");
+        assert!(script.contains("-traces"), "must produce traces file: {script}");
+        assert!(script.contains("exec go tool pprof cpu.prof"), "{script}");
     }
 
     #[test]
@@ -143,7 +180,8 @@ mod tests {
         let cfg = PprofBackend
             .spawn_config("./mybin cpu.prof", &[])
             .unwrap();
-        assert_eq!(cfg.args, vec!["tool", "pprof", "./mybin", "cpu.prof"]);
+        let script = shell_script(&cfg);
+        assert!(script.contains("./mybin") && script.contains("cpu.prof"), "{script}");
     }
 
     #[test]
@@ -157,11 +195,22 @@ mod tests {
         let cfg = PprofBackend
             .spawn_config("./mybin", &["cpu.prof".to_string()])
             .unwrap();
-        assert_eq!(
-            cfg.args,
-            vec!["tool", "pprof", "./mybin", "cpu.prof"],
-            "two-arg form was not forwarded"
+        let script = shell_script(&cfg);
+        assert!(
+            script.contains("./mybin") && script.contains("cpu.prof"),
+            "two-arg form was not forwarded: {script}"
         );
+    }
+
+    #[test]
+    fn spawn_config_emits_traces_side_file() {
+        let cfg = PprofBackend.spawn_config("cpu.prof", &[]).unwrap();
+        let script = shell_script(&cfg);
+        // -traces conversion must be in the shell script
+        assert!(script.contains("-traces"), "script missing -traces: {script}");
+        // profile_output() must point to the traces file
+        let out = PprofBackend.profile_output().unwrap();
+        assert!(out.ends_with("pprof.traces.txt"), "unexpected profile_output: {out}");
     }
 
     #[test]

@@ -139,6 +139,29 @@ impl ProfileData {
             return Self::load_v8_cpuprofile(&content);
         }
 
+        // Text-profile detection. `perf script` output has tab-indented
+        // stack frame lines under whitespace-prefixed sample headers;
+        // `go tool pprof -traces` output is dominated by `-----+---`
+        // sample separators. Both convert to speedscope in-memory and
+        // fall through to the JSON path below.
+        let looks_like_pprof_traces = content.contains("-----+-")
+            || (content.trim_start().starts_with("File:") && content.contains("Total samples"));
+        let looks_like_perf_script = !content.trim_start().starts_with('{')
+            && content
+                .lines()
+                .take(200)
+                .any(|l| l.starts_with('\t') && l.contains(' '));
+
+        let content = if looks_like_pprof_traces {
+            pprof_traces_to_speedscope(&content)
+                .context("failed to convert pprof -traces output to speedscope")?
+        } else if looks_like_perf_script {
+            perf_script_to_speedscope(&content)
+                .context("failed to convert perf script output to speedscope")?
+        } else {
+            content
+        };
+
         let file: SpeedscopeFile =
             serde_json::from_str(&content).context("failed to parse speedscope JSON")?;
 
@@ -1130,6 +1153,282 @@ impl ProfileData {
     }
 }
 
+/// Parse `perf script` output into speedscope-format JSON.
+///
+/// Input is `comm [tid] TS.FRAC: PERIOD EVENT:` headers each followed by
+/// tab-indented `IP symbol+offset (dso)` frame lines, separated by blank
+/// lines. Perf prints innermost frame first; we reverse to root→leaf and
+/// emit an evented speedscope profile per thread using common-prefix
+/// diffing across consecutive samples (same shape as the V8 loader).
+fn perf_script_to_speedscope(text: &str) -> Result<String> {
+    use std::collections::BTreeMap;
+
+    struct Sample {
+        thread: String,
+        t_ms: f64,
+        stack: Vec<String>, // root → leaf
+    }
+
+    let mut samples: Vec<Sample> = Vec::new();
+    let mut cur_thread: Option<String> = None;
+    let mut cur_t: Option<f64> = None;
+    let mut cur_stack: Vec<String> = Vec::new();
+
+    let flush = |samples: &mut Vec<Sample>,
+                 thread: &mut Option<String>,
+                 t: &mut Option<f64>,
+                 stack: &mut Vec<String>| {
+        if let (Some(thr), Some(ts)) = (thread.take(), t.take()) {
+            if !stack.is_empty() {
+                stack.reverse();
+                samples.push(Sample {
+                    thread: thr,
+                    t_ms: ts,
+                    stack: std::mem::take(stack),
+                });
+            } else {
+                stack.clear();
+            }
+        } else {
+            stack.clear();
+        }
+    };
+
+    for raw in text.lines() {
+        if raw.is_empty() {
+            flush(&mut samples, &mut cur_thread, &mut cur_t, &mut cur_stack);
+            continue;
+        }
+        // Frame line: starts with tab (perf default). Tolerate leading
+        // spaces some scripts emit.
+        if raw.starts_with('\t') || raw.starts_with("    ") {
+            // Typical: "\tIPHEX symbol+0xNN (dso)".
+            let mut tokens = raw.trim().splitn(2, char::is_whitespace);
+            let _ip = tokens.next();
+            let rest = tokens.next().unwrap_or("");
+            // Strip trailing " (dso)" if present, and "+0xNN" offset.
+            let rest = rest.rsplit_once(" (").map(|(a, _)| a).unwrap_or(rest);
+            let sym = rest.rsplit_once('+').map(|(a, _)| a).unwrap_or(rest);
+            let sym = sym.trim();
+            let name = if sym.is_empty() || sym == "[unknown]" {
+                "[unknown]".to_string()
+            } else {
+                sym.to_string()
+            };
+            cur_stack.push(name);
+            continue;
+        }
+        // Header line. Shape examples:
+        //   swapper     0 [000] 1234.567:    1000 cycles:
+        //   myapp   12345/12345 [002] 1234.567:    1000 cycles:
+        // The timestamp is always "<secs>.<frac>:". Find it and the
+        // leading comm/tid cluster.
+        let Some(ts_colon_idx) = raw.find(':') else { continue };
+        let before_ts = &raw[..ts_colon_idx];
+        // Timestamp is the last whitespace-separated token before `:`
+        // that parses as f64.
+        let Some(ts_tok) = before_ts.split_whitespace().last() else { continue };
+        let Ok(ts_sec) = ts_tok.parse::<f64>() else { continue };
+        flush(&mut samples, &mut cur_thread, &mut cur_t, &mut cur_stack);
+        // Thread id: prefer "pid/tid" → tid; else the first numeric token.
+        let thread = before_ts
+            .split_whitespace()
+            .find_map(|tok| {
+                if let Some((_, tid)) = tok.split_once('/') {
+                    tid.parse::<u64>().ok().map(|n| n.to_string())
+                } else {
+                    tok.parse::<u64>().ok().map(|n| n.to_string())
+                }
+            })
+            .unwrap_or_else(|| "0".to_string());
+        cur_thread = Some(thread);
+        cur_t = Some(ts_sec * 1000.0);
+    }
+    flush(&mut samples, &mut cur_thread, &mut cur_t, &mut cur_stack);
+
+    if samples.is_empty() {
+        anyhow::bail!("no samples parsed from perf script output");
+    }
+
+    // Group by thread, sort by time, then emit evented profile with
+    // common-prefix open/close between consecutive samples.
+    let mut by_thread: BTreeMap<String, Vec<Sample>> = BTreeMap::new();
+    for s in samples {
+        by_thread.entry(s.thread.clone()).or_default().push(s);
+    }
+
+    let mut frame_names: Vec<String> = Vec::new();
+    let mut name_to_idx: HashMap<String, usize> = HashMap::new();
+    let mut intern = |n: String| -> usize {
+        if let Some(&i) = name_to_idx.get(&n) {
+            return i;
+        }
+        let i = frame_names.len();
+        name_to_idx.insert(n.clone(), i);
+        frame_names.push(n);
+        i
+    };
+
+    let mut profiles_json: Vec<serde_json::Value> = Vec::new();
+    for (thread, mut samples) in by_thread {
+        samples.sort_by(|a, b| a.t_ms.partial_cmp(&b.t_ms).unwrap_or(std::cmp::Ordering::Equal));
+        let mut events: Vec<serde_json::Value> = Vec::new();
+        let mut prev: Vec<usize> = Vec::new();
+        let mut prev_time = samples.first().map(|s| s.t_ms).unwrap_or(0.0);
+        for s in samples {
+            let stack: Vec<usize> = s.stack.into_iter().map(&mut intern).collect();
+            let common = prev.iter().zip(stack.iter()).take_while(|(a, b)| a == b).count();
+            for j in (common..prev.len()).rev() {
+                events.push(serde_json::json!({"type":"C","at":prev_time,"frame":prev[j]}));
+            }
+            for &idx in &stack[common..] {
+                events.push(serde_json::json!({"type":"O","at":s.t_ms,"frame":idx}));
+            }
+            prev = stack;
+            prev_time = s.t_ms;
+        }
+        // Close any still-open frames at the last timestamp.
+        for j in (0..prev.len()).rev() {
+            events.push(serde_json::json!({"type":"C","at":prev_time,"frame":prev[j]}));
+        }
+        profiles_json.push(serde_json::json!({
+            "name": format!("tid-{thread}"),
+            "events": events,
+        }));
+    }
+
+    let out = serde_json::json!({
+        "shared": {
+            "frames": frame_names.iter().map(|n| serde_json::json!({"name": n})).collect::<Vec<_>>(),
+        },
+        "profiles": profiles_json,
+    });
+    Ok(out.to_string())
+}
+
+/// Parse `go tool pprof -traces` output into speedscope-format JSON.
+///
+/// Input is a header block followed by sample blocks separated by
+/// `-----+---` lines. Each sample block's first line is
+/// `<duration>  <innermost-frame>`, followed by indented frame lines
+/// (still innermost-first). No real timestamps are available, so we
+/// lay samples end-to-end on a synthetic monotonic clock — this makes
+/// `top`/`focus`/`ignore` rebaselining work; `window`/`phase` queries
+/// have no meaningful anchor for pprof data and will behave as if the
+/// full profile were one contiguous span.
+fn pprof_traces_to_speedscope(text: &str) -> Result<String> {
+    let mut blocks: Vec<Vec<String>> = Vec::new();
+    let mut cur: Vec<String> = Vec::new();
+    let mut past_header = false;
+    for line in text.lines() {
+        if line.contains("-----+-") {
+            if past_header && !cur.is_empty() {
+                blocks.push(std::mem::take(&mut cur));
+            }
+            past_header = true;
+            continue;
+        }
+        if past_header {
+            cur.push(line.to_string());
+        }
+    }
+    if !cur.is_empty() {
+        blocks.push(cur);
+    }
+    if blocks.is_empty() {
+        anyhow::bail!("no sample blocks found in pprof -traces output");
+    }
+
+    let parse_duration_ms = |tok: &str| -> Option<f64> {
+        // pprof duration tokens: 10ms, 500us, 2s, 1.2ms, 3ns.
+        let tok = tok.trim();
+        let (num, unit) = if let Some(s) = tok.strip_suffix("ms") {
+            (s, 1.0)
+        } else if let Some(s) = tok.strip_suffix("us") {
+            (s, 1.0 / 1000.0)
+        } else if let Some(s) = tok.strip_suffix("ns") {
+            (s, 1.0 / 1_000_000.0)
+        } else if let Some(s) = tok.strip_suffix('s') {
+            (s, 1000.0)
+        } else {
+            return None;
+        };
+        num.trim().parse::<f64>().ok().map(|v| v * unit)
+    };
+
+    let mut frame_names: Vec<String> = Vec::new();
+    let mut name_to_idx: HashMap<String, usize> = HashMap::new();
+    let mut intern = |n: String| -> usize {
+        if let Some(&i) = name_to_idx.get(&n) {
+            return i;
+        }
+        let i = frame_names.len();
+        name_to_idx.insert(n.clone(), i);
+        frame_names.push(n);
+        i
+    };
+
+    // Emit one speedscope profile per pprof sample so that ignore/focus
+    // filtering can drop individual samples whose stacks match. A single
+    // combined profile would let one ignored frame drag the entire
+    // synthetic thread out of the baseline, zeroing everything.
+    let mut profiles: Vec<serde_json::Value> = Vec::new();
+    let mut now = 0.0f64;
+
+    for (sample_i, block) in blocks.into_iter().enumerate() {
+        let mut iter = block.iter().filter(|l| !l.trim().is_empty());
+        let Some(first) = iter.next() else { continue };
+        let trimmed = first.trim_start();
+        let mut parts = trimmed.splitn(2, char::is_whitespace);
+        let dur_tok = parts.next().unwrap_or("");
+        let first_frame = parts.next().unwrap_or("").trim();
+        let Some(dur_ms) = parse_duration_ms(dur_tok) else { continue };
+
+        let mut stack_innermost_first: Vec<String> = Vec::new();
+        if !first_frame.is_empty() {
+            stack_innermost_first.push(first_frame.to_string());
+        }
+        for line in iter {
+            let f = line.trim();
+            if !f.is_empty() {
+                stack_innermost_first.push(f.to_string());
+            }
+        }
+        if stack_innermost_first.is_empty() {
+            continue;
+        }
+        stack_innermost_first.reverse();
+        let stack: Vec<usize> = stack_innermost_first.into_iter().map(&mut intern).collect();
+
+        let open_at = now;
+        let close_at = now + dur_ms;
+        let mut events: Vec<serde_json::Value> = Vec::new();
+        for &idx in &stack {
+            events.push(serde_json::json!({"type":"O","at":open_at,"frame":idx}));
+        }
+        for &idx in stack.iter().rev() {
+            events.push(serde_json::json!({"type":"C","at":close_at,"frame":idx}));
+        }
+        profiles.push(serde_json::json!({
+            "name": format!("sample-{sample_i}"),
+            "events": events,
+        }));
+        now = close_at;
+    }
+
+    if profiles.is_empty() {
+        anyhow::bail!("no sample blocks found in pprof -traces output");
+    }
+
+    let out = serde_json::json!({
+        "shared": {
+            "frames": frame_names.iter().map(|n| serde_json::json!({"name": n})).collect::<Vec<_>>(),
+        },
+        "profiles": profiles,
+    });
+    Ok(out.to_string())
+}
+
 fn shorten(s: &str, max: usize) -> String {
     if s.len() <= max {
         return s.to_string();
@@ -1441,6 +1740,138 @@ mod tests {
         let p = ProfileData::load(&path).unwrap();
         let out = p.cmd_marks(50.0);
         assert!(out.contains("95.00ms"), "expected 95ms gap: {out}");
+    }
+
+    // ---- perf script → speedscope converter ----
+
+    #[test]
+    fn perf_script_parses_two_samples_same_thread() {
+        let text = "\
+myapp 12345/12345 123.456: 1000 cycles:
+\t0000000000401234 hot_fn+0x10 (/home/x/myapp)
+\t0000000000400abc main+0x20 (/home/x/myapp)
+\t000000000040100f _start+0xef (/home/x/myapp)
+
+myapp 12345/12345 123.458: 1000 cycles:
+\t0000000000401234 hot_fn+0x10 (/home/x/myapp)
+\t00000000004012aa cold_fn+0x4 (/home/x/myapp)
+\t0000000000400abc main+0x20 (/home/x/myapp)
+\t000000000040100f _start+0xef (/home/x/myapp)
+";
+        let ss = perf_script_to_speedscope(text).unwrap();
+        assert!(ss.contains("hot_fn"));
+        assert!(ss.contains("cold_fn"));
+        assert!(ss.contains("_start"));
+        assert!(ss.contains("tid-12345"));
+    }
+
+    #[test]
+    fn perf_script_loads_through_profile_data() {
+        let text = "\
+myapp 100/100 0.000: 1000 cycles:
+\t1 work (/x/myapp)
+\t2 main (/x/myapp)
+
+myapp 100/100 0.010: 1000 cycles:
+\t3 work (/x/myapp)
+\t4 main (/x/myapp)
+";
+        let dir = std::env::temp_dir().join("dbg-test-perf-script");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("perf.script.txt");
+        std::fs::write(&path, text).unwrap();
+        let mut p = ProfileData::load(&path).unwrap();
+        let out = p.handle_command("top");
+        assert!(out.contains("work"));
+        assert!(out.contains("main"));
+    }
+
+    #[test]
+    fn perf_script_empty_input_errors() {
+        let err = perf_script_to_speedscope("").unwrap_err().to_string();
+        assert!(err.contains("no samples"));
+    }
+
+    #[test]
+    fn perf_script_multi_thread_splits_profiles() {
+        let text = "\
+appA 100/100 0.000: 1 cycles:
+\t1 fn_a (/x)
+
+appB 200/200 0.001: 1 cycles:
+\t2 fn_b (/x)
+";
+        let ss = perf_script_to_speedscope(text).unwrap();
+        // Two thread profiles
+        assert!(ss.contains("tid-100"));
+        assert!(ss.contains("tid-200"));
+    }
+
+    // ---- pprof -traces → speedscope converter ----
+
+    #[test]
+    fn pprof_traces_parses_two_samples() {
+        let text = "\
+File: myapp
+Type: cpu
+Duration: 10s, Total samples = 30ms
+-----------+-------------------------------------------------------
+      10ms   main.compute
+             main.main
+             runtime.main
+-----------+-------------------------------------------------------
+      20ms   runtime.gopark
+             main.worker
+             runtime.goexit
+";
+        let ss = pprof_traces_to_speedscope(text).unwrap();
+        assert!(ss.contains("main.compute"));
+        assert!(ss.contains("runtime.gopark"));
+        assert!(ss.contains("runtime.main"));
+    }
+
+    #[test]
+    fn pprof_traces_loads_through_profile_data_and_rebaselines() {
+        // Two samples: 10ms in main.work, 100ms in runtime.gopark. Without
+        // rebaseline main.work is ~9%. With `ignore gopark` it's 100% of
+        // the remaining baseline — proves the pprof path benefits from
+        // the same filter plumbing as dotnet-trace.
+        let text = "\
+File: myapp
+Type: cpu
+Duration: 1s
+-----------+-------------------------------------------------------
+      10ms   main.work
+             main.main
+-----------+-------------------------------------------------------
+     100ms   runtime.gopark
+             runtime.park_m
+";
+        let dir = std::env::temp_dir().join("dbg-test-pprof-traces");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("pprof.traces.txt");
+        std::fs::write(&path, text).unwrap();
+        let mut p = ProfileData::load(&path).unwrap();
+        let before = p.handle_command("top");
+        assert!(before.contains("main.work"));
+        // Before filter: main.work ~= 10/110 ≈ 9%
+        // pprof has only one profile so ignore drops the whole thing;
+        // validate that ignore works at frame level instead:
+        p.handle_command("ignore gopark");
+        let after = p.handle_command("top");
+        // The gopark sample is excluded; main.work is now the whole baseline.
+        assert!(
+            after.contains("100.0%"),
+            "expected main.work at 100% post-filter:\n{after}"
+        );
+    }
+
+    #[test]
+    fn pprof_traces_empty_errors() {
+        let err = pprof_traces_to_speedscope("File: x\nType: cpu")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no sample"));
     }
 
     #[test]
