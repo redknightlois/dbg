@@ -16,6 +16,83 @@ pub struct JitMethod {
     pub body: String,
 }
 
+/// Message shown when a `methods`/`disasm`/etc. pattern matches nothing.
+///
+/// The common trap: the JIT only emits a standalone body (with a
+/// `; Assembly listing for method …` header) for methods it compiled
+/// on their own. Small/hot methods get inlined at every call site and
+/// leave no trace in `capture.asm` under their own name — `dbg disasm
+/// FooHelper` correctly but misleadingly reports "no methods found".
+/// When the pattern looks specific (not bare `*` / empty), steer the
+/// agent toward `search` (find callers that contain the tell-tale
+/// instructions of the inlined body) before they conclude the code
+/// path is missing.
+fn empty_match_hint(pattern: &str, callers: &[&str]) -> String {
+    let p = pattern.trim().trim_matches('*');
+    if p.is_empty() {
+        return "no methods found\n".into();
+    }
+
+    // Preferred path: we already know, from the call-graph built at
+    // parse time, which methods reference this target. Advertise them
+    // concretely — the agent can jump straight to `disasm <caller>`
+    // without first running `search` to locate one. This is the
+    // "preemptive" behavior: information derived from one pass over
+    // the capture, surfaced at the moment it's actionable.
+    if !callers.is_empty() {
+        let list: Vec<String> = callers
+            .iter()
+            .take(8)
+            .map(|c| format!("    • {c}"))
+            .collect();
+        let more = if callers.len() > 8 {
+            format!("\n    … and {} more", callers.len() - 8)
+        } else {
+            String::new()
+        };
+        return format!(
+            "no standalone body for `{pattern}` — it was inlined at every call\n\
+             site. The inlined code runs, but lives embedded inside the callers'\n\
+             listings, not under its own header.\n\
+             \n\
+             Known callers (from the call graph of this capture):\n\
+             {}{more}\n\
+             \n\
+             Try `disasm {}` — the inlined body appears right after that\n\
+             call-site's argument setup. `search <tell-tale-instruction>` still\n\
+             works if you want to narrow down which caller actually hit a\n\
+             specific codegen variant.\n",
+            list.join("\n"),
+            callers[0],
+        );
+    }
+
+    // Fallback: no caller info (target not referenced by any standalone
+    // method either, e.g. everything up the chain also got inlined, or
+    // the pattern is misspelled). Give the generic workflow.
+    format!(
+        "no methods found matching `{pattern}`.\n\
+         If the method is small/hot it was probably inlined — the JIT emits no\n\
+         standalone body for inlined methods, so it won't appear here. The\n\
+         inlined code still executes: it lives inside the caller's disasm.\n\
+         \n\
+         Workflow:\n\
+           1. Find a caller (the \"parent\" method that invokes it):\n\
+                `search <tell-tale-instruction-or-helper>`\n\
+              Pick an op the callee is likely to emit (a distinctive mask,\n\
+              shift, compare, or helper call). Every method whose body\n\
+              contains it is a caller that inlined the target.\n\
+           2. `disasm <parent-method>` — the inlined body appears embedded\n\
+              in the caller's listing, usually right after the call-site's\n\
+              argument setup.\n\
+           3. `methods *{p}*` — double-check the name isn't just qualified\n\
+              differently (generics, overloads, nested types).\n\
+           4. Only as a last resort: add `[MethodImpl(MethodImplOptions.NoInlining)]`\n\
+              for a one-off run to force standalone codegen. Revert after —\n\
+              it distorts everything else's disasm.\n"
+    )
+}
+
 /// The .NET JIT emits `vxorps reg, reg, reg` (and `vpxor`, `xorps`, …)
 /// purely to zero a register before scalar work. Counting it as a SIMD
 /// hit in `simd` output turned scalar methods into false positives,
@@ -44,6 +121,48 @@ fn is_zero_init_xor(line: &str) -> bool {
 /// Parsed index of all methods in a JIT disassembly file.
 pub struct JitIndex {
     pub methods: Vec<JitMethod>,
+    /// Inverted call graph: callee-name-substring → caller method names.
+    ///
+    /// Built from `call     [Namespace.Class:Method(args):ret]` operands
+    /// in every method body. When `disasm <X>` matches no standalone
+    /// listing (because `X` was inlined at every site), we look up `X`
+    /// here and advertise the callers by name — the user can jump
+    /// straight to `disasm <caller>` and find the inlined body embedded
+    /// there, instead of having to discover the caller via `search`
+    /// first.
+    ///
+    /// Keyed by both the fully-qualified `Namespace.Class:Method` form
+    /// and the short `Class:Method` form, so a pattern in either shape
+    /// resolves.
+    pub call_graph: std::collections::HashMap<String, Vec<String>>,
+}
+
+/// Pull callee names out of a single disassembly line of the form
+/// `       call     [Namespace.Class:Method(args):ret]`.
+///
+/// Returns `(fq_name, short_name)` where `short_name` drops the leading
+/// `Namespace.` before `Class`. Returns `None` for runtime-helper calls
+/// (`CORINFO_HELP_*`) and indirect calls that don't name a method.
+fn extract_call_target(line: &str) -> Option<(String, String)> {
+    let trimmed = line.trim_start();
+    let rest = trimmed.strip_prefix("call")?;
+    // Must be whitespace-separated "call" followed by arguments — don't
+    // match `callq` or stray identifiers containing "call".
+    if !rest.starts_with(|c: char| c.is_ascii_whitespace()) {
+        return None;
+    }
+    let after = rest.trim_start();
+    let inside = after.strip_prefix('[').and_then(|s| s.split_once(']'))?.0;
+    // Take up to the first `(` — the signature is noise for graph purposes.
+    let name = inside.split('(').next().unwrap_or(inside).trim();
+    if !name.contains(':') {
+        return None;
+    }
+    let short = match name.rsplit_once('.') {
+        Some((_, tail)) if tail.contains(':') => tail.to_string(),
+        _ => name.to_string(),
+    };
+    Some((name.to_string(), short))
 }
 
 impl JitIndex {
@@ -100,7 +219,53 @@ impl JitIndex {
             });
         }
 
-        JitIndex { methods }
+        // Build the inverted call graph. See struct doc for rationale.
+        let mut call_graph: std::collections::HashMap<String, Vec<String>> =
+            std::collections::HashMap::new();
+        for m in &methods {
+            let mut already: std::collections::HashSet<(String, String)> =
+                std::collections::HashSet::new();
+            for line in m.body.lines() {
+                if let Some((fq, short)) = extract_call_target(line) {
+                    // Dedup per-caller so a method calling the same target
+                    // twice doesn't list itself twice in the advert.
+                    if already.insert((fq.clone(), short.clone())) {
+                        call_graph.entry(fq).or_default().push(m.name.clone());
+                        if !call_graph.get(&short).is_some_and(|v| v.contains(&m.name)) {
+                            call_graph.entry(short).or_default().push(m.name.clone());
+                        }
+                    }
+                }
+            }
+        }
+
+        JitIndex { methods, call_graph }
+    }
+
+    /// Callers that reference `pattern` in a `call` instruction. Used
+    /// by the empty-match hint to advertise where an inlined target's
+    /// body can actually be inspected (inside the caller's listing).
+    ///
+    /// Substring match so `MathUtils:Length`, `:Length`, and the full
+    /// `MyNamespace.MathUtils:Length` all resolve.
+    pub fn callers_of(&self, pattern: &str) -> Vec<&str> {
+        let needle = pattern.trim().trim_matches('*');
+        if needle.is_empty() {
+            return Vec::new();
+        }
+        let mut seen = std::collections::HashSet::new();
+        let mut out: Vec<&str> = Vec::new();
+        for (callee, callers) in &self.call_graph {
+            if callee.contains(needle) {
+                for c in callers {
+                    if seen.insert(c.as_str()) {
+                        out.push(c.as_str());
+                    }
+                }
+            }
+        }
+        out.sort_unstable();
+        out
     }
 
     /// Filter methods whose name matches a substring (case-sensitive).
@@ -124,23 +289,82 @@ impl JitIndex {
             out.push_str(&format!("{:<60} {} bytes\n", m.name, m.code_bytes));
         }
         if out.is_empty() {
-            out.push_str("no methods found\n");
+            let callers = self.callers_of(pattern);
+            out.push_str(&empty_match_hint(pattern, &callers));
         }
         out
     }
 
-    /// `disasm <pattern>` — show full disassembly for matching methods.
-    pub fn cmd_disasm(&self, pattern: &str) -> String {
+    /// Produce real disassembly text for `pattern` — the method's own
+    /// body if it was emitted standalone, or the callers' bodies
+    /// (banner-separated) when it was inlined away. Returns `None`
+    /// when neither path has anything: no standalone match, no
+    /// caller references in the capture. Callers decide whether to
+    /// render a hint, bail, etc.
+    ///
+    /// Shared between the interactive REPL and the on-demand
+    /// disasm collector so both surfaces benefit from the
+    /// inlined-parent fallback — previously the collector did a
+    /// plain header scan and bailed with "no matching header",
+    /// making `dbg disasm` from a shell strictly worse than the
+    /// REPL for inlined targets.
+    pub fn disasm_with_parent_fallback(&self, pattern: &str) -> Option<String> {
         let matched = self.filter(pattern);
-        let mut out = String::new();
-        for m in &matched {
+        if !matched.is_empty() {
+            let mut out = String::new();
+            for m in &matched {
+                out.push_str(&m.body);
+                out.push('\n');
+            }
+            return Some(out);
+        }
+
+        let callers = self.callers_of(pattern);
+        if callers.is_empty() {
+            return None;
+        }
+
+        // Cap at the 6 largest caller bodies to keep the output
+        // navigable. Larger methods are more likely to contain the
+        // inlined body in a recognisable form; if the agent wants all
+        // of them, they can ask for each by name.
+        const MAX: usize = 6;
+        let mut caller_methods: Vec<&JitMethod> = callers
+            .iter()
+            .filter_map(|c| self.methods.iter().find(|m| m.name == *c))
+            .collect();
+        caller_methods.sort_by(|a, b| b.code_bytes.cmp(&a.code_bytes));
+        let truncated = caller_methods.len() > MAX;
+        caller_methods.truncate(MAX);
+
+        let mut out = format!(
+            "── `{pattern}` has no standalone body — inlined at every call site. \
+             Showing {} caller listing(s); the inlined body is embedded in each. ──\n\n",
+            caller_methods.len()
+        );
+        for m in &caller_methods {
+            out.push_str(&format!(
+                "════════ parent: {} ════════\n",
+                m.name
+            ));
             out.push_str(&m.body);
             out.push('\n');
         }
-        if out.is_empty() {
-            out.push_str("no methods found\n");
+        if truncated {
+            out.push_str(&format!(
+                "\n(… {} more caller(s) omitted; request by name if needed.)\n",
+                callers.len() - MAX
+            ));
         }
-        out
+        Some(out)
+    }
+
+    /// `disasm <pattern>` — REPL command. Thin wrapper over
+    /// `disasm_with_parent_fallback` that renders the generic
+    /// inlining hint when there's nothing useful to show.
+    pub fn cmd_disasm(&self, pattern: &str) -> String {
+        self.disasm_with_parent_fallback(pattern)
+            .unwrap_or_else(|| empty_match_hint(pattern, &self.callers_of(pattern)))
     }
 
     /// `search <instruction>` — find methods containing a specific instruction.
@@ -430,7 +654,19 @@ pub fn run_repl(asm_path: &str, default_pattern: &str) -> io::Result<()> {
                  exit                 quit\n"
                     .into()
             }
-            "exit" | "quit" => break,
+            "exit" | "quit" => {
+                // Leaving the REPL does NOT kill the daemon; the
+                // session keeps the capture file and any child
+                // subprocesses alive. Agents (and humans) routinely
+                // forget this and move on, leaving leaked state that
+                // confuses the next `dbg start`. Surface the reminder
+                // at the exit boundary — it's the last thing they see.
+                println!(
+                    "\nREPL closed. The dbg session is still running in the background.\n\
+                     Run `dbg kill` now to release the capture file and any subprocesses."
+                );
+                break;
+            }
             _ => format!("unknown command: {}. Type 'help' for available commands.\n", cmd),
         };
 
@@ -452,6 +688,140 @@ mod tests {
     /// `disasm`. The scenario instructions and top-level `dbg jitdasm`
     /// verb both suggest the user-facing name, so the REPL now accepts
     /// `jitdasm` as a synonym.
+    #[test]
+    fn empty_match_hint_plain_for_wildcard() {
+        // Bare `*` or empty means "whole capture is empty" — a
+        // different problem (no methods compiled at all), so no
+        // inlining hint.
+        assert_eq!(empty_match_hint("*", &[]), "no methods found\n");
+        assert_eq!(empty_match_hint("", &[]), "no methods found\n");
+        assert_eq!(empty_match_hint("  ", &[]), "no methods found\n");
+    }
+
+    #[test]
+    fn empty_match_hint_generic_when_no_callers_known() {
+        let msg = empty_match_hint("FlatLongIntMap:TryGetValue", &[]);
+        assert!(msg.contains("inlined"), "hint should mention inlining: {msg}");
+        assert!(msg.contains("search"), "hint should suggest `search`: {msg}");
+        assert!(
+            msg.contains("caller"),
+            "hint should tell the agent to look at the caller: {msg}"
+        );
+        assert!(
+            msg.contains("disasm <parent-method>"),
+            "hint should spell out the parent-disasm step: {msg}"
+        );
+        assert!(
+            msg.contains("NoInlining"),
+            "hint should mention NoInlining escape hatch: {msg}"
+        );
+        assert!(
+            msg.contains("FlatLongIntMap:TryGetValue"),
+            "hint should echo the pattern: {msg}"
+        );
+    }
+
+    #[test]
+    fn empty_match_hint_advertises_known_callers() {
+        let msg = empty_match_hint(
+            "MathUtils:Length",
+            &["MyNamespace.MathUtils:Normalize(float[]):float[]"],
+        );
+        assert!(
+            msg.contains("Known callers"),
+            "hint should label the caller list: {msg}"
+        );
+        assert!(
+            msg.contains("MathUtils:Normalize"),
+            "hint should name the actual caller: {msg}"
+        );
+        assert!(
+            msg.contains("disasm MyNamespace.MathUtils:Normalize"),
+            "hint should include a ready-to-run `disasm <caller>` command: {msg}"
+        );
+        // Preemptive-mode hint shouldn't belabour the NoInlining escape
+        // hatch — the agent has a concrete next step.
+        assert!(
+            !msg.contains("NoInlining"),
+            "preemptive hint should skip the last-resort escape hatch: {msg}"
+        );
+    }
+
+    #[test]
+    fn extract_call_target_parses_managed_call() {
+        let (fq, short) = extract_call_target(
+            "       call     [MyNamespace.SimdOps:DotProduct(System.ReadOnlySpan`1[float],System.ReadOnlySpan`1[float]):float]",
+        )
+        .unwrap();
+        assert_eq!(fq, "MyNamespace.SimdOps:DotProduct");
+        assert_eq!(short, "SimdOps:DotProduct");
+    }
+
+    #[test]
+    fn extract_call_target_ignores_runtime_helpers() {
+        assert!(extract_call_target("       call     CORINFO_HELP_RNGCHKFAIL").is_none());
+        assert!(extract_call_target("       call     qword ptr [rax+0x10]").is_none());
+        // Must not match lines that merely contain "call" as a substring.
+        assert!(extract_call_target("       mov      rax, callable_ptr").is_none());
+    }
+
+    #[test]
+    fn call_graph_maps_inlined_callees_to_their_callers() {
+        // Fixture scenario: `MyNamespace.MathUtils:Length` is called
+        // inside `MathUtils:Normalize` but has no standalone listing.
+        // Exactly the inlinee → parent case we want to advertise.
+        let idx = JitIndex::parse(SAMPLE);
+        let callers = idx.callers_of("MathUtils:Length");
+        assert!(
+            callers.iter().any(|c| c.contains("MathUtils:Normalize")),
+            "MathUtils:Length should be advertised as called-by MathUtils:Normalize, got {callers:?}"
+        );
+    }
+
+    #[test]
+    fn cmd_disasm_of_inlined_method_emits_parent_body() {
+        // The central behavior: asking for an inlined method's disasm
+        // should transparently show the parent's disassembly (where
+        // the inlined body actually lives), not just name the parent
+        // and make the agent run a second command.
+        let idx = JitIndex::parse(SAMPLE);
+        let out = idx.cmd_disasm("MathUtils:Length");
+
+        // Banner makes the substitution explicit.
+        assert!(
+            out.contains("no standalone body"),
+            "output should flag that the target is inlined: {out}"
+        );
+        assert!(
+            out.contains("parent:") && out.contains("MathUtils:Normalize"),
+            "output should label the parent being shown: {out}"
+        );
+
+        // The parent's actual disassembly must be present, not just
+        // its name. `Normalize`'s body in the fixture contains this
+        // call instruction.
+        assert!(
+            out.contains("call     [MyNamespace.MathUtils:Length"),
+            "output should embed the parent's real disasm body, not a summary: {out}"
+        );
+    }
+
+    #[test]
+    fn cmd_disasm_falls_back_to_generic_hint_when_no_callers() {
+        let idx = JitIndex::parse(SAMPLE);
+        // A name that is neither a standalone method nor referenced by
+        // any call instruction → no call-graph entry, generic hint.
+        let out = idx.cmd_disasm("GhostMethod:Nope");
+        assert!(
+            out.contains("no methods found") || out.contains("NoInlining"),
+            "should fall back to the generic hint: {out}"
+        );
+        assert!(
+            !out.contains("parent:"),
+            "must not fabricate parent listings: {out}"
+        );
+    }
+
     #[test]
     fn canonical_verb_maps_jitdasm_to_disasm() {
         assert_eq!(canonical_verb("jitdasm"), "disasm");

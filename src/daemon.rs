@@ -225,6 +225,38 @@ pub fn startup_log_path() -> PathBuf {
     runtime_dir().join(format!("dbg-{}.startup.log", session_slug()))
 }
 
+/// Detach the current (post-fork) process from its parent's stdio.
+///
+/// Single-fork + setsid alone is not sufficient when the parent captures
+/// stdout/stderr via pipes (e.g. Claude Code's Bash tool): the captured
+/// pipe stays open as long as the daemon inherits fd 1/2, the parent
+/// blocks waiting for EOF, and when the harness tears the tool call down
+/// it kills the whole process tree — taking the daemon with it.
+///
+/// Redirect fd 0/1 to /dev/null and fd 2 to `log_path` so the parent's
+/// pipe can close and the daemon survives the tool call.
+///
+/// Must be called from the forked daemon child, after `setsid()`.
+pub fn detach_stdio(log_path: &std::path::Path) {
+    use std::os::unix::io::AsRawFd;
+    if let Ok(dn) = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/null")
+    {
+        let _ = nix::unistd::dup2(dn.as_raw_fd(), 0);
+        let _ = nix::unistd::dup2(dn.as_raw_fd(), 1);
+    }
+    if let Ok(f) = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(log_path)
+    {
+        let _ = nix::unistd::dup2(f.as_raw_fd(), 2);
+    }
+}
+
 /// Session-scoped temp directory for profile data etc.
 /// Uses a random ID to avoid collisions between concurrent sessions.
 pub fn session_tmp(filename: &str) -> PathBuf {

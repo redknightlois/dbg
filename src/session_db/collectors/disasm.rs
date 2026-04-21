@@ -13,6 +13,7 @@ use anyhow::{Context, Result, bail};
 use regex::Regex;
 
 use super::{CollectCtx, DisasmOutput, LiveDebugger, OnDemandCollector};
+use crate::jitdasm::JitIndex;
 use crate::session_db::TargetClass;
 
 // ============================================================
@@ -136,15 +137,29 @@ impl OnDemandCollector for JitDasmCollector {
             ),
             None => (run_jitdasm_fresh(ctx.target, ctx.symbol)?, "fresh dotnet run".into()),
         };
-        let asm_text = extract_jitdasm_section(&text, ctx.symbol);
-        if asm_text.is_empty() {
-            bail!(
-                "jitdasm produced no assembly for {} (no matching `; Assembly listing for method ...{}...` header in {})",
-                ctx.symbol,
+
+        // `::` is a C++/docs-style separator; .NET uses a single `:`.
+        // Normalise so the same symbol works in either shape.
+        let needle = ctx.symbol.replace("::", ":");
+
+        // Use the shared `JitIndex` fallback path so `dbg disasm` from
+        // a shell behaves exactly like the interactive REPL: when the
+        // target has no standalone body but the call graph knows
+        // callers, return the callers' bodies banner-separated (the
+        // inlined code lives embedded inside them). A plain header
+        // scan would bail with "no matching header" and leave the
+        // agent stuck.
+        let index = JitIndex::parse(&text);
+        let asm_text = index.disasm_with_parent_fallback(&needle).ok_or_else(|| {
+            anyhow::anyhow!(
+                "jitdasm produced no assembly for {} — no standalone body and no caller \
+                 references the name (so the method is either truly absent from this capture, \
+                 the pattern is misspelled, or every caller was also inlined away). Searched {}",
                 ctx.symbol,
                 source_desc,
-            );
-        }
+            )
+        })?;
+
         let tier = parse_jitdasm_tier(&asm_text);
         Ok(DisasmOutput {
             source: "jitdasm",
@@ -156,27 +171,59 @@ impl OnDemandCollector for JitDasmCollector {
     }
 }
 
-/// Fallback when no pre-captured `capture.asm` is available. Mirrors
-/// the invocation form used by `backend::jitdasm` so a `.csproj`
-/// target works (`dotnet run --project ...`) instead of being passed
-/// to `dotnet` as a positional arg, which fails.
+/// Fallback when no pre-captured `capture.asm` is available.
+///
+/// `dotnet run --project <csproj>` appears to drop `DOTNET_JitDisasm`
+/// (and friends) somewhere between the `dotnet` CLI host and the user
+/// process — an empty capture with zero `; Assembly listing` headers
+/// is the observable symptom. `dotnet exec <dll>` bypasses the
+/// intermediate host and the env vars reach the JIT. So: for a
+/// project target, first `dotnet build` and then resolve the output
+/// dll via the `runtimeconfig.json` sibling (only executable outputs
+/// emit one); for an already-built dll/exe target, exec it directly.
 fn run_jitdasm_fresh(target: &str, symbol: &str) -> Result<String> {
     let dotnet = std::env::var("DOTNET").unwrap_or_else(|_| "dotnet".into());
-    let mut cmd = Command::new(&dotnet);
-    if target.ends_with(".csproj") || target.ends_with(".fsproj") {
-        cmd.args(["run", "--project", target, "-c", "Release"]);
+
+    let dll_path: std::path::PathBuf = if target.ends_with(".csproj") || target.ends_with(".fsproj")
+    {
+        // Build the project so bin/Release/net*/ is populated.
+        let build = Command::new(&dotnet)
+            .args(["build", target, "-c", "Release", "--nologo", "-v", "q"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .with_context(|| format!("invoking {dotnet} build for {target}"))?;
+        if !build.status.success() {
+            bail!(
+                "dotnet build {} failed:\n{}",
+                target,
+                String::from_utf8_lossy(&build.stderr)
+            );
+        }
+        let proj_dir = std::path::Path::new(target)
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."));
+        locate_executable_dll(proj_dir).with_context(|| {
+            format!(
+                "locating built dll under {}/bin/Release/net*/",
+                proj_dir.display()
+            )
+        })?
     } else {
-        cmd.arg(target);
-    }
-    let output = cmd
+        std::path::PathBuf::from(target)
+    };
+
+    let output = Command::new(&dotnet)
+        .arg("exec")
+        .arg(&dll_path)
         .env("DOTNET_JitDisasm", symbol)
         .env("DOTNET_TieredCompilation", "0") // deterministic tier
         .env("DOTNET_JitDiffableDasm", "1")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .output()
-        .with_context(|| format!("invoking {dotnet} for jitdasm"))?;
-    // JitDisasm writes to stdout under `dotnet run` (stderr-vs-stdout
+        .with_context(|| format!("invoking {dotnet} exec {}", dll_path.display()))?;
+    // JitDisasm writes to stdout under `dotnet exec` (stderr-vs-stdout
     // varies by host); concatenate both so the parser sees everything.
     let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
     text.push('\n');
@@ -187,31 +234,49 @@ fn run_jitdasm_fresh(target: &str, symbol: &str) -> Result<String> {
     Ok(text)
 }
 
-/// jitdasm writes one method listing at a time, each starting with a
-/// `; Assembly listing for method <method> (...)`-style header. We
-/// keep everything from the first header that mentions our symbol up
-/// to the next header (or end).
-fn extract_jitdasm_section(stderr: &str, symbol: &str) -> String {
-    // .NET jitdasm headers use a single colon between type and method
-    // (`Namespace.Type:Method`). Accept the common C++/docs-style
-    // `Namespace.Type::Method` input by normalising both sides.
-    let needle = symbol.replace("::", ":");
-    let mut out = Vec::new();
-    let mut capturing = false;
-    for line in stderr.lines() {
-        if line.starts_with("; Assembly listing for method") {
-            if capturing {
-                break;
+/// Find the executable dll in a project's Release output directory.
+///
+/// Executable projects emit a `<AssemblyName>.runtimeconfig.json` next
+/// to the dll — library projects do not. Using its presence as a
+/// marker is more reliable than globbing *.dll and guessing which one
+/// is the entry point when dependencies are side-by-side.
+fn locate_executable_dll(proj_dir: &std::path::Path) -> Result<std::path::PathBuf> {
+    let release_root = proj_dir.join("bin").join("Release");
+    let tfm_dirs = std::fs::read_dir(&release_root)
+        .with_context(|| format!("reading {}", release_root.display()))?;
+    // Multiple `net*` TFMs may coexist (e.g. net6.0 + net8.0); prefer
+    // the most recently modified so a fresh build wins.
+    let mut candidates: Vec<(std::time::SystemTime, std::path::PathBuf)> = Vec::new();
+    for tfm in tfm_dirs.flatten() {
+        let tfm_path = tfm.path();
+        if !tfm_path.is_dir() {
+            continue;
+        }
+        let Ok(entries) = std::fs::read_dir(&tfm_path) else { continue };
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if p.extension().and_then(|e| e.to_str()) == Some("json")
+                && p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.ends_with(".runtimeconfig.json"))
+            {
+                let dll = p.with_extension("").with_extension("dll");
+                if dll.is_file() {
+                    let mtime = entry
+                        .metadata()
+                        .and_then(|m| m.modified())
+                        .unwrap_or(std::time::UNIX_EPOCH);
+                    candidates.push((mtime, dll));
+                }
             }
-            if line.contains(&needle) {
-                capturing = true;
-                out.push(line);
-            }
-        } else if capturing {
-            out.push(line);
         }
     }
-    out.join("\n")
+    candidates.sort_by(|a, b| b.0.cmp(&a.0));
+    candidates
+        .into_iter()
+        .next()
+        .map(|(_, p)| p)
+        .ok_or_else(|| anyhow::anyhow!("no <name>.runtimeconfig.json found under {}/net*/", release_root.display()))
 }
 
 fn parse_jitdasm_tier(asm: &str) -> Option<String> {
@@ -282,32 +347,37 @@ mod tests {
     // Parser-level tests — don't require the tool to be installed.
 
     #[test]
-    fn extract_jitdasm_isolates_target_method() {
-        let stderr = "\
+    fn jitdasm_collector_isolates_target_method() {
+        let text = "\
 Hello from pre-JIT chatter.
 ; Assembly listing for method MyApp.Foo:Bar() (Tier1)
  mov rax, rbx
  ret
 ; Assembly listing for method MyApp.Baz:Qux()
  mov rcx, rdx";
-        let got = extract_jitdasm_section(stderr, "MyApp.Foo:Bar");
+        let got = JitIndex::parse(text)
+            .disasm_with_parent_fallback("MyApp.Foo:Bar")
+            .expect("expected match");
         assert!(got.contains("MyApp.Foo:Bar"));
         assert!(got.contains("mov rax, rbx"));
         assert!(!got.contains("MyApp.Baz:Qux"));
     }
 
     #[test]
-    fn extract_jitdasm_normalizes_double_colon() {
+    fn jitdasm_collector_normalizes_double_colon() {
         // Callers (and human intuition) often write C++/docs-style
         // `Namespace::Type::Method`; the .NET jitdasm header uses a
-        // single `:` between type and method. The extractor must
-        // match both spellings so `dbg disasm "Broken.Program::Foo"`
-        // works when the header says `Broken.Program:Foo`.
-        let stderr = "\
+        // single `:` between type and method. The collector
+        // normalises `::` → `:` before lookup so `dbg disasm
+        // "Broken.Program::SumFast"` still works.
+        let text = "\
 ; Assembly listing for method Broken.Program:SumFast(System.Int32[]):int (Tier1)
  vaddps ymm0, ymm0, ymm1
  ret";
-        let got = extract_jitdasm_section(stderr, "Broken.Program::SumFast");
+        let needle = "Broken.Program::SumFast".replace("::", ":");
+        let got = JitIndex::parse(text)
+            .disasm_with_parent_fallback(&needle)
+            .expect("expected match");
         assert!(
             got.contains("vaddps"),
             "double-colon form did not match single-colon header: got={got:?}"
@@ -315,10 +385,42 @@ Hello from pre-JIT chatter.
     }
 
     #[test]
-    fn extract_jitdasm_empty_when_no_match() {
-        let stderr = "; Assembly listing for method MyApp.X:Y\n mov rax, rbx";
-        let got = extract_jitdasm_section(stderr, "Other.Method");
-        assert!(got.is_empty());
+    fn jitdasm_collector_empty_when_no_match_and_no_callers() {
+        let text = "; Assembly listing for method MyApp.X:Y\n mov rax, rbx";
+        let got = JitIndex::parse(text).disasm_with_parent_fallback("Other.Method");
+        assert!(
+            got.is_none(),
+            "no standalone body and no caller references should return None: {got:?}"
+        );
+    }
+
+    #[test]
+    fn jitdasm_collector_falls_back_to_parent_on_inlined_target() {
+        // Inlined target: no standalone `Helper:Probe` header, but
+        // `Outer:Run` contains a call to it. The collector should
+        // surface `Outer:Run`'s body with the banner.
+        let text = "\
+; Assembly listing for method MyNs.Outer:Run():int (FullOpts)
+       push     rbp
+       call     [MyNs.Helper:Probe(long):int]
+       pop      rbp
+       ret
+; Total bytes of code 9";
+        let got = JitIndex::parse(text)
+            .disasm_with_parent_fallback("Helper:Probe")
+            .expect("expected fallback-to-parent hit");
+        assert!(
+            got.contains("no standalone body") && got.contains("parent:"),
+            "fallback output should carry the banner+parent header: {got}"
+        );
+        assert!(
+            got.contains("MyNs.Outer:Run"),
+            "parent method name should be shown: {got}"
+        );
+        assert!(
+            got.contains("call     [MyNs.Helper:Probe"),
+            "parent body should be embedded verbatim: {got}"
+        );
     }
 
     #[test]

@@ -1,0 +1,15 @@
+/shared/disk2/src/dbg-gdbg-develop/examples/scenarios/25-jit-inlined-invisible-csharp/bin/Release/net8.0/broken
+/shared/disk2/src/dbg-gdbg-develop/examples/scenarios/25-jit-inlined-invisible-csharp/bin/Release/net8.0/broken.deps.json
+/shared/disk2/src/dbg-gdbg-develop/examples/scenarios/25-jit-inlined-invisible-csharp/bin/Release/net8.0/broken.runtimeconfig.json
+/shared/disk2/src/dbg-gdbg-develop/examples/scenarios/25-jit-inlined-invisible-csharp/bin/Release/net8.0/broken.dll
+/shared/disk2/src/dbg-gdbg-develop/examples/scenarios/25-jit-inlined-invisible-csharp/bin/Release/net8.0/broken.pdb
+/shared/disk2/src/dbg-gdbg-develop/examples/scenarios/25-jit-inlined-invisible-csharp/obj/Release/net8.0/Broken.GeneratedMSBuildEditorConfig.editorconfig
+/shared/disk2/src/dbg-gdbg-develop/examples/scenarios/25-jit-inlined-invisible-csharp/obj/Release/net8.0/Broken.AssemblyInfoInputs.cache
+/shared/disk2/src/dbg-gdbg-develop/examples/scenarios/25-jit-inlined-invisible-csharp/obj/Release/net8.0/Broken.AssemblyInfo.cs
+/shared/disk2/src/dbg-gdbg-develop/examples/scenarios/25-jit-inlined-invisible-csharp/obj/Release/net8.0/Broken.csproj.CoreCompileInputs.cache
+/shared/disk2/src/dbg-gdbg-develop/examples/scenarios/25-jit-inlined-invisible-csharp/obj/Release/net8.0/Broken.sourcelink.json
+/shared/disk2/src/dbg-gdbg-develop/examples/scenarios/25-jit-inlined-invisible-csharp/obj/Release/net8.0/broken.dll
+/shared/disk2/src/dbg-gdbg-develop/examples/scenarios/25-jit-inlined-invisible-csharp/obj/Release/net8.0/refint/broken.dll
+/shared/disk2/src/dbg-gdbg-develop/examples/scenarios/25-jit-inlined-invisible-csharp/obj/Release/net8.0/broken.pdb
+/shared/disk2/src/dbg-gdbg-develop/examples/scenarios/25-jit-inlined-invisible-csharp/obj/Release/net8.0/Broken.genruntimeconfig.cache
+/shared/disk2/src/dbg-gdbg-develop/examples/scenarios/25-jit-inlined-invisible-csharp/obj/Release/net8.0/ref/broken.dll

@@ -50,6 +50,35 @@ fn repl_default_pattern(raw: &str) -> String {
     raw.trim_matches('*').to_string()
 }
 
+/// Extract `--capture-duration <val>` (or `--capture-duration=<val>`)
+/// from the backend args, returning the duration string (as accepted by
+/// coreutils `timeout`, e.g. `30s`, `2m`, `1h`, or a bare number) and
+/// the remaining args. Unknown values are passed through to `timeout`
+/// verbatim — it rejects garbage at run time with a clear message.
+fn extract_capture_duration(args: &[String]) -> (Option<String>, Vec<String>) {
+    let mut out = Vec::with_capacity(args.len());
+    let mut duration: Option<String> = None;
+    let mut i = 0;
+    while i < args.len() {
+        let a = &args[i];
+        if let Some(val) = a.strip_prefix("--capture-duration=") {
+            duration = Some(val.to_string());
+            i += 1;
+            continue;
+        }
+        if a == "--capture-duration"
+            && let Some(val) = args.get(i + 1)
+        {
+            duration = Some(val.clone());
+            i += 2;
+            continue;
+        }
+        out.push(a.clone());
+        i += 1;
+    }
+    (duration, out)
+}
+
 /// Qualify a JitDisasm pattern with the project's namespace when the
 /// user supplied only `Type:Method` (no `.` in the type component).
 /// Leaves `*`, `Foo.Bar:Baz`, and already-qualified patterns alone.
@@ -119,15 +148,24 @@ impl Backend for JitDasmBackend {
         // the project's RootNamespace in the method name. Auto-prepend
         // the project's namespace to any pattern whose type portion
         // (before `:`) has no `.` and no leading `*`.
-        let raw_pattern = if args.is_empty() {
+        // Extract `--capture-duration <val>` before any positional
+        // parsing. Long-running targets (QPS benches, servers, REPLs)
+        // never exit under `dotnet run`, so `dbg start jitdasm` would
+        // hang forever waiting for the child to produce EOF. When the
+        // flag is set we wrap the child with `timeout --preserve-status`
+        // so a graceful time-kill still looks like success. See
+        // skills/adapters/jitdasm.md "Long-running targets".
+        let (capture_duration, rest_args) = extract_capture_duration(args);
+
+        let raw_pattern = if rest_args.is_empty() {
             "*".to_string()
         } else {
-            args[0].clone()
+            rest_args[0].clone()
         };
         let pattern = qualify_pattern(&raw_pattern, &project);
 
-        let extra_args: Vec<String> = if args.len() > 1 {
-            args[1..].to_vec()
+        let extra_args: Vec<String> = if rest_args.len() > 1 {
+            rest_args[1..].to_vec()
         } else {
             vec![]
         };
@@ -148,9 +186,37 @@ impl Backend for JitDasmBackend {
             shell_escape(&project)
         );
 
+        let timeout_prefix = match capture_duration.as_deref() {
+            Some(d) => format!("timeout --preserve-status {} ", shell_escape(d)),
+            None => String::new(),
+        };
+
+        // Why not `dotnet run --project <csproj>`? On recent SDKs, the
+        // `dotnet run` host launches the user program via an
+        // intermediate process that drops `DOTNET_JitDisasm` (and the
+        // other DOTNET_* JIT knobs) before reaching the process whose
+        // JIT we actually want to inspect. Result: `capture.asm` ends
+        // up empty except for the program's own stdout. Running
+        // `dotnet exec <dll>` directly skips the intermediate process
+        // and the env vars reach the JIT. We recover the dll path by
+        // reading the `<AssemblyName>.runtimeconfig.json` sibling that
+        // the build drops into `bin/Release/net*/` — only executables
+        // emit one, so it reliably names the entry-point dll.
+        let proj_dir_expr = format!("$(dirname {})", shell_escape(&project));
+        let locate_dll = format!(
+            "dll=$(ls -t {proj_dir}/bin/Release/net*/*.runtimeconfig.json 2>/dev/null | \
+             head -1 | sed 's/\\.runtimeconfig\\.json$/.dll/'); \
+             if [ -z \"$dll\" ] || [ ! -f \"$dll\" ]; then \
+               echo 'jitdasm: could not locate built dll under bin/Release/net*/; did build succeed?' >&2; \
+               exit 1; \
+             fi",
+            proj_dir = proj_dir_expr,
+        );
         let run_cmd = format!(
-            "echo 'Disassembling: {}' && DOTNET_TieredCompilation=0 DOTNET_JitDisasm='{}' DOTNET_JitDiffableDasm=1 dotnet run --project {} -c Release --no-build{} > {} 2>&1",
-            pattern, pattern, shell_escape(&project), extra, out_file_str
+            "echo 'Disassembling: {pattern}' && {locate_dll} && \
+             DOTNET_TieredCompilation=0 DOTNET_JitDisasm='{pattern}' DOTNET_JitDiffableDasm=1 \
+             {timeout_prefix}dotnet exec \"$dll\"{extra} > {out_file} 2>&1",
+            out_file = out_file_str,
         );
 
         // Replace the bash shell with our Rust REPL. Pass the raw
@@ -247,6 +313,55 @@ mod tests {
             )
             .unwrap();
         assert!(cfg.init_commands[2].contains("--ef 64"));
+    }
+
+    #[test]
+    fn capture_duration_wraps_with_timeout() {
+        let cfg = JitDasmBackend
+            .spawn_config(
+                "myapp.csproj",
+                &["--capture-duration".into(), "30s".into(), "Foo:Bar".into()],
+            )
+            .unwrap();
+        let run = &cfg.init_commands[2];
+        assert!(
+            run.contains("timeout --preserve-status 30s dotnet exec"),
+            "expected timeout prefix in: {run}"
+        );
+        // Flag must not leak through to the project's own args.
+        assert!(!run.contains("--capture-duration"), "flag leaked: {run}");
+    }
+
+    #[test]
+    fn capture_duration_equals_form_also_supported() {
+        let cfg = JitDasmBackend
+            .spawn_config(
+                "myapp.csproj",
+                &["--capture-duration=2m".into(), "Foo:Bar".into()],
+            )
+            .unwrap();
+        assert!(cfg.init_commands[2].contains("timeout --preserve-status 2m dotnet exec"));
+    }
+
+    #[test]
+    fn capture_duration_absent_means_no_timeout() {
+        let cfg = JitDasmBackend
+            .spawn_config("myapp.csproj", &["Foo:Bar".into()])
+            .unwrap();
+        assert!(!cfg.init_commands[2].contains("timeout "));
+    }
+
+    #[test]
+    fn extract_capture_duration_preserves_order_of_remaining_args() {
+        let (d, rest) = extract_capture_duration(&[
+            "Foo:Bar".into(),
+            "--capture-duration".into(),
+            "45s".into(),
+            "--iterations".into(),
+            "1".into(),
+        ]);
+        assert_eq!(d.as_deref(), Some("45s"));
+        assert_eq!(rest, vec!["Foo:Bar", "--iterations", "1"]);
     }
 
     #[test]

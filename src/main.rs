@@ -6,7 +6,6 @@ mod dap;
 mod ghcprof;
 mod init;
 mod inspector;
-mod jitdasm;
 mod phpprofile;
 mod profile;
 mod pty;
@@ -115,6 +114,35 @@ fn is_kill_alias(verb: &str) -> bool {
 }
 
 fn main() -> Result<()> {
+    // Hidden self-test hook: when DBG_DETACH_SELF_TEST is set, perform
+    // the same fork/setsid/detach_stdio dance as `dbg start` around a
+    // no-op "daemon" (sleep 5s). Used by the integration test in
+    // `tests/daemon_detach.rs` to prove that fd 1/2 are released before
+    // `dbg start` returns to its caller. Keeping this inside the real
+    // binary guarantees the test exercises production code, not a
+    // re-implementation.
+    if std::env::var_os("DBG_DETACH_SELF_TEST").is_some() {
+        let log_path = std::env::temp_dir().join(format!(
+            "dbg-detach-selftest-{}.log",
+            std::process::id()
+        ));
+        // Safety: fork duplicates the process
+        let fork_result = unsafe { fork() }?;
+        match fork_result {
+            ForkResult::Child => {
+                let _ = nix::unistd::setsid();
+                daemon::detach_stdio(&log_path);
+                std::thread::sleep(Duration::from_secs(5));
+                std::process::exit(0);
+            }
+            ForkResult::Parent { .. } => {
+                // Parent returns immediately — caller's pipe should
+                // EOF as soon as we exit *if* the child detached stdio.
+                return Ok(());
+            }
+        }
+    }
+
     let cli = Cli::parse();
     let mut registry = Registry::new();
     registry.register(Box::new(backend::lldb::LldbBackend));
@@ -149,7 +177,7 @@ fn main() -> Result<()> {
 
     // --jitdasm-repl (internal: launched by the jitdasm backend)
     if let Some(asm_path) = &cli.jitdasm_repl {
-        return jitdasm::run_repl(asm_path, &cli.jitdasm_pattern).map_err(Into::into);
+        return dbg_cli::jitdasm::run_repl(asm_path, &cli.jitdasm_pattern).map_err(Into::into);
     }
 
     // --phpprofile-repl (internal: launched by profile backends)
@@ -739,17 +767,7 @@ fn cmd_start(registry: &Registry, args: &[String]) -> Result<()> {
         ForkResult::Child => {
             // Daemon process
             let _ = nix::unistd::setsid();
-            // Redirect stderr to the startup log so the parent can read
-            // it back if the daemon dies before binding the socket.
-            if let Ok(f) = std::fs::OpenOptions::new()
-                .create(true)
-                .write(true)
-                .truncate(true)
-                .open(&log_path)
-            {
-                use std::os::unix::io::AsRawFd;
-                let _ = nix::unistd::dup2(f.as_raw_fd(), 2);
-            }
+            daemon::detach_stdio(&log_path);
             if let Err(e) = daemon::run_daemon(backend, &resolved, &run_args, attach.as_ref()) {
                 eprintln!("daemon error: {e:#}");
                 std::process::exit(1);

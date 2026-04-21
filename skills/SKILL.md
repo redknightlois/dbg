@@ -130,7 +130,7 @@ Examples that **do NOT work**:
 
 - Load the adapter first. Backend-specific knowledge lives there, not here.
 - Check preconditions from the adapter before starting.
-- Always `dbg kill` when done — leaked processes hold file locks.
+- **Always `dbg kill` when done** — the session daemon keeps the debuggee (and any capture subprocess) alive indefinitely otherwise. Exiting an interactive REPL (`exit`, `quit`, Ctrl-D) only ends your *view* of the session — the daemon keeps running. Before you move on to the next task, run `dbg kill`. Leaked daemons hold file locks, pin large capture files on disk, and will misattribute the next `dbg start` to the wrong target if the user forgets and restarts without a kill. Treat `dbg kill` as part of the task, not an optional cleanup.
 - Interpret output for the user — translate mangled names, summarize state, name the hypothesis each diff tests.
-- **Never prepend env vars to every `dbg` command.** The daemon inherits its environment from `dbg start`. If a tool needs env vars (e.g. `DOTNET_ROOT`), tell the user to set them in their shell profile once.
+- **Never prepend env vars to every `dbg` command.** The daemon inherits its environment from `dbg start`. If a tool needs env vars (e.g. `DOTNET_ROOT`), tell the user to add them to their shell profile once.
 - When preflight fails, read the error — it names the missing dependency. Don't retry blindly.
