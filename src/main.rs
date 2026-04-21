@@ -68,7 +68,9 @@ Run `dbg help <verb>` inside a session for backend-specific details.";
     after_help = SUBCOMMAND_HELP,
 )]
 struct Cli {
-    /// Initialize for an AI agent: claude, codex
+    /// Initialize for an AI agent (`claude`, `codex`), or print the
+    /// skill's YAML frontmatter to stdout (`agent-context`) for piping
+    /// into a harness SessionStart hook.
     #[arg(long)]
     init: Option<String>,
 
@@ -192,6 +194,10 @@ fn main() -> Result<()> {
 
     // --init
     if let Some(target) = &cli.init {
+        if target == "agent-context" {
+            init::emit_skill_yaml();
+            return Ok(());
+        }
         return init::run_init(target, &registry);
     }
 

@@ -33,8 +33,39 @@ pub fn run_init(target: &str, registry: &Registry) -> Result<()> {
     match target {
         "claude" => init_agent(registry, ".claude", "Claude Code"),
         "codex" => init_agent(registry, ".codex", "Codex"),
-        _ => bail!("unknown init target: {target} (use: claude, codex)"),
+        _ => bail!("unknown init target: {target} (use: claude, codex, agent-context)"),
     }
+}
+
+/// Print the YAML frontmatter of the embedded `SKILL.md` to stdout.
+///
+/// Intended for a harness SessionStart hook: the frontmatter enumerates
+/// the phrases that should trigger the `dbg` skill, and harnesses that
+/// discover tools via ToolSearch (Claude Code's recent behavior) would
+/// otherwise only see the bare name "dbg" — which reveals nothing about
+/// when to reach for it. Piping this to a session-start reminder puts
+/// the trigger contract in the model's context directly.
+///
+/// Emits the frontmatter bytes verbatim (including the `---` fences) so
+/// the receiver can keep it in its original YAML form or strip the
+/// fences as needed.
+pub fn emit_skill_yaml() {
+    if let Some(fm) = extract_frontmatter(SKILL_MD) {
+        println!("---\n{fm}\n---");
+    } else {
+        // No frontmatter found — dump the whole file so nothing silently
+        // drops. This is a build-time invariant violation rather than a
+        // user error, so no error return.
+        print!("{SKILL_MD}");
+    }
+}
+
+/// Return the YAML frontmatter block of a markdown document (the
+/// contents between the first pair of `---` lines), or None if absent.
+fn extract_frontmatter(doc: &str) -> Option<&str> {
+    let rest = doc.strip_prefix("---\n")?;
+    let end = rest.find("\n---\n")?;
+    Some(&rest[..end])
 }
 
 fn init_agent(registry: &Registry, config_dir: &str, agent_name: &str) -> Result<()> {
