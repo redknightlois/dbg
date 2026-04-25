@@ -726,8 +726,12 @@ fn cmd_start(registry: &Registry, args: &[String]) -> Result<()> {
                 }
             }
             "--args" | "-a" => {
+                // Everything after `--args` belongs to the debuggee,
+                // including hyphenated flags like `--commit-every`.
+                // Stopping at the next `--` token used to drop those
+                // silently into the catch-all below.
                 i += 1;
-                while i < args.len() && !args[i].starts_with("--") {
+                while i < args.len() {
                     run_args.push(args[i].clone());
                     i += 1;
                 }
@@ -740,11 +744,15 @@ fn cmd_start(registry: &Registry, args: &[String]) -> Result<()> {
                     attach_pid = args[i].parse().ok();
                 }
             }
-            other if !other.starts_with("--") => {
-                // Bare positional — forward to the backend.
+            other => {
+                // Bare positionals and unknown `--*` flags both go to
+                // the debuggee. dbg's own flags are a closed set above
+                // (`--break`, `--args`, `--run`, `--attach-pid`), so any
+                // long option that lands here is meant for the program.
+                // Silently dropping those used to break invocations like
+                // `dbg start <t> <target> ./bench --commit-every 1000`.
                 run_args.push(other.to_string());
             }
-            _ => {}
         }
         i += 1;
     }
