@@ -61,17 +61,6 @@ impl BreakLoc {
         BreakLoc::Fqn(spec.to_string())
     }
 
-    /// The string we store under `breakpoint_hits.location_key`. Same
-    /// key is produced whether a hit came from a `file:line` breakpoint
-    /// or a symbol one — stable for cross-session diffing.
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub fn location_key(&self) -> String {
-        match self {
-            BreakLoc::FileLine { file, line } => format!("{file}:{line}"),
-            BreakLoc::Fqn(s) => s.clone(),
-            BreakLoc::ModuleMethod { module, method } => format!("{module}!{method}"),
-        }
-    }
 }
 
 /// A breakpoint-id for `dbg unbreak`. Backends expose integer ids.
@@ -100,7 +89,9 @@ pub enum CanonicalReq {
 /// `op_locals` + `op_stack` and persists a `breakpoint_hits` row.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct HitEvent {
-    /// Canonical location key. See `BreakLoc::location_key`.
+    /// Canonical location key — `file:line` for file/line breakpoints,
+    /// `module!method` for module-qualified ones, otherwise the raw
+    /// FQN. Stable across sessions for cross-track joins.
     pub location_key: String,
     /// Thread or goroutine identifier, when the backend reports it.
     pub thread: Option<String>,
@@ -338,17 +329,6 @@ mod tests {
         assert_eq!(
             BreakLoc::parse("!foo"),
             BreakLoc::Fqn("!foo".into())
-        );
-    }
-
-    #[test]
-    fn location_key_stable_across_forms() {
-        let fl = BreakLoc::FileLine { file: "m.c".into(), line: 1 };
-        assert_eq!(fl.location_key(), "m.c:1");
-        assert_eq!(BreakLoc::Fqn("main".into()).location_key(), "main");
-        assert_eq!(
-            BreakLoc::ModuleMethod { module: "m".into(), method: "f".into() }.location_key(),
-            "m!f"
         );
     }
 
