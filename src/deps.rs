@@ -6,7 +6,6 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 /// How to verify a dependency is installed.
-#[allow(dead_code)]
 pub enum DependencyCheck {
     /// Check that a binary exists on PATH (optionally with minimum version).
     Binary {
@@ -16,10 +15,6 @@ pub enum DependencyCheck {
         /// Command + args to get version string, e.g., ("lldb-20", &["--version"]).
         /// If None, just checks existence.
         version_cmd: Option<(&'static str, &'static [&'static str])>,
-    },
-    /// Check that a Python module can be imported.
-    PythonImport {
-        module: &'static str,
     },
     /// Run an arbitrary command; exit code 0 means installed.
     Command {
@@ -102,25 +97,6 @@ pub fn check_dep(dep: Dependency) -> DepStatus {
                 name: dep.name,
                 ok: false,
                 detail: "not found".into(),
-                install: dep.install,
-                warning: None,
-            }
-        }
-        DependencyCheck::PythonImport { module } => {
-            let ok = Command::new("python3")
-                .args(["-c", &format!("import {module}")])
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status()
-                .is_ok_and(|s| s.success());
-            DepStatus {
-                name: dep.name,
-                ok,
-                detail: if ok {
-                    format!("{module} importable")
-                } else {
-                    format!("{module} not found")
-                },
                 install: dep.install,
                 warning: None,
             }
