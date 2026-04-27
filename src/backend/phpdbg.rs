@@ -62,25 +62,16 @@ impl Backend for PhpdbgBackend {
     }
 
     fn parse_help(&self, raw: &str) -> String {
-        let mut cmds: Vec<String> = Vec::new();
-        for line in raw.lines() {
-            let line = line.trim();
-            if line.is_empty() || line.starts_with("phpdbg") || line.starts_with("To") {
-                continue;
-            }
-            // phpdbg help lists commands as "  command   alias  description"
-            if let Some(first) = line.split_whitespace().next() {
-                if first.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
-                    && first.len() < 20
-                    && first.len() > 1
-                {
-                    cmds.push(first.to_string());
-                }
-            }
-        }
-        cmds.sort();
-        cmds.dedup();
-        format!("phpdbg: {}", cmds.join(", "))
+        // phpdbg help lists commands as "  command   alias  description"; the
+        // banner line ("phpdbg version ...") and the "To exit ..." footer
+        // share a first-token prefix and are filtered here.
+        super::parse_help_first_token(raw, "phpdbg", true, |tok| {
+            tok.len() > 1
+                && tok.len() < 20
+                && !tok.starts_with("phpdbg")
+                && !tok.starts_with("To")
+                && tok.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        })
     }
 
     fn adapters(&self) -> Vec<(&'static str, &'static str)> {

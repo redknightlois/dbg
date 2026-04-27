@@ -191,6 +191,34 @@ pub fn shell_escape(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
+/// Helper for `Backend::parse_help` impls that follow the common shape:
+/// take the first whitespace-separated token of each line, accept it as a
+/// command if `accept(tok)` holds, then format the deduplicated list as
+/// `"<label>: cmd1, cmd2, ..."`. Dedup preserves insertion order so callers
+/// who skip the sort still drop later duplicates correctly.
+pub fn parse_help_first_token(
+    raw: &str,
+    label: &str,
+    sort: bool,
+    accept: impl Fn(&str) -> bool,
+) -> String {
+    let mut cmds: Vec<String> = Vec::new();
+    for line in raw.lines() {
+        let line = line.trim();
+        if let Some(tok) = line.split_whitespace().next() {
+            if accept(tok) {
+                cmds.push(tok.to_string());
+            }
+        }
+    }
+    if sort {
+        cmds.sort();
+    }
+    let mut seen = std::collections::HashSet::new();
+    cmds.retain(|c| seen.insert(c.clone()));
+    format!("{label}: {}", cmds.join(", "))
+}
+
 /// Registry of all available backends.
 pub struct Registry {
     backends: Vec<Box<dyn Backend>>,

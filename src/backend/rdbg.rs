@@ -79,27 +79,14 @@ impl Backend for RdbgBackend {
     }
 
     fn parse_help(&self, raw: &str) -> String {
-        let mut cmds: Vec<String> = Vec::new();
-        for line in raw.lines() {
-            let line = line.trim();
-            if line.is_empty() {
-                continue;
-            }
-            // rdbg help lists commands as "  command (alias) -- description"
-            // or "  command    -- description"
-            if let Some(first) = line.split_whitespace().next() {
-                if first.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '!')
-                    && first.len() < 20
-                    && first.len() > 1
-                    && !first.starts_with('-')
-                {
-                    cmds.push(first.to_string());
-                }
-            }
-        }
-        cmds.sort();
-        cmds.dedup();
-        format!("rdbg: {}", cmds.join(", "))
+        // rdbg help lists commands as "  command (alias) -- description"
+        // or "  command    -- description"
+        super::parse_help_first_token(raw, "rdbg", true, |tok| {
+            tok.len() > 1
+                && tok.len() < 20
+                && !tok.starts_with('-')
+                && tok.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '!')
+        })
     }
 
     fn adapters(&self) -> Vec<(&'static str, &'static str)> {

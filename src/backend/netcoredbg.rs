@@ -84,20 +84,15 @@ impl Backend for NetCoreDbgBackend {
     }
 
     fn parse_help(&self, raw: &str) -> String {
-        let mut cmds = Vec::new();
-        let mut seen = std::collections::HashSet::new();
-        for line in raw.lines() {
-            let line = line.trim();
-            if line.is_empty() || line.starts_with('-') || line.starts_with("command") {
-                continue;
-            }
-            if let Some(tok) = line.split_whitespace().next() {
-                if tok.chars().all(|c| c.is_ascii_alphabetic()) && tok.len() < 20 && seen.insert(tok.to_string()) {
-                    cmds.push(tok.to_string());
-                }
-            }
-        }
-        format!("netcoredbg: {}", cmds.join(", "))
+        // The first token of the banner ("command list:") and dash-prefixed
+        // option lines ("-h", "-v") would otherwise slip through the
+        // alphabetic check; reject them by token shape.
+        super::parse_help_first_token(raw, "netcoredbg", false, |tok| {
+            tok.len() < 20
+                && !tok.starts_with('-')
+                && !tok.starts_with("command")
+                && tok.chars().all(|c| c.is_ascii_alphabetic())
+        })
     }
 
     fn adapters(&self) -> Vec<(&'static str, &'static str)> {

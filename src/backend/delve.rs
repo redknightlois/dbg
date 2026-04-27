@@ -73,23 +73,14 @@ impl Backend for DelveBackend {
     }
 
     fn parse_help(&self, raw: &str) -> String {
-        let mut cmds = Vec::new();
-        for line in raw.lines() {
-            let line = line.trim();
-            // Delve help: "command (alias) description" or "command  description"
-            if let Some(tok) = line.split_whitespace().next() {
-                if tok.chars().all(|c| c.is_ascii_alphabetic())
-                    && tok.len() < 20
-                    && !tok.is_empty()
-                    && tok != "Type"
-                    && tok != "Aliases"
-                {
-                    cmds.push(tok.to_string());
-                }
-            }
-        }
-        cmds.dedup();
-        format!("delve: {}", cmds.join(", "))
+        // Delve help: "command (alias) description" or "command  description"
+        super::parse_help_first_token(raw, "delve", false, |tok| {
+            !tok.is_empty()
+                && tok.len() < 20
+                && tok.chars().all(|c| c.is_ascii_alphabetic())
+                && tok != "Type"
+                && tok != "Aliases"
+        })
     }
 
     fn clean(&self, _cmd: &str, output: &str) -> CleanResult {

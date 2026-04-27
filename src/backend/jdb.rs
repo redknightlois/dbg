@@ -58,21 +58,11 @@ impl Backend for JdbBackend {
     }
 
     fn parse_help(&self, raw: &str) -> String {
-        let mut cmds = Vec::new();
-        for line in raw.lines() {
-            let line = line.trim();
-            if let Some(tok) = line.split_whitespace().next() {
-                if tok.chars().all(|c| c.is_ascii_alphabetic() || c == '-')
-                    && tok.len() < 20
-                    && !tok.is_empty()
-                    && tok.len() > 1
-                {
-                    cmds.push(tok.to_string());
-                }
-            }
-        }
-        cmds.dedup();
-        format!("jdb: {}", cmds.join(", "))
+        super::parse_help_first_token(raw, "jdb", false, |tok| {
+            tok.len() > 1
+                && tok.len() < 20
+                && tok.chars().all(|c| c.is_ascii_alphabetic() || c == '-')
+        })
     }
 
     fn clean(&self, _cmd: &str, output: &str) -> CleanResult {
