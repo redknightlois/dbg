@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use super::db::{GpuDb, escape_sql_like};
 
 // ---------------------------------------------------------------------------
@@ -86,7 +88,7 @@ pub(crate) fn compute_gpu_gaps(db: &GpuDb) -> Vec<(f64, f64)> {
 /// Total time (us) during which the GPU was doing work — either a kernel or a
 /// transfer. Kernel and transfer intervals are unioned and merged, so concurrent
 /// activity is only counted once.
-pub(crate) fn gpu_busy_us(db: &GpuDb) -> f64 {
+fn gpu_busy_us(db: &GpuDb) -> f64 {
     let mut intervals = db.kernel_intervals();
     intervals.extend(db.transfer_intervals(None));
     intervals.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
@@ -303,28 +305,21 @@ pub fn cmd_ops(db: &GpuDb, args: &[&str]) {
         .unwrap_or_default();
 
     let sql = format!(
-        "SELECT name, module_path, cpu_time_us, gpu_time_us, input_shapes
+        "SELECT name, module_path, cpu_time_us
          FROM ops WHERE 1=1 {pattern_clause}
          ORDER BY cpu_time_us DESC LIMIT ?1"
     );
 
-    let mut stmt = db.conn.prepare(&sql).unwrap();
-    let rows = stmt.query_map([n as i64], |row| {
-        Ok((
-            row.get::<_, String>(0)?,
-            row.get::<_, Option<String>>(1)?,
-            row.get::<_, f64>(2)?,
-            row.get::<_, f64>(3)?,
-            row.get::<_, Option<String>>(4)?,
-        ))
-    }).unwrap();
+    let rows: Vec<(String, Option<String>, f64)> = db.query_vec(
+        &sql, [n as i64],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    );
 
     println!("  #  Op                               CPU Time    Module");
     println!("  ── ───────────────────────────────── ────────── ────────────");
-    for (i, row) in rows.enumerate() {
-        let (name, module, cpu_time, _, _) = row.unwrap();
+    for (i, (name, module, cpu_time)) in rows.iter().enumerate() {
         println!("  {:<2} {:<34} {:>9}  {}",
-            i + 1, trunc(&name, 34), fmt_us(cpu_time),
+            i + 1, trunc(name, 34), fmt_us(*cpu_time),
             module.as_deref().unwrap_or(""));
     }
 }
@@ -796,7 +791,7 @@ pub fn cmd_overlap(db: &GpuDb) {
     ).unwrap();
 
     // Compute actual overlap: how much transfer time runs concurrently with kernels.
-    let overlap_us = compute_xfer_kernel_overlap(db);
+    let (_, overlap_us) = xfer_kernel_overlap(db, None);
 
     println!("  Compute/Transfer Overlap:");
     println!("    GPU kernel time:   {}", fmt_us(gpu_us));
@@ -822,7 +817,7 @@ pub fn cmd_overlap(db: &GpuDb) {
         println!("    Kind   Transfer   Overlap    %");
         println!("    ────── ────────── ────────── ──────");
         for kind in &kinds {
-            let (dir_time, dir_overlap) = compute_xfer_kernel_overlap_for_kind(db, kind);
+            let (dir_time, dir_overlap) = xfer_kernel_overlap(db, Some(kind));
             if dir_time <= 0.0 { continue; }
             let pct = dir_overlap / dir_time * 100.0;
             println!("    {:<6} {:>10} {:>10} {:>5.1}%",
@@ -831,11 +826,12 @@ pub fn cmd_overlap(db: &GpuDb) {
     }
 }
 
-/// Per-kind version of `compute_xfer_kernel_overlap` — returns (total_time_us, overlap_us)
-/// restricted to transfers matching the given kind (e.g. "H2D", "D2H", "D2D").
-fn compute_xfer_kernel_overlap_for_kind(db: &GpuDb, kind: &str) -> (f64, f64) {
+/// Compute (total_transfer_us, kernel_overlap_us) for transfers matching `kind`.
+/// `None` means all transfers. Merges kernel intervals, then sums the per-transfer
+/// overlap against the merged set.
+pub(crate) fn xfer_kernel_overlap(db: &GpuDb, kind: Option<&str>) -> (f64, f64) {
     let merged = merge_intervals(&db.kernel_intervals());
-    let t_intervals = db.transfer_intervals(Some(kind));
+    let t_intervals = db.transfer_intervals(kind);
 
     let total_time: f64 = t_intervals.iter().map(|(s, e)| e - s).sum();
     let mut overlap = 0.0;
@@ -847,26 +843,6 @@ fn compute_xfer_kernel_overlap_for_kind(db: &GpuDb, kind: &str) -> (f64, f64) {
         }
     }
     (total_time, overlap)
-}
-
-/// Compute how much transfer time overlaps with kernel execution.
-/// Merges kernel intervals, then checks each transfer against the merged set.
-pub(crate) fn compute_xfer_kernel_overlap(db: &GpuDb) -> f64 {
-    let merged = merge_intervals(&db.kernel_intervals());
-    let t_intervals = db.transfer_intervals(None);
-
-    // For each transfer, compute how much of it overlaps with any merged kernel interval
-    let mut total_overlap = 0.0;
-    for &(ts, te) in &t_intervals {
-        for &(ks, ke) in &merged {
-            let overlap_start = ts.max(ks);
-            let overlap_end = te.min(ke);
-            if overlap_start < overlap_end {
-                total_overlap += overlap_end - overlap_start;
-            }
-        }
-    }
-    total_overlap
 }
 
 /// Merge overlapping or adjacent intervals into non-overlapping sorted intervals.
@@ -1382,7 +1358,7 @@ pub fn cmd_warmup(db: &GpuDb) {
     let wall_us: f64 = db.meta("wall_time_us").parse().unwrap_or(0.0);
     let mut found_warmup = false;
 
-    for (kernel_name, _cnt) in &kernels {
+    for (kernel_name, _) in &kernels {
         let launch_sql = format!(
             "SELECT start_us, duration_us
              FROM launches WHERE kernel_name = ?1 AND start_us IS NOT NULL AND {tl}
@@ -2046,14 +2022,13 @@ pub fn cmd_outliers(db: &GpuDb, args: &[&str]) {
           WHERE kernel_name LIKE ?1 ESCAPE '\' AND {tl}
           GROUP BY kernel_name ORDER BY COUNT(*) DESC LIMIT 1"
     );
-    let kernel = match db.conn.query_row(
+    let (name, total_cnt) = match db.conn.query_row(
         &resolve_sql, [like_param(pattern)],
         |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
     ) {
         Ok(x) => x,
         Err(_) => { println!("no kernel matching '{pattern}'"); return; }
     };
-    let (name, total_cnt) = kernel;
 
     // Pull all launches ordered by launch-order (start_us) so we can assign a launch index.
     let all_sql = format!(
@@ -2286,8 +2261,6 @@ pub fn cmd_memory(db: &GpuDb, args: &[&str]) {
         }
     }
 }
-
-use std::path::PathBuf;
 
 // ---------------------------------------------------------------------------
 // bandwidth — per-kernel achieved memory bandwidth (requires ncu)
@@ -2629,14 +2602,11 @@ pub fn cmd_hotspot(db: &GpuDb, args: &[&str]) {
     if rows.is_empty() { println!("no timeline data"); return; }
 
     let intervals: Vec<(f64, f64)> = rows.iter().map(|(_, s, d)| (*s, *d)).collect();
-    let (busy_best, w_start_best, lo, hi_end) = find_hottest_window(&intervals, window_us);
-    let best = (busy_best, w_start_best, lo, hi_end);
-
-    if best.0 == 0.0 {
+    let (busy, w_start, lo, hi_end) = find_hottest_window(&intervals, window_us);
+    if busy == 0.0 {
         println!("no activity found in any window");
         return;
     }
-    let (busy, w_start, lo, hi_end) = best;
     let w_end = w_start + window_us;
     let util = busy / window_us * 100.0;
     println!("  Hottest {} window:\n", fmt_us(window_us));
@@ -2688,14 +2658,13 @@ pub fn cmd_launches(db: &GpuDb, args: &[&str]) {
           WHERE kernel_name LIKE ?1 ESCAPE '\' AND {tl}
           GROUP BY kernel_name ORDER BY COUNT(*) DESC LIMIT 1"
     );
-    let kernel = match db.conn.query_row(
+    let (name, cnt) = match db.conn.query_row(
         &resolve_sql, [like_param(pattern)],
         |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
     ) {
         Ok(x) => x,
         Err(_) => { println!("no kernel matching '{pattern}'"); return; }
     };
-    let (name, cnt) = kernel;
 
     let sql = format!(
         "SELECT start_us, duration_us, grid_x, grid_y, grid_z,

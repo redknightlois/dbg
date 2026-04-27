@@ -2,7 +2,7 @@
 //! CUDA kernels.  Each test calls the actual production function that was
 //! fixed, so reverting the fix will break the test.
 
-use crate::commands::{compute_gpu_gaps, compute_xfer_kernel_overlap, detect_warmup_count, find_hottest_window};
+use crate::commands::{compute_gpu_gaps, detect_warmup_count, find_hottest_window, xfer_kernel_overlap};
 use crate::db::{GpuDb, escape_sql_like};
 use crate::parsers::nsys::import_wall_time;
 use rusqlite::params;
@@ -130,7 +130,7 @@ fn overlap_zero_when_serialized() {
         &[("k", 2000.0, 500.0, 7), ("k", 2500.0, 500.0, 7)],
         &[("H2D", 0.0, 1000.0, 1_000_000)],
     );
-    let overlap = compute_xfer_kernel_overlap(&db);
+    let (_, overlap) = xfer_kernel_overlap(&db, None);
     assert!(overlap < 0.01, "serialized → 0 overlap, got {overlap}us");
 }
 
@@ -141,7 +141,7 @@ fn overlap_positive_when_concurrent() {
         &[("k", 0.0, 1000.0, 7)],
         &[("H2D", 500.0, 1000.0, 1_000_000)],
     );
-    let overlap = compute_xfer_kernel_overlap(&db);
+    let (_, overlap) = xfer_kernel_overlap(&db, None);
     assert!(
         (overlap - 500.0).abs() < 0.01,
         "concurrent 500us should yield overlap=500us, got {overlap}"
@@ -158,7 +158,7 @@ fn overlap_across_multiple_kernels() {
         &[("k", 0.0, 500.0, 7), ("k", 1000.0, 500.0, 7)],
         &[("H2D", 400.0, 700.0, 1000)],
     );
-    let overlap = compute_xfer_kernel_overlap(&db);
+    let (_, overlap) = xfer_kernel_overlap(&db, None);
     assert!(
         (overlap - 200.0).abs() < 0.01,
         "expected 200us overlap (100+100), got {overlap}"
