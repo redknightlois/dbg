@@ -234,23 +234,12 @@ pub fn cmd_kernels(db: &GpuDb, args: &[&str]) {
     );
 
     let gpu_total = db.total_gpu_time_us();
-    let mut stmt = db.conn.prepare(&sql).unwrap();
-    let rows: Vec<_> = stmt
-        .query_map([n as i64], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, i64>(1)?,
-                row.get::<_, f64>(2)?,
-                row.get::<_, f64>(3)?,
-                row.get::<_, f64>(4)?,
-                row.get::<_, Option<String>>(5)?,
-                row.get::<_, Option<f64>>(6)?,
-                row.get::<_, Option<f64>>(7)?,
-            ))
-        })
-        .unwrap()
-        .filter_map(|r| r.ok())
-        .collect();
+    let rows: Vec<_> = db.query_vec(&sql, [n as i64], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?,
+            row.get::<_, f64>(2)?, row.get::<_, f64>(3)?, row.get::<_, f64>(4)?,
+            row.get::<_, Option<String>>(5)?, row.get::<_, Option<f64>>(6)?,
+            row.get::<_, Option<f64>>(7)?))
+    });
 
     println!("  #  Kernel                          Time      %     Launches   Avg       Stddev    Tail%  Bound");
     println!("  ── ──────────────────────────────── ──────── ────── ────────── ───────── ───────── ────── ────────────");
@@ -340,32 +329,18 @@ pub fn cmd_inspect(db: &GpuDb, args: &[&str]) {
                       MIN(duration_us), MAX(duration_us)
                FROM launches WHERE kernel_name LIKE ?1 ESCAPE '\' AND {tl}
                GROUP BY kernel_name");
-    let mut stmt = db.conn.prepare(&sql).unwrap();
-    let mut rows = stmt.query_map([like_param(pattern)], |row| {
-        Ok((
-            row.get::<_, String>(0)?,
-            row.get::<_, i64>(1)?,
-            row.get::<_, f64>(2)?,
-            row.get::<_, f64>(3)?,
-            row.get::<_, f64>(4)?,
-            row.get::<_, f64>(5)?,
-        ))
-    }).unwrap();
-
-    let (name, cnt, total, avg, min, max) = match rows.next() {
-        Some(Ok(r)) => r,
-        _ => { println!("no kernel matching '{pattern}'"); return; }
-    };
-    if rows.next().is_some() {
-        // Multiple matches — list them
+    let rows: Vec<(String, i64, f64, f64, f64, f64)> = db.query_vec(
+        &sql, [like_param(pattern)],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?)),
+    );
+    if rows.is_empty() { println!("no kernel matching '{pattern}'"); return; }
+    if rows.len() > 1 {
         println!("multiple matches for '{pattern}':");
-        println!("  {name}");
-        for row in rows { if let Ok((n,_,_,_,_,_)) = row { println!("  {n}"); } }
+        for (n, ..) in &rows { println!("  {n}"); }
         println!("narrow the pattern");
         return;
     }
-    drop(rows);
-    drop(stmt);
+    let (name, cnt, total, avg, min, max) = rows.into_iter().next().unwrap();
 
     println!("Kernel: {name}");
     println!("  Launches: {cnt}");
@@ -380,12 +355,11 @@ pub fn cmd_inspect(db: &GpuDb, args: &[&str]) {
                       AND grid_x IS NOT NULL AND {tl}
                       GROUP BY grid_x, grid_y, grid_z, block_x, block_y, block_z
                       ORDER BY cnt DESC LIMIT 5");
-    let mut stmt = db.conn.prepare(&config_sql).unwrap();
-    let configs: Vec<_> = stmt.query_map([&name], |row| {
-        Ok((row.get::<_,u32>(0)?, row.get::<_,u32>(1)?, row.get::<_,u32>(2)?,
-            row.get::<_,u32>(3)?, row.get::<_,u32>(4)?, row.get::<_,u32>(5)?,
-            row.get::<_,i64>(6)?))
-    }).unwrap().filter_map(|r| r.ok()).collect();
+    let configs: Vec<(u32, u32, u32, u32, u32, u32, i64)> = db.query_vec(
+        &config_sql, [&name],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?,
+                  row.get(4)?, row.get(5)?, row.get(6)?)),
+    );
 
     if !configs.is_empty() {
         println!();
@@ -430,10 +404,10 @@ pub fn cmd_inspect(db: &GpuDb, args: &[&str]) {
     let op_sql = "SELECT o.name, o.module_path, o.input_shapes
                   FROM op_kernel_map okm JOIN ops o ON o.id = okm.op_id
                   WHERE okm.kernel_name = ?1";
-    let mut stmt = db.conn.prepare(op_sql).unwrap();
-    let ops: Vec<_> = stmt.query_map([&name], |row| {
-        Ok((row.get::<_,String>(0)?, row.get::<_,Option<String>>(1)?, row.get::<_,Option<String>>(2)?))
-    }).unwrap().filter_map(|r| r.ok()).collect();
+    let ops: Vec<(String, Option<String>, Option<String>)> = db.query_vec(
+        op_sql, [&name],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    );
     if !ops.is_empty() {
         println!("\n  Origin (torch/proton):");
         for (opname, modpath, shapes) in &ops {
@@ -459,15 +433,12 @@ pub fn cmd_bound(db: &GpuDb, args: &[&str]) {
                       m.l2_hit_rate_pct, m.achieved_bandwidth_gb_s, m.peak_bandwidth_gb_s,
                       m.occupancy_pct
                FROM metrics m WHERE m.kernel_name LIKE ?1 ESCAPE '\'";
-    let mut stmt = db.conn.prepare(sql).unwrap();
-    let rows: Vec<_> = stmt.query_map([like_param(pattern)], |row| {
-        Ok((
-            row.get::<_,String>(0)?, row.get::<_,Option<String>>(1)?,
-            row.get::<_,Option<f64>>(2)?, row.get::<_,Option<f64>>(3)?,
-            row.get::<_,Option<f64>>(4)?, row.get::<_,Option<f64>>(5)?,
-            row.get::<_,Option<f64>>(6)?, row.get::<_,Option<f64>>(7)?,
-        ))
-    }).unwrap().filter_map(|r| r.ok()).collect();
+    let rows: Vec<_> = db.query_vec(sql, [like_param(pattern)], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?,
+            row.get::<_, Option<f64>>(2)?, row.get::<_, Option<f64>>(3)?,
+            row.get::<_, Option<f64>>(4)?, row.get::<_, Option<f64>>(5)?,
+            row.get::<_, Option<f64>>(6)?, row.get::<_, Option<f64>>(7)?))
+    });
 
     if rows.is_empty() {
         println!("no metrics for kernel matching '{pattern}'");
@@ -505,18 +476,17 @@ pub fn cmd_roofline(db: &GpuDb, args: &[&str]) {
         return;
     }
     let pattern = parse_pattern(args);
-    let pat = pattern.map(|p| like_param(p)).unwrap_or_else(|| "%".into());
+    let pat = pattern.map(like_param).unwrap_or_else(|| "%".into());
 
     let sql = "SELECT kernel_name, boundedness, compute_throughput_pct,
                       memory_throughput_pct, occupancy_pct
                FROM metrics WHERE kernel_name LIKE ?1 ESCAPE '\'
                ORDER BY kernel_name";
-    let mut stmt = db.conn.prepare(sql).unwrap();
-    let rows: Vec<_> = stmt.query_map([&pat], |row| {
-        Ok((row.get::<_,String>(0)?, row.get::<_,Option<String>>(1)?,
-            row.get::<_,Option<f64>>(2)?, row.get::<_,Option<f64>>(3)?,
-            row.get::<_,Option<f64>>(4)?))
-    }).unwrap().filter_map(|r| r.ok()).collect();
+    let rows: Vec<_> = db.query_vec(sql, [&pat], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?,
+            row.get::<_, Option<f64>>(2)?, row.get::<_, Option<f64>>(3)?,
+            row.get::<_, Option<f64>>(4)?))
+    });
 
     println!("  Kernel                            Bound     Compute%  Memory%   Occupancy");
     println!("  ────────────────────────────────── ──────── ──────── ──────── ──────────");
@@ -541,11 +511,10 @@ pub fn cmd_occupancy(db: &GpuDb, args: &[&str]) {
                       shared_mem_static_bytes + shared_mem_dynamic_bytes as shmem
                FROM metrics WHERE occupancy_pct IS NOT NULL
                ORDER BY occupancy_pct ASC LIMIT ?1";
-    let mut stmt = db.conn.prepare(sql).unwrap();
-    let rows: Vec<_> = stmt.query_map([n as i64], |row| {
-        Ok((row.get::<_,String>(0)?, row.get::<_,f64>(1)?,
-            row.get::<_,Option<i64>>(2)?, row.get::<_,Option<i64>>(3)?))
-    }).unwrap().filter_map(|r| r.ok()).collect();
+    let rows: Vec<(String, f64, Option<i64>, Option<i64>)> = db.query_vec(
+        sql, [n as i64],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+    );
 
     println!("  Kernel                            Occupancy  Regs  ShmemK  Limiting");
     println!("  ────────────────────────────────── ───────── ───── ─────── ────────");
@@ -602,12 +571,10 @@ pub fn cmd_transfers(db: &GpuDb, args: &[&str]) {
     let kind_sql = "SELECT kind, COUNT(*), SUM(bytes), SUM(duration_us),
                            MIN(bytes), MAX(bytes)
                     FROM transfers GROUP BY kind ORDER BY SUM(duration_us) DESC";
-    let mut stmt = db.conn.prepare(kind_sql).unwrap();
-    let kinds: Vec<_> = stmt.query_map([], |row| {
-        Ok((row.get::<_,String>(0)?, row.get::<_,i64>(1)?,
-            row.get::<_,i64>(2)?, row.get::<_,f64>(3)?,
-            row.get::<_,i64>(4)?, row.get::<_,i64>(5)?))
-    }).unwrap().filter_map(|r| r.ok()).collect();
+    let kinds: Vec<(String, i64, i64, f64, i64, i64)> = db.query_vec(
+        kind_sql, [],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?)),
+    );
 
     println!("  By Direction:");
     println!("  Kind  Count    Total         Time        Avg BW       Size range");
@@ -645,11 +612,10 @@ pub fn cmd_transfers(db: &GpuDb, args: &[&str]) {
     // --- Top N by duration ---
     let sql = "SELECT kind, bytes, duration_us, stream_id
                FROM transfers ORDER BY duration_us DESC LIMIT ?1";
-    let mut stmt = db.conn.prepare(sql).unwrap();
-    let rows: Vec<_> = stmt.query_map([n as i64], |row| {
-        Ok((row.get::<_,String>(0)?, row.get::<_,i64>(1)?,
-            row.get::<_,f64>(2)?, row.get::<_,Option<u32>>(3)?))
-    }).unwrap().filter_map(|r| r.ok()).collect();
+    let rows: Vec<(String, i64, f64, Option<u32>)> = db.query_vec(
+        sql, [n as i64],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+    );
 
     println!("\n  Top {} by Duration:", rows.len());
     println!("  #  Kind  Size        Duration    BW          Stream  Notes");
@@ -872,10 +838,10 @@ pub fn cmd_streams(db: &GpuDb) {
     let sql = format!("SELECT stream_id, COUNT(*) as cnt, SUM(duration_us) as total
                FROM launches WHERE stream_id IS NOT NULL AND {tl}
                GROUP BY stream_id ORDER BY total DESC");
-    let mut stmt = db.conn.prepare(&sql).unwrap();
-    let rows: Vec<_> = stmt.query_map([], |row| {
-        Ok((row.get::<_,u32>(0)?, row.get::<_,i64>(1)?, row.get::<_,f64>(2)?))
-    }).unwrap().filter_map(|r| r.ok()).collect();
+    let rows: Vec<(u32, i64, f64)> = db.query_vec(
+        &sql, [],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    );
 
     if rows.is_empty() { println!("no stream data"); return; }
     println!("  Stream  Kernels  Active Time");
@@ -895,11 +861,10 @@ pub fn cmd_timeline(db: &GpuDb, args: &[&str]) {
     let sql = format!("SELECT kernel_name, start_us, duration_us, stream_id
                FROM launches WHERE start_us IS NOT NULL AND {tl}
                ORDER BY start_us LIMIT ?1");
-    let mut stmt = db.conn.prepare(&sql).unwrap();
-    let rows: Vec<_> = stmt.query_map([n as i64], |row| {
-        Ok((row.get::<_,String>(0)?, row.get::<_,f64>(1)?,
-            row.get::<_,f64>(2)?, row.get::<_,Option<u32>>(3)?))
-    }).unwrap().filter_map(|r| r.ok()).collect();
+    let rows: Vec<(String, f64, f64, Option<u32>)> = db.query_vec(
+        &sql, [n as i64],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+    );
 
     if rows.is_empty() { println!("no timeline data"); return; }
     println!("  #  Start        Duration    Stream  Kernel");
@@ -925,12 +890,11 @@ pub fn cmd_trace(db: &GpuDb, args: &[&str]) {
 
     let sql = r"SELECT id, name, module_path, cpu_time_us, input_shapes
                FROM ops WHERE name LIKE ?1 ESCAPE '\'";
-    let mut stmt = db.conn.prepare(sql).unwrap();
-    let ops: Vec<_> = stmt.query_map([like_param(pattern)], |row| {
-        Ok((row.get::<_,i64>(0)?, row.get::<_,String>(1)?,
-            row.get::<_,Option<String>>(2)?, row.get::<_,f64>(3)?,
-            row.get::<_,Option<String>>(4)?))
-    }).unwrap().filter_map(|r| r.ok()).collect();
+    let ops: Vec<_> = db.query_vec(sql, [like_param(pattern)], |row| {
+        Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?,
+            row.get::<_, Option<String>>(2)?, row.get::<_, f64>(3)?,
+            row.get::<_, Option<String>>(4)?))
+    });
 
     if ops.is_empty() { println!("no op matching '{pattern}'"); return; }
 
@@ -939,11 +903,10 @@ pub fn cmd_trace(db: &GpuDb, args: &[&str]) {
         if let Some(m) = module { println!("  Module: {m}"); }
         if let Some(s) = shapes { println!("  Shapes: {s}"); }
         println!("  CPU: {}", fmt_us(*cpu_time));
-        // Find linked kernels
-        let k_sql = "SELECT kernel_name FROM op_kernel_map WHERE op_id = ?1";
-        let mut k_stmt = db.conn.prepare(k_sql).unwrap();
-        let kernels: Vec<String> = k_stmt.query_map([op_id], |row| row.get(0))
-            .unwrap().filter_map(|r| r.ok()).collect();
+        let kernels: Vec<String> = db.query_vec(
+            "SELECT kernel_name FROM op_kernel_map WHERE op_id = ?1",
+            [op_id], |row| row.get(0),
+        );
         if !kernels.is_empty() {
             println!("  Kernels: {}", kernels.join(", "));
         }
@@ -964,10 +927,10 @@ pub fn cmd_callers(db: &GpuDb, args: &[&str]) {
     let sql = r"SELECT DISTINCT o.name, o.module_path
                FROM op_kernel_map okm JOIN ops o ON o.id = okm.op_id
                WHERE okm.kernel_name LIKE ?1 ESCAPE '\'";
-    let mut stmt = db.conn.prepare(sql).unwrap();
-    let rows: Vec<_> = stmt.query_map([like_param(pattern)], |row| {
-        Ok((row.get::<_,String>(0)?, row.get::<_,Option<String>>(1)?))
-    }).unwrap().filter_map(|r| r.ok()).collect();
+    let rows: Vec<(String, Option<String>)> = db.query_vec(
+        sql, [like_param(pattern)],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    );
 
     if rows.is_empty() { println!("no op mapping for kernels matching '{pattern}'"); return; }
     for (name, module) in &rows {
@@ -981,12 +944,10 @@ pub fn cmd_callers(db: &GpuDb, args: &[&str]) {
 
 pub fn cmd_layers(db: &GpuDb) {
     let sql = "SELECT id, source, file, collected_at, collection_secs FROM layers ORDER BY id";
-    let mut stmt = db.conn.prepare(sql).unwrap();
-    let rows: Vec<_> = stmt.query_map([], |row| {
-        Ok((row.get::<_,i64>(0)?, row.get::<_,String>(1)?,
-            row.get::<_,String>(2)?, row.get::<_,String>(3)?,
-            row.get::<_,Option<f64>>(4)?))
-    }).unwrap().filter_map(|r| r.ok()).collect();
+    let rows: Vec<(i64, String, String, String, Option<f64>)> = db.query_vec(
+        sql, [],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+    );
 
     if rows.is_empty() { println!("no layers loaded"); return; }
     println!("  #  Source  File                                     Collected          Secs");
@@ -1047,10 +1008,9 @@ pub fn cmd_suggest(db: &GpuDb) {
         let tl = db.timeline_filter();
         let top_sql = format!("SELECT kernel_name, SUM(duration_us) as total
                        FROM launches WHERE {tl} GROUP BY kernel_name ORDER BY total DESC LIMIT 5");
-        let mut stmt = db.conn.prepare(&top_sql).unwrap();
-        let top: Vec<(String, f64)> = stmt.query_map([], |row| {
-            Ok((row.get(0)?, row.get(1)?))
-        }).unwrap().filter_map(|r| r.ok()).collect();
+        let top: Vec<(String, f64)> = db.query_vec(
+            &top_sql, [], |row| Ok((row.get(0)?, row.get(1)?)),
+        );
 
         if !top.is_empty() {
             let gpu_total = db.total_gpu_time_us();
@@ -1075,10 +1035,10 @@ pub fn cmd_suggest(db: &GpuDb) {
                    FROM launches WHERE {tl2} GROUP BY kernel_name
                    HAVING cnt > 5 AND var > 0
                    ORDER BY SUM(duration_us) DESC LIMIT 5");
-    let mut stmt = db.conn.prepare(&var_sql).unwrap();
-    let vars: Vec<_> = stmt.query_map([], |row| {
-        Ok((row.get::<_,String>(0)?, row.get::<_,f64>(2)?, row.get::<_,f64>(3)?))
-    }).unwrap().filter_map(|r| r.ok()).collect();
+    let vars: Vec<(String, f64, f64)> = db.query_vec(
+        &var_sql, [],
+        |row| Ok((row.get(0)?, row.get(2)?, row.get(3)?)),
+    );
 
     for (name, avg, var) in &vars {
         let stddev = var.max(0.0).sqrt();
@@ -1214,10 +1174,9 @@ pub fn cmd_diff(db: &GpuDb, args: &[&str]) {
        ORDER BY ABS(COALESCE(c.total,0) - COALESCE(o.total,0)) DESC
        LIMIT 15";
 
-    let mut stmt = db.conn.prepare(sql).unwrap();
-    let rows: Vec<_> = stmt.query_map([], |row| {
-        Ok((row.get::<_,String>(0)?, row.get::<_,f64>(1)?, row.get::<_,f64>(2)?))
-    }).unwrap().filter_map(|r| r.ok()).collect();
+    let rows: Vec<(String, f64, f64)> = db.query_vec(
+        sql, [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    );
 
     println!("  Diff: current vs {name}\n");
     println!("  Kernel                            Before     After      Delta");
@@ -1256,11 +1215,10 @@ pub fn cmd_region(db: &mut GpuDb, args: &[&str]) {
     match args.first() {
         Some(p) => { db.region_filter = Some(p.to_string()); println!("region filter set to '{p}'"); }
         None => {
-            let sql = "SELECT name, duration_us FROM regions ORDER BY start_us";
-            let mut stmt = db.conn.prepare(sql).unwrap();
-            let rows: Vec<_> = stmt.query_map([], |row| {
-                Ok((row.get::<_,String>(0)?, row.get::<_,f64>(1)?))
-            }).unwrap().filter_map(|r| r.ok()).collect();
+            let rows: Vec<(String, f64)> = db.query_vec(
+                "SELECT name, duration_us FROM regions ORDER BY start_us", [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            );
             if rows.is_empty() { println!("no NVTX regions"); }
             else { for (n, d) in &rows { println!("  {} ({})", n, fmt_us(*d)); } }
         }
@@ -1290,12 +1248,10 @@ pub fn cmd_variance(db: &GpuDb, args: &[&str]) {
                       AVG(duration_us * duration_us) - AVG(duration_us) * AVG(duration_us)
                FROM launches WHERE kernel_name LIKE ?1 ESCAPE '\' AND {tl}
                GROUP BY kernel_name");
-    let mut stmt = db.conn.prepare(&sql).unwrap();
-    let rows: Vec<_> = stmt.query_map([like_param(pattern)], |row| {
-        Ok((row.get::<_,String>(0)?, row.get::<_,i64>(1)?,
-            row.get::<_,f64>(2)?, row.get::<_,f64>(3)?,
-            row.get::<_,f64>(4)?, row.get::<_,f64>(5)?))
-    }).unwrap().filter_map(|r| r.ok()).collect();
+    let rows: Vec<(String, i64, f64, f64, f64, f64)> = db.query_vec(
+        &sql, [like_param(pattern)],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?)),
+    );
 
     if rows.is_empty() { println!("no kernel matching '{pattern}'"); return; }
     for (name, cnt, avg, min, max, var) in &rows {
@@ -1345,10 +1301,9 @@ pub fn cmd_warmup(db: &GpuDb) {
          GROUP BY kernel_name HAVING cnt >= 5
          ORDER BY SUM(duration_us) DESC"
     );
-    let mut k_stmt = db.conn.prepare(&kernel_sql).unwrap();
-    let kernels: Vec<(String, i64)> = k_stmt.query_map([], |row| {
-        Ok((row.get(0)?, row.get(1)?))
-    }).unwrap().filter_map(|r| r.ok()).collect();
+    let kernels: Vec<(String, i64)> = db.query_vec(
+        &kernel_sql, [], |row| Ok((row.get(0)?, row.get(1)?)),
+    );
 
     if kernels.is_empty() {
         println!("not enough launches to detect warmup (need ≥5 of the same kernel)");
@@ -1364,10 +1319,9 @@ pub fn cmd_warmup(db: &GpuDb) {
              FROM launches WHERE kernel_name = ?1 AND start_us IS NOT NULL AND {tl}
              ORDER BY start_us LIMIT 200"
         );
-        let mut stmt = db.conn.prepare(&launch_sql).unwrap();
-        let launches: Vec<(f64, f64)> = stmt.query_map([kernel_name], |row| {
-            Ok((row.get(0)?, row.get(1)?))
-        }).unwrap().filter_map(|r| r.ok()).collect();
+        let launches: Vec<(f64, f64)> = db.query_vec(
+            &launch_sql, [kernel_name], |row| Ok((row.get(0)?, row.get(1)?)),
+        );
 
         if launches.len() < 5 { continue; }
 
@@ -1435,11 +1389,10 @@ pub fn cmd_small(db: &GpuDb, args: &[&str]) {
         db.kernel_filter()
     );
 
-    let mut stmt = db.conn.prepare(&sql).unwrap();
-    let rows: Vec<_> = stmt.query_map(rusqlite::params![threshold_us, n as i64], |row| {
-        Ok((row.get::<_,String>(0)?, row.get::<_,i64>(1)?,
-            row.get::<_,f64>(2)?, row.get::<_,f64>(3)?))
-    }).unwrap().filter_map(|r| r.ok()).collect();
+    let rows: Vec<(String, i64, f64, f64)> = db.query_vec(
+        &sql, rusqlite::params![threshold_us, n as i64],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+    );
 
     if rows.is_empty() {
         println!("no kernels averaging under {threshold_us:.0}us");
@@ -1492,11 +1445,10 @@ pub fn cmd_fuse(db: &GpuDb, args: &[&str]) {
                ORDER BY gap_us ASC
                LIMIT 500";
 
-    let mut stmt = db.conn.prepare(&sql).unwrap();
-    let rows: Vec<_> = stmt.query_map([], |row| {
-        Ok((row.get::<_,String>(0)?, row.get::<_,String>(1)?,
-            row.get::<_,f64>(2)?, row.get::<_,f64>(3)?))
-    }).unwrap().filter_map(|r| r.ok()).collect();
+    let rows: Vec<(String, String, f64, f64)> = db.query_vec(
+        &sql, [],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+    );
 
     if rows.is_empty() {
         println!("no fusion candidates found (no sequential same-stream kernels with < 5us gap)");
@@ -1638,10 +1590,10 @@ pub fn cmd_concurrency(db: &GpuDb) {
     let sql = format!("SELECT stream_id, COUNT(*) as cnt, SUM(duration_us) as total
                FROM launches WHERE stream_id IS NOT NULL AND {tl}
                GROUP BY stream_id ORDER BY total DESC");
-    let mut stmt = db.conn.prepare(&sql).unwrap();
-    let streams: Vec<_> = stmt.query_map([], |row| {
-        Ok((row.get::<_,u32>(0)?, row.get::<_,i64>(1)?, row.get::<_,f64>(2)?))
-    }).unwrap().filter_map(|r| r.ok()).collect();
+    let streams: Vec<(u32, i64, f64)> = db.query_vec(
+        &sql, [],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    );
 
     println!("  Stream Concurrency Analysis:\n");
 
@@ -1706,11 +1658,10 @@ pub fn cmd_hotpath(db: &GpuDb) {
                WHERE cpu_time_us > 0
                ORDER BY cpu_time_us DESC
                LIMIT 20";
-    let mut stmt = db.conn.prepare(sql).unwrap();
-    let ops: Vec<_> = stmt.query_map([], |row| {
-        Ok((row.get::<_,String>(0)?, row.get::<_,f64>(1)?,
-            row.get::<_,f64>(2)?, row.get::<_,Option<String>>(3)?))
-    }).unwrap().filter_map(|r| r.ok()).collect();
+    let ops: Vec<(String, f64, f64, Option<String>)> = db.query_vec(
+        sql, [],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+    );
 
     if ops.is_empty() { println!("no op data"); return; }
 
@@ -1759,10 +1710,10 @@ pub fn cmd_compare_ops(db: &GpuDb, args: &[&str]) {
                WHERE cpu_time_us > 0
                ORDER BY cpu_time_us DESC
                LIMIT ?1";
-    let mut stmt = db.conn.prepare(sql).unwrap();
-    let ops: Vec<_> = stmt.query_map([n as i64], |row| {
-        Ok((row.get::<_,String>(0)?, row.get::<_,f64>(1)?, row.get::<_,f64>(2)?))
-    }).unwrap().filter_map(|r| r.ok()).collect();
+    let ops: Vec<(String, f64, f64)> = db.query_vec(
+        sql, [n as i64],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    );
 
     if ops.is_empty() { println!("no op data"); return; }
 
@@ -1811,11 +1762,10 @@ pub fn cmd_top_ops(db: &GpuDb, args: &[&str]) {
          LIMIT ?1"
     );
 
-    let mut stmt = db.conn.prepare(&sql).unwrap();
-    let rows: Vec<_> = stmt.query_map([n as i64], |row| {
-        Ok((row.get::<_,String>(0)?, row.get::<_,f64>(1)?,
-            row.get::<_,f64>(2)?, row.get::<_,Option<String>>(3)?))
-    }).unwrap().filter_map(|r| r.ok()).collect();
+    let rows: Vec<(String, f64, f64, Option<String>)> = db.query_vec(
+        &sql, [n as i64],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+    );
 
     if rows.is_empty() {
         println!("no ops with GPU time (op->kernel correlation may be missing)");
@@ -1848,11 +1798,10 @@ pub fn cmd_breakdown(db: &GpuDb, args: &[&str]) {
 
     // Find matching ops
     let op_sql = r"SELECT id, name, cpu_time_us, gpu_time_us FROM ops WHERE name LIKE ?1 ESCAPE '\'";
-    let mut stmt = db.conn.prepare(op_sql).unwrap();
-    let ops: Vec<_> = stmt.query_map([like_param(pattern)], |row| {
-        Ok((row.get::<_,i64>(0)?, row.get::<_,String>(1)?,
-            row.get::<_,f64>(2)?, row.get::<_,f64>(3)?))
-    }).unwrap().filter_map(|r| r.ok()).collect();
+    let ops: Vec<(i64, String, f64, f64)> = db.query_vec(
+        op_sql, [like_param(pattern)],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+    );
 
     if ops.is_empty() { println!("no op matching '{pattern}'"); return; }
 
@@ -1874,11 +1823,10 @@ pub fn cmd_breakdown(db: &GpuDb, args: &[&str]) {
              GROUP BY okm.kernel_name
              ORDER BY total_us DESC"
         );
-        let mut k_stmt = db.conn.prepare(&k_sql).unwrap();
-        let kernels: Vec<_> = k_stmt.query_map([op_id], |row| {
-            Ok((row.get::<_,String>(0)?, row.get::<_,i64>(1)?,
-                row.get::<_,f64>(2)?, row.get::<_,f64>(3)?))
-        }).unwrap().filter_map(|r| r.ok()).collect();
+        let kernels: Vec<(String, i64, f64, f64)> = db.query_vec(
+            &k_sql, [op_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        );
 
         if kernels.is_empty() {
             println!("  (no correlated kernels)\n");
@@ -1929,16 +1877,8 @@ pub fn cmd_idle_between(db: &GpuDb, args: &[&str]) {
     let ka_sql = r"SELECT DISTINCT kernel_name FROM op_kernel_map okm
                   JOIN ops o ON o.id = okm.op_id
                   WHERE o.name LIKE ?1 ESCAPE '\'";
-    let mut stmt = db.conn.prepare(ka_sql).unwrap();
-    let kernels_a: Vec<String> = stmt.query_map([like_param(pat_a)], |row| row.get(0))
-        .unwrap().filter_map(|r| r.ok()).collect();
-
-    let kb_sql = r"SELECT DISTINCT kernel_name FROM op_kernel_map okm
-                  JOIN ops o ON o.id = okm.op_id
-                  WHERE o.name LIKE ?1 ESCAPE '\'";
-    let mut stmt = db.conn.prepare(kb_sql).unwrap();
-    let kernels_b: Vec<String> = stmt.query_map([like_param(pat_b)], |row| row.get(0))
-        .unwrap().filter_map(|r| r.ok()).collect();
+    let kernels_a: Vec<String> = db.query_vec(ka_sql, [like_param(pat_a)], |row| row.get(0));
+    let kernels_b: Vec<String> = db.query_vec(ka_sql, [like_param(pat_b)], |row| row.get(0));
 
     if kernels_a.is_empty() { println!("no kernels found for op '{pat_a}'"); return; }
     if kernels_b.is_empty() { println!("no kernels found for op '{pat_b}'"); return; }
@@ -1958,13 +1898,8 @@ pub fn cmd_idle_between(db: &GpuDb, args: &[&str]) {
          ORDER BY start_us"
     );
 
-    let mut a_stmt = db.conn.prepare(&a_sql).unwrap();
-    let a_ends: Vec<f64> = a_stmt.query_map([], |row| row.get(0))
-        .unwrap().filter_map(|r| r.ok()).collect();
-
-    let mut b_stmt = db.conn.prepare(&b_sql).unwrap();
-    let b_starts: Vec<f64> = b_stmt.query_map([], |row| row.get(0))
-        .unwrap().filter_map(|r| r.ok()).collect();
+    let a_ends: Vec<f64> = db.query_vec(&a_sql, [], |row| row.get(0));
+    let b_starts: Vec<f64> = db.query_vec(&b_sql, [], |row| row.get(0));
 
     // For each A end, find the next B start
     let mut gaps: Vec<f64> = Vec::new();
