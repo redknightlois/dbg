@@ -83,10 +83,7 @@ struct SpeedscopeFrame {
 }
 
 #[derive(Deserialize)]
-#[allow(dead_code)]
 struct SpeedscopeProfile {
-    #[serde(default)]
-    name: Option<String>,
     #[serde(default)]
     events: Vec<SpeedscopeEvent>,
 }
