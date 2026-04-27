@@ -62,21 +62,8 @@ pub(crate) fn escape_regex(s: &str) -> String {
 /// A gap is time when the GPU has no kernel running AND no DMA in flight.
 /// Returns (gap_start, gap_duration) pairs sorted by start time.
 pub(crate) fn compute_gpu_gaps(db: &GpuDb) -> Vec<(f64, f64)> {
-    let tl = db.timeline_filter();
-    let kernel_sql = format!(
-        "SELECT start_us, start_us + duration_us AS end_us
-         FROM launches WHERE start_us IS NOT NULL AND {tl}"
-    );
-    let mut intervals: Vec<(f64, f64)> = db.query_vec(&kernel_sql, [], |row| {
-        Ok((row.get::<_,f64>(0)?, row.get::<_,f64>(1)?))
-    });
-
-    let xfer_intervals: Vec<(f64, f64)> = db.query_vec(
-        "SELECT start_us, start_us + duration_us FROM transfers WHERE start_us IS NOT NULL",
-        [],
-        |row| Ok((row.get(0)?, row.get(1)?)),
-    );
-    intervals.extend(xfer_intervals);
+    let mut intervals = db.kernel_intervals();
+    intervals.extend(db.transfer_intervals(None));
     intervals.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
 
     let mut gaps = Vec::new();
@@ -100,19 +87,8 @@ pub(crate) fn compute_gpu_gaps(db: &GpuDb) -> Vec<(f64, f64)> {
 /// transfer. Kernel and transfer intervals are unioned and merged, so concurrent
 /// activity is only counted once.
 pub(crate) fn gpu_busy_us(db: &GpuDb) -> f64 {
-    let tl = db.timeline_filter();
-    let k_sql = format!(
-        "SELECT start_us, start_us + duration_us FROM launches
-         WHERE start_us IS NOT NULL AND {tl}"
-    );
-    let mut intervals: Vec<(f64, f64)> = db.query_vec(&k_sql, [], |row| {
-        Ok((row.get(0)?, row.get(1)?))
-    });
-    let xfer: Vec<(f64, f64)> = db.query_vec(
-        "SELECT start_us, start_us + duration_us FROM transfers WHERE start_us IS NOT NULL",
-        [], |row| Ok((row.get(0)?, row.get(1)?))
-    );
-    intervals.extend(xfer);
+    let mut intervals = db.kernel_intervals();
+    intervals.extend(db.transfer_intervals(None));
     intervals.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
     merge_intervals(&intervals).iter().map(|(s, e)| e - s).sum()
 }
@@ -858,21 +834,8 @@ pub fn cmd_overlap(db: &GpuDb) {
 /// Per-kind version of `compute_xfer_kernel_overlap` — returns (total_time_us, overlap_us)
 /// restricted to transfers matching the given kind (e.g. "H2D", "D2H", "D2D").
 fn compute_xfer_kernel_overlap_for_kind(db: &GpuDb, kind: &str) -> (f64, f64) {
-    let tl = db.timeline_filter();
-    let k_sql = format!(
-        "SELECT start_us, start_us + duration_us FROM launches
-         WHERE start_us IS NOT NULL AND {tl} ORDER BY start_us"
-    );
-    let k_intervals: Vec<(f64, f64)> = db.query_vec(&k_sql, [], |row| {
-        Ok((row.get(0)?, row.get(1)?))
-    });
-    let merged = merge_intervals(&k_intervals);
-
-    let t_intervals: Vec<(f64, f64)> = db.query_vec(
-        "SELECT start_us, start_us + duration_us FROM transfers
-         WHERE start_us IS NOT NULL AND kind = ?1 ORDER BY start_us",
-        [kind], |row| Ok((row.get(0)?, row.get(1)?))
-    );
+    let merged = merge_intervals(&db.kernel_intervals());
+    let t_intervals = db.transfer_intervals(Some(kind));
 
     let total_time: f64 = t_intervals.iter().map(|(s, e)| e - s).sum();
     let mut overlap = 0.0;
@@ -889,24 +852,8 @@ fn compute_xfer_kernel_overlap_for_kind(db: &GpuDb, kind: &str) -> (f64, f64) {
 /// Compute how much transfer time overlaps with kernel execution.
 /// Merges kernel intervals, then checks each transfer against the merged set.
 pub(crate) fn compute_xfer_kernel_overlap(db: &GpuDb) -> f64 {
-    let tl = db.timeline_filter();
-
-    // Collect and merge kernel intervals
-    let k_sql = format!(
-        "SELECT start_us, start_us + duration_us AS end_us
-         FROM launches WHERE start_us IS NOT NULL AND {tl}
-         ORDER BY start_us"
-    );
-    let k_intervals: Vec<(f64, f64)> = db.query_vec(&k_sql, [], |row| {
-        Ok((row.get(0)?, row.get(1)?))
-    });
-    let merged = merge_intervals(&k_intervals);
-
-    // Collect transfer intervals
-    let t_intervals: Vec<(f64, f64)> = db.query_vec(
-        "SELECT start_us, start_us + duration_us FROM transfers WHERE start_us IS NOT NULL ORDER BY start_us",
-        [], |row| Ok((row.get(0)?, row.get(1)?))
-    );
+    let merged = merge_intervals(&db.kernel_intervals());
+    let t_intervals = db.transfer_intervals(None);
 
     // For each transfer, compute how much of it overlaps with any merged kernel interval
     let mut total_overlap = 0.0;
@@ -1740,14 +1687,8 @@ pub fn cmd_concurrency(db: &GpuDb) {
     // Parallelism index: sum-of-per-kernel-time / merged-active-time.
     // 1.0 = pure serial; N on N streams = perfect overlap.
     let gpu_total = db.total_gpu_time_us();
-    let k_sql = format!(
-        "SELECT start_us, start_us + duration_us FROM launches
-         WHERE start_us IS NOT NULL AND {tl} ORDER BY start_us"
-    );
-    let k_intervals: Vec<(f64, f64)> = db.query_vec(&k_sql, [], |row| {
-        Ok((row.get(0)?, row.get(1)?))
-    });
-    let merged_active: f64 = merge_intervals(&k_intervals).iter().map(|(s, e)| e - s).sum();
+    let merged_active: f64 = merge_intervals(&db.kernel_intervals())
+        .iter().map(|(s, e)| e - s).sum();
     if merged_active > 0.0 && gpu_total > 0.0 {
         let pindex = gpu_total / merged_active;
         let verdict = if pindex < 1.05 { "serial — no overlap" }

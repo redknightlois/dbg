@@ -448,6 +448,37 @@ impl GpuDb {
         self.scalar_f64(&format!("SELECT COALESCE(SUM(duration_us), 0) FROM launches WHERE {tl}"))
     }
 
+    /// Kernel `(start_us, end_us)` intervals from `launches`, timeline-filtered,
+    /// ordered by `start_us`. Skips rows where `start_us IS NULL`.
+    pub fn kernel_intervals(&self) -> Vec<(f64, f64)> {
+        let tl = self.timeline_filter();
+        let sql = format!(
+            "SELECT start_us, start_us + duration_us FROM launches
+             WHERE start_us IS NOT NULL AND {tl} ORDER BY start_us"
+        );
+        self.query_vec(&sql, [], |row| Ok((row.get(0)?, row.get(1)?)))
+    }
+
+    /// Transfer `(start_us, end_us)` intervals from `transfers`, ordered by `start_us`.
+    /// Skips rows where `start_us IS NULL`. If `kind` is `Some`, restricts to that
+    /// transfer kind (e.g. "H2D", "D2H", "D2D").
+    pub fn transfer_intervals(&self, kind: Option<&str>) -> Vec<(f64, f64)> {
+        match kind {
+            Some(k) => self.query_vec(
+                "SELECT start_us, start_us + duration_us FROM transfers
+                 WHERE start_us IS NOT NULL AND kind = ?1 ORDER BY start_us",
+                [k],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            ),
+            None => self.query_vec(
+                "SELECT start_us, start_us + duration_us FROM transfers
+                 WHERE start_us IS NOT NULL ORDER BY start_us",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            ),
+        }
+    }
+
     pub fn transfer_count(&self) -> usize {
         self.count("SELECT COUNT(*) FROM transfers")
     }
