@@ -13,7 +13,7 @@ use std::path::Path;
 use anyhow::Result;
 use dbg_cli::session_db::{
     CollectCtx, CollectTrigger, LiveDebugger, OnDemandCollector, SessionDb, TargetClass,
-    collectors::disasm::{GoDisassCollector, JitDasmCollector, LldbDisassembleCollector},
+    collectors::disasm::{JitDasmCollector, LldbDisassembleCollector},
     persist_disasm,
 };
 use rusqlite::{OptionalExtension, params};
@@ -1145,18 +1145,6 @@ fn cmd_at_hit_disasm(db: &SessionDb, ctx: &RunCtx<'_>) -> String {
         return "no recent breakpoint hit — `at-hit` requires the debugger to be stopped".into();
     };
     cmd_disasm(db, ctx, Some(&sym), false)
-}
-
-// Silence unused-import clippy when building with only some of the
-// collectors in scope (all three stay referenced above but lints may
-// false-positive across target classes).
-#[allow(dead_code)]
-fn _keep_types_linked() -> (
-    LldbDisassembleCollector,
-    JitDasmCollector,
-    GoDisassCollector,
-) {
-    (LldbDisassembleCollector, JitDasmCollector, GoDisassCollector)
 }
 
 #[cfg(test)]
