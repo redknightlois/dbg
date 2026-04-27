@@ -4,7 +4,7 @@ use regex::Regex;
 use serde_json::{Map, Value};
 
 use super::canonical::{BreakLoc, CanonicalOps, HitEvent};
-use super::{Backend, CleanResult, Dependency, DependencyCheck, SpawnConfig};
+use super::{Backend, Dependency, DependencyCheck, SpawnConfig};
 
 pub struct PhpdbgBackend;
 
@@ -78,21 +78,15 @@ impl Backend for PhpdbgBackend {
         vec![("php.md", include_str!("../../skills/adapters/php.md"))]
     }
 
-    fn clean(&self, cmd: &str, output: &str) -> CleanResult {
+    fn clean(&self, cmd: &str, output: &str) -> String {
         let trimmed = cmd.trim();
-        let mut events = Vec::new();
         let mut lines = Vec::new();
 
         for line in output.lines() {
             let l = line.trim();
-            // Extract lifecycle events
+            // Filter banner / compile-success noise.
             if l.starts_with("[Welcome to phpdbg") || l.starts_with("[Successful compilation") {
-                events.push(l.to_string());
                 continue;
-            }
-            // Extract stop/breakpoint hit events
-            if l.starts_with("[Breakpoint") || l.starts_with("[Break") {
-                events.push(l.to_string());
             }
             // Filter internal noise from backtraces
             if (trimmed == "back" || trimmed == "t") && l.contains("phpdbg_exec") {
@@ -101,10 +95,7 @@ impl Backend for PhpdbgBackend {
             lines.push(line);
         }
 
-        CleanResult {
-            output: lines.join("\n"),
-            events,
-        }
+        lines.join("\n")
     }
 
     fn canonical_ops(&self) -> Option<&dyn CanonicalOps> { Some(self) }
@@ -239,33 +230,30 @@ mod tests {
     fn clean_extracts_breakpoint_events() {
         let input = "[Breakpoint #0 at test.php:10]\nsome output\nmore output";
         let r = PhpdbgBackend.clean("run", input);
-        assert!(r.events.iter().any(|e| e.contains("Breakpoint #0")));
-        assert!(r.output.contains("some output"));
+        assert!(r.contains("some output"));
     }
 
     #[test]
     fn clean_filters_phpdbg_exec_from_backtrace() {
         let input = "frame #0: test.php:10\nframe #1: phpdbg_exec stuff\nframe #2: test.php:5";
         let r = PhpdbgBackend.clean("back", input);
-        assert!(!r.output.contains("phpdbg_exec"));
-        assert!(r.output.contains("frame #0"));
-        assert!(r.output.contains("frame #2"));
+        assert!(!r.contains("phpdbg_exec"));
+        assert!(r.contains("frame #0"));
+        assert!(r.contains("frame #2"));
     }
 
     #[test]
     fn clean_welcome_as_event() {
         let input = "[Welcome to phpdbg, the interactive PHP debugger]\nready";
         let r = PhpdbgBackend.clean("", input);
-        assert!(r.events.iter().any(|e| e.contains("Welcome")));
-        assert!(r.output.contains("ready"));
+        assert!(r.contains("ready"));
     }
 
     #[test]
     fn clean_passthrough_normal_commands() {
         let input = "$x = 42";
         let r = PhpdbgBackend.clean("ev $x", input);
-        assert_eq!(r.output, "$x = 42");
-        assert!(r.events.is_empty());
+        assert_eq!(r, "$x = 42");
     }
 
     #[test]

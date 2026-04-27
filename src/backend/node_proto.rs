@@ -12,7 +12,7 @@ use regex::Regex;
 use serde_json::Value;
 
 use super::canonical::{BreakLoc, CanonicalOps, HitEvent};
-use super::{Backend, CleanResult, Dependency, DependencyCheck, SpawnConfig};
+use super::{Backend, Dependency, DependencyCheck, SpawnConfig};
 
 pub struct NodeProtoBackend;
 
@@ -97,13 +97,10 @@ impl Backend for NodeProtoBackend {
         Some(self)
     }
 
-    fn clean(&self, _cmd: &str, output: &str) -> CleanResult {
+    fn clean(&self, _cmd: &str, output: &str) -> String {
         // The inspector transport produces structured text already —
         // no banner noise to strip.
-        CleanResult {
-            output: output.to_string(),
-            events: vec![],
-        }
+        output.to_string()
     }
 
     /// Hook: tells the daemon that this backend wants a protocol

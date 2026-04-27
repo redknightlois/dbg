@@ -5,7 +5,7 @@ use regex::Regex;
 use serde_json::{Map, Value};
 
 use super::canonical::{BreakId, BreakLoc, CanonicalOps, HitEvent, unsupported};
-use super::{Backend, CleanResult, Dependency, DependencyCheck, SpawnConfig};
+use super::{Backend, Dependency, DependencyCheck, SpawnConfig};
 
 pub struct NetCoreDbgBackend;
 
@@ -99,32 +99,24 @@ impl Backend for NetCoreDbgBackend {
         vec![("dotnet.md", include_str!("../../skills/adapters/dotnet.md"))]
     }
 
-    fn clean(&self, _cmd: &str, output: &str) -> CleanResult {
+    fn clean(&self, _cmd: &str, output: &str) -> String {
         let stop_re = Regex::new(r"reason: (.+?)(?:, thread|, stopped|$)").unwrap();
         let frame_re = Regex::new(r"frame=\{(.+?)\}").unwrap();
 
-        let mut events = Vec::new();
         let mut lines = Vec::new();
         for line in output.lines() {
             let trimmed = line.trim();
             if trimmed.is_empty() || trimmed.contains("^running") {
                 continue;
             }
-            // Emit lifecycle noise as events instead of dropping
-            if trimmed.contains("library loaded:") || trimmed.contains("symbols loaded, base") {
-                events.push(trimmed.to_string());
-                continue;
-            }
-            if trimmed.contains("no symbols loaded") {
-                events.push(trimmed.to_string());
-                continue;
-            }
-            if trimmed.contains("thread created") || trimmed.contains("thread exited") {
-                events.push(trimmed.to_string());
-                continue;
-            }
-            if trimmed.contains("breakpoint modified") {
-                events.push(trimmed.to_string());
+            // Drop lifecycle noise — agents query session state, not banners.
+            if trimmed.contains("library loaded:")
+                || trimmed.contains("symbols loaded, base")
+                || trimmed.contains("no symbols loaded")
+                || trimmed.contains("thread created")
+                || trimmed.contains("thread exited")
+                || trimmed.contains("breakpoint modified")
+            {
                 continue;
             }
             if trimmed.starts_with("stopped,") {
@@ -142,10 +134,7 @@ impl Backend for NetCoreDbgBackend {
             lines.push(trimmed.to_string());
         }
 
-        CleanResult {
-            output: lines.join("\n"),
-            events,
-        }
+        lines.join("\n")
     }
 
     fn canonical_ops(&self) -> Option<&dyn CanonicalOps> {
@@ -387,23 +376,22 @@ mod tests {
     fn clean_parses_stopped_with_reason_and_frame() {
         let input = "stopped, reason: breakpoint 1 hit, thread-id: 1, frame={Program.Main() at Program.cs:4}";
         let r = NetCoreDbgBackend.clean("run", input);
-        assert!(r.output.contains("stopped: breakpoint 1 hit"));
-        assert!(r.output.contains("@ Program.Main() at Program.cs:4"));
+        assert!(r.contains("stopped: breakpoint 1 hit"));
+        assert!(r.contains("@ Program.Main() at Program.cs:4"));
     }
 
     #[test]
     fn clean_emits_library_events() {
         let input = "library loaded: System.dll, symbols loaded, base address: 0x1000\nthread created, id: 123\nbreakpoint modified, Breakpoint 1";
         let r = NetCoreDbgBackend.clean("run", input);
-        assert!(r.output.is_empty());
-        assert_eq!(r.events.len(), 3);
+        assert!(r.is_empty());
     }
 
     #[test]
     fn clean_skips_empty_and_running() {
         let input = "\n^running\nactual output";
         let r = NetCoreDbgBackend.clean("continue", input);
-        assert_eq!(r.output, "actual output");
+        assert_eq!(r, "actual output");
     }
 
     #[test]

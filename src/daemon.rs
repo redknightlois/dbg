@@ -758,8 +758,7 @@ fn handle_command(
                         backfill_locals(&mut guard, backend, &raw);
                     }
 
-                    let result = backend.clean(&native_cmd, &raw);
-                    let mut cleaned = result.output;
+                    let mut cleaned = backend.clean(&native_cmd, &raw);
                     if decorate {
                         cleaned = debug_cmds::decorate_output_for_op(backend, canonical_op, &cleaned);
                     }
@@ -815,8 +814,7 @@ fn handle_command(
                     if command_may_stop(cmd) {
                         capture_hit_if_stopped(&mut guard, backend, &raw);
                     }
-                    let result = backend.clean(cmd, &raw);
-                    let cleaned = result.output;
+                    let cleaned = backend.clean(cmd, &raw);
                     log_command(&mut guard, cmd, &cleaned, None);
                     cleaned
                 }

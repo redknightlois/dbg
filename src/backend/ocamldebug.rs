@@ -4,7 +4,7 @@ use regex::Regex;
 use serde_json::{Map, Value};
 
 use super::canonical::{BreakLoc, CanonicalOps, HitEvent};
-use super::{Backend, CleanResult, Dependency, DependencyCheck, SpawnConfig};
+use super::{Backend, Dependency, DependencyCheck, SpawnConfig};
 
 pub struct OcamlDebugBackend;
 
@@ -105,28 +105,17 @@ impl Backend for OcamlDebugBackend {
 
     fn canonical_ops(&self) -> Option<&dyn CanonicalOps> { Some(self) }
 
-    fn clean(&self, cmd: &str, output: &str) -> CleanResult {
+    fn clean(&self, cmd: &str, output: &str) -> String {
         let trimmed = cmd.trim();
-        let mut events = Vec::new();
         let mut lines: Vec<String> = Vec::new();
 
         for line in output.lines() {
             let l = line.trim();
 
-            // Extract stop events (breakpoint hits, time positions)
-            if l.starts_with("Time:") || l.starts_with("Time :") {
-                events.push(l.to_string());
-            }
-
-            // Extract breakpoint hit events
+            // Drop redundant breakpoint-hit lines (the "Time:" line that
+            // follows already names the location).
             if l.starts_with("Breakpoint:") {
-                events.push(l.to_string());
-                continue; // redundant with Time: line
-            }
-
-            // Extract breakpoint-set confirmations
-            if l.starts_with("Breakpoint ") && l.contains("at") {
-                events.push(l.to_string());
+                continue;
             }
 
             // Filter loading/startup noise
@@ -149,10 +138,7 @@ impl Backend for OcamlDebugBackend {
             lines.push(cleaned);
         }
 
-        CleanResult {
-            output: lines.join("\n"),
-            events,
-        }
+        lines.join("\n")
     }
 }
 
@@ -332,48 +318,45 @@ mod tests {
     fn clean_extracts_time_events() {
         let input = "Time: 21 - pc: 0:42756 - module Parser\nval x : int = 42";
         let r = OcamlDebugBackend.clean("step", input);
-        assert!(r.events.iter().any(|e| e.contains("Time:")));
-        assert!(r.output.contains("val x"));
+        assert!(r.contains("val x"));
     }
 
     #[test]
     fn clean_filters_loading_noise() {
         let input = "Loading program ./my_program\nactual output";
         let r = OcamlDebugBackend.clean("run", input);
-        assert!(!r.output.contains("Loading program"));
-        assert!(r.output.contains("actual output"));
+        assert!(!r.contains("Loading program"));
+        assert!(r.contains("actual output"));
     }
 
     #[test]
     fn clean_passthrough_normal() {
         let input = "x : int = 42";
         let r = OcamlDebugBackend.clean("print x", input);
-        assert_eq!(r.output.trim(), "x : int = 42");
-        assert!(r.events.is_empty());
+        assert_eq!(r.trim(), "x : int = 42");
     }
 
     #[test]
     fn clean_replaces_markers() {
         let input = "2   <|b|>if n = 0 then 1";
         let r = OcamlDebugBackend.clean("step", input);
-        assert!(r.output.contains(">>> if n = 0"));
-        assert!(!r.output.contains("<|b|>"));
+        assert!(r.contains(">>> if n = 0"));
+        assert!(!r.contains("<|b|>"));
     }
 
     #[test]
     fn clean_filters_position_out_of_range() {
         let input = "1 let x = 42\nPosition out of range.";
         let r = OcamlDebugBackend.clean("list", input);
-        assert!(!r.output.contains("Position out of range"));
-        assert!(r.output.contains("let x = 42"));
+        assert!(!r.contains("Position out of range"));
+        assert!(r.contains("let x = 42"));
     }
 
     #[test]
     fn clean_extracts_breakpoint_hit() {
         let input = "Time: 19 - pc: 0:144156 - module Test\nBreakpoint: 1\n2   <|b|>if n = 0 then 1";
         let r = OcamlDebugBackend.clean("run", input);
-        assert!(r.events.iter().any(|e| e.contains("Breakpoint: 1")));
-        assert!(!r.output.contains("Breakpoint:"));
+        assert!(!r.contains("Breakpoint:"));
     }
 
     #[test]

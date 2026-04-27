@@ -1,4 +1,4 @@
-use super::{Backend, CleanResult, Dependency, DependencyCheck, SpawnConfig, shell_escape};
+use super::{Backend, Dependency, DependencyCheck, SpawnConfig, shell_escape};
 use crate::daemon::session_tmp;
 
 pub struct PerfBackend;
@@ -142,7 +142,7 @@ impl Backend for PerfBackend {
         "perf: record, report, stat, annotate, script, top".to_string()
     }
 
-    fn clean(&self, _cmd: &str, output: &str) -> CleanResult {
+    fn clean(&self, _cmd: &str, output: &str) -> String {
         let mut lines = Vec::new();
         for line in output.lines() {
             let trimmed = line.trim();
@@ -155,10 +155,7 @@ impl Backend for PerfBackend {
             }
             lines.push(line);
         }
-        CleanResult {
-            output: lines.join("\n"),
-            events: vec![],
-        }
+        lines.join("\n")
     }
 
     fn adapters(&self) -> Vec<(&'static str, &'static str)> {
@@ -174,16 +171,16 @@ mod tests {
     fn clean_filters_perf_noise() {
         let input = "# Samples: 1234\n# was taken at 2024-01-01\n# Total Lost Samples: 5\nactual report data";
         let r = PerfBackend.clean("report", input);
-        assert!(!r.output.contains("was taken at"));
-        assert!(!r.output.contains("Total Lost"));
-        assert!(r.output.contains("# Samples: 1234"));
-        assert!(r.output.contains("actual report data"));
+        assert!(!r.contains("was taken at"));
+        assert!(!r.contains("Total Lost"));
+        assert!(r.contains("# Samples: 1234"));
+        assert!(r.contains("actual report data"));
     }
 
     #[test]
     fn clean_passthrough_normal() {
         let r = PerfBackend.clean("report", "overhead  symbol\n  50%  main");
-        assert!(r.output.contains("50%"));
+        assert!(r.contains("50%"));
     }
 
     #[test]

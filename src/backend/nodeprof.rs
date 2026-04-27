@@ -1,4 +1,4 @@
-use super::{Backend, CleanResult, Dependency, DependencyCheck, SpawnConfig, shell_escape};
+use super::{Backend, Dependency, DependencyCheck, SpawnConfig, shell_escape};
 use crate::daemon::session_tmp;
 
 pub struct NodeProfBackend;
@@ -108,7 +108,7 @@ impl Backend for NodeProfBackend {
         Some(session_tmp("profile.cpuprofile").display().to_string())
     }
 
-    fn clean(&self, _cmd: &str, output: &str) -> CleanResult {
+    fn clean(&self, _cmd: &str, output: &str) -> String {
         let mut lines = Vec::new();
         for line in output.lines() {
             let trimmed = line.trim();
@@ -119,10 +119,7 @@ impl Backend for NodeProfBackend {
             }
             lines.push(line);
         }
-        CleanResult {
-            output: lines.join("\n"),
-            events: vec![],
-        }
+        lines.join("\n")
     }
 
     fn adapters(&self) -> Vec<(&'static str, &'static str)> {
@@ -179,8 +176,8 @@ mod tests {
     fn clean_filters_debugger_noise() {
         let input = "Waiting for the debugger to disconnect\nactual output";
         let r = NodeProfBackend.clean("top", input);
-        assert!(!r.output.contains("Waiting for the debugger"));
-        assert!(r.output.contains("actual output"));
+        assert!(!r.contains("Waiting for the debugger"));
+        assert!(r.contains("actual output"));
     }
 
     #[test]

@@ -4,7 +4,7 @@ use regex::Regex;
 use serde_json::{Map, Value};
 
 use super::canonical::{BreakLoc, CanonicalOps, HitEvent};
-use super::{Backend, CleanResult, Dependency, DependencyCheck, SpawnConfig};
+use super::{Backend, Dependency, DependencyCheck, SpawnConfig};
 
 pub struct JdbBackend;
 
@@ -65,8 +65,7 @@ impl Backend for JdbBackend {
         })
     }
 
-    fn clean(&self, _cmd: &str, output: &str) -> CleanResult {
-        let mut events = Vec::new();
+    fn clean(&self, _cmd: &str, output: &str) -> String {
         let mut lines = Vec::new();
         let mut saw_deferred_bp = false;
         let mut saw_bp_hit = false;
@@ -75,7 +74,6 @@ impl Backend for JdbBackend {
             let trimmed = line.trim();
             if trimmed.starts_with("Set breakpoint") || trimmed.starts_with("Deferring breakpoint") {
                 saw_deferred_bp = true;
-                events.push(trimmed.to_string());
                 continue;
             }
             if trimmed.starts_with("Breakpoint hit") {
@@ -87,7 +85,6 @@ impl Backend for JdbBackend {
                 saw_exit = true;
             }
             if trimmed.contains("thread") && (trimmed.contains("started") || trimmed.contains("died")) {
-                events.push(trimmed.to_string());
                 continue;
             }
             lines.push(line);
@@ -108,10 +105,7 @@ impl Backend for JdbBackend {
                  so jdb can resolve line numbers.",
             );
         }
-        CleanResult {
-            output: out,
-            events,
-        }
+        out
     }
 
     fn adapters(&self) -> Vec<(&'static str, &'static str)> {
@@ -249,8 +243,7 @@ mod tests {
     fn clean_extracts_breakpoint_events() {
         let input = "Set breakpoint at Main:10\nnormal output\nDeferring breakpoint Main:20";
         let r = JdbBackend.clean("stop at Main:10", input);
-        assert_eq!(r.output, "normal output");
-        assert_eq!(r.events.len(), 2);
+        assert_eq!(r, "normal output");
     }
 
     /// Regression: a `.class` compiled without `-g` has no
@@ -267,10 +260,10 @@ It will be set after the class is loaded.\n\
 The application exited";
         let r = JdbBackend.clean("run", input);
         assert!(
-            r.output.to_lowercase().contains("javac -g")
-                || r.output.to_lowercase().contains("debug info"),
+            r.to_lowercase().contains("javac -g")
+                || r.to_lowercase().contains("debug info"),
             "expected -g hint when bp didn't fire before exit, got: {}",
-            r.output
+            r
         );
     }
 
@@ -284,9 +277,9 @@ Breakpoint hit: \"thread=main\", Broken.main(), line=40 bci=0\n\
 The application exited";
         let r = JdbBackend.clean("run", input);
         assert!(
-            !r.output.to_lowercase().contains("javac -g"),
+            !r.to_lowercase().contains("javac -g"),
             "hint must not fire when a breakpoint was hit: {}",
-            r.output
+            r
         );
     }
 
@@ -294,8 +287,7 @@ The application exited";
     fn clean_extracts_thread_events() {
         let input = "thread \"main\" started\noutput\nthread \"worker\" died";
         let r = JdbBackend.clean("run", input);
-        assert_eq!(r.output, "output");
-        assert_eq!(r.events.len(), 2);
+        assert_eq!(r, "output");
     }
 
     #[test]

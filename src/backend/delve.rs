@@ -5,7 +5,7 @@ use regex::Regex;
 use serde_json::{Map, Value};
 
 use super::canonical::{BreakId, BreakLoc, CanonicalOps, HitEvent};
-use super::{Backend, CleanResult, Dependency, DependencyCheck, SpawnConfig};
+use super::{Backend, Dependency, DependencyCheck, SpawnConfig};
 
 pub struct DelveBackend;
 
@@ -83,25 +83,19 @@ impl Backend for DelveBackend {
         })
     }
 
-    fn clean(&self, _cmd: &str, output: &str) -> CleanResult {
-        let mut events = Vec::new();
+    fn clean(&self, _cmd: &str, output: &str) -> String {
         let mut lines = Vec::new();
         for line in output.lines() {
             let trimmed = line.trim();
             if trimmed.starts_with("Created breakpoint") {
-                events.push(trimmed.to_string());
                 continue;
             }
             if trimmed.contains("goroutine") && trimmed.contains("exited") {
-                events.push(trimmed.to_string());
                 continue;
             }
             lines.push(line);
         }
-        CleanResult {
-            output: lines.join("\n"),
-            events,
-        }
+        lines.join("\n")
     }
 
     fn adapters(&self) -> Vec<(&'static str, &'static str)> {
@@ -265,19 +259,16 @@ mod tests {
     fn clean_extracts_breakpoint_events() {
         let input = "Created breakpoint 1 at main.go:10\nnormal output";
         let r = DelveBackend.clean("break main.go:10", input);
-        assert_eq!(r.output, "normal output");
-        assert_eq!(r.events.len(), 1);
-        assert!(r.events[0].contains("Created breakpoint"));
+        assert_eq!(r, "normal output");
     }
 
     #[test]
     fn clean_extracts_goroutine_exit() {
         let input = "some output\ngoroutine 1 exited\nmore output";
         let r = DelveBackend.clean("continue", input);
-        assert!(r.output.contains("some output"));
-        assert!(r.output.contains("more output"));
-        assert!(!r.output.contains("goroutine"));
-        assert_eq!(r.events.len(), 1);
+        assert!(r.contains("some output"));
+        assert!(r.contains("more output"));
+        assert!(!r.contains("goroutine"));
     }
 
     #[test]

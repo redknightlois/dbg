@@ -5,7 +5,7 @@ use regex::Regex;
 use serde_json::{Map, Value};
 
 use super::canonical::{BreakId, BreakLoc, CanonicalOps, HitEvent};
-use super::{Backend, CleanResult, Dependency, DependencyCheck, SpawnConfig};
+use super::{Backend, Dependency, DependencyCheck, SpawnConfig};
 
 pub struct LldbBackend;
 
@@ -93,7 +93,7 @@ impl Backend for LldbBackend {
         ]
     }
 
-    fn clean(&self, cmd: &str, output: &str) -> CleanResult {
+    fn clean(&self, cmd: &str, output: &str) -> String {
         let noise = [
             "Manually indexing DWARF",
             "Parsing symbol table",
@@ -101,19 +101,14 @@ impl Backend for LldbBackend {
             "Reading binary from memory",
         ];
 
-        let mut events = Vec::new();
         let mut lines = Vec::new();
         for line in output.lines() {
             if noise.iter().any(|n| line.contains(n)) {
                 continue;
             }
-            // Capture thread/process lifecycle as events
-            if line.contains("Process") && line.contains("launched") {
-                events.push(line.trim().to_string());
-                continue;
-            }
-            if line.contains("Process") && line.contains("exited") {
-                events.push(line.trim().to_string());
+            // Drop process-lifecycle banners — they belong to the
+            // session log, not user-facing command output.
+            if line.contains("Process") && (line.contains("launched") || line.contains("exited")) {
                 continue;
             }
             lines.push(line);
@@ -121,13 +116,11 @@ impl Backend for LldbBackend {
         let cleaned = lines.join("\n");
 
         let trimmed = cmd.trim();
-        let output = if trimmed == "bt" || trimmed == "backtrace" {
+        if trimmed == "bt" || trimmed == "backtrace" {
             clean_bt(&cleaned)
         } else {
             cleaned
-        };
-
-        CleanResult { output, events }
+        }
     }
 
     fn canonical_ops(&self) -> Option<&dyn CanonicalOps> {
@@ -441,8 +434,7 @@ mod tests {
         let b = LldbBackend;
         let input = "Manually indexing DWARF in foo.o\nactual output\nParsing symbol table";
         let r = b.clean("p x", input);
-        assert_eq!(r.output, "actual output");
-        assert!(r.events.is_empty());
+        assert_eq!(r, "actual output");
     }
 
     #[test]
@@ -450,25 +442,22 @@ mod tests {
         let b = LldbBackend;
         let input = "Process 1234 launched: '/bin/test'\nsome output\nProcess 1234 exited with status = 0";
         let r = b.clean("continue", input);
-        assert_eq!(r.output, "some output");
-        assert_eq!(r.events.len(), 2);
-        assert!(r.events[0].contains("launched"));
-        assert!(r.events[1].contains("exited"));
+        assert_eq!(r, "some output");
     }
 
     #[test]
     fn clean_bt_reformats_frames() {
         let input = "* thread #1, name = 'test', stop reason = breakpoint 1.1\n    frame #0: 0x00005555 test`main + 12 at main.c:4\n    frame #1: 0x00007fff libc`__libc_start_main + 128 at start.c:100";
         let r = LldbBackend.clean("bt", input);
-        assert!(r.output.contains("frame #0: main at main.c:4"));
-        assert!(r.output.contains("frame #1: __libc_start_main at start.c:100"));
-        assert!(r.output.contains("* thread"));
+        assert!(r.contains("frame #0: main at main.c:4"));
+        assert!(r.contains("frame #1: __libc_start_main at start.c:100"));
+        assert!(r.contains("* thread"));
     }
 
     #[test]
     fn clean_bt_passthrough_on_no_frames() {
         let r = LldbBackend.clean("bt", "no frames here");
-        assert_eq!(r.output, "no frames here");
+        assert_eq!(r, "no frames here");
     }
 
     #[test]

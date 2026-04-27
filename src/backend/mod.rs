@@ -32,13 +32,6 @@ pub use dbg_cli::deps::{Dependency, DependencyCheck, DepStatus};
 
 pub use canonical::{BreakId, BreakLoc, CanonicalOps, CanonicalReq};
 
-/// Result of cleaning debugger output.
-pub struct CleanResult {
-    pub output: String,
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub events: Vec<String>,
-}
-
 /// Configuration for spawning a debugger process.
 pub struct SpawnConfig {
     pub bin: String,
@@ -116,12 +109,9 @@ pub trait Backend: Send + Sync {
     }
 
     /// Clean noise from command output.
-    fn clean(&self, cmd: &str, output: &str) -> CleanResult {
+    fn clean(&self, cmd: &str, output: &str) -> String {
         let _ = cmd;
-        CleanResult {
-            output: output.to_string(),
-            events: vec![],
-        }
+        output.to_string()
     }
 
     /// Canonical-operations hook. Debug backends that implement the

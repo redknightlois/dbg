@@ -8,7 +8,7 @@
 use serde_json::{Value, json};
 
 use super::canonical::{BreakLoc, CanonicalOps};
-use super::{Backend, CleanResult, Dependency, DependencyCheck, SpawnConfig};
+use super::{Backend, Dependency, DependencyCheck, SpawnConfig};
 
 pub struct DelveProtoBackend;
 
@@ -91,11 +91,8 @@ impl Backend for DelveProtoBackend {
         Some(self)
     }
 
-    fn clean(&self, _cmd: &str, output: &str) -> CleanResult {
-        CleanResult {
-            output: output.to_string(),
-            events: vec![],
-        }
+    fn clean(&self, _cmd: &str, output: &str) -> String {
+        output.to_string()
     }
 
     fn uses_dap(&self) -> bool {

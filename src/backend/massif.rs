@@ -1,4 +1,4 @@
-use super::{Backend, CleanResult, Dependency, DependencyCheck, SpawnConfig, shell_escape};
+use super::{Backend, Dependency, DependencyCheck, SpawnConfig, shell_escape};
 use crate::daemon::session_tmp;
 
 pub struct MassifBackend;
@@ -82,7 +82,7 @@ impl Backend for MassifBackend {
         "massif: ms_print [--threshold=N] $MASSIF_OUT".to_string()
     }
 
-    fn clean(&self, _cmd: &str, output: &str) -> CleanResult {
+    fn clean(&self, _cmd: &str, output: &str) -> String {
         let mut lines = Vec::new();
         for line in output.lines() {
             let trimmed = line.trim();
@@ -91,10 +91,7 @@ impl Backend for MassifBackend {
             }
             lines.push(line);
         }
-        CleanResult {
-            output: lines.join("\n"),
-            events: vec![],
-        }
+        lines.join("\n")
     }
 
     fn adapters(&self) -> Vec<(&'static str, &'static str)> {
@@ -110,16 +107,16 @@ mod tests {
     fn clean_filters_massif_header() {
         let input = "  == Massif, a heap profiler\n  == Copyright (C) 2022\nactual data\nmore data";
         let r = MassifBackend.clean("ms_print", input);
-        assert!(!r.output.contains("Massif"));
-        assert!(!r.output.contains("Copyright"));
-        assert!(r.output.contains("actual data"));
+        assert!(!r.contains("Massif"));
+        assert!(!r.contains("Copyright"));
+        assert!(r.contains("actual data"));
     }
 
     #[test]
     fn clean_keeps_non_header_lines() {
         let input = "  == Some other valgrind line\ndata";
         let r = MassifBackend.clean("ms_print", input);
-        assert!(r.output.contains("Some other valgrind line"));
+        assert!(r.contains("Some other valgrind line"));
     }
 
     #[test]

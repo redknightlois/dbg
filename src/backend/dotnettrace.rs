@@ -140,8 +140,7 @@ mod tests {
     #[test]
     fn clean_passthrough() {
         let r = DotnetTraceBackend.clean("top", "profile output");
-        assert_eq!(r.output, "profile output");
-        assert!(r.events.is_empty());
+        assert_eq!(r, "profile output");
     }
 
     #[test]

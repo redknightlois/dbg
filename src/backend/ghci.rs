@@ -4,7 +4,7 @@ use regex::Regex;
 use serde_json::{Map, Value};
 
 use super::canonical::{BreakLoc, CanonicalOps, HitEvent, unsupported};
-use super::{Backend, CleanResult, Dependency, DependencyCheck, SpawnConfig};
+use super::{Backend, Dependency, DependencyCheck, SpawnConfig};
 use crate::check::find_bin;
 
 pub struct GhciBackend;
@@ -107,25 +107,16 @@ impl Backend for GhciBackend {
         vec![("haskell.md", include_str!("../../skills/adapters/haskell.md"))]
     }
 
-    fn clean(&self, cmd: &str, output: &str) -> CleanResult {
+    fn clean(&self, cmd: &str, output: &str) -> String {
         let trimmed = cmd.trim();
-        let mut events = Vec::new();
         let mut lines: Vec<&str> = Vec::new();
 
         for line in output.lines() {
             let l = line.trim();
 
-            // Extract stop events (breakpoint hits)
-            // GHC <9.6: `Stopped at Main.hs:5:3-39`
-            // GHC ≥9.6: `Stopped in Main.fibonacci.go, Main.hs:5:3-39`
-            if l.starts_with("Stopped at ") || l.starts_with("Stopped in ") {
-                events.push(l.to_string());
-            }
-
-            // Extract trace events
+            // Filter trace noise
             if l.starts_with("Logged breakpoint at ") {
-                events.push(l.to_string());
-                continue; // noise during :trace
+                continue;
             }
 
             // Filter GHCi internal noise
@@ -151,7 +142,7 @@ impl Backend for GhciBackend {
         }
 
         // For backtrace (:history), strip the "logged events" preamble noise
-        let output = if trimmed == ":history" || trimmed.starts_with(":history ") {
+        if trimmed == ":history" || trimmed.starts_with(":history ") {
             lines
                 .iter()
                 .filter(|l| !l.trim().starts_with("Empty history"))
@@ -160,9 +151,7 @@ impl Backend for GhciBackend {
                 .join("\n")
         } else {
             lines.join("\n")
-        };
-
-        CleanResult { output, events }
+        }
     }
 
     fn canonical_ops(&self) -> Option<&dyn CanonicalOps> { Some(self) }
@@ -274,51 +263,40 @@ mod tests {
     fn clean_extracts_stop_events() {
         let input = "Stopped at Main.hs:5:3-39\n_result :: [Integer]\nn :: Integer = 12";
         let r = GhciBackend.clean(":continue", input);
-        assert!(r.events.iter().any(|e| e.contains("Stopped at")));
-        assert!(r.output.contains("_result"));
-        assert!(r.output.contains("n :: Integer = 12"));
-    }
-
-    #[test]
-    fn clean_extracts_stop_events_ghc96() {
-        // GHC ≥9.6 format: "Stopped in <symbol>, <file>:<line>:<col>"
-        let input = "Stopped in Main.fibonacci.go, /path/algos.hs:20:16-35\n_result :: Integer";
-        let r = GhciBackend.clean(":continue", input);
-        assert!(r.events.iter().any(|e| e.contains("Stopped in")));
+        assert!(r.contains("_result"));
+        assert!(r.contains("n :: Integer = 12"));
     }
 
     #[test]
     fn clean_filters_loading_noise() {
         let input = "[1 of 2] Compiling Lib\nOk, modules loaded: Main, Lib.\nactual output here";
         let r = GhciBackend.clean(":load Main.hs", input);
-        assert!(!r.output.contains("Compiling"));
-        assert!(!r.output.contains("Ok, modules loaded"));
-        assert!(r.output.contains("actual output here"));
+        assert!(!r.contains("Compiling"));
+        assert!(!r.contains("Ok, modules loaded"));
+        assert!(r.contains("actual output here"));
     }
 
     #[test]
     fn clean_filters_version_banner() {
         let input = "GHCi, version 9.8.1\ntype :? for help\nλ> ";
         let r = GhciBackend.clean("", input);
-        assert!(!r.output.contains("GHCi, version"));
-        assert!(!r.output.contains("type :? for help"));
+        assert!(!r.contains("GHCi, version"));
+        assert!(!r.contains("type :? for help"));
     }
 
     #[test]
     fn clean_passthrough_normal_output() {
         let input = "42";
         let r = GhciBackend.clean("2 + 40", input);
-        assert_eq!(r.output.trim(), "42");
-        assert!(r.events.is_empty());
+        assert_eq!(r.trim(), "42");
     }
 
     #[test]
     fn clean_filters_logged_breakpoint_noise() {
         let input = "Logged breakpoint at Main.hs:3:5\nLogged breakpoint at Main.hs:4:8\nStopped at Main.hs:5:1";
         let r = GhciBackend.clean(":trace main", input);
-        assert!(!r.output.contains("Logged breakpoint"));
-        assert!(r.output.contains("Stopped at"));
-        assert_eq!(r.events.len(), 3); // 2 logged + 1 stopped
+        assert!(!r.contains("Logged breakpoint"));
+        assert!(r.contains("Stopped at"));
     }
 
     #[test]

@@ -1,4 +1,4 @@
-use super::{Backend, CleanResult, Dependency, DependencyCheck, SpawnConfig, shell_escape};
+use super::{Backend, Dependency, DependencyCheck, SpawnConfig, shell_escape};
 use crate::daemon::session_tmp;
 
 pub struct PstatsBackend;
@@ -98,7 +98,7 @@ impl Backend for PstatsBackend {
         "pstats: sort, stats, callers, callees, strip, add, read, reverse, quit".to_string()
     }
 
-    fn clean(&self, _cmd: &str, output: &str) -> CleanResult {
+    fn clean(&self, _cmd: &str, output: &str) -> String {
         let mut lines = Vec::new();
         for line in output.lines() {
             let trimmed = line.trim();
@@ -110,10 +110,7 @@ impl Backend for PstatsBackend {
             }
             lines.push(line);
         }
-        CleanResult {
-            output: lines.join("\n"),
-            events: vec![],
-        }
+        lines.join("\n")
     }
 
     fn adapters(&self) -> Vec<(&'static str, &'static str)> {
@@ -144,16 +141,16 @@ mod tests {
     fn clean_filters_welcome_and_goodbye() {
         let input = "Welcome to the profiler\nactual stats\nGoodbye.";
         let r = PstatsBackend.clean("stats", input);
-        assert!(!r.output.contains("Welcome"));
-        assert!(!r.output.contains("Goodbye"));
-        assert!(r.output.contains("actual stats"));
+        assert!(!r.contains("Welcome"));
+        assert!(!r.contains("Goodbye"));
+        assert!(r.contains("actual stats"));
     }
 
     #[test]
     fn clean_keeps_normal_output() {
         let input = "   ncalls  tottime\n       1    0.178";
         let r = PstatsBackend.clean("stats", input);
-        assert!(r.output.contains("ncalls"));
+        assert!(r.contains("ncalls"));
     }
 
     #[test]

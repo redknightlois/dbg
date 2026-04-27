@@ -5,7 +5,7 @@ use regex::Regex;
 use serde_json::{Map, Value};
 
 use super::canonical::{BreakId, BreakLoc, CanonicalOps, HitEvent, unsupported};
-use super::{Backend, CleanResult, Dependency, DependencyCheck, SpawnConfig};
+use super::{Backend, Dependency, DependencyCheck, SpawnConfig};
 
 pub struct PdbBackend {
     /// pdb stops at line 1 of the module before any user command runs.
@@ -163,9 +163,9 @@ impl Backend for PdbBackend {
         vec![("python.md", include_str!("../../skills/adapters/python.md"))]
     }
 
-    fn clean(&self, cmd: &str, output: &str) -> CleanResult {
+    fn clean(&self, cmd: &str, output: &str) -> String {
         let trimmed = cmd.trim();
-        let output = if trimmed == "where" || trimmed == "bt" {
+        if trimmed == "where" || trimmed == "bt" {
             output
                 .lines()
                 .filter(|l| !l.contains("bdb.py") && !l.contains("<string>(1)"))
@@ -173,10 +173,6 @@ impl Backend for PdbBackend {
                 .join("\n")
         } else {
             output.to_string()
-        };
-        CleanResult {
-            output,
-            events: vec![],
         }
     }
 
@@ -588,17 +584,17 @@ mod tests {
     fn clean_where_filters_bdb() {
         let input = "> script.py(5)main()\n  bdb.py(123)dispatch()\n> script.py(10)<module>()\n  <string>(1)<module>()";
         let r = PdbBackend::new().clean("where", input);
-        assert!(!r.output.contains("bdb.py"));
-        assert!(!r.output.contains("<string>(1)"));
-        assert!(r.output.contains("script.py(5)"));
-        assert!(r.output.contains("script.py(10)"));
+        assert!(!r.contains("bdb.py"));
+        assert!(!r.contains("<string>(1)"));
+        assert!(r.contains("script.py(5)"));
+        assert!(r.contains("script.py(10)"));
     }
 
     #[test]
     fn clean_other_cmd_passthrough() {
         let input = "bdb.py line should stay";
         let r = PdbBackend::new().clean("p x", input);
-        assert!(r.output.contains("bdb.py"));
+        assert!(r.contains("bdb.py"));
     }
 
     #[test]

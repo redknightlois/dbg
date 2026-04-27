@@ -1,4 +1,4 @@
-use super::{Backend, CleanResult, Dependency, DependencyCheck, SpawnConfig, shell_escape};
+use super::{Backend, Dependency, DependencyCheck, SpawnConfig, shell_escape};
 
 pub struct MemcheckBackend;
 
@@ -81,24 +81,8 @@ impl Backend for MemcheckBackend {
         "memcheck: memory error detector — reports use-after-free, uninitialized reads, leaks, buffer overflows".to_string()
     }
 
-    fn clean(&self, _cmd: &str, output: &str) -> CleanResult {
-        let mut events = Vec::new();
-        let mut lines = Vec::new();
-        for line in output.lines() {
-            let trimmed = line.trim();
-            // Valgrind prefix lines (==PID==) with summary info → events
-            if trimmed.starts_with("==") && trimmed.contains("== HEAP SUMMARY:") {
-                events.push("heap summary available".to_string());
-            }
-            if trimmed.starts_with("==") && trimmed.contains("== LEAK SUMMARY:") {
-                events.push("leak summary available".to_string());
-            }
-            lines.push(line);
-        }
-        CleanResult {
-            output: lines.join("\n"),
-            events,
-        }
+    fn clean(&self, _cmd: &str, output: &str) -> String {
+        output.to_string()
     }
 
     fn adapters(&self) -> Vec<(&'static str, &'static str)> {
@@ -111,24 +95,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn clean_emits_heap_summary_event() {
+    fn clean_passes_summary_through() {
+        // Memcheck no longer parses lifecycle events — the cleaned
+        // output is the raw valgrind output verbatim.
         let input = "==123== HEAP SUMMARY:\n==123==     in use at exit: 400 bytes";
         let r = MemcheckBackend.clean("valgrind", input);
-        assert!(r.events.iter().any(|e| e == "heap summary available"));
-        assert!(r.output.contains("HEAP SUMMARY"));
-    }
-
-    #[test]
-    fn clean_emits_leak_summary_event() {
-        let input = "==123== LEAK SUMMARY:\n==123==    definitely lost: 400 bytes";
-        let r = MemcheckBackend.clean("valgrind", input);
-        assert!(r.events.iter().any(|e| e == "leak summary available"));
-    }
-
-    #[test]
-    fn clean_no_events_on_clean_output() {
-        let r = MemcheckBackend.clean("echo", "no valgrind output here");
-        assert!(r.events.is_empty());
+        assert!(r.contains("HEAP SUMMARY"));
+        assert!(r.contains("in use at exit"));
     }
 
     #[test]

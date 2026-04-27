@@ -4,7 +4,7 @@ use regex::Regex;
 use serde_json::{Map, Value};
 
 use super::canonical::{BreakLoc, CanonicalOps, HitEvent};
-use super::{Backend, CleanResult, Dependency, DependencyCheck, SpawnConfig};
+use super::{Backend, Dependency, DependencyCheck, SpawnConfig};
 
 pub struct RdbgBackend;
 
@@ -95,23 +95,18 @@ impl Backend for RdbgBackend {
 
     fn canonical_ops(&self) -> Option<&dyn CanonicalOps> { Some(self) }
 
-    fn clean(&self, cmd: &str, output: &str) -> CleanResult {
+    fn clean(&self, cmd: &str, output: &str) -> String {
         let trimmed = cmd.trim();
-        let mut events = Vec::new();
         let mut lines = Vec::new();
 
         for line in output.lines() {
             let l = line.trim();
 
-            // Extract lifecycle events
-            if l.starts_with("DEBUGGER: ") {
-                events.push(l.to_string());
-                continue;
-            }
-
-            // Extract stop events (breakpoint hits, catchpoints)
-            if l.starts_with("Stop by ") || l.starts_with("Catch ") {
-                events.push(l.to_string());
+            // Drop lifecycle / stop banners — agents query session state.
+            if l.starts_with("DEBUGGER: ")
+                || l.starts_with("Stop by ")
+                || l.starts_with("Catch ")
+            {
                 continue;
             }
 
@@ -125,10 +120,7 @@ impl Backend for RdbgBackend {
             lines.push(line);
         }
 
-        CleanResult {
-            output: lines.join("\n"),
-            events,
-        }
+        lines.join("\n")
     }
 }
 
@@ -216,36 +208,33 @@ mod tests {
     fn clean_extracts_debugger_events() {
         let input = "DEBUGGER: Session start (pid: 12345)\nsome output\nmore output";
         let r = RdbgBackend.clean("continue", input);
-        assert!(r.events.iter().any(|e| e.contains("Session start")));
-        assert!(!r.output.contains("DEBUGGER:"));
-        assert!(r.output.contains("some output"));
+        assert!(!r.contains("DEBUGGER:"));
+        assert!(r.contains("some output"));
     }
 
     #[test]
     fn clean_extracts_stop_events() {
         let input = "Stop by #0 BP - Line /path/test.rb:10\nlocal_var = 42";
         let r = RdbgBackend.clean("continue", input);
-        assert!(r.events.iter().any(|e| e.contains("Stop by")));
-        assert!(!r.output.contains("Stop by"), "stop event should not be duplicated in output");
-        assert!(r.output.contains("local_var = 42"));
+        assert!(!r.contains("Stop by"), "stop event should not be duplicated in output");
+        assert!(r.contains("local_var = 42"));
     }
 
     #[test]
     fn clean_filters_internal_frames_from_backtrace() {
         let input = "=>#0 test.rb:10:in 'main'\n  #1 /usr/lib/ruby/debug/session.rb:100\n  #2 <internal:kernel>:100\n  #3 test.rb:5:in 'setup'";
         let r = RdbgBackend.clean("bt", input);
-        assert!(!r.output.contains("/debug/"));
-        assert!(!r.output.contains("<internal:"));
-        assert!(r.output.contains("test.rb:10"));
-        assert!(r.output.contains("test.rb:5"));
+        assert!(!r.contains("/debug/"));
+        assert!(!r.contains("<internal:"));
+        assert!(r.contains("test.rb:10"));
+        assert!(r.contains("test.rb:5"));
     }
 
     #[test]
     fn clean_passthrough_normal_commands() {
         let input = "=> 42";
         let r = RdbgBackend.clean("p 6 * 7", input);
-        assert_eq!(r.output, "=> 42");
-        assert!(r.events.is_empty());
+        assert_eq!(r, "=> 42");
     }
 
     #[test]

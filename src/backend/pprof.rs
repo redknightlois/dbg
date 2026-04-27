@@ -275,8 +275,7 @@ mod tests {
     #[test]
     fn clean_passthrough() {
         let r = PprofBackend.clean("top", "some output");
-        assert_eq!(r.output, "some output");
-        assert!(r.events.is_empty());
+        assert_eq!(r, "some output");
     }
 
     /// Regression: parse_help required `tok.chars().all(is_ascii_alphabetic)`,
