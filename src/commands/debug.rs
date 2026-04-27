@@ -514,7 +514,7 @@ mod tests {
 
     #[test]
     fn watch_unsupported_on_pdb_is_immediate_error() {
-        let d = dispatch_to("watch x", &PdbBackend);
+        let d = dispatch_to("watch x", &PdbBackend::new());
         match d {
             Dispatched::Immediate(s) => {
                 assert!(s.contains("pdb"));
@@ -605,13 +605,13 @@ mod tests {
 
     #[test]
     fn pdb_break_routes_to_pdb_syntax() {
-        let (_, cmd, _) = native_of(dispatch_to("break app.py:10", &PdbBackend));
+        let (_, cmd, _) = native_of(dispatch_to("break app.py:10", &PdbBackend::new()));
         assert_eq!(cmd, "break app.py:10");
     }
 
     #[test]
     fn pdb_exec_verbs_match_pdb_vocabulary() {
-        let b = PdbBackend;
+        let b = PdbBackend::new();
         for (verb, expected) in [
             ("continue", "continue"),
             ("step", "step"),

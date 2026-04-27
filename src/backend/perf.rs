@@ -3,6 +3,18 @@ use crate::daemon::session_tmp;
 
 pub struct PerfBackend;
 
+/// Recognise a perf data file by its 8-byte `PERFILE2` magic header.
+/// The legacy heuristic (`name contains "perf" || ends_with(".data")`)
+/// false-positives ELF binaries whose paths happen to contain `perf`
+/// (e.g. `./perf-bench`) and misses data files with non-standard names.
+fn is_perf_data_file(path: &std::path::Path) -> bool {
+    use std::io::Read;
+    let mut buf = [0u8; 8];
+    let Ok(mut f) = std::fs::File::open(path) else { return false };
+    if f.read_exact(&mut buf).is_err() { return false }
+    &buf == b"PERFILE2"
+}
+
 impl Backend for PerfBackend {
     fn name(&self) -> &'static str {
         "perf"
@@ -24,7 +36,7 @@ impl Backend for PerfBackend {
         let script_out = session_tmp("perf.script.txt");
         let script_str = script_out.display().to_string();
 
-        if path.is_file() && (target.contains("perf") || target.ends_with(".data")) {
+        if path.is_file() && is_perf_data_file(path) {
             // Existing perf data — emit script text for ProfileData, then
             // run the native report.
             Ok(SpawnConfig {
@@ -177,7 +189,9 @@ mod tests {
     #[test]
     fn spawn_config_existing_data_file() {
         let tmp = std::env::temp_dir().join("dbg-test-perf.data");
-        std::fs::write(&tmp, "fake").unwrap();
+        // PERFILE2 magic identifies a real perf data file; the
+        // backend now requires this rather than relying on the path.
+        std::fs::write(&tmp, b"PERFILE2\0\0\0\0\0\0\0\0").unwrap();
         let cfg = PerfBackend
             .spawn_config(tmp.to_str().unwrap(), &[])
             .unwrap();
@@ -258,5 +272,49 @@ mod tests {
     #[test]
     fn quit_command_exits_bash() {
         assert_eq!(PerfBackend.quit_command(), "exit");
+    }
+
+    #[test]
+    fn spawn_config_records_elf_binary_whose_name_contains_perf() {
+        // Regression: the existing-data heuristic was a name match
+        // (`target.contains("perf") || target.ends_with(".data")`),
+        // which false-positived any ELF binary whose path contained
+        // `perf` (e.g. `./perf-bench`, `./myperf`). The backend then
+        // tried to `perf report` the binary, which exits immediately
+        // because it isn't a recorded profile. Magic-byte detection is
+        // the only reliable signal — `.data` files start with the
+        // 8-byte `PERFILE2` header.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let elf_path = tmp.path().join("perf-bench");
+        std::fs::write(&elf_path, [0x7f, b'E', b'L', b'F', 0, 0, 0, 0]).unwrap();
+        let cfg = PerfBackend
+            .spawn_config(elf_path.to_str().unwrap(), &[])
+            .unwrap();
+        // ELF binary → must take the record path, not the report path.
+        assert!(
+            cfg.init_commands[0].starts_with("perf record"),
+            "ELF target with `perf` in name should be recorded, not reported: {:?}",
+            cfg.init_commands,
+        );
+    }
+
+    #[test]
+    fn spawn_config_recognizes_perf_data_by_magic_bytes() {
+        // PERFILE2 magic is the only reliable way to identify a perf
+        // data file — names like `cpu.profile`, `trace.out`, etc. are
+        // common in the wild and don't match the legacy heuristic.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let data_path = tmp.path().join("trace.out");
+        let mut content = b"PERFILE2".to_vec();
+        content.extend(std::iter::repeat_n(0u8, 1024));
+        std::fs::write(&data_path, &content).unwrap();
+        let cfg = PerfBackend
+            .spawn_config(data_path.to_str().unwrap(), &[])
+            .unwrap();
+        assert!(
+            cfg.init_commands.iter().any(|c| c.contains("perf report --stdio -i")),
+            "PERFILE2-magic file should take the report path: {:?}",
+            cfg.init_commands,
+        );
     }
 }

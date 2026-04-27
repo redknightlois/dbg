@@ -207,9 +207,12 @@ impl Registry {
 
     pub fn register(&mut self, backend: Box<dyn Backend>) {
         let idx = self.backends.len();
-        self.type_map.insert(backend.name().to_string(), idx);
+        let name = backend.name().to_string();
+        let prev = self.type_map.insert(name.clone(), idx);
+        debug_assert!(prev.is_none(), "duplicate backend name: {name}");
         for t in backend.types() {
-            self.type_map.insert(t.to_string(), idx);
+            let prev = self.type_map.insert(t.to_string(), idx);
+            debug_assert!(prev.is_none(), "duplicate type registration: {t}");
         }
         self.backends.push(backend);
     }
@@ -269,5 +272,46 @@ mod tests {
     #[test]
     fn shell_escape_backticks() {
         assert_eq!(shell_escape("`whoami`"), "'`whoami`'");
+    }
+
+    /// Regression guard: registering two backends that claim the same
+    /// type silently dropped the first registration's mapping. Today
+    /// no two backends overlap, but adding one is a one-line mistake
+    /// that only surfaces when a user runs `dbg start <type> ...` and
+    /// gets the wrong tool. Catch it at startup.
+    #[test]
+    #[should_panic(expected = "duplicate")]
+    fn registry_panics_on_duplicate_type_in_debug() {
+        struct A;
+        impl Backend for A {
+            fn name(&self) -> &'static str { "a" }
+            fn description(&self) -> &'static str { "" }
+            fn types(&self) -> &'static [&'static str] { &["shared"] }
+            fn spawn_config(&self, _: &str, _: &[String]) -> anyhow::Result<SpawnConfig> {
+                anyhow::bail!("test")
+            }
+            fn prompt_pattern(&self) -> &str { "" }
+            fn dependencies(&self) -> Vec<Dependency> { vec![] }
+            fn run_command(&self) -> &'static str { "" }
+            fn adapters(&self) -> Vec<(&'static str, &'static str)> { vec![] }
+            fn parse_help(&self, _: &str) -> String { String::new() }
+        }
+        struct B;
+        impl Backend for B {
+            fn name(&self) -> &'static str { "b" }
+            fn description(&self) -> &'static str { "" }
+            fn types(&self) -> &'static [&'static str] { &["shared"] }
+            fn spawn_config(&self, _: &str, _: &[String]) -> anyhow::Result<SpawnConfig> {
+                anyhow::bail!("test")
+            }
+            fn prompt_pattern(&self) -> &str { "" }
+            fn dependencies(&self) -> Vec<Dependency> { vec![] }
+            fn run_command(&self) -> &'static str { "" }
+            fn adapters(&self) -> Vec<(&'static str, &'static str)> { vec![] }
+            fn parse_help(&self, _: &str) -> String { String::new() }
+        }
+        let mut r = Registry::new();
+        r.register(Box::new(A));
+        r.register(Box::new(B));
     }
 }

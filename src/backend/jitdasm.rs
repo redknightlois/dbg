@@ -202,21 +202,23 @@ impl Backend for JitDasmBackend {
         // reading the `<AssemblyName>.runtimeconfig.json` sibling that
         // the build drops into `bin/Release/net*/` — only executables
         // emit one, so it reliably names the entry-point dll.
-        let proj_dir_expr = format!("$(dirname {})", shell_escape(&project));
+        // Capture dirname into a shell variable so paths with spaces
+        // survive expansion inside the ls glob.
         let locate_dll = format!(
-            "dll=$(ls -t {proj_dir}/bin/Release/net*/*.runtimeconfig.json 2>/dev/null | \
+            "proj_dir=$(dirname {project_arg}); \
+             dll=$(ls -t \"$proj_dir\"/bin/Release/net*/*.runtimeconfig.json 2>/dev/null | \
              head -1 | sed 's/\\.runtimeconfig\\.json$/.dll/'); \
              if [ -z \"$dll\" ] || [ ! -f \"$dll\" ]; then \
                echo 'jitdasm: could not locate built dll under bin/Release/net*/; did build succeed?' >&2; \
                exit 1; \
              fi",
-            proj_dir = proj_dir_expr,
+            project_arg = shell_escape(&project),
         );
         let run_cmd = format!(
             "echo 'Disassembling: {pattern}' && {locate_dll} && \
              DOTNET_TieredCompilation=0 DOTNET_JitDisasm='{pattern}' DOTNET_JitDiffableDasm=1 \
              {timeout_prefix}dotnet exec \"$dll\"{extra} > {out_file} 2>&1",
-            out_file = out_file_str,
+            out_file = shell_escape(&out_file_str),
         );
 
         // Replace the bash shell with our Rust REPL. Pass the raw
@@ -487,6 +489,67 @@ mod tests {
         assert_eq!(
             qualify_pattern("*:DoWork", "/tmp/Broken.csproj"),
             "*:DoWork"
+        );
+    }
+
+    /// Regression: the dll-locator embedded `$(dirname …)` directly
+    /// into an unquoted `ls -t {proj_dir}/bin/...` interpolation. When
+    /// the project path contained spaces the substitution produced
+    /// `ls -t /home/me/my project/bin/...`, which bash word-split into
+    /// three separate ls arguments. The fix is to capture the dirname
+    /// in a shell variable and quote its expansion.
+    #[test]
+    fn locate_dll_quotes_project_dir_for_paths_with_spaces() {
+        let cfg = JitDasmBackend
+            .spawn_config("my project/app.csproj", &["Foo:Bar".into()])
+            .unwrap();
+        let run = &cfg.init_commands[2];
+        // No raw, unquoted command-substitution embedded in a glob —
+        // the dirname result must be assigned to a variable first and
+        // then referenced via "$proj_dir" inside the ls.
+        assert!(
+            !run.contains("ls -t $(dirname"),
+            "dirname substitution must not be inlined into ls: {run}"
+        );
+        assert!(
+            run.contains("\"$proj_dir\"") || run.contains("\"${proj_dir}\""),
+            "proj_dir should be expanded inside double quotes: {run}"
+        );
+    }
+
+    /// Regression: the capture redirect `> {out_file}` was unquoted,
+    /// so an `XDG_RUNTIME_DIR` containing whitespace broke the shell
+    /// command. The redirect target must go through shell_escape.
+    #[test]
+    fn capture_redirect_quotes_paths_with_spaces() {
+        // Force session_tmp to materialise under a directory with a
+        // space by overriding XDG_RUNTIME_DIR. Serialised against
+        // other env-mutating tests.
+        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::TempDir::new().unwrap();
+        let spaced = tmp.path().join("with space");
+        std::fs::create_dir_all(&spaced).unwrap();
+        let prev = std::env::var("XDG_RUNTIME_DIR").ok();
+        unsafe {
+            std::env::set_var("XDG_RUNTIME_DIR", &spaced);
+        }
+        let cfg = JitDasmBackend
+            .spawn_config("app.csproj", &["Foo:Bar".into()])
+            .unwrap();
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("XDG_RUNTIME_DIR", v),
+                None => std::env::remove_var("XDG_RUNTIME_DIR"),
+            }
+        }
+        let run = &cfg.init_commands[2];
+        let redirect_idx = run.find("> ").expect("redirect present");
+        let after = &run[redirect_idx + 2..];
+        let first_char = after.chars().next().unwrap();
+        assert!(
+            first_char == '\'' || first_char == '"',
+            "redirect target with spaces must be quoted: {run}"
         );
     }
 }

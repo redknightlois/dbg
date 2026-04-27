@@ -7,7 +7,27 @@ use serde_json::{Map, Value};
 use super::canonical::{BreakId, BreakLoc, CanonicalOps, HitEvent, unsupported};
 use super::{Backend, CleanResult, Dependency, DependencyCheck, SpawnConfig};
 
-pub struct PdbBackend;
+pub struct PdbBackend {
+    /// pdb stops at line 1 of the module before any user command runs.
+    /// That synthetic stop must be skipped, but only the first one —
+    /// a user breakpoint at line 1 during a later `continue` is a real
+    /// hit. Track whether we've consumed the synthetic stop.
+    module_load_consumed: std::sync::atomic::AtomicBool,
+}
+
+impl PdbBackend {
+    pub const fn new() -> Self {
+        Self {
+            module_load_consumed: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+}
+
+impl Default for PdbBackend {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 /// If `file` exists and line `line` is a `def`/`class`/decorator line
 /// that can't hold a bytecode breakpoint in pdb, advance to the first
@@ -321,8 +341,16 @@ impl CanonicalOps for PdbBackend {
                 // Bug 2 fix: only skip the very first line (line_no == 1);
                 // a user breakpoint at module-level line N > 1 IS a real
                 // hit and must be captured.
-                if func == "<module>" && line_no <= 1 {
-                    continue;
+                // The synthetic module-load stop fires once at line 1
+                // before any user command runs. Skip it the first time
+                // we see it; on subsequent line-1 <module> stops the
+                // user has set a real breakpoint there and the hit
+                // must be captured.
+                if func == "<module>" && line_no == 1 {
+                    use std::sync::atomic::Ordering;
+                    if !self.module_load_consumed.swap(true, Ordering::Relaxed) {
+                        continue;
+                    }
                 }
                 return Some(HitEvent {
                     location_key: format!("{file}:{line_no}"),
@@ -465,7 +493,7 @@ mod tests {
 
     #[test]
     fn format_breakpoint() {
-        assert_eq!(PdbBackend.format_breakpoint("test.py:10"), "break test.py:10");
+        assert_eq!(PdbBackend::new().format_breakpoint("test.py:10"), "break test.py:10");
     }
 
     #[test]
@@ -514,7 +542,7 @@ mod tests {
         // appears in them (e.g. a printed local whose repr contains it).
         let weird_locals_dump =
             "{'code': '-> exec(cmd, globals, locals)', 'n': 3}";
-        let got = PdbBackend.postprocess_output("locals", weird_locals_dump);
+        let got = PdbBackend::new().postprocess_output("locals", weird_locals_dump);
         assert_eq!(got, weird_locals_dump);
     }
 
@@ -559,7 +587,7 @@ mod tests {
     #[test]
     fn clean_where_filters_bdb() {
         let input = "> script.py(5)main()\n  bdb.py(123)dispatch()\n> script.py(10)<module>()\n  <string>(1)<module>()";
-        let r = PdbBackend.clean("where", input);
+        let r = PdbBackend::new().clean("where", input);
         assert!(!r.output.contains("bdb.py"));
         assert!(!r.output.contains("<string>(1)"));
         assert!(r.output.contains("script.py(5)"));
@@ -569,13 +597,13 @@ mod tests {
     #[test]
     fn clean_other_cmd_passthrough() {
         let input = "bdb.py line should stay";
-        let r = PdbBackend.clean("p x", input);
+        let r = PdbBackend::new().clean("p x", input);
         assert!(r.output.contains("bdb.py"));
     }
 
     #[test]
     fn spawn_config_includes_target_and_args() {
-        let cfg = PdbBackend
+        let cfg = PdbBackend::new()
             .spawn_config("test.py", &["--verbose".into()])
             .unwrap();
         assert!(cfg.args.contains(&"test.py".to_string()));
@@ -586,7 +614,7 @@ mod tests {
     #[test]
     fn parse_help_extracts_and_deduplicates() {
         let raw = "Documented commands:\n========\nbreak  continue  help\nbreak  next  step";
-        let result = PdbBackend.parse_help(raw);
+        let result = PdbBackend::new().parse_help(raw);
         assert!(result.contains("break"));
         assert!(result.contains("continue"));
         let count = result.matches("break").count();
@@ -599,7 +627,7 @@ mod tests {
 
     #[test]
     fn canonical_break_ops() {
-        let ops: &dyn CanonicalOps = &PdbBackend;
+        let ops: &dyn CanonicalOps = &PdbBackend::new();
         assert_eq!(
             ops.op_break(&BreakLoc::FileLine { file: "app.py".into(), line: 10 }).unwrap(),
             "break app.py:10"
@@ -616,7 +644,7 @@ mod tests {
 
     #[test]
     fn canonical_exec_ops() {
-        let ops: &dyn CanonicalOps = &PdbBackend;
+        let ops: &dyn CanonicalOps = &PdbBackend::new();
         assert_eq!(ops.op_continue().unwrap(), "continue");
         assert_eq!(ops.op_step().unwrap(), "step");
         assert_eq!(ops.op_next().unwrap(), "next");
@@ -625,13 +653,13 @@ mod tests {
 
     #[test]
     fn canonical_locals_uses_pp_locals_builtin() {
-        let ops: &dyn CanonicalOps = &PdbBackend;
+        let ops: &dyn CanonicalOps = &PdbBackend::new();
         assert_eq!(ops.op_locals().unwrap(), "pp locals()");
     }
 
     #[test]
     fn canonical_watch_is_unsupported() {
-        let ops: &dyn CanonicalOps = &PdbBackend;
+        let ops: &dyn CanonicalOps = &PdbBackend::new();
         let err = ops.op_watch("x").unwrap_err().to_string();
         assert!(err.contains("pdb"));
         assert!(err.contains("watchpoints"));
@@ -640,7 +668,7 @@ mod tests {
 
     #[test]
     fn canonical_threads_are_unsupported() {
-        let ops: &dyn CanonicalOps = &PdbBackend;
+        let ops: &dyn CanonicalOps = &PdbBackend::new();
         assert!(ops.op_threads().is_err());
         assert!(ops.op_thread(1).is_err());
     }
@@ -648,7 +676,7 @@ mod tests {
     #[test]
     fn parse_hit_from_stop_marker() {
         let out = "> /app/main.py(42)handle_request()\n-> return result\n(Pdb) ";
-        let hit = PdbBackend.parse_hit(out).expect("should parse");
+        let hit = PdbBackend::new().parse_hit(out).expect("should parse");
         assert_eq!(hit.location_key, "/app/main.py:42");
         assert_eq!(hit.file.as_deref(), Some("/app/main.py"));
         assert_eq!(hit.line, Some(42));
@@ -657,7 +685,7 @@ mod tests {
 
     #[test]
     fn parse_hit_none_without_marker() {
-        assert!(PdbBackend.parse_hit("some output without marker").is_none());
+        assert!(PdbBackend::new().parse_hit("some output without marker").is_none());
     }
 
     #[test]
@@ -665,13 +693,13 @@ mod tests {
         // pdb stops at the very first line of the module (line 1) before any
         // breakpoint fires. That synthetic stop must be skipped.
         let out = "> /app/main.py(1)<module>()\n-> \"\"\"Algorithms.\"\"\"\n(Pdb) ";
-        assert!(PdbBackend.parse_hit(out).is_none(), "should skip <module> stop at line 1");
+        assert!(PdbBackend::new().parse_hit(out).is_none(), "should skip <module> stop at line 1");
     }
 
     #[test]
     fn parse_locals_from_pp_dict() {
         let out = "{'x': 42, 'name': 'hello', 'items': [1, 2, 3]}";
-        let v = PdbBackend.parse_locals(out).expect("should parse");
+        let v = PdbBackend::new().parse_locals(out).expect("should parse");
         let obj = v.as_object().unwrap();
         assert_eq!(obj.get("x").unwrap().get("value").unwrap().as_str().unwrap(), "42");
         assert_eq!(
@@ -687,7 +715,7 @@ mod tests {
     #[test]
     fn parse_locals_handles_nested_dicts() {
         let out = "{'cfg': {'host': 'localhost', 'port': 8080}, 'ready': True}";
-        let v = PdbBackend.parse_locals(out).expect("should parse");
+        let v = PdbBackend::new().parse_locals(out).expect("should parse");
         let obj = v.as_object().unwrap();
         assert_eq!(
             obj.get("cfg").unwrap().get("value").unwrap().as_str().unwrap(),
@@ -699,7 +727,7 @@ mod tests {
     #[test]
     fn parse_locals_handles_commas_inside_strings() {
         let out = "{'greeting': 'hello, world', 'n': 3}";
-        let v = PdbBackend.parse_locals(out).expect("should parse");
+        let v = PdbBackend::new().parse_locals(out).expect("should parse");
         let obj = v.as_object().unwrap();
         assert_eq!(
             obj.get("greeting").unwrap().get("value").unwrap().as_str().unwrap(),
@@ -710,7 +738,7 @@ mod tests {
 
     #[test]
     fn backend_canonical_ops_hook_returns_self() {
-        let b: Box<dyn Backend> = Box::new(PdbBackend);
+        let b: Box<dyn Backend> = Box::new(PdbBackend::new());
         assert!(b.canonical_ops().is_some());
         assert_eq!(b.canonical_ops().unwrap().tool_name(), "pdb");
     }
@@ -728,7 +756,7 @@ mod tests {
     fn parse_locals_filters_dunder_keys() {
         let out = "{'__name__': '__main__', '__file__': 'broken.py', \
                    '__builtins__': <module 'builtins'>, 'x': 42, 'items': [1, 2, 3]}";
-        let v = PdbBackend.parse_locals(out).expect("should parse");
+        let v = PdbBackend::new().parse_locals(out).expect("should parse");
         let obj = v.as_object().unwrap();
         // Dunder keys must be absent.
         assert!(
@@ -754,7 +782,7 @@ mod tests {
     #[test]
     fn parse_locals_all_dunders_returns_none() {
         let out = "{'__name__': '__main__', '__doc__': None, '__builtins__': <module 'builtins'>}";
-        let v = PdbBackend.parse_locals(out);
+        let v = PdbBackend::new().parse_locals(out);
         assert!(
             v.is_none(),
             "all-dunder dict should yield None, got: {v:?}"
@@ -774,7 +802,7 @@ mod tests {
     fn parse_hit_captures_module_level_breakpoint_beyond_line_1() {
         // Breakpoint at line 26 in module scope — must be captured.
         let out = "> /app/broken.py(26)<module>()\n-> result = compute()\n(Pdb) ";
-        let hit = PdbBackend.parse_hit(out);
+        let hit = PdbBackend::new().parse_hit(out);
         assert!(
             hit.is_some(),
             "module-level breakpoint hit at line 26 must be captured, got None"
@@ -789,8 +817,34 @@ mod tests {
     fn parse_hit_still_skips_synthetic_module_load_at_line_1() {
         let out = "> /app/broken.py(1)<module>()\n-> \"\"\"Module docstring.\"\"\"\n(Pdb) ";
         assert!(
-            PdbBackend.parse_hit(out).is_none(),
+            PdbBackend::new().parse_hit(out).is_none(),
             "line-1 <module> stop is synthetic and must be skipped"
         );
+    }
+
+    /// Regression: a user breakpoint at line 1 of a module produces
+    /// the same `> file.py(1)<module>()` marker as the synthetic
+    /// module-load stop. The first line-1 stop is the synthetic one;
+    /// any subsequent line-1 stop is the user's breakpoint and must
+    /// be captured rather than silently swallowed.
+    #[test]
+    fn parse_hit_captures_user_breakpoint_at_module_line_1() {
+        let backend = PdbBackend::new();
+        let out = "> /app/broken.py(1)<module>()\n-> import sys\n(Pdb) ";
+        // First call: synthetic module-load stop, must be skipped.
+        assert!(
+            backend.parse_hit(out).is_none(),
+            "first line-1 <module> stop should be skipped"
+        );
+        // Second call (after user `continue` returns to line 1): the
+        // user has a breakpoint at line 1 that just fired. Capture it.
+        let hit = backend.parse_hit(out);
+        assert!(
+            hit.is_some(),
+            "second line-1 <module> stop should be a real user-breakpoint hit"
+        );
+        let h = hit.unwrap();
+        assert_eq!(h.line, Some(1));
+        assert_eq!(h.location_key, "/app/broken.py:1");
     }
 }

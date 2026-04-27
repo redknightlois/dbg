@@ -534,17 +534,14 @@ pub fn run_daemon(
         target_class,
     });
 
-    // Non-blocking accept so threads can handle connections concurrently.
-    listener.set_nonblocking(true)?;
-
+    // Blocking accept — the daemon does nothing useful between
+    // connections, and ctrl-c is delivered to the signal handler
+    // regardless of whether accept is blocked. Polling burned ~100
+    // wakeups/sec idle for no benefit.
     std::thread::scope(|scope| {
         loop {
             let stream = match listener.accept() {
                 Ok((s, _)) => s,
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    std::thread::sleep(Duration::from_millis(10));
-                    continue;
-                }
                 Err(_) => continue,
             };
 
@@ -1518,13 +1515,18 @@ pub fn is_running() -> bool {
 /// Safe to call before `dbg start` / `dbg replay` — those used to
 /// rely on `is_running()` doing it as a side-effect, which caused
 /// the race described above.
+///
+/// Bail as soon as the pid file names a live process. A live pid
+/// means either a fully-running daemon (socket also exists) or one
+/// mid-startup (pid written, socket bind a few microseconds away);
+/// in both cases its files belong to that process and must not be
+/// removed. Only when the pid file is missing or names a dead pid
+/// do we treat the runtime files as orphans and reap them.
 pub fn clean_stale_runtime_files() {
     if let Ok(pid_str) = std::fs::read_to_string(&pid_path()) {
         if let Ok(pid) = pid_str.trim().parse::<i32>() {
             if nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None).is_ok() {
-                if Path::new(&socket_path()).exists() {
-                    return; // Live, healthy — leave it alone.
-                }
+                return;
             }
         }
     }
@@ -1573,6 +1575,33 @@ pub fn wait_for_socket(timeout: Duration) -> bool {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    /// Regression: the accept loop used non-blocking accept + a
+    /// 10ms sleep, which burned ~100 wakeups/sec on an idle daemon
+    /// for no benefit (ctrl-c is signal-delivered regardless of
+    /// whether accept is blocked, and the daemon has no other work
+    /// to do between connections). Assert the polling pattern stays
+    /// out of the source.
+    #[test]
+    fn accept_loop_does_not_busy_poll() {
+        let src = include_str!("daemon.rs");
+        // Confine the search to run_daemon's accept loop region: after
+        // the listener bind, before std::thread::scope's closing.
+        let bind_pos = src.find("UnixListener::bind").expect("bind site");
+        let scope_end = src[bind_pos..]
+            .find("cleanup_and_exit();\n}")
+            .map(|p| bind_pos + p)
+            .unwrap_or(src.len());
+        let region = &src[bind_pos..scope_end];
+        assert!(
+            !region.contains("set_nonblocking(true)"),
+            "listener must not be set non-blocking — that's the polling defect"
+        );
+        assert!(
+            !region.contains("WouldBlock"),
+            "WouldBlock retry loop signals the polling defect has returned"
+        );
+    }
 
     #[test]
     fn pid_and_socket_bind_before_init_commands() {
@@ -1750,6 +1779,32 @@ mod tests {
                 "`{v}` must NOT be intercepted by the profile REPL"
             );
         }
+    }
+
+    /// Regression: between `pid_path` write and `socket_path` bind in
+    /// `run_daemon`, a concurrent `dbg start` could call
+    /// `clean_stale_runtime_files`, see "alive pid, socket missing",
+    /// and delete the live daemon's pid file. The fix: bail out as
+    /// soon as the pid file names a live process, regardless of
+    /// socket presence — that's a healthy daemon (or one mid-startup),
+    /// either way its files are not orphans.
+    #[test]
+    fn clean_stale_runtime_files_preserves_live_daemon_mid_startup() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = TempDir::new().unwrap();
+        unsafe {
+            std::env::set_var("XDG_RUNTIME_DIR", tmp.path());
+            std::env::set_var("DBG_SESSION", "testmidstart");
+        }
+        // Mid-startup: pid file written, socket not yet bound.
+        std::fs::write(pid_path(), std::process::id().to_string()).unwrap();
+        assert!(!socket_path().exists());
+        clean_stale_runtime_files();
+        assert!(
+            pid_path().exists(),
+            "live daemon mid-startup must keep its pid file"
+        );
+        unsafe { std::env::remove_var("DBG_SESSION"); }
     }
 
     #[test]

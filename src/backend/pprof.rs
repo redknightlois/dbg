@@ -141,10 +141,11 @@ impl Backend for PprofBackend {
         for line in raw.lines() {
             let line = line.trim();
             if let Some(tok) = line.split_whitespace().next() {
-                if tok.chars().all(|c| c.is_ascii_alphabetic())
+                let valid = tok.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+                    && tok.chars().next().is_some_and(|c| c.is_ascii_alphabetic())
                     && tok.len() > 1
-                    && tok.len() < 20
-                {
+                    && tok.len() < 20;
+                if valid {
                     cmds.push(tok.to_string());
                 }
             }
@@ -276,5 +277,23 @@ mod tests {
         let r = PprofBackend.clean("top", "some output");
         assert_eq!(r.output, "some output");
         assert!(r.events.is_empty());
+    }
+
+    /// Regression: parse_help required `tok.chars().all(is_ascii_alphabetic)`,
+    /// which dropped legitimate pprof verbs like `top10`, `peek`, and
+    /// `web` aliases that include digits or hyphens. Real pprof help
+    /// output shows `top10`, `traces`, `disasm`, `weblist` etc. and
+    /// agents lost discoverability of these via `dbg help`.
+    #[test]
+    fn parse_help_keeps_alphanumeric_and_hyphenated_commands() {
+        let raw = "  top10           Outputs top entries\n  \
+                       peek            Inspect a sample\n  \
+                       weblist         HTML view\n  \
+                       no-such-thing   Some weird verb\n";
+        let got = PprofBackend.parse_help(raw);
+        assert!(got.contains("top10"), "top10 dropped: {got}");
+        assert!(got.contains("peek"), "peek dropped: {got}");
+        assert!(got.contains("weblist"), "weblist dropped: {got}");
+        assert!(got.contains("no-such-thing"), "hyphenated dropped: {got}");
     }
 }

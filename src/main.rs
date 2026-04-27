@@ -149,7 +149,7 @@ fn main() -> Result<()> {
     let mut registry = Registry::new();
     registry.register(Box::new(backend::lldb::LldbBackend));
     registry.register(Box::new(backend::lldb_dap_proto::LldbDapProtoBackend));
-    registry.register(Box::new(backend::pdb::PdbBackend));
+    registry.register(Box::new(backend::pdb::PdbBackend::new()));
     registry.register(Box::new(backend::debugpy_proto::DebugpyProtoBackend));
     registry.register(Box::new(backend::netcoredbg::NetCoreDbgBackend));
     registry.register(Box::new(backend::netcoredbg_proto::NetCoreDbgProtoBackend));
