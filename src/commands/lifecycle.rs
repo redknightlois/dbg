@@ -7,7 +7,7 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime};
 
 use anyhow::Result;
 use dbg_cli::session_db::{PrunePolicy, SessionDb, prune, sessions_dir};
@@ -599,11 +599,6 @@ fn resolve_session_path(cwd: &Path, other: &str) -> PathBuf {
     }
     sessions_dir(cwd).join(format!("{other}.db"))
 }
-
-// Suppress `UNIX_EPOCH` unused warning in builds that short-circuit
-// before a timestamp comparison runs.
-#[allow(dead_code)]
-fn _keep_epoch_import() -> SystemTime { UNIX_EPOCH }
 
 #[cfg(test)]
 mod tests {
