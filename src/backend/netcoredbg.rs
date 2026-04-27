@@ -360,6 +360,13 @@ fn locals_regex() -> &'static Regex {
     RE.get_or_init(|| Regex::new(r"^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.+)$").unwrap())
 }
 
+fn detect_dotnet_root() -> Option<String> {
+    // Homebrew layout: .../dotnet/<ver>/bin/dotnet → sibling libexec/.
+    // Standard layout: dotnet binary lives directly in the root.
+    dbg_cli::deps::find_tool_root("dotnet", Some("libexec"), None, 2)
+        .and_then(|p| p.to_str().map(str::to_string))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -496,11 +503,4 @@ mod tests {
         let b: Box<dyn Backend> = Box::new(NetCoreDbgBackend);
         assert_eq!(b.canonical_ops().unwrap().tool_name(), "netcoredbg");
     }
-}
-
-fn detect_dotnet_root() -> Option<String> {
-    // Homebrew layout: .../dotnet/<ver>/bin/dotnet → sibling libexec/.
-    // Standard layout: dotnet binary lives directly in the root.
-    dbg_cli::deps::find_tool_root("dotnet", Some("libexec"), None, 2)
-        .and_then(|p| p.to_str().map(str::to_string))
 }
