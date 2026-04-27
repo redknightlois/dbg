@@ -797,60 +797,47 @@ impl ProfileData {
     }
 
     fn cmd_callers(&self, pattern: &str) -> String {
-        let targets: Vec<usize> = self.find_frames(pattern);
-        if targets.is_empty() {
-            return format!("no function matching '{pattern}'");
-        }
-
-        let mut out = String::new();
-        for &idx in &targets {
-            out.push_str(&format!("callers of {}:\n", self.frames[idx].name));
-            if let Some(parent_list) = self.parents.get(&idx) {
-                let mut aggregated: HashMap<usize, f64> = HashMap::new();
-                for &(parent_idx, time) in parent_list {
-                    *aggregated.entry(parent_idx).or_default() += time;
-                }
-                let mut sorted: Vec<(usize, f64)> = aggregated.into_iter().collect();
-                sorted.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-                for (parent_idx, time) in sorted.iter().take(15) {
-                    out.push_str(&format!(
-                        "  {:>8.2}ms  {}\n",
-                        time,
-                        shorten(&self.frames[*parent_idx].name, 70)
-                    ));
-                }
-            } else {
-                out.push_str("  (root — no callers)\n");
-            }
-        }
-        out
+        self.cmd_neighbors(pattern, "callers", "root — no callers", &self.parents)
     }
 
     fn cmd_callees(&self, pattern: &str) -> String {
-        let targets: Vec<usize> = self.find_frames(pattern);
+        self.cmd_neighbors(pattern, "callees", "leaf — no callees", &self.children)
+    }
+
+    /// Render the top-15 caller or callee frames for each match of `pattern`.
+    /// `edges` maps a frame index to a list of `(neighbor_frame_idx, time_ms)`
+    /// pairs — `parents` for callers, `children` for callees.
+    fn cmd_neighbors(
+        &self,
+        pattern: &str,
+        verb: &str,
+        empty_label: &str,
+        edges: &HashMap<usize, Vec<(usize, f64)>>,
+    ) -> String {
+        let targets = self.find_frames(pattern);
         if targets.is_empty() {
             return format!("no function matching '{pattern}'");
         }
 
         let mut out = String::new();
         for &idx in &targets {
-            out.push_str(&format!("callees of {}:\n", self.frames[idx].name));
-            if let Some(child_list) = self.children.get(&idx) {
-                let mut aggregated: HashMap<usize, f64> = HashMap::new();
-                for &(child_idx, time) in child_list {
-                    *aggregated.entry(child_idx).or_default() += time;
-                }
-                let mut sorted: Vec<(usize, f64)> = aggregated.into_iter().collect();
-                sorted.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-                for (child_idx, time) in sorted.iter().take(15) {
-                    out.push_str(&format!(
-                        "  {:>8.2}ms  {}\n",
-                        time,
-                        shorten(&self.frames[*child_idx].name, 70)
-                    ));
-                }
-            } else {
-                out.push_str("  (leaf — no callees)\n");
+            out.push_str(&format!("{verb} of {}:\n", self.frames[idx].name));
+            let Some(neighbors) = edges.get(&idx) else {
+                out.push_str(&format!("  ({empty_label})\n"));
+                continue;
+            };
+            let mut aggregated: HashMap<usize, f64> = HashMap::new();
+            for &(n_idx, time) in neighbors {
+                *aggregated.entry(n_idx).or_default() += time;
+            }
+            let mut sorted: Vec<(usize, f64)> = aggregated.into_iter().collect();
+            sorted.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            for (n_idx, time) in sorted.iter().take(15) {
+                out.push_str(&format!(
+                    "  {:>8.2}ms  {}\n",
+                    time,
+                    shorten(&self.frames[*n_idx].name, 70)
+                ));
             }
         }
         out
@@ -1206,6 +1193,52 @@ impl ProfileData {
 /// lines. Perf prints innermost frame first; we reverse to root→leaf and
 /// emit an evented speedscope profile per thread using common-prefix
 /// diffing across consecutive samples (same shape as the V8 loader).
+/// Builds speedscope-format JSON: interns frame names into a shared table and
+/// collects per-thread/per-sample evented profiles. Used by both the perf
+/// script loader and the pprof -traces loader.
+struct SpeedscopeBuilder {
+    frame_names: Vec<String>,
+    name_to_idx: HashMap<String, usize>,
+    profiles: Vec<serde_json::Value>,
+}
+
+impl SpeedscopeBuilder {
+    fn new() -> Self {
+        Self {
+            frame_names: Vec::new(),
+            name_to_idx: HashMap::new(),
+            profiles: Vec::new(),
+        }
+    }
+
+    fn intern(&mut self, name: String) -> usize {
+        if let Some(&i) = self.name_to_idx.get(&name) {
+            return i;
+        }
+        let i = self.frame_names.len();
+        self.name_to_idx.insert(name.clone(), i);
+        self.frame_names.push(name);
+        i
+    }
+
+    fn add_profile(&mut self, name: String, events: Vec<serde_json::Value>) {
+        self.profiles.push(serde_json::json!({
+            "name": name,
+            "events": events,
+        }));
+    }
+
+    fn build(self) -> String {
+        let frames: Vec<_> = self.frame_names.iter()
+            .map(|n| serde_json::json!({"name": n}))
+            .collect();
+        serde_json::json!({
+            "shared": { "frames": frames },
+            "profiles": self.profiles,
+        }).to_string()
+    }
+}
+
 fn perf_script_to_speedscope(text: &str) -> Result<String> {
     use std::collections::BTreeMap;
 
@@ -1303,26 +1336,14 @@ fn perf_script_to_speedscope(text: &str) -> Result<String> {
         by_thread.entry(s.thread.clone()).or_default().push(s);
     }
 
-    let mut frame_names: Vec<String> = Vec::new();
-    let mut name_to_idx: HashMap<String, usize> = HashMap::new();
-    let mut intern = |n: String| -> usize {
-        if let Some(&i) = name_to_idx.get(&n) {
-            return i;
-        }
-        let i = frame_names.len();
-        name_to_idx.insert(n.clone(), i);
-        frame_names.push(n);
-        i
-    };
-
-    let mut profiles_json: Vec<serde_json::Value> = Vec::new();
+    let mut builder = SpeedscopeBuilder::new();
     for (thread, mut samples) in by_thread {
         samples.sort_by(|a, b| a.t_ms.partial_cmp(&b.t_ms).unwrap_or(std::cmp::Ordering::Equal));
         let mut events: Vec<serde_json::Value> = Vec::new();
         let mut prev: Vec<usize> = Vec::new();
         let mut prev_time = samples.first().map(|s| s.t_ms).unwrap_or(0.0);
         for s in samples {
-            let stack: Vec<usize> = s.stack.into_iter().map(&mut intern).collect();
+            let stack: Vec<usize> = s.stack.into_iter().map(|n| builder.intern(n)).collect();
             let common = prev.iter().zip(stack.iter()).take_while(|(a, b)| a == b).count();
             for j in (common..prev.len()).rev() {
                 events.push(serde_json::json!({"type":"C","at":prev_time,"frame":prev[j]}));
@@ -1337,19 +1358,9 @@ fn perf_script_to_speedscope(text: &str) -> Result<String> {
         for j in (0..prev.len()).rev() {
             events.push(serde_json::json!({"type":"C","at":prev_time,"frame":prev[j]}));
         }
-        profiles_json.push(serde_json::json!({
-            "name": format!("tid-{thread}"),
-            "events": events,
-        }));
+        builder.add_profile(format!("tid-{thread}"), events);
     }
-
-    let out = serde_json::json!({
-        "shared": {
-            "frames": frame_names.iter().map(|n| serde_json::json!({"name": n})).collect::<Vec<_>>(),
-        },
-        "profiles": profiles_json,
-    });
-    Ok(out.to_string())
+    Ok(builder.build())
 }
 
 /// Parse `go tool pprof -traces` output into speedscope-format JSON.
@@ -1402,23 +1413,11 @@ fn pprof_traces_to_speedscope(text: &str) -> Result<String> {
         num.trim().parse::<f64>().ok().map(|v| v * unit)
     };
 
-    let mut frame_names: Vec<String> = Vec::new();
-    let mut name_to_idx: HashMap<String, usize> = HashMap::new();
-    let mut intern = |n: String| -> usize {
-        if let Some(&i) = name_to_idx.get(&n) {
-            return i;
-        }
-        let i = frame_names.len();
-        name_to_idx.insert(n.clone(), i);
-        frame_names.push(n);
-        i
-    };
-
     // Emit one speedscope profile per pprof sample so that ignore/focus
     // filtering can drop individual samples whose stacks match. A single
     // combined profile would let one ignored frame drag the entire
     // synthetic thread out of the baseline, zeroing everything.
-    let mut profiles: Vec<serde_json::Value> = Vec::new();
+    let mut builder = SpeedscopeBuilder::new();
     let mut now = 0.0f64;
 
     for (sample_i, block) in blocks.into_iter().enumerate() {
@@ -1444,7 +1443,8 @@ fn pprof_traces_to_speedscope(text: &str) -> Result<String> {
             continue;
         }
         stack_innermost_first.reverse();
-        let stack: Vec<usize> = stack_innermost_first.into_iter().map(&mut intern).collect();
+        let stack: Vec<usize> = stack_innermost_first.into_iter()
+            .map(|n| builder.intern(n)).collect();
 
         let open_at = now;
         let close_at = now + dur_ms;
@@ -1455,24 +1455,15 @@ fn pprof_traces_to_speedscope(text: &str) -> Result<String> {
         for &idx in stack.iter().rev() {
             events.push(serde_json::json!({"type":"C","at":close_at,"frame":idx}));
         }
-        profiles.push(serde_json::json!({
-            "name": format!("sample-{sample_i}"),
-            "events": events,
-        }));
+        builder.add_profile(format!("sample-{sample_i}"), events);
         now = close_at;
     }
 
-    if profiles.is_empty() {
+    if builder.profiles.is_empty() {
         anyhow::bail!("no sample blocks found in pprof -traces output");
     }
 
-    let out = serde_json::json!({
-        "shared": {
-            "frames": frame_names.iter().map(|n| serde_json::json!({"name": n})).collect::<Vec<_>>(),
-        },
-        "profiles": profiles,
-    });
-    Ok(out.to_string())
+    Ok(builder.build())
 }
 
 fn shorten(s: &str, max: usize) -> String {
