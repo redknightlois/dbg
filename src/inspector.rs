@@ -985,7 +985,7 @@ fn driver_loop(
                     let id = next_id;
                     next_id += 1;
                     let frame = json!({ "id": id, "method": method, "params": params });
-                    if let Err(e) = ws.send(Message::Text(frame.to_string().into())) {
+                    if let Err(e) = ws.send(Message::Text(frame.to_string())) {
                         let _ = resp.send(Err(format!("ws send failed: {e}")));
                         continue;
                     }
@@ -1070,8 +1070,8 @@ fn dispatch_incoming(
             // one carries hit_seq, ours wouldn't.
             let call_frames = params
                 .get("callFrames")
+                .and_then(|v| v.as_array())
                 .cloned()
-                .and_then(|v| v.as_array().cloned().map(|a| a.iter().cloned().collect::<Vec<_>>()))
                 .unwrap_or_default();
             let hit = build_hit_event(&call_frames, state);
             let (lock, cvar) = &**state;

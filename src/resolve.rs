@@ -470,8 +470,7 @@ mod tests {
         let src = tmp.path().join("main.rs");
         std::fs::write(&src, "fn main(){}").unwrap();
         let err = resolve_native(src.to_str().unwrap())
-            .err()
-            .expect("should error on .rs source");
+            .expect_err("should error on .rs source");
         let msg = err.to_string();
         assert!(
             msg.contains("source") && (msg.contains("cargo build") || msg.contains("compiled binary")),
