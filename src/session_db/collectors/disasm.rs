@@ -83,16 +83,18 @@ fn run_oneshot_lldb(target: &str, disasm_cmd: &str) -> Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }
 
-/// Very rough upper bound on code size: count `0x` prefixes on the
-/// address column of each disasm line. lldb emits `0x<hex>:` per
-/// instruction — works for both x86-64 and aarch64 dumps.
+/// Very rough upper bound on code size: span between first and last
+/// `0x<hex>:` address column emitted by lldb's disassemble (works for
+/// both x86-64 and aarch64 dumps).
 fn count_instruction_bytes(asm: &str) -> Option<i64> {
     let re = lldb_addr_regex();
     let mut addrs = asm
         .lines()
         .filter_map(|l| re.captures(l).and_then(|c| u64::from_str_radix(&c[1], 16).ok()));
     let first = addrs.next()?;
-    let last = addrs.last()?;
+    // `next_back()` walks from the end; `last()` would re-scan the
+    // entire iterator just to find the final element.
+    let last = addrs.next_back()?;
     Some((last as i64) - (first as i64))
 }
 
