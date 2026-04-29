@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 use anyhow::Result;
-use dbg_cli::session_db::{PrunePolicy, SessionDb, prune, sessions_dir};
+use dbg_cli::session_db::{PrunePolicy, SessionDb, SessionKind, prune, sessions_dir};
 use rusqlite::{OptionalExtension, params};
 
 /// Parsed lifecycle command.
@@ -26,9 +26,12 @@ pub enum Lifecycle {
         older_than: Duration,
         policy: PrunePolicy,
     },
-    /// `dbg diff <other-session>` — FULL OUTER JOIN current vs <other>
-    /// on breakpoint hits (debug) or sample totals (profile).
-    Diff { other: String },
+    /// `dbg diff <other>` — current session vs <other>. `dbg diff <a>
+    /// <b>` — two saved sessions, no live session needed (regression
+    /// hunts on saved profiles). For debug-kind sessions, FULL OUTER
+    /// JOIN on breakpoint hits; for profile-kind, per-frame
+    /// inclusive/exclusive ms delta.
+    Diff { a: Option<String>, b: String },
     /// `dbg status` — one-line summary of the currently-live session.
     Status,
     /// `dbg replay <label>` — open a persisted session read-only and
@@ -102,13 +105,24 @@ pub fn try_dispatch(input: &str) -> Option<super::Dispatched> {
             Lifecycle::Prune { older_than, policy }
         }
         "diff" => {
-            if rest.is_empty() {
-                return Some(super::Dispatched::Immediate(
-                    "usage: dbg diff <other-session-label-or-path>".into(),
-                ));
-            }
-            Lifecycle::Diff {
-                other: rest.to_string(),
+            let toks: Vec<&str> = rest.split_whitespace().collect();
+            match toks.len() {
+                0 => {
+                    return Some(super::Dispatched::Immediate(
+                        "usage:\n  dbg diff <other>          (active vs other)\n  \
+                         dbg diff <a> <b>          (two saved sessions)".into(),
+                    ));
+                }
+                1 => Lifecycle::Diff { a: None, b: toks[0].to_string() },
+                2 => Lifecycle::Diff {
+                    a: Some(toks[0].to_string()),
+                    b: toks[1].to_string(),
+                },
+                _ => {
+                    return Some(super::Dispatched::Immediate(
+                        format!("dbg diff takes at most two arguments, got {}", toks.len()),
+                    ));
+                }
             }
         }
         "status" => Lifecycle::Status,
@@ -188,7 +202,7 @@ pub fn run(l: &Lifecycle, ctx: &LifeCtx<'_>) -> String {
         Lifecycle::Sessions { group_only } => cmd_sessions(ctx, *group_only),
         Lifecycle::Save { label } => cmd_save(ctx, label.as_deref()),
         Lifecycle::Prune { older_than, policy } => cmd_prune(ctx, *older_than, *policy),
-        Lifecycle::Diff { other } => cmd_diff(ctx, other),
+        Lifecycle::Diff { a, b } => cmd_diff(ctx, a.as_deref(), b),
         Lifecycle::Status => cmd_status(ctx),
         Lifecycle::Replay { label } => cmd_replay_info(ctx, label),
     }
@@ -475,43 +489,182 @@ fn cmd_prune(ctx: &LifeCtx<'_>, older_than: Duration, policy: PrunePolicy) -> St
     out
 }
 
-fn cmd_diff(ctx: &LifeCtx<'_>, other: &str) -> String {
+fn cmd_diff(ctx: &LifeCtx<'_>, a_label: Option<&str>, b_label: &str) -> String {
+    // Two-arg form: open both DBs read-only and diff them. Used for
+    // regression hunts on saved profiles where neither side is the
+    // active live session.
+    if let Some(a_label) = a_label {
+        let a_path = resolve_session_path(ctx.cwd, a_label);
+        if !a_path.exists() {
+            return format!("no session file at {}", a_path.display());
+        }
+        if let Some(msg) = check_schema_version(&a_path) {
+            return msg;
+        }
+        let a_db = match SessionDb::open(&a_path) {
+            Ok(db) => db,
+            Err(e) => return format!("[error opening {}: {e}]", a_path.display()),
+        };
+        return diff_two_dbs(ctx, &a_db, a_label, b_label);
+    }
+
+    // One-arg form: active session vs other.
     let active = match ctx.active {
         Some(a) => a,
-        None => return "no active session — start one before diffing".into(),
+        None => {
+            return "no active session — start one with `dbg start`, or use \
+                    `dbg diff <a> <b>` to compare two saved sessions"
+                .into();
+        }
     };
-    let other_path = resolve_session_path(ctx.cwd, other);
-    if !other_path.exists() {
-        return format!("no session file at {}", other_path.display());
+    diff_two_dbs(ctx, active, active.label(), b_label)
+}
+
+fn check_schema_version(path: &Path) -> Option<String> {
+    // We refuse to diff a DB the daemon can't read (matches the
+    // no-migration policy). Profile-mode rehydration also depends on
+    // a current schema, so this guard is shared with the replay path.
+    let conn = rusqlite::Connection::open(path).ok()?;
+    let v: i64 = conn
+        .query_row("PRAGMA user_version", [], |r| r.get(0))
+        .unwrap_or(-1);
+    if v != dbg_cli::session_db::SCHEMA_VERSION {
+        return Some(format!(
+            "`{}` has schema_version={v}, expected {} — re-collect to diff",
+            path.display(),
+            dbg_cli::session_db::SCHEMA_VERSION,
+        ));
+    }
+    None
+}
+
+fn diff_two_dbs(ctx: &LifeCtx<'_>, a_db: &SessionDb, a_label: &str, b_label: &str) -> String {
+    let b_path = resolve_session_path(ctx.cwd, b_label);
+    if !b_path.exists() {
+        return format!("no session file at {}", b_path.display());
+    }
+    if let Some(msg) = check_schema_version(&b_path) {
+        return msg;
     }
 
-    // Guard against version skew: we refuse to diff a DB the daemon
-    // can't read (matches the no-migration policy).
-    if let Ok(conn) = rusqlite::Connection::open(&other_path) {
-        let v: i64 = conn
-            .query_row("PRAGMA user_version", [], |r| r.get(0))
-            .unwrap_or(-1);
-        if v != dbg_cli::session_db::SCHEMA_VERSION {
+    // Profile-vs-profile diff: per-frame inclusive/exclusive ms delta
+    // sorted by |ΔInclusive|. This is the regression-hunt path the
+    // SQL hits-diff doesn't serve — profile sessions have no
+    // breakpoint_hits, so the old `cmd_diff` returned "no symbols to
+    // compare" and forced manual %×total_ms math.
+    let a_is_profile = a_db.kind() == SessionKind::Profile;
+    if a_is_profile {
+        let b_db = match SessionDb::open(&b_path) {
+            Ok(db) => db,
+            Err(e) => return format!("[error opening {}: {e}]", b_path.display()),
+        };
+        if b_db.kind() != SessionKind::Profile {
             return format!(
-                "`{}` has schema_version={v}, expected {} — re-collect to diff",
-                other_path.display(),
-                dbg_cli::session_db::SCHEMA_VERSION,
+                "diff {a_label} ↔ {b_label}  — kind mismatch (a=profile, b={:?}): \
+                 cannot diff profile against debug",
+                b_db.kind(),
             );
         }
+        return profile_diff(a_db, &b_db, a_label, b_label);
     }
 
-    // ATTACH the other DB into the active conn and run a FULL OUTER
-    // JOIN on symbols (lang, fqn) with LEFT/RIGHT OUTER unioned —
-    // SQLite doesn't support FULL OUTER JOIN natively so we emulate.
-    let attach_sql = format!(
-        "ATTACH DATABASE ? AS other_db",
-    );
-    if let Err(e) = active.conn().execute(&attach_sql, params![other_path.to_string_lossy().as_ref()]) {
-        return format!("[error attaching {}: {e}]", other_path.display());
+    diff_hits(a_db, &b_path, a_label, b_label)
+}
+
+/// Per-frame inclusive/exclusive ms delta between two profile
+/// sessions. Frames present in only one side appear with 0.0 on the
+/// missing side (the "appeared/disappeared" case is itself signal).
+/// Output is capped at 40 rows by default.
+fn profile_diff(a_db: &SessionDb, b_db: &SessionDb, a_label: &str, b_label: &str) -> String {
+    use std::collections::HashMap;
+    let a = match (load_profile(a_db), load_profile(b_db)) {
+        (Some(a), Some(b)) => (a, b),
+        (None, _) => return format!(
+            "session `{a_label}` has no persisted profile source \
+             (collected before replay support landed; re-collect to enable diff)"
+        ),
+        (_, None) => return format!(
+            "session `{b_label}` has no persisted profile source \
+             (collected before replay support landed; re-collect to enable diff)"
+        ),
+    };
+    let (a, b) = a;
+    let total_a = a.total_ms();
+    let total_b = b.total_ms();
+
+    let mut combined: HashMap<String, [f64; 4]> = HashMap::new();
+    for (name, inc, exc) in a.frame_metrics() {
+        let entry = combined.entry(name).or_default();
+        entry[0] = inc;
+        entry[1] = exc;
     }
-    // Best-effort detach on exit — leaking is benign within one
-    // daemon lifetime but tidy is better.
-    let _detach_guard = DetachGuard(active);
+    for (name, inc, exc) in b.frame_metrics() {
+        let entry = combined.entry(name).or_default();
+        entry[2] = inc;
+        entry[3] = exc;
+    }
+
+    let mut rows: Vec<(String, f64, f64, f64, f64)> = combined
+        .into_iter()
+        .map(|(name, [ia, ea, ib, eb])| (name, ia, ea, ib, eb))
+        .collect();
+
+    if rows.is_empty() {
+        return format!("diff {a_label} ↔ {b_label}  — both profiles are empty");
+    }
+
+    rows.sort_by(|x, y| {
+        let dx = (x.3 - x.1).abs();
+        let dy = (y.3 - y.1).abs();
+        dy.partial_cmp(&dx).unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    let mut out = format!(
+        "diff {a_label} ↔ {b_label}  (totals: a={total_a:.1}ms, b={total_b:.1}ms, \
+         Δ={:+.1}ms)\n",
+        total_b - total_a,
+    );
+    out.push_str(&format!(
+        "{:<58}  {:>10} {:>10} {:>10}   {:>10} {:>10} {:>10}\n",
+        "Function", "Inc_A", "Inc_B", "ΔInc", "Exc_A", "Exc_B", "ΔExc",
+    ));
+    for (name, ia, ea, ib, eb) in rows.iter().take(40) {
+        let dinc = ib - ia;
+        let dexc = eb - ea;
+        out.push_str(&format!(
+            "{:<58}  {:>9.1} {:>9.1} {:>+9.1}   {:>9.1} {:>9.1} {:>+9.1}\n",
+            truncate(name, 58),
+            ia, ib, dinc,
+            ea, eb, dexc,
+        ));
+    }
+    if rows.len() > 40 {
+        out.push_str(&format!(
+            "… {} more rows (use `dbg replay <session>` for full per-session views)\n",
+            rows.len() - 40,
+        ));
+    }
+    out
+}
+
+fn load_profile(db: &SessionDb) -> Option<crate::profile::ProfileData> {
+    let content = db.meta("profile_raw").ok().flatten()?;
+    let ext = db.meta("profile_raw_ext").ok().flatten();
+    crate::profile::ProfileData::load_str(&content, ext.as_deref()).ok()
+}
+
+/// Hits-mode diff: FULL OUTER JOIN of `a_db` against the DB at
+/// `b_path` on (lang, fqn) with breakpoint-hit counts. Schema mirrors
+/// the original `cmd_diff` body — only the entry shape changed.
+fn diff_hits(a_db: &SessionDb, b_path: &Path, a_label: &str, b_label: &str) -> String {
+    let attach_sql = "ATTACH DATABASE ? AS other_db";
+    if let Err(e) = a_db
+        .conn()
+        .execute(attach_sql, params![b_path.to_string_lossy().as_ref()])
+    {
+        return format!("[error attaching {}: {e}]", b_path.display());
+    }
+    let _detach_guard = DetachGuard(a_db);
 
     // SQLite has no native FULL OUTER JOIN; emulate with a LEFT JOIN
     // ∪ a swapped LEFT JOIN and aggregate in a wrapper so ORDER BY
@@ -546,14 +699,12 @@ fn cmd_diff(ctx: &LifeCtx<'_>, other: &str) -> String {
         FROM combined
         ORDER BY ABS(hits_a - hits_b) DESC, lang, fqn";
 
-    let rows: Result<Vec<(String, String, i64, i64)>, rusqlite::Error> = active
+    let rows: Result<Vec<(String, String, i64, i64)>, rusqlite::Error> = a_db
         .conn()
         .prepare(sql)
         .and_then(|mut s| {
-            s.query_map([], |r| {
-                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
-            })
-            .and_then(|it| it.collect())
+            s.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+                .and_then(|it| it.collect())
         });
     let rows = match rows {
         Ok(r) => r,
@@ -561,14 +712,10 @@ fn cmd_diff(ctx: &LifeCtx<'_>, other: &str) -> String {
     };
 
     if rows.is_empty() {
-        return format!(
-            "diff {} ↔ {}  — no symbols to compare",
-            active.label(),
-            other,
-        );
+        return format!("diff {a_label} ↔ {b_label}  — no symbols to compare");
     }
 
-    let mut out = format!("diff {} ↔ {}\n", active.label(), other);
+    let mut out = format!("diff {a_label} ↔ {b_label}\n");
     out.push_str("lang     fqn                                     hits_a  hits_b  Δ\n");
     for (lang, fqn, a, b) in rows.iter().take(40) {
         let delta = a - b;
@@ -861,7 +1008,7 @@ mod tests {
     fn diff_reports_no_active_session() {
         let tmp = TempDir::new().unwrap();
         let ctx = LifeCtx { cwd: tmp.path(), active: None };
-        let out = cmd_diff(&ctx, "anything");
+        let out = cmd_diff(&ctx, None, "anything");
         assert!(out.contains("no active session"));
     }
 
@@ -875,7 +1022,7 @@ mod tests {
             conn.execute("PRAGMA user_version = 9999", []).unwrap();
         }
         let ctx = LifeCtx { cwd: tmp.path(), active: Some(&active) };
-        let out = cmd_diff(&ctx, other_path.to_string_lossy().as_ref());
+        let out = cmd_diff(&ctx, None, other_path.to_string_lossy().as_ref());
         assert!(out.contains("9999"));
         assert!(out.contains("re-collect"));
     }
@@ -889,7 +1036,7 @@ mod tests {
         other.save_to(&other_path).unwrap();
 
         let ctx = LifeCtx { cwd: tmp.path(), active: Some(&active) };
-        let out = cmd_diff(&ctx, "other");
+        let out = cmd_diff(&ctx, None, "other");
         assert!(
             out.contains("no symbols") || out.contains("diff cur"),
             "unexpected output:\n{out}"
@@ -933,11 +1080,108 @@ mod tests {
         other.save_to(&other_path).unwrap();
 
         let ctx = LifeCtx { cwd: tmp.path(), active: Some(&active) };
-        let out = cmd_diff(&ctx, "b");
+        let out = cmd_diff(&ctx, None, "b");
         assert!(out.contains("foo"), "{out}");
         assert!(out.contains("bar"), "{out}");
         // foo: hits_a=3, hits_b=0 (δ=+3). bar: hits_a=0, hits_b=5 (δ=-5).
         assert!(out.contains("+3") || out.contains("+5"));
         assert!(out.contains("-5") || out.contains("-3"));
+    }
+
+    fn mk_profile_db(tmp: &TempDir, label: &str, speedscope: &str) -> SessionDb {
+        use dbg_cli::session_db::CreateOptions;
+        let db = SessionDb::create(CreateOptions {
+            kind: SessionKind::Profile,
+            target: "./app",
+            target_class: dbg_cli::session_db::TargetClass::NativeCpu,
+            cwd: tmp.path(),
+            db_path: None,
+            label: Some(label.into()),
+            target_hash: Some("h".into()),
+        })
+        .unwrap();
+        db.set_meta("profile_raw", speedscope).unwrap();
+        db.save_to(&sessions_dir(tmp.path()).join(format!("{label}.db"))).unwrap();
+        db
+    }
+
+    /// `slow` runs in 4 ms in profile A, 10 ms in profile B → +6 ms
+    /// inclusive delta. `fast` runs 1 ms in both → 0 delta. The diff
+    /// must surface `slow` first (sorted by |Δinc|) with the +6.0 ms
+    /// regression marker, and must work without any active session.
+    #[test]
+    fn profile_diff_two_saved_sessions_surfaces_regression() {
+        let tmp = TempDir::new().unwrap();
+        let prof_a = r#"{"shared":{"frames":[{"name":"slow"},{"name":"fast"}]},
+            "profiles":[{"events":[
+                {"type":"O","at":0.0,"frame":0},{"type":"C","at":4.0,"frame":0},
+                {"type":"O","at":4.0,"frame":1},{"type":"C","at":5.0,"frame":1}
+            ]}]}"#;
+        let prof_b = r#"{"shared":{"frames":[{"name":"slow"},{"name":"fast"}]},
+            "profiles":[{"events":[
+                {"type":"O","at":0.0,"frame":0},{"type":"C","at":10.0,"frame":0},
+                {"type":"O","at":10.0,"frame":1},{"type":"C","at":11.0,"frame":1}
+            ]}]}"#;
+        mk_profile_db(&tmp, "a", prof_a);
+        mk_profile_db(&tmp, "b", prof_b);
+
+        let ctx = LifeCtx { cwd: tmp.path(), active: None };
+        let out = cmd_diff(&ctx, Some("a"), "b");
+
+        assert!(out.contains("slow"), "diff missing `slow`:\n{out}");
+        assert!(out.contains("fast"), "diff missing `fast`:\n{out}");
+        // `slow`: ΔInc = 10 - 4 = +6.0 ms.
+        assert!(out.contains("+6.0"), "expected ΔInc +6.0 in:\n{out}");
+        // `slow` has the larger |Δ| so it should appear before `fast`
+        // in the sort.
+        let slow_pos = out.find("slow").unwrap();
+        let fast_pos = out.find("fast").unwrap();
+        assert!(slow_pos < fast_pos, "rows not sorted by |ΔInc|:\n{out}");
+    }
+
+    #[test]
+    fn profile_diff_reports_when_one_side_lacks_persisted_source() {
+        // Old profile sessions captured before persistence landed have
+        // no `profile_raw` meta. The diff must fail loudly with a
+        // re-collect hint, not panic or silently produce empty output.
+        let tmp = TempDir::new().unwrap();
+        let prof_b = r#"{"shared":{"frames":[{"name":"x"}]},
+            "profiles":[{"events":[
+                {"type":"O","at":0.0,"frame":0},{"type":"C","at":1.0,"frame":0}
+            ]}]}"#;
+
+        // a: profile-kind but no profile_raw meta.
+        use dbg_cli::session_db::CreateOptions;
+        let a = SessionDb::create(CreateOptions {
+            kind: SessionKind::Profile,
+            target: "./app",
+            target_class: dbg_cli::session_db::TargetClass::NativeCpu,
+            cwd: tmp.path(),
+            db_path: None,
+            label: Some("a".into()),
+            target_hash: Some("h".into()),
+        })
+        .unwrap();
+        a.save_to(&sessions_dir(tmp.path()).join("a.db")).unwrap();
+
+        mk_profile_db(&tmp, "b", prof_b);
+
+        let ctx = LifeCtx { cwd: tmp.path(), active: None };
+        let out = cmd_diff(&ctx, Some("a"), "b");
+        assert!(
+            out.contains("re-collect") && out.contains("a"),
+            "expected re-collect hint mentioning `a`:\n{out}"
+        );
+    }
+
+    #[test]
+    fn diff_two_arg_form_parses() {
+        match try_dispatch("diff foo bar").unwrap() {
+            super::super::Dispatched::Lifecycle(Lifecycle::Diff { a, b }) => {
+                assert_eq!(a.as_deref(), Some("foo"));
+                assert_eq!(b, "bar");
+            }
+            _ => panic!("expected two-arg Diff"),
+        }
     }
 }

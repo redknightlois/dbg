@@ -308,6 +308,26 @@ fn main() -> Result<()> {
             Ok(())
         }
         "replay" => cmd_replay(&cli.args[1..]),
+        "diff" if cli.args.len() == 3 || (!daemon::is_running() && cli.args.len() == 2) => {
+            // Client-side diff between two saved sessions (or between
+            // one saved session and... well, the parser handles a
+            // single label as "active vs other", which fails cleanly
+            // when no daemon is running). The two-arg form is the
+            // regression-hunt path: open both DBs read-only,
+            // dispatch to lifecycle::run.
+            let cwd = std::env::current_dir()?;
+            let l = match commands::lifecycle::try_dispatch(&cli.args.join(" ")) {
+                Some(commands::Dispatched::Lifecycle(l)) => l,
+                Some(commands::Dispatched::Immediate(s)) => {
+                    println!("{s}");
+                    return Ok(());
+                }
+                _ => bail!("internal: diff parser returned wrong variant"),
+            };
+            let ctx = commands::lifecycle::LifeCtx { cwd: &cwd, active: None };
+            println!("{}", commands::lifecycle::run(&l, &ctx));
+            Ok(())
+        }
         "help" => {
             if cli.args.len() > 1 {
                 // dbg help <topic> — serve dbg-level verbs client-side

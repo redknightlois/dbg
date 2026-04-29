@@ -1194,6 +1194,31 @@ impl ProfileData {
             .map(|(i, _)| i)
             .collect()
     }
+
+    /// Per-frame `(name, inclusive_ms, exclusive_ms)` over the full
+    /// (unfiltered) profile. Used by `dbg diff` to compare two
+    /// profile sessions function-by-function. Frames with the same
+    /// name are merged so V8's per-recursion-depth split nodes don't
+    /// produce duplicate rows.
+    pub fn frame_metrics(&self) -> Vec<(String, f64, f64)> {
+        let mut by_name: HashMap<&str, (f64, f64)> = HashMap::new();
+        for (i, frame) in self.frames.iter().enumerate() {
+            let entry = by_name.entry(frame.name.as_str()).or_default();
+            entry.0 += self.inclusive[i];
+            entry.1 += self.exclusive[i];
+        }
+        by_name
+            .into_iter()
+            .map(|(name, (inc, exc))| (name.to_string(), inc, exc))
+            .collect()
+    }
+
+    /// Total time across root frames — denominator for percentage
+    /// reporting in `dbg diff` so a slowdown shows up as both an
+    /// absolute ms increase and a relative share.
+    pub fn total_ms(&self) -> f64 {
+        self.total_time
+    }
 }
 
 /// Parse `perf script` output into speedscope-format JSON.
