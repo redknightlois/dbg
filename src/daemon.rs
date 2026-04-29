@@ -365,7 +365,7 @@ fn command_may_stop(cmd: &str) -> bool {
 /// be handled by the profile REPL or fall through to the normal dispatch
 /// path — meta verbs like `sessions`, `status`, `save`, `kill`, `replay`
 /// must still work during a profile session.
-fn is_profile_repl_verb(cmd: &str) -> bool {
+pub fn is_profile_repl_verb(cmd: &str) -> bool {
     let first = cmd.trim().split_whitespace().next().unwrap_or("");
     matches!(
         first,
@@ -382,6 +382,34 @@ fn is_profile_repl_verb(cmd: &str) -> bool {
             | "ignore"
             | "reset"
     )
+}
+
+/// Read the profile source file at `src` and copy it into the session
+/// DB's meta table so a subsequent `dbg replay` can rebuild a
+/// `ProfileData` from it. Best-effort — failures are logged, never
+/// fatal: a profile session without persisted source is still useful
+/// live, it just can't be queried after replay. The format hint comes
+/// from the file extension so V8 cpuprofile vs speedscope JSON
+/// disambiguation matches what `ProfileData::load` would have used on
+/// the original path.
+fn persist_profile_source(db: &SessionDb, src: &Path) {
+    let content = match std::fs::read_to_string(src) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!(
+                "[dbg] warning: profile replay disabled — could not read {} ({e})",
+                src.display()
+            );
+            return;
+        }
+    };
+    if let Err(e) = db.set_meta("profile_raw", &content) {
+        eprintln!("[dbg] warning: profile replay disabled — meta write failed ({e})");
+        return;
+    }
+    if let Some(ext) = src.extension().and_then(|e| e.to_str()) {
+        let _ = db.set_meta("profile_raw_ext", ext);
+    }
 }
 
 /// Start the daemon: spawn the debugger, listen on socket.
@@ -492,9 +520,10 @@ pub fn run_daemon(
         .map(|raw| backend.parse_help(&raw))
         .unwrap_or_default();
 
-    let profile = backend
-        .profile_output()
-        .and_then(|path| ProfileData::load(Path::new(&path)).ok());
+    let profile_output_path = backend.profile_output();
+    let profile = profile_output_path
+        .as_ref()
+        .and_then(|path| ProfileData::load(Path::new(path)).ok());
 
     // Build a per-run SessionDb alongside the debugger session. Create
     // failure is non-fatal — we proceed without persistence rather than
@@ -503,8 +532,13 @@ pub fn run_daemon(
     let target_class = backend_target_class(backend.name());
     let tmp_db = session_tmp("session.db");
     let _ = std::fs::remove_file(&tmp_db); // fresh DB on every start
+    let session_kind = if profile.is_some() {
+        SessionKind::Profile
+    } else {
+        SessionKind::Debug
+    };
     let (db, save_to) = match SessionDb::create(CreateOptions {
-        kind: SessionKind::Debug,
+        kind: session_kind,
         target,
         target_class,
         cwd: &cwd,
@@ -513,6 +547,16 @@ pub fn run_daemon(
         target_hash: None,
     }) {
         Ok(db) => {
+            // Profile sessions need their source content stashed in the
+            // DB so `dbg replay` can rehydrate top/callers/callees from
+            // a saved session. The raw file is on a tmp path that won't
+            // survive the daemon — copy it into the SessionDb's meta
+            // table now while we still know where it is.
+            if profile.is_some() {
+                if let Some(ref src) = profile_output_path {
+                    persist_profile_source(&db, Path::new(src));
+                }
+            }
             let final_path =
                 session_db::sessions_dir(&cwd).join(format!("{}.db", db.label()));
             (Some(db), Some(final_path))

@@ -134,12 +134,22 @@ impl ProfileData {
     pub fn load(path: &Path) -> Result<Self> {
         let content = std::fs::read_to_string(path)
             .context("failed to read profile file")?;
+        let ext = path.extension().and_then(|e| e.to_str());
+        Self::load_str(&content, ext)
+    }
 
+    /// Build a `ProfileData` from in-memory profile content. `ext_hint`
+    /// is the original file extension (e.g. `Some("cpuprofile")`) when
+    /// known — it lets V8 cpuprofile detection short-circuit when the
+    /// JSON shape would otherwise be ambiguous. Used by the daemon to
+    /// stash and replay profile content from the SessionDb without
+    /// touching the original file.
+    pub fn load_str(content: &str, ext_hint: Option<&str>) -> Result<Self> {
         // Auto-detect: V8 cpuprofile has "nodes" + "samples" at top level
-        if path.extension().is_some_and(|e| e == "cpuprofile")
+        if ext_hint == Some("cpuprofile")
             || (content.contains("\"nodes\"") && content.contains("\"timeDeltas\""))
         {
-            return Self::load_v8_cpuprofile(&content);
+            return Self::load_v8_cpuprofile(content);
         }
 
         // Text-profile detection. `perf script` output has tab-indented
@@ -155,18 +165,21 @@ impl ProfileData {
                 .take(200)
                 .any(|l| l.starts_with('\t') && l.contains(' '));
 
-        let content = if looks_like_pprof_traces {
-            pprof_traces_to_speedscope(&content)
-                .context("failed to convert pprof -traces output to speedscope")?
+        let content_owned;
+        let content: &str = if looks_like_pprof_traces {
+            content_owned = pprof_traces_to_speedscope(content)
+                .context("failed to convert pprof -traces output to speedscope")?;
+            &content_owned
         } else if looks_like_perf_script {
-            perf_script_to_speedscope(&content)
-                .context("failed to convert perf script output to speedscope")?
+            content_owned = perf_script_to_speedscope(content)
+                .context("failed to convert perf script output to speedscope")?;
+            &content_owned
         } else {
             content
         };
 
         let file: SpeedscopeFile =
-            serde_json::from_str(&content).context("failed to parse speedscope JSON")?;
+            serde_json::from_str(content).context("failed to parse speedscope JSON")?;
 
         let frames: Vec<Frame> = file
             .shared

@@ -422,20 +422,43 @@ fn cmd_replay(args: &[String]) -> Result<()> {
             |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .unwrap_or_else(|_| ("?".into(), "?".into()));
-    eprintln!(
-        "replay `{label}` (target={target}, class={target_class}) — read-only crosstrack REPL"
-    );
-    eprintln!("supported: hits, hit-diff, hit-trend, cross, disasm, source, sessions");
-    eprintln!("type `quit` or EOF to exit");
 
     use std::str::FromStr;
     let target_class_enum = dbg_cli::session_db::TargetClass::from_str(&target_class)
         .unwrap_or(dbg_cli::session_db::TargetClass::NativeCpu);
 
+    // Profile-mode replay: rehydrate the in-memory `ProfileData` from
+    // the source content stashed in `meta.profile_raw` at session start.
+    // Without this, `dbg replay` on a profile session would be
+    // write-only — top/callers/callees would all bail because no live
+    // backend is attached. With it, every profile REPL verb works
+    // identically against a saved DB.
+    let mut profile = load_profile_from_db(&db);
+
+    let is_profile = matches!(db.kind(), dbg_cli::session_db::SessionKind::Profile);
+    eprintln!(
+        "replay `{label}` (target={target}, class={target_class}) — read-only REPL"
+    );
+    if is_profile && profile.is_some() {
+        eprintln!(
+            "supported: top, callers, callees, traces, tree, hotpath, threads, stats, \
+             search, focus, ignore, reset, plus crosstrack verbs (cross, disasm, source)"
+        );
+    } else if is_profile {
+        eprintln!(
+            "[warn] profile session has no persisted source — profile verbs unavailable. \
+             Re-collect with a recent dbg to enable replay queries."
+        );
+        eprintln!("supported: hits, hit-diff, hit-trend, cross, disasm, source, sessions");
+    } else {
+        eprintln!("supported: hits, hit-diff, hit-trend, cross, disasm, source, sessions");
+    }
+    eprintln!("type `quit` or EOF to exit");
+
     // One-shot mode: `dbg replay <label> hits foo:42`
     if args.len() > 1 {
         let cmd = args[1..].join(" ");
-        let out = replay_eval(&cmd, &db, &cwd, &target, target_class_enum);
+        let out = replay_eval(&cmd, &db, &cwd, &target, target_class_enum, profile.as_mut());
         println!("{out}");
         return Ok(());
     }
@@ -457,10 +480,22 @@ fn cmd_replay(args: &[String]) -> Result<()> {
         if matches!(cmd, "quit" | "exit" | "q") {
             break;
         }
-        let out = replay_eval(cmd, &db, &cwd, &target, target_class_enum);
+        let out = replay_eval(cmd, &db, &cwd, &target, target_class_enum, profile.as_mut());
         println!("{out}");
     }
     Ok(())
+}
+
+/// Rebuild a `ProfileData` from the source content stashed in the DB
+/// at session start. Returns `None` when the meta keys are missing
+/// (debug session, or profile session captured before persistence
+/// landed) or when parsing fails.
+pub(crate) fn load_profile_from_db(
+    db: &dbg_cli::session_db::SessionDb,
+) -> Option<profile::ProfileData> {
+    let content = db.meta("profile_raw").ok().flatten()?;
+    let ext = db.meta("profile_raw_ext").ok().flatten();
+    profile::ProfileData::load_str(&content, ext.as_deref()).ok()
 }
 
 fn replay_eval(
@@ -469,7 +504,20 @@ fn replay_eval(
     cwd: &std::path::Path,
     target: &str,
     target_class: dbg_cli::session_db::TargetClass,
+    profile: Option<&mut profile::ProfileData>,
 ) -> String {
+    // Profile REPL verbs (top/callers/callees/…) are owned by the
+    // in-memory ProfileData — short-circuit before the dispatcher,
+    // matching how the live daemon routes them in handle_command.
+    if daemon::is_profile_repl_verb(cmd) {
+        return match profile {
+            Some(p) => p.handle_command(cmd),
+            None => "no profile data available in this session — profile verbs require \
+                     a profile-kind session captured with dbg ≥ schema_version 1 (try \
+                     `dbg sessions` to check the kind)"
+                .to_string(),
+        };
+    }
     match commands::dispatch_no_backend(cmd) {
         Some(commands::Dispatched::Immediate(s)) => s,
         Some(commands::Dispatched::Query(q)) => {
@@ -487,7 +535,8 @@ fn replay_eval(
         }
         _ => {
             "replay only supports crosstrack + lifecycle verbs (hits, hit-diff, \
-             hit-trend, cross, disasm, source, sessions, status). Live debugger \
+             hit-trend, cross, disasm, source, sessions, status) plus profile verbs \
+             (top, callers, callees, …) on profile-kind sessions. Live debugger \
              verbs (step, continue, break, …) aren't available — start a new \
              session with `dbg start` for those."
                 .to_string()
@@ -986,6 +1035,66 @@ mod tests {
                 "dbg_verb_help missing entry for `{verb}`"
             );
         }
+    }
+
+    #[test]
+    fn replay_rehydrates_profile_from_meta() {
+        // Regression: `dbg replay <profile-session>` used to leave the
+        // saved DB write-only — top/callers/callees would all bail
+        // because the in-memory ProfileData never got rebuilt. Now
+        // session start stashes the profile source into meta and
+        // replay reconstructs ProfileData from it.
+        use dbg_cli::session_db::{CreateOptions, SessionDb, SessionKind, TargetClass};
+        let speedscope = r#"{
+            "shared": {"frames": [{"name":"a"},{"name":"b"}]},
+            "profiles": [{
+                "events": [
+                    {"type":"O","at":0.0,"frame":0},
+                    {"type":"O","at":1.0,"frame":1},
+                    {"type":"C","at":3.0,"frame":1},
+                    {"type":"C","at":4.0,"frame":0}
+                ]
+            }]
+        }"#;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db = SessionDb::create(CreateOptions {
+            kind: SessionKind::Profile,
+            target: "./app",
+            target_class: TargetClass::NativeCpu,
+            cwd: tmp.path(),
+            db_path: None,
+            label: Some("p1".into()),
+            target_hash: None,
+        })
+        .unwrap();
+        db.set_meta("profile_raw", speedscope).unwrap();
+
+        let mut p = load_profile_from_db(&db).expect("rehydrate failed");
+        let top = p.handle_command("top 5");
+        // Both frames should appear with non-zero inclusive %.
+        assert!(top.contains("a"), "top output missing frame `a`:\n{top}");
+        assert!(top.contains("b"), "top output missing frame `b`:\n{top}");
+    }
+
+    #[test]
+    fn replay_returns_none_when_meta_absent() {
+        // Debug sessions (or older profile sessions captured before
+        // persistence landed) lack `profile_raw` — the rehydrate path
+        // must surface that as `None` so replay can fall back to the
+        // crosstrack-only message instead of panicking.
+        use dbg_cli::session_db::{CreateOptions, SessionDb, SessionKind, TargetClass};
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db = SessionDb::create(CreateOptions {
+            kind: SessionKind::Debug,
+            target: "./app",
+            target_class: TargetClass::NativeCpu,
+            cwd: tmp.path(),
+            db_path: None,
+            label: Some("d1".into()),
+            target_hash: None,
+        })
+        .unwrap();
+        assert!(load_profile_from_db(&db).is_none());
     }
 
     #[test]
