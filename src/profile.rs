@@ -711,18 +711,7 @@ impl ProfileData {
     }
 
     fn matches_filter(&self, frame_idx: usize) -> bool {
-        let name = &self.frames[frame_idx].name;
-        if let Some(ref focus) = self.focus {
-            if !name.contains(focus.as_str()) {
-                return false;
-            }
-        }
-        if let Some(ref ignore) = self.ignore {
-            if name.contains(ignore.as_str()) {
-                return false;
-            }
-        }
-        true
+        self.stack_matches_filter(std::slice::from_ref(&frame_idx))
     }
 
     fn stack_matches_filter(&self, stack: &[usize]) -> bool {
