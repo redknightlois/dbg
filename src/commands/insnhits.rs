@@ -224,7 +224,7 @@ pub enum Verdict {
     Chosen,
     Eligible,
     Rejected(String),
-    NotAvailable,
+    NotAvailable(Option<String>),
 }
 
 /// Runtime detection: which BackendIds does this host actually carry?
@@ -232,6 +232,13 @@ pub enum Verdict {
 /// the only one populated is `Mock`, which is always available.
 pub trait HostProbe {
     fn is_available(&self, id: BackendId) -> bool;
+    /// Optional human-readable reason a backend is not currently usable
+    /// (missing tool, insufficient privilege, kernel sysctl). Surfaced
+    /// via the `--why` trail so the user knows what to fix instead of
+    /// only seeing "not available".
+    fn unavailable_reason(&self, _id: BackendId) -> Option<String> {
+        None
+    }
 }
 
 /// Real-host probe used by the daemon. Each backend gets an honest
@@ -242,14 +249,19 @@ pub trait HostProbe {
 pub struct HostProbeAuto;
 impl HostProbe for HostProbeAuto {
     fn is_available(&self, id: BackendId) -> bool {
+        self.unavailable_reason(id).is_none()
+            && matches!(id, BackendId::Pt | BackendId::Uprobe)
+    }
+
+    fn unavailable_reason(&self, id: BackendId) -> Option<String> {
         match id {
-            BackendId::Pt => pt::is_intel_pt_available(),
-            BackendId::Uprobe => uprobe::is_bpftrace_available(),
-            BackendId::Mock => false,
+            BackendId::Pt => pt::unavailable_reason(),
+            BackendId::Uprobe => uprobe::unavailable_reason(),
+            BackendId::Mock => Some("mock backend disabled outside tests".into()),
             // ETM, IBS, PEBS, SPE, hwbp probes land with their
             // collectors. Until then their availability is reported
             // false so the planner steers clear.
-            _ => false,
+            _ => Some("backend not yet implemented".into()),
         }
     }
 }
@@ -266,7 +278,7 @@ pub fn plan(req: &Request, probe: &dyn HostProbe) -> std::result::Result<Plan, S
         if !probe.is_available(*id) {
             trail.push(TrailEntry {
                 backend: *id,
-                verdict: Verdict::NotAvailable,
+                verdict: Verdict::NotAvailable(probe.unavailable_reason(*id)),
             });
             continue;
         }
@@ -297,10 +309,16 @@ pub fn plan(req: &Request, probe: &dyn HostProbe) -> std::result::Result<Plan, S
                     "backend `{name}` is not eligible for this request: {r}",
                     name = forced.as_str()
                 )),
-                Verdict::NotAvailable => Err(format!(
-                    "backend `{name}` is not available on this host",
-                    name = forced.as_str()
-                )),
+                Verdict::NotAvailable(reason) => Err(match reason {
+                    Some(r) => format!(
+                        "backend `{name}` is not available on this host: {r}",
+                        name = forced.as_str()
+                    ),
+                    None => format!(
+                        "backend `{name}` is not available on this host",
+                        name = forced.as_str()
+                    ),
+                }),
                 Verdict::Chosen => unreachable!("not yet marked"),
             };
         }
@@ -335,13 +353,23 @@ fn caps_reject(req: &Request, caps: &Capabilities) -> Option<String> {
 fn no_eligible_reason(req: &Request, trail: &[TrailEntry]) -> String {
     let avail: Vec<_> = trail
         .iter()
-        .filter(|e| !matches!(e.verdict, Verdict::NotAvailable))
+        .filter(|e| !matches!(e.verdict, Verdict::NotAvailable(_)))
         .collect();
     if avail.is_empty() {
-        return "no instruction-hit backend is available on this host (PT/ETM/uprobe/hwbp \
-                /IBS/PEBS/SPE all reported unavailable; install bpftrace or run on a host \
-                with a supported PMU)"
-            .into();
+        let mut buf =
+            String::from("no instruction-hit backend is available on this host:\n");
+        for e in trail {
+            if let Verdict::NotAvailable(reason) = &e.verdict {
+                match reason {
+                    Some(r) => buf.push_str(&format!("  {:>7}: {}\n", e.backend.as_str(), r)),
+                    None => buf.push_str(&format!(
+                        "  {:>7}: not available\n",
+                        e.backend.as_str()
+                    )),
+                }
+            }
+        }
+        return buf;
     }
     let mut buf = String::from("no available backend can satisfy this request:");
     if matches!(req.mode, Mode::Live) {
@@ -377,10 +405,17 @@ pub fn format_why(plan: &Plan) -> String {
                 e.backend.as_str(),
                 r
             )),
-            Verdict::NotAvailable => buf.push_str(&format!(
-                "  {:>7}: not available on this host\n",
-                e.backend.as_str()
-            )),
+            Verdict::NotAvailable(reason) => match reason {
+                Some(r) => buf.push_str(&format!(
+                    "  {:>7}: not available -- {}\n",
+                    e.backend.as_str(),
+                    r
+                )),
+                None => buf.push_str(&format!(
+                    "  {:>7}: not available on this host\n",
+                    e.backend.as_str()
+                )),
+            },
         }
     }
     buf
@@ -697,6 +732,28 @@ pub fn verbs() -> &'static [&'static str] {
     &["insn-hits"]
 }
 
+/// True when the calling process is running as root. Read from
+/// `/proc/self/status` so no extra crate dependency is needed; the
+/// `Uid:` line lists real, effective, saved-set, and filesystem UIDs
+/// in that order. We check the effective UID since that is what the
+/// kernel uses for capability and perf-event checks.
+fn is_root() -> bool {
+    let status = match std::fs::read_to_string("/proc/self/status") {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+    for line in status.lines() {
+        if let Some(rest) = line.strip_prefix("Uid:") {
+            let mut parts = rest.split_whitespace();
+            let _real = parts.next();
+            if let Some(euid) = parts.next() {
+                return euid == "0";
+            }
+        }
+    }
+    false
+}
+
 // ============================================================
 // Uprobe backend
 // ============================================================
@@ -765,7 +822,23 @@ pub mod uprobe {
     }
 
     pub(super) fn is_bpftrace_available() -> bool {
-        which::which("bpftrace").is_ok()
+        unavailable_reason().is_none()
+    }
+
+    /// Two preconditions: bpftrace on PATH, and the process can run it.
+    /// bpftrace itself bails with "currently only supports running as
+    /// the root user", so the privilege check stops the planner from
+    /// picking uprobe and only seeing that error after a window elapses.
+    pub(super) fn unavailable_reason() -> Option<String> {
+        if which::which("bpftrace").is_err() {
+            return Some("bpftrace not on PATH (install bpftrace)".into());
+        }
+        if !super::is_root() {
+            return Some(
+                "bpftrace requires root (run with sudo, or grant CAP_BPF/CAP_PERFMON)".into(),
+            );
+        }
+        None
     }
 
     /// Reject characters that would let a hostile or malformed target
@@ -1060,6 +1133,23 @@ mod tests {
         }
     }
 
+    /// Probe that reports every backend unavailable but supplies a
+    /// reason for one of them. Used to verify the reason flows through
+    /// the trail into `--why` and the forced-backend error path.
+    struct ReasoningProbe(BackendId, &'static str);
+    impl HostProbe for ReasoningProbe {
+        fn is_available(&self, _id: BackendId) -> bool {
+            false
+        }
+        fn unavailable_reason(&self, id: BackendId) -> Option<String> {
+            if id == self.0 {
+                Some(self.1.into())
+            } else {
+                None
+            }
+        }
+    }
+
     fn req(target: &str) -> Request {
         Request {
             target: target.into(),
@@ -1223,10 +1313,34 @@ mod tests {
         let r = req("foo");
         let probe = FakeProbe(vec![]);
         let err = plan(&r, &probe).unwrap_err();
-        assert!(
-            err.contains("no instruction-hit backend") && err.contains("bpftrace"),
-            "{err}"
-        );
+        assert!(err.contains("no instruction-hit backend"), "{err}");
+        // Every BACKENDS entry should appear in the per-backend list.
+        for (id, _) in BACKENDS.iter() {
+            assert!(err.contains(id.as_str()), "missing {} in: {err}", id.as_str());
+        }
+    }
+
+    #[test]
+    fn format_why_surfaces_unavailable_reason() {
+        let r = req("foo");
+        let probe = ReasoningProbe(BackendId::Uprobe, "bpftrace requires root");
+        // No backend eligible, but the planner returns a Plan only when
+        // one is chosen; here we drive the trail through the
+        // forced-backend error path instead.
+        let mut forced = r.clone();
+        forced.forced_backend = Some(BackendId::Uprobe);
+        let err = plan(&forced, &probe).unwrap_err();
+        assert!(err.contains("bpftrace requires root"), "{err}");
+        assert!(err.contains("not available"), "{err}");
+    }
+
+    #[test]
+    fn no_eligible_message_includes_per_backend_reasons() {
+        let r = req("foo");
+        let probe = ReasoningProbe(BackendId::Pt, "perf_event_paranoid=4 blocks userspace PT");
+        let err = plan(&r, &probe).unwrap_err();
+        assert!(err.contains("no instruction-hit backend"), "{err}");
+        assert!(err.contains("perf_event_paranoid=4"), "{err}");
     }
 
     #[test]
@@ -1365,15 +1479,51 @@ pub mod pt {
     }
 
     pub(super) fn is_intel_pt_available() -> bool {
-        Path::new("/sys/bus/event_source/devices/intel_pt").exists()
+        unavailable_reason().is_none()
     }
 
+    /// PT needs three things: the PMU exposed as a perf event source,
+    /// `perf` on PATH, and either root or a relaxed perf_event_paranoid
+    /// (>=2 blocks userspace tracing even with PT advertised). Surfacing
+    /// each precondition lets the planner explain "what to fix" rather
+    /// than failing inside `perf record` after the user already waited
+    /// for the window to elapse.
+    pub(super) fn unavailable_reason() -> Option<String> {
+        if !Path::new("/sys/bus/event_source/devices/intel_pt").exists() {
+            return Some("Intel PT PMU not present (non-Intel CPU or kernel support absent)".into());
+        }
+        if which::which("perf").is_err() {
+            return Some("perf not on PATH (install linux-perf or linux-tools)".into());
+        }
+        if !super::is_root() {
+            let paranoid = std::fs::read_to_string("/proc/sys/kernel/perf_event_paranoid")
+                .ok()
+                .and_then(|s| s.trim().parse::<i32>().ok())
+                .unwrap_or(2);
+            if paranoid > 1 {
+                return Some(format!(
+                    "perf_event_paranoid={paranoid} blocks userspace PT \
+                     (run as root or `sysctl kernel.perf_event_paranoid=1`)"
+                ));
+            }
+        }
+        None
+    }
+
+    /// Resolve the live PID by exact basename match. `pgrep -f` would
+    /// match any process with the basename anywhere in its cmdline,
+    /// which silently picks up unrelated processes (browser tabs whose
+    /// titles contain the target name). `-x` matches the comm field
+    /// exactly so the wrong PID is never returned.
     fn find_pid(binary: &str) -> Option<i32> {
         let basename = Path::new(binary)
             .file_name()
             .and_then(|s| s.to_str())
             .unwrap_or(binary);
-        let out = Command::new("pgrep").arg("-f").arg(basename).output().ok()?;
+        // comm is truncated to 15 chars by the kernel; truncate the
+        // query the same way so long binary names still match.
+        let comm: String = basename.chars().take(15).collect();
+        let out = Command::new("pgrep").arg("-x").arg(&comm).output().ok()?;
         if !out.status.success() {
             return None;
         }
