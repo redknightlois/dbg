@@ -792,22 +792,46 @@ fn handle_command(
             response
         }
         Dispatched::InsnHits(req) => {
-            let mut guard = lock_session(session);
-            drain_pending_events(&mut guard, backend);
-            let response = match guard.db.as_ref() {
-                Some(db) => {
-                    let probe = crate::commands::insnhits::HostProbeAuto;
-                    let ctx = crate::commands::insnhits::CollectCtx {
-                        target_binary: &guard.target,
-                        cwd: &guard.cwd,
+            // Capture what the collector needs under the lock, then
+            // drop the guard before running the collector. Holding
+            // the session mutex for the full --window would block
+            // every other command (status, kill, ...) for the whole
+            // capture, which can run for minutes.
+            let captured = {
+                let mut guard = lock_session(session);
+                drain_pending_events(&mut guard, backend);
+                guard.db.as_ref().and_then(|db| db.db_path()).map(|p| {
+                    (
+                        p.to_path_buf(),
+                        guard.target.clone(),
+                        guard.cwd.clone(),
+                    )
+                })
+            };
+            let response = match captured {
+                Some((db_path, target, cwd)) => {
+                    let response = match SessionDb::open(&db_path) {
+                        Ok(db) => {
+                            let probe = crate::commands::insnhits::HostProbeAuto;
+                            let ctx = crate::commands::insnhits::CollectCtx {
+                                target_binary: &target,
+                                cwd: &cwd,
+                            };
+                            crate::commands::insnhits::run(&req, &db, &probe, &ctx)
+                        }
+                        Err(e) => format!(
+                            "[insn-hits: could not reopen session DB at {}: {e}]",
+                            db_path.display()
+                        ),
                     };
-                    crate::commands::insnhits::run(&req, db, &probe, &ctx)
+                    let mut guard = lock_session(session);
+                    log_command(&mut guard, cmd, &response, Some("insn-hits"));
+                    response
                 }
                 None => "[insn-hits unavailable: SessionDb failed to initialize at \
                          start; restart the session to collect a fresh capture]"
                     .to_string(),
             };
-            log_command(&mut guard, cmd, &response, Some("insn-hits"));
             response
         }
         Dispatched::Fallthrough => {
