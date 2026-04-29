@@ -170,10 +170,8 @@ impl GpuDb {
                         .to_string();
                     sessions.push(SavedSession {
                         name,
-                        _target: db.meta("target"),
                         device: db.meta("device"),
                         kernel_count: db.unique_kernel_count(),
-                        _launch_count: db.total_launch_count(),
                         layers: db.layer_names(),
                         created: db.meta("created"),
                     });
@@ -747,10 +745,8 @@ pub fn escape_sql_like(s: &str) -> String {
 #[derive(Debug)]
 pub struct SavedSession {
     pub name: String,
-    pub _target: String,
     pub device: String,
     pub kernel_count: usize,
-    pub _launch_count: usize,
     pub layers: Vec<String>,
     pub created: String,
 }
