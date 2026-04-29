@@ -234,13 +234,22 @@ pub trait HostProbe {
     fn is_available(&self, id: BackendId) -> bool;
 }
 
-pub struct DefaultProbe;
-impl HostProbe for DefaultProbe {
+/// Real-host probe used by the daemon. Each backend gets an honest
+/// answer from a runtime check (binary on PATH, CPU feature flag, /
+/// kernel capability). Mock is never visible here so the daemon does
+/// not silently report synthetic counts when a real backend was not
+/// installed.
+pub struct HostProbeAuto;
+impl HostProbe for HostProbeAuto {
     fn is_available(&self, id: BackendId) -> bool {
-        // Mock is always available so the dispatch wiring can be
-        // exercised end-to-end without the real backends. Every
-        // other slot reports unavailable until its collector lands.
-        matches!(id, BackendId::Mock)
+        match id {
+            BackendId::Uprobe => uprobe::is_bpftrace_available(),
+            BackendId::Mock => false,
+            // PT, ETM, IBS, PEBS, SPE, hwbp probes land with their
+            // collectors. Until then their availability is reported
+            // false so the planner steers clear.
+            _ => false,
+        }
     }
 }
 
@@ -492,7 +501,19 @@ flags:
 /// isolation.
 pub trait Collector {
     fn id(&self) -> BackendId;
-    fn collect(&self, req: &Request) -> Result<Outcome>;
+    fn collect(&self, req: &Request, ctx: &CollectCtx<'_>) -> Result<Outcome>;
+}
+
+/// Inputs the backend needs from the surrounding session that are
+/// not part of the user's parsed `Request`. Lives separately so the
+/// `Request` stays a pure CLI parse artifact.
+pub struct CollectCtx<'a> {
+    /// Path to the target binary the session is debugging. Used by
+    /// uprobe and PT to scope probes to one binary.
+    pub target_binary: &'a str,
+    /// Working directory at session start. Used for relative path
+    /// resolution and (for PT) where the raw trace lands.
+    pub cwd: &'a std::path::Path,
 }
 
 /// Result of one collection. Multiple rows iff the request asked for
@@ -542,7 +563,7 @@ impl Collector for MockBackend {
         BackendId::Mock
     }
 
-    fn collect(&self, req: &Request) -> Result<Outcome> {
+    fn collect(&self, req: &Request, _ctx: &CollectCtx<'_>) -> Result<Outcome> {
         let window_us = match req.mode {
             Mode::Live => 1_000_000.0,
             Mode::Window(d) => d.as_secs_f64() * 1e6,
@@ -561,7 +582,12 @@ impl Collector for MockBackend {
 /// Top-level execution. Plans, picks a Collector by `BackendId`,
 /// invokes it, and writes one `insn_hits` row plus zero or more
 /// `insn_hit_details` rows. Returns the user-facing summary.
-pub fn run(req: &Request, db: &SessionDb, probe: &dyn HostProbe) -> String {
+pub fn run(
+    req: &Request,
+    db: &SessionDb,
+    probe: &dyn HostProbe,
+    ctx: &CollectCtx<'_>,
+) -> String {
     let plan = match plan(req, probe) {
         Ok(p) => p,
         Err(e) => return e,
@@ -574,7 +600,7 @@ pub fn run(req: &Request, db: &SessionDb, probe: &dyn HostProbe) -> String {
     }
 
     let collector = collector_for(plan.chosen);
-    let outcome = match collector.collect(req) {
+    let outcome = match collector.collect(req, ctx) {
         Ok(o) => o,
         Err(e) => {
             buf.push_str(&format!(
@@ -598,11 +624,12 @@ pub fn run(req: &Request, db: &SessionDb, probe: &dyn HostProbe) -> String {
 }
 
 fn collector_for(id: BackendId) -> Box<dyn Collector> {
-    // TODO(insn-hits): real backends land here. PT, ETM, uprobe, hwbp,
-    // PEBS, IBS, SPE each become a Collector impl that selects on
-    // their `BackendId`. Until they exist, every BackendId routes to
-    // MockBackend so the dispatch + planner trail stays exercised.
+    // TODO(insn-hits): real backends fill in their slots one by one.
+    // ETM, PEBS, IBS, SPE, hwbp still route through MockBackend; the
+    // planner already advertises their capabilities so when their
+    // collectors land the only change here is an extra match arm.
     match id {
+        BackendId::Uprobe => Box::new(uprobe::UprobeBackend),
         BackendId::Mock => Box::new(MockBackend),
         _ => Box::new(MockBackend),
     }
@@ -666,6 +693,262 @@ fn format_outcome(req: &Request, plan: &Plan, outcome: &Outcome) -> String {
 /// stable list of verbs without each module re-encoding it.
 pub fn verbs() -> &'static [&'static str] {
     &["insn-hits"]
+}
+
+// ============================================================
+// Uprobe backend
+// ============================================================
+
+pub mod uprobe {
+    //! eBPF uprobe collector. Shells out to `bpftrace` and parses its
+    //! aggregation output. Cross-architecture (x86_64, ARM64,
+    //! POWER, RISC-V on recent kernels) so this is the fallback path
+    //! for hosts without Intel PT or ARM CoreSight.
+    //!
+    //! Trade-off the user pays: every hit traps via int3, kernel
+    //! handler, BPF execution, return. Sub-microsecond per hit, but
+    //! a hot inner loop with ~1e9 hits/sec spends seconds in the
+    //! trap path, so the planner exposes this honestly via the
+    //! `overhead_score` ranking.
+    use super::*;
+    use std::process::Command;
+    use std::time::Duration;
+
+    pub struct UprobeBackend;
+
+    impl Collector for UprobeBackend {
+        fn id(&self) -> BackendId {
+            BackendId::Uprobe
+        }
+
+        fn collect(&self, req: &Request, ctx: &CollectCtx<'_>) -> Result<Outcome> {
+            if !is_bpftrace_available() {
+                anyhow::bail!(
+                    "uprobe backend needs `bpftrace` on PATH. Install via your package \
+                     manager (apt install bpftrace, dnf install bpftrace, ...) or pick \
+                     another backend with --backend"
+                );
+            }
+            let window = match req.mode {
+                Mode::Live => {
+                    anyhow::bail!(
+                        "uprobe live-mode streaming readout is not yet implemented. \
+                         Pass --window <duration> for a one-shot count, or use --backend hwbp \
+                         for an exact live counter when 4 simultaneous targets are enough."
+                    );
+                }
+                Mode::Window(d) => d,
+            };
+            let prog = build_program(&req.target, ctx.target_binary, req.with_stack);
+            let raw = run_bpftrace(&prog, window)?;
+            let parsed = parse_output(&raw, req.with_stack)?;
+            Ok(Outcome {
+                hit_count: parsed.total,
+                sample_basis: SampleBasis::Exact,
+                sample_period: None,
+                window_us: Some(window.as_secs_f64() * 1e6),
+                details: parsed
+                    .by_stack
+                    .into_iter()
+                    .map(|(stack, n)| HitDetail {
+                        ts_us: None,
+                        stack_json: Some(serialize_stack(&stack, n)),
+                        regs_json: None,
+                    })
+                    .collect(),
+                detail_summary: None,
+            })
+        }
+    }
+
+    pub(super) fn is_bpftrace_available() -> bool {
+        which::which("bpftrace").is_ok()
+    }
+
+    /// Build the bpftrace program text. With-stack uses an aggregation
+    /// keyed by `ustack`; without it, a single scalar counter. Target
+    /// strings starting with `0x` are treated as raw addresses, anything
+    /// else as a symbol name. bpftrace itself rejects malformed input.
+    pub(super) fn build_program(target: &str, binary: &str, with_stack: bool) -> String {
+        let probe_target = if target.starts_with("0x") || target.starts_with("0X") {
+            target.to_string()
+        } else {
+            target.to_string()
+        };
+        if with_stack {
+            format!(
+                "uprobe:{binary}:{probe_target} {{ @[ustack] = count(); }}"
+            )
+        } else {
+            format!(
+                "uprobe:{binary}:{probe_target} {{ @ = count(); }}"
+            )
+        }
+    }
+
+    fn run_bpftrace(prog: &str, window: Duration) -> Result<String> {
+        // `timeout` ships everywhere bpftrace does; bpftrace itself
+        // has no built-in deadline that emits its aggregation on
+        // expiry. SIGTERM (default for `timeout`) makes bpftrace
+        // print its accumulated maps before exiting, which is the
+        // only way to get the count out without a streaming reader.
+        let secs = window.as_secs().max(1);
+        let out = Command::new("timeout")
+            .arg("--signal=TERM")
+            .arg(secs.to_string())
+            .arg("bpftrace")
+            .arg("-q")
+            .arg("-e")
+            .arg(prog)
+            .output()
+            .map_err(|e| anyhow::anyhow!("failed to launch bpftrace: {e}"))?;
+        // `timeout` exits 124 on SIGTERM; for bpftrace that is the
+        // happy path (program printed its maps, then we killed it).
+        if !out.status.success() && out.status.code() != Some(124) {
+            anyhow::bail!(
+                "bpftrace failed (exit {:?}): {}",
+                out.status.code(),
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        Ok(String::from_utf8_lossy(&out.stdout).to_string())
+    }
+
+    /// Aggregated parse result. `total` is the scalar count when
+    /// no stacks were collected, or the sum across stacks when
+    /// `--with-stack` was set.
+    #[derive(Debug, Default, PartialEq, Eq)]
+    pub(super) struct Parsed {
+        pub total: u64,
+        pub by_stack: Vec<(Vec<String>, u64)>,
+    }
+
+    /// Parse the textual output `bpftrace -q` emits when its
+    /// aggregations dump. Two shapes:
+    ///   `@: 42`                      (scalar count)
+    ///   `@[\n  symbol+0x10\n  ...]: 5` (stack-keyed aggregation)
+    pub(super) fn parse_output(raw: &str, with_stack: bool) -> Result<Parsed> {
+        let mut parsed = Parsed::default();
+        if with_stack {
+            // Stack-keyed entries span multiple lines. Walk the text
+            // splitting on `]: <n>` and recovering the stack body that
+            // came before each closing bracket.
+            let mut idx = 0;
+            while let Some(open) = raw[idx..].find("@[") {
+                let abs_open = idx + open + 2;
+                let Some(close_rel) = raw[abs_open..].find("]:") else {
+                    break;
+                };
+                let abs_close = abs_open + close_rel;
+                let body = &raw[abs_open..abs_close];
+                let after = &raw[abs_close + 2..];
+                let count_str = after
+                    .lines()
+                    .next()
+                    .unwrap_or("")
+                    .trim();
+                let n: u64 = count_str.parse().unwrap_or(0);
+                let stack: Vec<String> = body
+                    .lines()
+                    .map(|l| l.trim())
+                    .filter(|l| !l.is_empty())
+                    .map(|l| l.to_string())
+                    .collect();
+                parsed.total = parsed.total.saturating_add(n);
+                parsed.by_stack.push((stack, n));
+                idx = abs_close + 2;
+            }
+        } else {
+            for line in raw.lines() {
+                let line = line.trim();
+                if let Some(rest) = line.strip_prefix("@:") {
+                    let n: u64 = rest.trim().parse().unwrap_or(0);
+                    parsed.total = parsed.total.saturating_add(n);
+                }
+            }
+        }
+        Ok(parsed)
+    }
+
+    fn serialize_stack(stack: &[String], hits: u64) -> String {
+        let frames: Vec<String> = stack
+            .iter()
+            .map(|f| format!("    \"{}\"", f.replace('"', "\\\"")))
+            .collect();
+        format!(
+            "{{\n  \"hits\": {hits},\n  \"frames\": [\n{}\n  ]\n}}",
+            frames.join(",\n")
+        )
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn build_program_scalar() {
+            let p = build_program("CosineDistanceSingles", "/usr/bin/raven", false);
+            assert!(p.contains("uprobe:/usr/bin/raven:CosineDistanceSingles"));
+            assert!(p.contains("@ = count();"));
+            assert!(!p.contains("ustack"));
+        }
+
+        #[test]
+        fn build_program_with_stack() {
+            let p = build_program("foo", "./bin", true);
+            assert!(p.contains("@[ustack] = count();"));
+        }
+
+        #[test]
+        fn parse_scalar_output() {
+            let raw = "Attaching 1 probe...\n\n@: 12345\n";
+            let parsed = parse_output(raw, false).unwrap();
+            assert_eq!(parsed.total, 12345);
+            assert!(parsed.by_stack.is_empty());
+        }
+
+        #[test]
+        fn parse_stack_keyed_output() {
+            let raw = "\
+Attaching 1 probe...
+
+@[
+    foo+0x10
+    bar+0x20
+    main+0x40
+]: 5
+
+@[
+    foo+0x10
+    other+0x8
+]: 3
+";
+            let parsed = parse_output(raw, true).unwrap();
+            assert_eq!(parsed.total, 8);
+            assert_eq!(parsed.by_stack.len(), 2);
+            let (stack0, n0) = &parsed.by_stack[0];
+            assert_eq!(*n0, 5);
+            assert_eq!(stack0.len(), 3);
+            assert_eq!(stack0[0], "foo+0x10");
+        }
+
+        #[test]
+        fn parse_handles_multiple_scalar_lines() {
+            // A user could attach multiple uprobes; bpftrace prints
+            // one `@: N` per. The parser sums.
+            let raw = "@: 10\n@: 32\n";
+            let parsed = parse_output(raw, false).unwrap();
+            assert_eq!(parsed.total, 42);
+        }
+
+        #[test]
+        fn parse_empty_output_is_zero_not_error() {
+            // bpftrace exits cleanly with no probes fired — the
+            // count must read as 0 rather than failing.
+            let parsed = parse_output("Attaching 1 probe...\n", false).unwrap();
+            assert_eq!(parsed.total, 0);
+        }
+    }
 }
 
 // ============================================================
@@ -739,6 +1022,23 @@ mod tests {
             with_regs: false,
             forced_backend: None,
             explain: false,
+        }
+    }
+
+    fn ctx() -> CollectCtxOwned {
+        CollectCtxOwned {
+            target_binary: "/usr/bin/test".into(),
+            cwd: std::env::temp_dir(),
+        }
+    }
+
+    struct CollectCtxOwned {
+        target_binary: String,
+        cwd: std::path::PathBuf,
+    }
+    impl CollectCtxOwned {
+        fn as_ref(&self) -> CollectCtx<'_> {
+            CollectCtx { target_binary: &self.target_binary, cwd: &self.cwd }
         }
     }
 
@@ -914,8 +1214,9 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let db = mk_db(&tmp, "s1");
         let r = req("foo");
-        let probe = DefaultProbe;
-        let summary = run(&r, &db, &probe);
+        let probe = FakeProbe(vec![BackendId::Mock]);
+        let c = ctx();
+        let summary = run(&r, &db, &probe, &c.as_ref());
         assert!(summary.contains("insn-hits foo"), "{summary}");
         assert!(summary.contains("backend: mock"), "{summary}");
         assert!(summary.contains("hits:    42"), "{summary}");
@@ -934,8 +1235,9 @@ mod tests {
         let db = mk_db(&tmp, "s2");
         let mut r = req("foo");
         r.explain = true;
-        let probe = DefaultProbe;
-        let out = run(&r, &db, &probe);
+        let probe = FakeProbe(vec![BackendId::Mock]);
+        let c = ctx();
+        let out = run(&r, &db, &probe, &c.as_ref());
         let why_pos = out.find("backend=mock").unwrap();
         let summary_pos = out.find("insn-hits foo").unwrap();
         assert!(why_pos < summary_pos, "--why should print before summary:\n{out}");

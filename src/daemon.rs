@@ -796,8 +796,12 @@ fn handle_command(
             drain_pending_events(&mut guard, backend);
             let response = match guard.db.as_ref() {
                 Some(db) => {
-                    let probe = crate::commands::insnhits::DefaultProbe;
-                    crate::commands::insnhits::run(&req, db, &probe)
+                    let probe = crate::commands::insnhits::HostProbeAuto;
+                    let ctx = crate::commands::insnhits::CollectCtx {
+                        target_binary: &guard.target,
+                        cwd: &guard.cwd,
+                    };
+                    crate::commands::insnhits::run(&req, db, &probe, &ctx)
                 }
                 None => "[insn-hits unavailable: SessionDb failed to initialize at \
                          start; restart the session to collect a fresh capture]"
