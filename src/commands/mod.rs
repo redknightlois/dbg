@@ -12,6 +12,7 @@
 
 pub mod crosstrack;
 pub mod debug;
+pub mod insnhits;
 pub mod lifecycle;
 
 use crate::backend::{Backend, CanonicalReq};
@@ -39,6 +40,9 @@ pub enum Dispatched {
     /// Session-lifecycle command (sessions/save/prune/diff) — daemon
     /// resolves the `.dbg/sessions/` path and optional ATTACH-for-diff.
     Lifecycle(lifecycle::Lifecycle),
+    /// `insn-hits <target>` request — planner picks a backend and the
+    /// daemon hands the SessionDb to the collector.
+    InsnHits(insnhits::Request),
     /// Not a canonical verb — daemon runs the legacy passthrough path.
     Fallthrough,
 }
@@ -52,6 +56,9 @@ pub fn dispatch(input: &str, backend: &dyn Backend) -> Dispatched {
     if let Some(d) = lifecycle::try_dispatch(input) {
         return d;
     }
+    if let Some(d) = insnhits::try_dispatch(input) {
+        return d;
+    }
     if let Some(d) = crosstrack::try_dispatch(input) {
         return d;
     }
@@ -63,6 +70,9 @@ pub fn dispatch(input: &str, backend: &dyn Backend) -> Dispatched {
 /// since those require a live debugger.
 pub fn dispatch_no_backend(input: &str) -> Option<Dispatched> {
     if let Some(d) = lifecycle::try_dispatch(input) {
+        return Some(d);
+    }
+    if let Some(d) = insnhits::try_dispatch(input) {
         return Some(d);
     }
     if let Some(d) = crosstrack::try_dispatch(input) {

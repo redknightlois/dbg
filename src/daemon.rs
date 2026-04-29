@@ -791,6 +791,21 @@ fn handle_command(
             log_command(&mut guard, cmd, &response, Some(canonical_op));
             response
         }
+        Dispatched::InsnHits(req) => {
+            let mut guard = lock_session(session);
+            drain_pending_events(&mut guard, backend);
+            let response = match guard.db.as_ref() {
+                Some(db) => {
+                    let probe = crate::commands::insnhits::DefaultProbe;
+                    crate::commands::insnhits::run(&req, db, &probe)
+                }
+                None => "[insn-hits unavailable: SessionDb failed to initialize at \
+                         start; restart the session to collect a fresh capture]"
+                    .to_string(),
+            };
+            log_command(&mut guard, cmd, &response, Some("insn-hits"));
+            response
+        }
         Dispatched::Fallthrough => {
             let mut guard = lock_session(session);
             drain_pending_events(&mut guard, backend);
@@ -877,6 +892,15 @@ dbg replay <label>
   Open a persisted session read-only and run crosstrack queries against
   it. Same vocabulary as a live session: hits, hit-trend, hit-diff,
   cross, disasm, source. No live debugger — exec verbs are rejected.",
+        "insn-hits" => "\
+dbg insn-hits <symbol|0xADDR> [--live | --window <duration>]
+              [--with-stack] [--with-regs]
+              [--backend auto|pt|etm|uprobe|hwbp|ibs|pebs|spe] [--why]
+  Count how many times an instruction (or symbol entry) executed.
+  The planner picks the cheapest backend that satisfies the requested
+  flags from those available on the host. Pass --why to see the
+  trail (chosen backend, eligible alternatives, why each rejected
+  backend lost).",
         "run" => "\
 dbg run
   Start the debuggee (or restart it). Stops at the first breakpoint

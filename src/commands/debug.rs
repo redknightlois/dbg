@@ -349,6 +349,7 @@ mod tests {
             Dispatched::Immediate(s) => format!("Immediate({s:?})"),
             Dispatched::Query(q) => format!("Query({})", q.canonical_op()),
             Dispatched::Lifecycle(l) => format!("Lifecycle({})", l.canonical_op()),
+            Dispatched::InsnHits(r) => format!("InsnHits({})", r.target),
             Dispatched::Fallthrough => "Fallthrough".into(),
         }
     }

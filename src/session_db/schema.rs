@@ -12,7 +12,7 @@ use rusqlite::Connection;
 use super::TargetClass;
 
 /// Bump this on every schema-breaking change. No migrations.
-pub const SCHEMA_VERSION: i64 = 1;
+pub const SCHEMA_VERSION: i64 = 2;
 
 /// Shared meta tables — always created regardless of track or target class.
 pub const CORE_DDL: &str = "
@@ -174,6 +174,29 @@ CREATE TABLE IF NOT EXISTS alloc_sites (
     layer_id        INTEGER REFERENCES layers(id)
 );
 CREATE INDEX IF NOT EXISTS idx_alloc_site_sym ON alloc_sites(symbol_id);
+
+CREATE TABLE IF NOT EXISTS insn_hits (
+    id              INTEGER PRIMARY KEY,
+    session_id      TEXT NOT NULL REFERENCES sessions(id),
+    target          TEXT NOT NULL,
+    hit_count       INTEGER NOT NULL,
+    sample_basis    TEXT NOT NULL,
+    sample_period   INTEGER,
+    window_us       REAL,
+    backend         TEXT NOT NULL,
+    collected_at    TEXT NOT NULL,
+    detail_json     TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_insn_hits_target ON insn_hits(session_id, target);
+
+CREATE TABLE IF NOT EXISTS insn_hit_details (
+    id              INTEGER PRIMARY KEY,
+    insn_hit_id     INTEGER NOT NULL REFERENCES insn_hits(id),
+    ts_us           REAL,
+    stack_json      TEXT,
+    regs_json       TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_insn_hit_details ON insn_hit_details(insn_hit_id);
 ";
 
 /// GPU domain tables (CUDA launches, ncu metrics, memcpy transfers,
@@ -398,6 +421,7 @@ mod tests {
                   "regions", "allocations",
                   "commands", "breakpoint_hits", "watch_evals",
                   "disassembly", "source_snapshots", "alloc_sites",
+                  "insn_hits", "insn_hit_details",
                   "samples", "counters"] {
             let exists: i64 = c.query_row(
                 "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
