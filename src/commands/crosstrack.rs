@@ -314,6 +314,13 @@ fn basename_line_key(loc: &str) -> String {
     format!("{base}:{line}")
 }
 
+/// `(basename:line, stem:line)` — the two relaxed forms of a location
+/// key paired with the original. Every cmd_* that resolves a `loc`
+/// against the `breakpoint_hits.location_key` column needs both.
+fn loc_keys(loc: &str) -> (String, String) {
+    (basename_line_key(loc), stem_line_key(loc))
+}
+
 // ============================================================
 // dbg hits <loc>
 // ============================================================
@@ -324,11 +331,8 @@ fn cmd_hits(db: &SessionDb, loc: &str) -> String {
     // stores, the `src/main.rs:42` form lldb stores, and so on.
     // Also try stem:line (strip file extension) so `Algos.java:17`
     // matches jdb's `Algos:17` or `Algos.fibonacci:17`.
-    let (exact, tail, stem_tail) = (
-        loc.to_string(),
-        basename_line_key(loc),
-        stem_line_key(loc),
-    );
+    let exact = loc.to_string();
+    let (tail, stem_tail) = loc_keys(loc);
     let mut stmt = match db.conn().prepare(
         "SELECT hit_seq, thread, ts, locals_json
          FROM breakpoint_hits
@@ -376,8 +380,7 @@ fn cmd_hits(db: &SessionDb, loc: &str) -> String {
 /// `locals_json[field].value` matches; outputs `value -> count` sorted
 /// descending. With `top=Some(n)`, truncates to the n most-frequent.
 fn cmd_hits_grouped(db: &SessionDb, loc: &str, field: &str, top: Option<usize>) -> String {
-    let tail = basename_line_key(loc);
-    let stem_tail = stem_line_key(loc);
+    let (tail, stem_tail) = loc_keys(loc);
     let mut stmt = match db.conn().prepare(
         "SELECT locals_json FROM breakpoint_hits
          WHERE location_key = ?1
@@ -558,8 +561,7 @@ fn no_hits_message(db: &SessionDb, loc: &str, verb: &str) -> String {
 /// Collect the set of captured locals field names across all hits at
 /// `loc`. Used to enumerate options in error messages.
 fn collect_captured_names(db: &SessionDb, loc: &str) -> Vec<String> {
-    let tail = basename_line_key(loc);
-    let stem_tail = stem_line_key(loc);
+    let (tail, stem_tail) = loc_keys(loc);
     let Ok(mut stmt) = db.conn().prepare(
         "SELECT locals_json FROM breakpoint_hits
          WHERE (location_key = ?1
@@ -612,8 +614,7 @@ fn locals_summary(locals_json: &str) -> Option<String> {
 // ============================================================
 
 fn cmd_hit_diff(db: &SessionDb, loc: &str, a: u32, b: u32) -> String {
-    let tail = basename_line_key(loc);
-    let stem_tail = stem_line_key(loc);
+    let (tail, stem_tail) = loc_keys(loc);
     let fetch = |seq: u32| -> Option<(Option<String>, Option<String>)> {
         db.conn()
             .query_row(
@@ -687,8 +688,7 @@ fn cmd_hit_diff(db: &SessionDb, loc: &str, a: u32, b: u32) -> String {
 // ============================================================
 
 fn cmd_hit_trend(db: &SessionDb, loc: &str, field: &str) -> String {
-    let tail = basename_line_key(loc);
-    let stem_tail = stem_line_key(loc);
+    let (tail, stem_tail) = loc_keys(loc);
     let mut stmt = match db.conn().prepare(
         "SELECT hit_seq, locals_json FROM breakpoint_hits
          WHERE location_key = ?1
