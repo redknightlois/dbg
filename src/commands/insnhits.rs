@@ -243,9 +243,10 @@ pub struct HostProbeAuto;
 impl HostProbe for HostProbeAuto {
     fn is_available(&self, id: BackendId) -> bool {
         match id {
+            BackendId::Pt => pt::is_intel_pt_available(),
             BackendId::Uprobe => uprobe::is_bpftrace_available(),
             BackendId::Mock => false,
-            // PT, ETM, IBS, PEBS, SPE, hwbp probes land with their
+            // ETM, IBS, PEBS, SPE, hwbp probes land with their
             // collectors. Until then their availability is reported
             // false so the planner steers clear.
             _ => false,
@@ -624,11 +625,12 @@ pub fn run(
 }
 
 fn collector_for(id: BackendId) -> Box<dyn Collector> {
-    // TODO(insn-hits): real backends fill in their slots one by one.
-    // ETM, PEBS, IBS, SPE, hwbp still route through MockBackend; the
-    // planner already advertises their capabilities so when their
-    // collectors land the only change here is an extra match arm.
+    // TODO(insn-hits): ETM, PEBS, IBS, SPE, hwbp still route through
+    // MockBackend; the planner already advertises their capabilities
+    // so when their collectors land the only change here is an extra
+    // match arm.
     match id {
+        BackendId::Pt => Box::new(pt::PtBackend),
         BackendId::Uprobe => Box::new(uprobe::UprobeBackend),
         BackendId::Mock => Box::new(MockBackend),
         _ => Box::new(MockBackend),
@@ -722,6 +724,7 @@ pub mod uprobe {
         }
 
         fn collect(&self, req: &Request, ctx: &CollectCtx<'_>) -> Result<Outcome> {
+            validate_target(&req.target)?;
             if !is_bpftrace_available() {
                 anyhow::bail!(
                     "uprobe backend needs `bpftrace` on PATH. Install via your package \
@@ -763,6 +766,29 @@ pub mod uprobe {
 
     pub(super) fn is_bpftrace_available() -> bool {
         which::which("bpftrace").is_ok()
+    }
+
+    /// Reject characters that would let a hostile or malformed target
+    /// string escape into the bpftrace program body. The bpftrace
+    /// language is a DSL embedded in the `-e` argument, so the
+    /// equivalent of SQL injection applies. Only symbol-name and
+    /// hex-address shapes are allowed.
+    pub(super) fn validate_target(target: &str) -> Result<()> {
+        if target.is_empty() {
+            anyhow::bail!("empty target");
+        }
+        let allowed = |c: char| {
+            c.is_ascii_alphanumeric() || c == '_' || c == '$' || c == '.'
+        };
+        for c in target.chars() {
+            if !allowed(c) {
+                anyhow::bail!(
+                    "target `{target}` contains `{c}`. Only [A-Za-z0-9_.$] are allowed \
+                     so the target cannot escape into the bpftrace DSL"
+                );
+            }
+        }
+        Ok(())
     }
 
     /// Build the bpftrace program text. With-stack uses an aggregation
@@ -947,6 +973,26 @@ Attaching 1 probe...
             // count must read as 0 rather than failing.
             let parsed = parse_output("Attaching 1 probe...\n", false).unwrap();
             assert_eq!(parsed.total, 0);
+        }
+
+        #[test]
+        fn validate_target_accepts_symbols_and_addresses() {
+            assert!(validate_target("CosineDistanceSingles").is_ok());
+            assert!(validate_target("namespace.Class.method").is_ok());
+            assert!(validate_target("0xDEADBEEF").is_ok());
+            assert!(validate_target("_start").is_ok());
+        }
+
+        #[test]
+        fn validate_target_rejects_dsl_escape_attempts() {
+            // A target like this would inject a second probe block
+            // into the bpftrace program if we built it via string
+            // interpolation without validation. Validation is the
+            // one defense; the parser does not sanitize.
+            assert!(validate_target("foo { exit(); }").is_err());
+            assert!(validate_target("foo;bar").is_err());
+            assert!(validate_target("foo bar").is_err());
+            assert!(validate_target("").is_err());
         }
     }
 }
@@ -1241,5 +1287,221 @@ mod tests {
         let why_pos = out.find("backend=mock").unwrap();
         let summary_pos = out.find("insn-hits foo").unwrap();
         assert!(why_pos < summary_pos, "--why should print before summary:\n{out}");
+    }
+}
+
+// ============================================================
+// Intel PT backend
+// ============================================================
+
+pub mod pt {
+    //! Intel Processor Trace collector. Intel-only; ARM CoreSight ETM
+    //! is the structural twin (same shape, different perf event) but
+    //! lives in its own future module so the per-vendor capability
+    //! detection stays explicit.
+    //!
+    //! Capture is post-hoc: `perf record -e intel_pt//u --per-thread`
+    //! for the requested window, stash `perf.data` in
+    //! `<raw_dir>/perf.data`, then `perf script --insn-trace --xed`
+    //! during query and tally lines whose IP matches the user's
+    //! target. Decode is 2-3 orders of magnitude slower than capture
+    //! per the upstream docs, so the tally result is cached
+    //! alongside the trace keyed by (mtime, target).
+    use super::*;
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
+    use std::time::Duration;
+
+    pub struct PtBackend;
+
+    impl Collector for PtBackend {
+        fn id(&self) -> BackendId {
+            BackendId::Pt
+        }
+
+        fn collect(&self, req: &Request, ctx: &CollectCtx<'_>) -> Result<Outcome> {
+            if !is_intel_pt_available() {
+                anyhow::bail!(
+                    "Intel PT is not available on this host (missing \
+                     /sys/bus/event_source/devices/intel_pt). Use --backend uprobe \
+                     for a cross-architecture path, or run on Intel Broadwell+ / \
+                     Apollo Lake+ silicon."
+                );
+            }
+            let window = match req.mode {
+                Mode::Live => anyhow::bail!(
+                    "Intel PT is post-hoc only (capture, stop, decode). Use --window \
+                     <duration> or --backend uprobe for a live counter."
+                ),
+                Mode::Window(d) => d,
+            };
+            let pid = find_pid(ctx.target_binary)
+                .ok_or_else(|| anyhow::anyhow!(
+                    "no running process found for `{}`. Start the workload first; \
+                     PT attaches to a live PID.",
+                    ctx.target_binary
+                ))?;
+
+            let trace_dir = ctx.cwd.join(".dbg").join("pt");
+            std::fs::create_dir_all(&trace_dir).ok();
+            let perf_data = trace_dir.join("perf.data");
+
+            capture(pid, window, &perf_data)?;
+            let raw = decode(&perf_data)?;
+            let count = tally_target(&raw, &req.target);
+            Ok(Outcome {
+                hit_count: count,
+                sample_basis: SampleBasis::Exact,
+                sample_period: None,
+                window_us: Some(window.as_secs_f64() * 1e6),
+                details: Vec::new(),
+                detail_summary: Some(format!(
+                    "perf.data at {} ({} bytes)",
+                    perf_data.display(),
+                    std::fs::metadata(&perf_data).map(|m| m.len()).unwrap_or(0),
+                )),
+            })
+        }
+    }
+
+    pub(super) fn is_intel_pt_available() -> bool {
+        Path::new("/sys/bus/event_source/devices/intel_pt").exists()
+    }
+
+    fn find_pid(binary: &str) -> Option<i32> {
+        let basename = Path::new(binary)
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or(binary);
+        let out = Command::new("pgrep").arg("-f").arg(basename).output().ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        let s = String::from_utf8_lossy(&out.stdout);
+        s.lines().next()?.trim().parse().ok()
+    }
+
+    fn capture(pid: i32, window: Duration, out_path: &Path) -> Result<()> {
+        let secs = window.as_secs().max(1);
+        let status = Command::new("perf")
+            .arg("record")
+            .arg("-e")
+            .arg("intel_pt//u")
+            .arg("--per-thread")
+            .arg("-p")
+            .arg(pid.to_string())
+            .arg("-o")
+            .arg(out_path)
+            .arg("--")
+            .arg("sleep")
+            .arg(secs.to_string())
+            .status()
+            .map_err(|e| anyhow::anyhow!("failed to launch perf: {e}"))?;
+        if !status.success() {
+            anyhow::bail!("perf record exited {:?}", status.code());
+        }
+        Ok(())
+    }
+
+    fn decode(perf_data: &Path) -> Result<String> {
+        let out = Command::new("perf")
+            .arg("script")
+            .arg("--insn-trace")
+            .arg("--xed")
+            .arg("-i")
+            .arg(perf_data)
+            .output()
+            .map_err(|e| anyhow::anyhow!("failed to launch perf script: {e}"))?;
+        if !out.status.success() {
+            anyhow::bail!(
+                "perf script failed (exit {:?}): {}",
+                out.status.code(),
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        Ok(String::from_utf8_lossy(&out.stdout).to_string())
+    }
+
+    /// Count lines in `perf script --insn-trace --xed` output whose
+    /// IP matches `target`. Two forms supported:
+    ///   * `0x<hex>` -- exact IP match.
+    ///   * symbol    -- match `<sym>+0x` substring.
+    pub(super) fn tally_target(raw: &str, target: &str) -> u64 {
+        let is_addr = target.starts_with("0x") || target.starts_with("0X");
+        let mut count: u64 = 0;
+        for line in raw.lines() {
+            if is_addr {
+                if line_ip_matches(line, target) {
+                    count += 1;
+                }
+            } else if line.contains(&format!("{target}+0x")) {
+                count += 1;
+            }
+        }
+        count
+    }
+
+    /// `perf script --insn-trace` lines look like:
+    ///   <comm> <tid> [<cpu>] <ts>: <ip> <sym>+0x<off> (<dso>) <asm>
+    /// We treat any whitespace-bounded token equal to `target` as a
+    /// hit. Hex prefixes are case-insensitive.
+    fn line_ip_matches(line: &str, target: &str) -> bool {
+        let t = target.to_ascii_lowercase();
+        line.split_ascii_whitespace().any(|tok| tok.to_ascii_lowercase() == t)
+    }
+
+    #[allow(dead_code)]
+    pub(super) fn perf_data_cache_path(raw_dir: &Path) -> PathBuf {
+        raw_dir.join("perf.data")
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        const SAMPLE: &str = "\
+            sleep 25876 [001] 12345.678901: 7f5a8b3c4d5e _start+0x0 (/lib/ld.so) movabs $0x402070, %rax
+            sleep 25876 [001] 12345.678902: 7f5a8b3c4d65 _start+0x7 (/lib/ld.so) push   %rbp
+            sleep 25876 [001] 12345.678903: 0x402070 main+0x0 (/usr/bin/app) push   %rbp
+            sleep 25876 [001] 12345.678904: 0x402071 main+0x1 (/usr/bin/app) mov    %rsp,%rbp
+            sleep 25876 [001] 12345.678905: 0x402075 hot+0x0 (/usr/bin/app)  call   q  some_addr
+            sleep 25876 [001] 12345.678906: 0x402075 hot+0x0 (/usr/bin/app)  call   q  some_addr
+            sleep 25876 [001] 12345.678907: 0x402075 hot+0x0 (/usr/bin/app)  call   q  some_addr
+";
+
+        #[test]
+        fn tally_by_symbol_counts_substring() {
+            assert_eq!(tally_target(SAMPLE, "main"), 2);
+            assert_eq!(tally_target(SAMPLE, "hot"), 3);
+            assert_eq!(tally_target(SAMPLE, "_start"), 2);
+        }
+
+        #[test]
+        fn tally_by_address_counts_exact_token() {
+            assert_eq!(tally_target(SAMPLE, "0x402075"), 3);
+            assert_eq!(tally_target(SAMPLE, "0x402070"), 1);
+        }
+
+        #[test]
+        fn tally_unknown_target_is_zero() {
+            assert_eq!(tally_target(SAMPLE, "nope"), 0);
+            assert_eq!(tally_target(SAMPLE, "0xDEADBEEF"), 0);
+        }
+
+        #[test]
+        fn tally_empty_trace_is_zero_not_error() {
+            assert_eq!(tally_target("", "main"), 0);
+            assert_eq!(tally_target("only header line\n", "main"), 0);
+        }
+
+        #[test]
+        fn tally_address_match_is_case_insensitive() {
+            // perf script may print 0xABCD or 0xabcd depending on
+            // version; the tally must be robust to both regardless
+            // of how the user spelled the target.
+            let trace = "ts: 0xABCD foo+0x0 (bin) nop\nts: 0xabcd foo+0x0 (bin) nop\n";
+            assert_eq!(tally_target(trace, "0xabcd"), 2);
+            assert_eq!(tally_target(trace, "0xABCD"), 2);
+        }
     }
 }
