@@ -166,7 +166,7 @@ pub fn is_slug_live(slug: &str) -> bool {
     if nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None).is_err() {
         return false;
     }
-    socket_path_for(slug).exists()
+    proc_comm_is_dbg(pid)
 }
 
 /// Pick a slug for a new daemon. With `DBG_SESSION` set we honor the
@@ -1531,9 +1531,27 @@ fn connect_with_retry() -> Result<std::os::unix::net::UnixStream> {
         match UnixStream::connect(&socket_path()) {
             Ok(s) => return Ok(s),
             Err(e) => {
-                // Only retry if the daemon *appears* to exist; fail
-                // fast otherwise so genuine "no session" stays instant.
+                // Two failure modes to distinguish:
+                //  (a) no daemon — pid file gone or names a
+                //      dead/non-dbg pid. Fail fast with the start hint.
+                //  (b) daemon alive but its socket path is gone. The
+                //      bound `UnixListener` keeps serving the inode,
+                //      so the daemon can't tell anything is wrong;
+                //      the client can't reach it via path. There's
+                //      no in-process recovery — `dbg kill` + restart
+                //      is the only path back to a connectable
+                //      socket.
                 if !is_running() || attempts >= 5 {
+                    if is_running() && !Path::new(&socket_path()).exists() {
+                        let path = socket_path();
+                        return Err(e).context(format!(
+                            "daemon is running but its socket file is gone \
+                             ({}). Something unlinked the path while the \
+                             daemon held its bound listener — recover with \
+                             `dbg kill` then `dbg start ...`",
+                            path.display()
+                        ));
+                    }
                     let hint = foreign_daemon_hint();
                     return Err(e).context(format!(
                         "no session running — use: dbg start{hint}"
@@ -1599,10 +1617,37 @@ pub fn is_running() -> bool {
     if !alive {
         return false;
     }
-    // Require the socket too — the daemon unlinks it on graceful
-    // exit, so a live pid with no socket means the PID has been
-    // recycled for somebody else.
-    Path::new(&socket_path()).exists()
+    // PID recycling defense: the kernel may hand pid N to a
+    // different program after our daemon dies, and a bare
+    // `kill(pid, 0)` would happily green-light that stranger.
+    // /proc/<pid>/comm names the binary backing the live pid, so
+    // checking it equals "dbg" rejects the recycled-pid case
+    // without depending on any file we wrote ourselves. We don't
+    // gate on the socket file's presence: the daemon's
+    // `UnixListener` keeps serving on its bound inode even after
+    // the directory entry is unlinked, so a missing path is not
+    // proof the daemon is gone — only that something removed the
+    // path. Diagnosing that case (alive daemon, dead socket path)
+    // is `connect_with_retry`'s job, not ours.
+    proc_comm_is_dbg(pid)
+}
+
+fn proc_comm_is_dbg(pid: i32) -> bool {
+    let Ok(comm) = std::fs::read_to_string(format!("/proc/{pid}/comm")) else {
+        // No /proc on this platform (non-Linux). Fall back to
+        // trusting raw pid liveness. PID-recycling within the
+        // sub-second window between our daemon dying and a client
+        // checking is rare enough to accept here.
+        return true;
+    };
+    // Prefix match rather than equality: cargo's test binary is
+    // named `dbg-<hash>` (and so is any future `dbg-foo` helper we
+    // might ship). The kernel truncates /proc/<pid>/comm to 15
+    // chars but the prefix is preserved. The only way this
+    // false-positives is a recycled pid landing on a different
+    // binary that happens to start with "dbg" — vastly less likely
+    // than a bare `kill(pid, 0)` accepting any random process.
+    comm.trim().starts_with("dbg")
 }
 
 /// Clean up stale pid/socket files from a dead or foreign daemon.
@@ -1728,19 +1773,22 @@ mod tests {
     #[test]
     fn is_running_is_observational_only() {
         let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        // Regression: earlier versions auto-deleted pid/socket files
-        // they judged stale, which raced with our own daemon's
-        // startup. is_running() must now be purely read-only.
+        // is_running() is read-only: it inspects pid_path and
+        // /proc/<pid>/comm but never deletes either. Plant a pid
+        // pointing at init (pid 1, comm = "systemd" or "init") —
+        // alive, but its comm doesn't start with "dbg", so
+        // is_running must reject it. The pid file must still be on
+        // disk afterwards.
         let tmp = TempDir::new().unwrap();
         unsafe {
             std::env::set_var("XDG_RUNTIME_DIR", tmp.path());
             std::env::set_var("DBG_SESSION", "testobs");
         }
-        // Live PID (ourselves) without socket — is_running should
-        // return false but MUST NOT delete the pid file.
-        let my_pid = std::process::id();
-        std::fs::write(pid_path(), my_pid.to_string()).unwrap();
-        assert!(!is_running(), "live PID without socket should read false");
+        std::fs::write(pid_path(), "1").unwrap();
+        assert!(
+            !is_running(),
+            "live pid whose comm != dbg must read as not-running"
+        );
         assert!(pid_path().exists(), "is_running must not mutate fs");
         unsafe { std::env::remove_var("DBG_SESSION"); }
     }
