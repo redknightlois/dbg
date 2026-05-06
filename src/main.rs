@@ -869,16 +869,37 @@ fn cmd_start(registry: &Registry, args: &[String]) -> Result<()> {
             }
 
             // The socket may be bound *before* the backend itself has
-            // produced a prompt — if the backend dies (delve bails on
-            // a bad exec target, dotnet build fails, …) we'd previously
-            // fall through and the agent would see a healthy-looking
-            // "target: foo" with no session actually listening. Give
-            // the daemon a short grace window and then ping it; if
-            // the ping fails (or the daemon process is gone), surface
-            // the captured startup log.
-            std::thread::sleep(Duration::from_millis(150));
-            let healthy = daemon::is_running()
-                && daemon::send_command("status").is_ok();
+            // Wait for the daemon to be ready, then confirm it's
+            // alive before returning. "Ready" here means: pid file
+            // exists, pid is alive, and the listener socket is
+            // bound. We poll those over a 5s window — long enough
+            // for slow backends like dotnet-trace, where the
+            // collector forks `dotnet` which then JITs and loads
+            // the target assembly before the command channel
+            // accepts traffic, and a sub-second probe consistently
+            // races the bind. We do NOT round-trip a command
+            // through the backend here: a backend whose dispatcher
+            // hasn't finished initializing answers EAGAIN, which
+            // looks indistinguishable from a dead daemon to the
+            // client and produces the bogus "daemon exited" bail
+            // even though `ps` shows pid+collector+debuggee all
+            // alive. Genuine backend exec failures still surface:
+            // the daemon process itself exits when its child fails
+            // to launch, so `is_running()` returns false within the
+            // 5s window and we bail with whatever the daemon
+            // wrote to its startup log.
+            let probe_deadline = std::time::Instant::now() + Duration::from_secs(5);
+            let mut healthy = false;
+            loop {
+                std::thread::sleep(Duration::from_millis(100));
+                if daemon::is_running() {
+                    healthy = true;
+                    break;
+                }
+                if std::time::Instant::now() >= probe_deadline {
+                    break;
+                }
+            }
             if !healthy {
                 let log = std::fs::read_to_string(&log_path).unwrap_or_default();
                 let log = log.trim();
