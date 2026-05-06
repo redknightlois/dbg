@@ -1049,6 +1049,21 @@ dbg cancel
   Interrupt the currently-running debugger command without tearing
   down the session (sends SIGINT to the debuggee). Use to break out
   of a `continue` that hasn't hit a breakpoint.",
+        "finalize" => "\
+dbg finalize
+  Stop a profile/sample collector cleanly so its trace is flushed and
+  the daemon can move into query mode. Walks the daemon's child tree
+  (daemon → bash → collector) and SIGINTs the collector (dotnet-trace,
+  perf, callgrind, ...). Works while the daemon is still blocked in
+  init waiting for the target to exit — `dbg cancel` cannot, because
+  the accept loop hasn't started yet.
+
+  Typical flow for a long-running server profile:
+    1. dbg start dotnet-trace ./Server.dll
+    2. drive load against it
+    3. dbg finalize          (collector flushes, daemon proceeds)
+    4. dbg top / dbg callers ...
+    5. dbg kill",
         _ => return None,
     })
 }
@@ -1603,6 +1618,32 @@ fn foreign_daemon_hint() -> String {
 }
 
 /// Check if a daemon is running.
+/// Read the current cwd's daemon PID file. Returns `None` when no
+/// daemon is registered for this slug — does NOT verify the process
+/// is alive (callers that need liveness should also check `is_running`
+/// or `is_slug_live`). Public so client-side commands like `dbg
+/// finalize` can locate the daemon's child process tree even before
+/// the accept loop is serving requests.
+pub fn current_daemon_pid() -> Option<i32> {
+    let s = std::fs::read_to_string(pid_path()).ok()?;
+    s.trim().parse().ok()
+}
+
+/// List the direct child PIDs of `pid` via `/proc/<pid>/task/<pid>/children`.
+/// Linux-only — returns an empty vec on other platforms or when the
+/// procfs entry is missing. Used by `dbg finalize` to walk from the
+/// daemon down to the profile collector (daemon → bash → collector).
+pub fn proc_children(pid: i32) -> Vec<i32> {
+    let path = format!("/proc/{pid}/task/{pid}/children");
+    let Ok(content) = std::fs::read_to_string(&path) else {
+        return Vec::new();
+    };
+    content
+        .split_whitespace()
+        .filter_map(|t| t.parse().ok())
+        .collect()
+}
+
 pub fn is_running() -> bool {
     // Purely observational — never mutates filesystem state. A
     // previous version auto-deleted pid/socket files it judged

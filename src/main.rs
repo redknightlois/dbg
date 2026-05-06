@@ -35,6 +35,8 @@ Common commands (forwarded to the session daemon):
     sessions [--group]      List saved / live sessions
     save [label]            Persist the active session to .dbg/sessions/
     replay <label>          Re-open a saved session read-only
+    finalize                Stop a profile collector cleanly so its
+                            trace flushes and the daemon can serve queries
     prune [--older-than D]  Delete auto-saved sessions past age D
     diff <other>            Compare active session against another
     cross <symbol>          Aggregate all captured evidence for a symbol
@@ -308,6 +310,7 @@ fn main() -> Result<()> {
             Ok(())
         }
         "replay" => cmd_replay(&cli.args[1..]),
+        "finalize" => cmd_finalize(),
         "diff" if cli.args.len() == 3 || (!daemon::is_running() && cli.args.len() == 2) => {
             // Client-side diff between two saved sessions (or between
             // one saved session and... well, the parser handles a
@@ -353,7 +356,7 @@ fn main() -> Result<()> {
                 println!("  dbg <any debugger command>");
                 println!("  dbg help            list available commands");
                 println!("  dbg help <command>   help for a specific verb\n");
-                println!("session lifecycle:  start, run, continue, step, next, finish, kill, status, cancel");
+                println!("session lifecycle:  start, run, continue, step, next, finish, kill, status, cancel, finalize");
                 println!("inspection:         break, locals, stack, print");
                 println!("crosstrack (DB):    hits, hit-diff, hit-trend, cross, disasm, source");
                 println!("persistence:        sessions, save, replay");
@@ -597,6 +600,106 @@ fn ensure_running() -> Result<()> {
     if !daemon::is_running() {
         bail!("no session running — use: dbg start <type> <target>");
     }
+    Ok(())
+}
+
+/// Client-side `dbg finalize`: stop a profile/sample collector cleanly
+/// so its on-disk trace flushes and the daemon can transition into
+/// query mode.
+///
+/// This is a *client-side* operation — it does NOT go through the
+/// daemon socket. The daemon's accept loop only starts after init
+/// completes, but profile backends (dotnet-trace, perf, callgrind)
+/// block init for the entire lifetime of the target process. So while
+/// init is running there's no listener to receive a `dbg cancel`,
+/// even though the kernel happily queues the connection. `finalize`
+/// sidesteps that by reading the daemon's pid file and walking its
+/// child tree directly.
+///
+/// All profile backends spawn `bash` as their direct child (PTY-driven
+/// init script), and bash spawns the actual collector. We send SIGINT
+/// to bash's foreground process group (i.e. the collector) — this
+/// matches what Ctrl-C from a real terminal would do via the PTY's
+/// tty discipline, which is exactly what dotnet-trace / perf-record
+/// expect to receive in order to flush their trace and exit.
+fn cmd_finalize() -> Result<()> {
+    use nix::sys::signal::{Signal, kill};
+    use nix::unistd::{Pid, getpgid};
+
+    let daemon_pid = daemon::current_daemon_pid().ok_or_else(|| {
+        anyhow::anyhow!(
+            "no daemon registered for this cwd — `dbg start` must be running. \
+             If `dbg start` is mid-init the pid file should exist; check \
+             $XDG_RUNTIME_DIR/dbg-$UID/ for stale state."
+        )
+    })?;
+
+    // Daemon → bash (depth 1) → collector (depth 2). The collector is
+    // what we want to SIGINT; bash itself ignores SIGINT in interactive
+    // mode. Fall back to depth-1 children if depth-2 is empty (covers
+    // backends that don't go through bash, or races where the
+    // collector hasn't spawned yet).
+    let depth1 = daemon::proc_children(daemon_pid);
+    if depth1.is_empty() {
+        bail!(
+            "daemon {daemon_pid} has no child processes — has the collector \
+             already exited? Try `dbg status` to see the current state."
+        );
+    }
+    let mut targets: Vec<i32> = depth1
+        .iter()
+        .flat_map(|&p| daemon::proc_children(p))
+        .collect();
+    if targets.is_empty() {
+        targets = depth1.clone();
+    }
+
+    let mut signalled = Vec::new();
+    let mut errors = Vec::new();
+    for pid in &targets {
+        // Send to the process group, not the bare PID: collectors that
+        // fork helper processes (perf record's session manager, etc.)
+        // need every member to see the signal for a clean shutdown.
+        let pgid = getpgid(Some(Pid::from_raw(*pid)))
+            .map(|p| p.as_raw())
+            .unwrap_or(*pid);
+        match kill(Pid::from_raw(-pgid), Signal::SIGINT) {
+            Ok(()) => signalled.push(*pid),
+            // EPERM is rare here (same-uid) but include the bare PID as
+            // a fallback so we still try the direct kill.
+            Err(_) => match kill(Pid::from_raw(*pid), Signal::SIGINT) {
+                Ok(()) => signalled.push(*pid),
+                Err(e) => errors.push((*pid, e)),
+            },
+        }
+    }
+
+    if signalled.is_empty() {
+        let msg: String = errors
+            .iter()
+            .map(|(p, e)| format!("{p}: {e}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        bail!("finalize: failed to signal any collector ({msg})");
+    }
+
+    println!(
+        "finalize: SIGINT sent to {} collector process(es): {:?}",
+        signalled.len(),
+        signalled
+    );
+    if !errors.is_empty() {
+        eprintln!(
+            "finalize: {} child(ren) could not be signalled: {:?}",
+            errors.len(),
+            errors.iter().map(|(p, _)| p).collect::<Vec<_>>()
+        );
+    }
+    println!(
+        "the collector should now flush its trace and exit. The daemon will \
+         convert the trace and start serving profile queries — poll with \
+         `dbg status` or just run `dbg top` (it will block until init completes)."
+    );
     Ok(())
 }
 

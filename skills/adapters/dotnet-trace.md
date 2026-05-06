@@ -31,6 +31,18 @@ dotnet-trace is the official Microsoft .NET CLI profiler. It captures CPU sample
 2. The app runs and trace collects automatically. Wait for completion.
 3. Profile data is loaded into memory. All subsequent `dbg` commands query the profile directly.
 
+### Long-running server (profile under load)
+
+`dotnet-trace collect -- <target>` blocks until the target exits, and the speedscope conversion runs only after that. So for a server you want to profile under live load:
+
+1. `dbg start dotnet-trace <server.dll>` — server boots under the collector
+2. drive load against it (bench, replay traffic, ...) — do **not** try to query yet; the daemon's accept loop hasn't started
+3. `dbg finalize` — SIGINTs the dotnet-trace collector via the daemon's child tree. Collector flushes the `.nettrace`, the daemon runs the speedscope convert step, then transitions into query mode. (Equivalent to externally killing the target — `dbg finalize` just doesn't make you look up the PID.)
+4. `dbg top`, `dbg callers <sym>`, etc. now work
+5. `dbg kill` to persist the session under `.dbg/sessions/<label>/` for later `dbg replay`
+
+`dbg cancel` does **not** substitute for `dbg finalize` here: `cancel` rides the daemon socket, but the accept loop only starts after init — and init is exactly what's blocked on the collector. `finalize` is client-side: it reads the daemon's pid file and signals the child tree directly.
+
 ## Key Commands
 
 After the trace completes, the session enters profile mode. All commands go through `dbg`:
