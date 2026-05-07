@@ -9,7 +9,6 @@
 //! matrix below makes those differences first-class so the planner
 //! can pick honestly and `--why` can explain the choice.
 
-use std::collections::BTreeMap;
 use std::time::Duration;
 
 use anyhow::Result;
@@ -249,8 +248,7 @@ pub trait HostProbe {
 pub struct HostProbeAuto;
 impl HostProbe for HostProbeAuto {
     fn is_available(&self, id: BackendId) -> bool {
-        self.unavailable_reason(id).is_none()
-            && matches!(id, BackendId::Pt | BackendId::Uprobe)
+        self.unavailable_reason(id).is_none() && matches!(id, BackendId::Pt | BackendId::Uprobe)
     }
 
     fn unavailable_reason(&self, id: BackendId) -> Option<String> {
@@ -303,7 +301,10 @@ pub fn plan(req: &Request, probe: &dyn HostProbe) -> std::result::Result<Plan, S
                 Verdict::Eligible => {
                     let mut t = trail;
                     t[idx].verdict = Verdict::Chosen;
-                    Ok(Plan { chosen: forced, trail: t })
+                    Ok(Plan {
+                        chosen: forced,
+                        trail: t,
+                    })
                 }
                 Verdict::Rejected(r) => Err(format!(
                     "backend `{name}` is not eligible for this request: {r}",
@@ -356,16 +357,12 @@ fn no_eligible_reason(req: &Request, trail: &[TrailEntry]) -> String {
         .filter(|e| !matches!(e.verdict, Verdict::NotAvailable(_)))
         .collect();
     if avail.is_empty() {
-        let mut buf =
-            String::from("no instruction-hit backend is available on this host:\n");
+        let mut buf = String::from("no instruction-hit backend is available on this host:\n");
         for e in trail {
             if let Verdict::NotAvailable(reason) = &e.verdict {
                 match reason {
                     Some(r) => buf.push_str(&format!("  {:>7}: {}\n", e.backend.as_str(), r)),
-                    None => buf.push_str(&format!(
-                        "  {:>7}: not available\n",
-                        e.backend.as_str()
-                    )),
+                    None => buf.push_str(&format!("  {:>7}: not available\n", e.backend.as_str())),
                 }
             }
         }
@@ -400,11 +397,9 @@ pub fn format_why(plan: &Plan) -> String {
                 "  {:>7}: eligible (not chosen, higher overhead)\n",
                 e.backend.as_str()
             )),
-            Verdict::Rejected(r) => buf.push_str(&format!(
-                "  {:>7}: rejected -- {}\n",
-                e.backend.as_str(),
-                r
-            )),
+            Verdict::Rejected(r) => {
+                buf.push_str(&format!("  {:>7}: rejected -- {}\n", e.backend.as_str(), r))
+            }
             Verdict::NotAvailable(reason) => match reason {
                 Some(r) => buf.push_str(&format!(
                     "  {:>7}: not available -- {}\n",
@@ -470,7 +465,8 @@ pub fn try_dispatch(input: &str) -> Option<super::Dispatched> {
             "--backend" => {
                 let Some(v) = toks.next() else {
                     return Some(super::Dispatched::Immediate(
-                        "--backend needs a name (auto, pt, etm, uprobe, hwbp, ibs, pebs, spe)".into(),
+                        "--backend needs a name (auto, pt, etm, uprobe, hwbp, ibs, pebs, spe)"
+                            .into(),
                     ));
                 };
                 if v == "auto" {
@@ -536,7 +532,6 @@ flags:
 /// session-DB or daemon types so the backends stay testable in
 /// isolation.
 pub trait Collector {
-    fn id(&self) -> BackendId;
     fn collect(&self, req: &Request, ctx: &CollectCtx<'_>) -> Result<Outcome>;
 }
 
@@ -566,18 +561,12 @@ pub struct Outcome {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SampleBasis {
     Exact,
-    Pebs,
-    Ibs,
-    Spe,
 }
 
 impl SampleBasis {
     pub fn as_str(self) -> &'static str {
         match self {
             SampleBasis::Exact => "exact",
-            SampleBasis::Pebs => "pebs",
-            SampleBasis::Ibs => "ibs",
-            SampleBasis::Spe => "spe",
         }
     }
 }
@@ -595,10 +584,6 @@ pub struct HitDetail {
 pub struct MockBackend;
 
 impl Collector for MockBackend {
-    fn id(&self) -> BackendId {
-        BackendId::Mock
-    }
-
     fn collect(&self, req: &Request, _ctx: &CollectCtx<'_>) -> Result<Outcome> {
         let window_us = match req.mode {
             Mode::Live => 1_000_000.0,
@@ -618,12 +603,7 @@ impl Collector for MockBackend {
 /// Top-level execution. Plans, picks a Collector by `BackendId`,
 /// invokes it, and writes one `insn_hits` row plus zero or more
 /// `insn_hit_details` rows. Returns the user-facing summary.
-pub fn run(
-    req: &Request,
-    db: &SessionDb,
-    probe: &dyn HostProbe,
-    ctx: &CollectCtx<'_>,
-) -> String {
+pub fn run(req: &Request, db: &SessionDb, probe: &dyn HostProbe, ctx: &CollectCtx<'_>) -> String {
     let plan = match plan(req, probe) {
         Ok(p) => p,
         Err(e) => return e,
@@ -635,14 +615,17 @@ pub fn run(
         buf.push('\n');
     }
 
-    let collector = collector_for(plan.chosen);
+    let collector = match collector_for(plan.chosen) {
+        Ok(c) => c,
+        Err(e) => {
+            buf.push_str(&format!("[{} backend failed: {e}]", plan.chosen.as_str()));
+            return buf;
+        }
+    };
     let outcome = match collector.collect(req, ctx) {
         Ok(o) => o,
         Err(e) => {
-            buf.push_str(&format!(
-                "[{} backend failed: {e}]",
-                plan.chosen.as_str()
-            ));
+            buf.push_str(&format!("[{} backend failed: {e}]", plan.chosen.as_str()));
             return buf;
         }
     };
@@ -650,25 +633,24 @@ pub fn run(
     if let Err(e) = persist(db, req, &plan, &outcome) {
         // A persistence failure should not hide the count we already
         // measured. Surface both so the agent can react.
-        buf.push_str(&format!(
-            "[warn: writing insn_hits row failed: {e}]\n"
-        ));
+        buf.push_str(&format!("[warn: writing insn_hits row failed: {e}]\n"));
     }
 
     buf.push_str(&format_outcome(req, &plan, &outcome));
     buf
 }
 
-fn collector_for(id: BackendId) -> Box<dyn Collector> {
-    // TODO(insn-hits): ETM, PEBS, IBS, SPE, hwbp still route through
-    // MockBackend; the planner already advertises their capabilities
-    // so when their collectors land the only change here is an extra
-    // match arm.
+fn collector_for(id: BackendId) -> Result<Box<dyn Collector>> {
     match id {
-        BackendId::Pt => Box::new(pt::PtBackend),
-        BackendId::Uprobe => Box::new(uprobe::UprobeBackend),
-        BackendId::Mock => Box::new(MockBackend),
-        _ => Box::new(MockBackend),
+        BackendId::Pt => Ok(Box::new(pt::PtBackend)),
+        BackendId::Uprobe => Ok(Box::new(uprobe::UprobeBackend)),
+        BackendId::Mock => Ok(Box::new(MockBackend)),
+        BackendId::Etm | BackendId::Hwbp | BackendId::Ibs | BackendId::Pebs | BackendId::Spe => {
+            anyhow::bail!(
+                "{} backend is planned but its collector is not implemented yet",
+                id.as_str()
+            )
+        }
     }
 }
 
@@ -701,13 +683,7 @@ fn persist(db: &SessionDb, req: &Request, plan: &Plan, outcome: &Outcome) -> Res
 }
 
 fn format_outcome(req: &Request, plan: &Plan, outcome: &Outcome) -> String {
-    let basis = match outcome.sample_basis {
-        SampleBasis::Exact => "exact".to_string(),
-        other => match outcome.sample_period {
-            Some(p) => format!("{} (period={})", other.as_str(), p),
-            None => other.as_str().to_string(),
-        },
-    };
+    let basis = outcome.sample_basis.as_str().to_string();
     let window = outcome
         .window_us
         .map(|us| format!("{:.1}ms", us / 1000.0))
@@ -724,12 +700,6 @@ fn format_outcome(req: &Request, plan: &Plan, outcome: &Outcome) -> String {
         backend = plan.chosen.as_str(),
         hits = outcome.hit_count,
     )
-}
-
-/// Public so the daemon's `pub fn is_repl_verb` can refer to a
-/// stable list of verbs without each module re-encoding it.
-pub fn verbs() -> &'static [&'static str] {
-    &["insn-hits"]
 }
 
 /// True when the calling process is running as root. Read from
@@ -776,10 +746,6 @@ pub mod uprobe {
     pub struct UprobeBackend;
 
     impl Collector for UprobeBackend {
-        fn id(&self) -> BackendId {
-            BackendId::Uprobe
-        }
-
         fn collect(&self, req: &Request, ctx: &CollectCtx<'_>) -> Result<Outcome> {
             validate_target(&req.target)?;
             if !is_bpftrace_available() {
@@ -850,9 +816,7 @@ pub mod uprobe {
         if target.is_empty() {
             anyhow::bail!("empty target");
         }
-        let allowed = |c: char| {
-            c.is_ascii_alphanumeric() || c == '_' || c == '$' || c == '.'
-        };
+        let allowed = |c: char| c.is_ascii_alphanumeric() || c == '_' || c == '$' || c == '.';
         for c in target.chars() {
             if !allowed(c) {
                 anyhow::bail!(
@@ -875,13 +839,9 @@ pub mod uprobe {
             target.to_string()
         };
         if with_stack {
-            format!(
-                "uprobe:{binary}:{probe_target} {{ @[ustack] = count(); }}"
-            )
+            format!("uprobe:{binary}:{probe_target} {{ @[ustack] = count(); }}")
         } else {
-            format!(
-                "uprobe:{binary}:{probe_target} {{ @ = count(); }}"
-            )
+            format!("uprobe:{binary}:{probe_target} {{ @ = count(); }}")
         }
     }
 
@@ -941,11 +901,7 @@ pub mod uprobe {
                 let abs_close = abs_open + close_rel;
                 let body = &raw[abs_open..abs_close];
                 let after = &raw[abs_close + 2..];
-                let count_str = after
-                    .lines()
-                    .next()
-                    .unwrap_or("")
-                    .trim();
+                let count_str = after.lines().next().unwrap_or("").trim();
                 let n: u64 = count_str.parse().unwrap_or(0);
                 let stack: Vec<String> = body
                     .lines()
@@ -1070,56 +1026,6 @@ Attaching 1 probe...
     }
 }
 
-// ============================================================
-// Aggregation helpers (replay surface)
-// ============================================================
-
-/// Read all `insn_hits` rows for one session, grouped by target. Used
-/// by replay to render a one-shot summary without re-running the
-/// collector. Returns `BTreeMap` so the order is deterministic.
-pub fn aggregate_by_target(db: &SessionDb) -> BTreeMap<String, Vec<StoredRow>> {
-    let mut out: BTreeMap<String, Vec<StoredRow>> = BTreeMap::new();
-    let Ok(mut stmt) = db.conn().prepare(
-        "SELECT target, hit_count, sample_basis, sample_period, window_us,
-                backend, collected_at, detail_json
-         FROM insn_hits
-         WHERE session_id = ?1
-         ORDER BY collected_at ASC, id ASC",
-    ) else {
-        return out;
-    };
-    let rows = stmt.query_map(params![db.session_id()], |r| {
-        Ok(StoredRow {
-            target: r.get(0)?,
-            hit_count: r.get(1)?,
-            sample_basis: r.get(2)?,
-            sample_period: r.get(3)?,
-            window_us: r.get(4)?,
-            backend: r.get(5)?,
-            collected_at: r.get(6)?,
-            detail_summary: r.get(7)?,
-        })
-    });
-    if let Ok(it) = rows {
-        for r in it.flatten() {
-            out.entry(r.target.clone()).or_default().push(r);
-        }
-    }
-    out
-}
-
-#[derive(Clone, Debug)]
-pub struct StoredRow {
-    pub target: String,
-    pub hit_count: i64,
-    pub sample_basis: String,
-    pub sample_period: Option<i64>,
-    pub window_us: Option<f64>,
-    pub backend: String,
-    pub collected_at: String,
-    pub detail_summary: Option<String>,
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1130,6 +1036,14 @@ mod tests {
     impl HostProbe for FakeProbe {
         fn is_available(&self, id: BackendId) -> bool {
             self.0.contains(&id)
+        }
+
+        fn unavailable_reason(&self, id: BackendId) -> Option<String> {
+            if self.is_available(id) {
+                None
+            } else {
+                Some("not provided by fake probe".into())
+            }
         }
     }
 
@@ -1174,7 +1088,10 @@ mod tests {
     }
     impl CollectCtxOwned {
         fn as_ref(&self) -> CollectCtx<'_> {
-            CollectCtx { target_binary: &self.target_binary, cwd: &self.cwd }
+            CollectCtx {
+                target_binary: &self.target_binary,
+                cwd: &self.cwd,
+            }
         }
     }
 
@@ -1194,10 +1111,9 @@ mod tests {
 
     #[test]
     fn parser_full_flag_set() {
-        let d = try_dispatch(
-            "insn-hits foo --live --with-stack --with-regs --backend uprobe --why",
-        )
-        .unwrap();
+        let d =
+            try_dispatch("insn-hits foo --live --with-stack --with-regs --backend uprobe --why")
+                .unwrap();
         match d {
             super::super::Dispatched::InsnHits(r) => {
                 assert_eq!(r.target, "foo");
@@ -1316,7 +1232,11 @@ mod tests {
         assert!(err.contains("no instruction-hit backend"), "{err}");
         // Every BACKENDS entry should appear in the per-backend list.
         for (id, _) in BACKENDS.iter() {
-            assert!(err.contains(id.as_str()), "missing {} in: {err}", id.as_str());
+            assert!(
+                err.contains(id.as_str()),
+                "missing {} in: {err}",
+                id.as_str()
+            );
         }
     }
 
@@ -1381,12 +1301,22 @@ mod tests {
         assert!(summary.contains("backend: mock"), "{summary}");
         assert!(summary.contains("hits:    42"), "{summary}");
 
-        let stored = aggregate_by_target(&db);
-        let rows = stored.get("foo").expect("missing target row");
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].hit_count, 42);
-        assert_eq!(rows[0].backend, "mock");
-        assert_eq!(rows[0].sample_basis, "exact");
+        let rows: Vec<(i64, String, String)> = db
+            .conn()
+            .prepare(
+                "SELECT hit_count, backend, sample_basis
+                 FROM insn_hits
+                 WHERE session_id = ?1 AND target = ?2
+                 ORDER BY collected_at ASC, id ASC",
+            )
+            .unwrap()
+            .query_map(params![db.session_id(), "foo"], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(rows, vec![(42, "mock".into(), "exact".into())]);
     }
 
     #[test]
@@ -1400,7 +1330,24 @@ mod tests {
         let out = run(&r, &db, &probe, &c.as_ref());
         let why_pos = out.find("backend=mock").unwrap();
         let summary_pos = out.find("insn-hits foo").unwrap();
-        assert!(why_pos < summary_pos, "--why should print before summary:\n{out}");
+        assert!(
+            why_pos < summary_pos,
+            "--why should print before summary:\n{out}"
+        );
+    }
+
+    #[test]
+    fn run_fails_instead_of_mocking_unimplemented_backend() {
+        let tmp = TempDir::new().unwrap();
+        let db = mk_db(&tmp, "s3");
+        let mut r = req("foo");
+        r.forced_backend = Some(BackendId::Spe);
+        let probe = FakeProbe(vec![BackendId::Spe]);
+        let c = ctx();
+        let out = run(&r, &db, &probe, &c.as_ref());
+        assert!(out.contains("spe backend failed"), "{out}");
+        assert!(out.contains("not implemented"), "{out}");
+        assert!(!out.contains("hits:    42"), "{out}");
     }
 }
 
@@ -1422,17 +1369,13 @@ pub mod pt {
     //! per the upstream docs, so the tally result is cached
     //! alongside the trace keyed by (mtime, target).
     use super::*;
-    use std::path::{Path, PathBuf};
+    use std::path::Path;
     use std::process::Command;
     use std::time::Duration;
 
     pub struct PtBackend;
 
     impl Collector for PtBackend {
-        fn id(&self) -> BackendId {
-            BackendId::Pt
-        }
-
         fn collect(&self, req: &Request, ctx: &CollectCtx<'_>) -> Result<Outcome> {
             if !is_intel_pt_available() {
                 anyhow::bail!(
@@ -1449,12 +1392,13 @@ pub mod pt {
                 ),
                 Mode::Window(d) => d,
             };
-            let pid = find_pid(ctx.target_binary)
-                .ok_or_else(|| anyhow::anyhow!(
+            let pid = find_pid(ctx.target_binary).ok_or_else(|| {
+                anyhow::anyhow!(
                     "no running process found for `{}`. Start the workload first; \
                      PT attaches to a live PID.",
                     ctx.target_binary
-                ))?;
+                )
+            })?;
 
             let trace_dir = ctx.cwd.join(".dbg").join("pt");
             std::fs::create_dir_all(&trace_dir).ok();
@@ -1490,7 +1434,9 @@ pub mod pt {
     /// for the window to elapse.
     pub(super) fn unavailable_reason() -> Option<String> {
         if !Path::new("/sys/bus/event_source/devices/intel_pt").exists() {
-            return Some("Intel PT PMU not present (non-Intel CPU or kernel support absent)".into());
+            return Some(
+                "Intel PT PMU not present (non-Intel CPU or kernel support absent)".into(),
+            );
         }
         if which::which("perf").is_err() {
             return Some("perf not on PATH (install linux-perf or linux-tools)".into());
@@ -1597,12 +1543,8 @@ pub mod pt {
     /// hit. Hex prefixes are case-insensitive.
     fn line_ip_matches(line: &str, target: &str) -> bool {
         let t = target.to_ascii_lowercase();
-        line.split_ascii_whitespace().any(|tok| tok.to_ascii_lowercase() == t)
-    }
-
-    #[allow(dead_code)]
-    pub(super) fn perf_data_cache_path(raw_dir: &Path) -> PathBuf {
-        raw_dir.join("perf.data")
+        line.split_ascii_whitespace()
+            .any(|tok| tok.to_ascii_lowercase() == t)
     }
 
     #[cfg(test)]
