@@ -132,8 +132,7 @@ struct V8CallFrame {
 
 impl ProfileData {
     pub fn load(path: &Path) -> Result<Self> {
-        let content = std::fs::read_to_string(path)
-            .context("failed to read profile file")?;
+        let content = std::fs::read_to_string(path).context("failed to read profile file")?;
         let ext = path.extension().and_then(|e| e.to_str());
         Self::load_str(&content, ext)
     }
@@ -342,7 +341,12 @@ impl ProfileData {
                 } else {
                     &node.call_frame.function_name
                 };
-                format!("{} ({}:{})", fn_name, node.call_frame.url, node.call_frame.line_number + 1)
+                format!(
+                    "{} ({}:{})",
+                    fn_name,
+                    node.call_frame.url,
+                    node.call_frame.line_number + 1
+                )
             };
             let frame_idx = *name_to_frame.entry(name.clone()).or_insert_with(|| {
                 let idx = frames.len();
@@ -469,8 +473,7 @@ impl ProfileData {
                                     .or_default()
                                     .push((parent_idx, duration));
                             }
-                            let mut trace: Vec<usize> =
-                                stack.iter().map(|(idx, _)| *idx).collect();
+                            let mut trace: Vec<usize> = stack.iter().map(|(idx, _)| *idx).collect();
                             trace.push(opened_idx);
                             stacks.push((trace.clone(), duration));
                             pending_events.push(StackEvent {
@@ -693,10 +696,7 @@ impl ProfileData {
             "phase" => self.cmd_phase(&parts[1..]),
             "phases" => self.cmd_phase_list(),
             "marks" => {
-                let threshold: f64 = parts
-                    .get(1)
-                    .and_then(|s| s.parse().ok())
-                    .unwrap_or(50.0);
+                let threshold: f64 = parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(50.0);
                 self.cmd_marks(threshold)
             }
             "reset" => {
@@ -764,7 +764,8 @@ impl ProfileData {
         // meaningful percentages — surface that instead of dividing by
         // ~0 and printing millions-of-percent garbage.
         if total <= 0.01 {
-            let active_filters = self.focus.is_some() || self.ignore.is_some() || self.window.is_some();
+            let active_filters =
+                self.focus.is_some() || self.ignore.is_some() || self.window.is_some();
             if active_filters {
                 return "(baseline is empty under current filters — nothing matched; try `reset` or a narrower ignore pattern)\n"
                     .to_string();
@@ -774,7 +775,17 @@ impl ProfileData {
         let mut entries: Vec<(usize, f64, f64)> = (0..self.frames.len())
             .filter(|&i| self.matches_filter(i))
             .filter(|&i| inclusive[i] > 0.0)
-            .map(|i| (i, inclusive[i], if exclusive_available { self.exclusive[i] } else { 0.0 }))
+            .map(|i| {
+                (
+                    i,
+                    inclusive[i],
+                    if exclusive_available {
+                        self.exclusive[i]
+                    } else {
+                        0.0
+                    },
+                )
+            })
             .collect();
 
         entries.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
@@ -782,7 +793,10 @@ impl ProfileData {
 
         let total = total.max(0.001);
         let mut out = if exclusive_available {
-            format!("{:<60} {:>10} {:>10}\n", "Function", "Inclusive", "Exclusive")
+            format!(
+                "{:<60} {:>10} {:>10}\n",
+                "Function", "Inclusive", "Exclusive"
+            )
         } else {
             format!("{:<60} {:>10}\n", "Function", "Inclusive")
         };
@@ -796,11 +810,7 @@ impl ProfileData {
                     exc / total * 100.0
                 ));
             } else {
-                out.push_str(&format!(
-                    "{:<60} {:>9.1}%\n",
-                    name,
-                    inc / total * 100.0
-                ));
+                out.push_str(&format!("{:<60} {:>9.1}%\n", name, inc / total * 100.0));
             }
         }
         out
@@ -949,10 +959,7 @@ impl ProfileData {
     fn is_trivial_pseudo_stack(&self, stack: &[usize]) -> bool {
         stack.iter().all(|&i| {
             let n = self.frames.get(i).map(|f| f.name.as_str()).unwrap_or("");
-            matches!(
-                n,
-                "(root)" | "(program)" | "(idle)" | "(garbage collector)"
-            )
+            matches!(n, "(root)" | "(program)" | "(idle)" | "(garbage collector)")
         })
     }
 
@@ -978,7 +985,11 @@ impl ProfileData {
             .iter()
             .filter(|(stack, _)| !self.is_trivial_pseudo_stack(stack))
             .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
-            .or_else(|| aggregated.iter().max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal)));
+            .or_else(|| {
+                aggregated
+                    .iter()
+                    .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
+            });
 
         match hottest {
             Some((stack, time)) => {
@@ -1036,9 +1047,7 @@ impl ProfileData {
             .frames
             .iter()
             .enumerate()
-            .filter(|(i, f)| {
-                f.name.contains(pattern) && self.inclusive[*i] > 0.0
-            })
+            .filter(|(i, f)| f.name.contains(pattern) && self.inclusive[*i] > 0.0)
             .collect();
 
         if matches.is_empty() {
@@ -1263,14 +1272,70 @@ impl SpeedscopeBuilder {
         }));
     }
 
+    fn add_diffed_samples(&mut self, name: String, mut samples: Vec<(f64, Vec<String>)>) {
+        samples.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+
+        let mut events: Vec<serde_json::Value> = Vec::new();
+        let mut prev: Vec<usize> = Vec::new();
+        let mut prev_time = samples.first().map(|(t_ms, _)| *t_ms).unwrap_or(0.0);
+
+        for (t_ms, stack_names) in samples {
+            let stack: Vec<usize> = stack_names.into_iter().map(|n| self.intern(n)).collect();
+            let common = prev
+                .iter()
+                .zip(stack.iter())
+                .take_while(|(a, b)| a == b)
+                .count();
+            for j in (common..prev.len()).rev() {
+                events.push(serde_json::json!({"type":"C","at":prev_time,"frame":prev[j]}));
+            }
+            for &idx in &stack[common..] {
+                events.push(serde_json::json!({"type":"O","at":t_ms,"frame":idx}));
+            }
+            prev = stack;
+            prev_time = t_ms;
+        }
+
+        for j in (0..prev.len()).rev() {
+            events.push(serde_json::json!({"type":"C","at":prev_time,"frame":prev[j]}));
+        }
+
+        self.add_profile(name, events);
+    }
+
+    fn add_stack_sample_profile(
+        &mut self,
+        name: String,
+        stack_names: Vec<String>,
+        open_at: f64,
+        close_at: f64,
+    ) {
+        let stack: Vec<usize> = stack_names.into_iter().map(|n| self.intern(n)).collect();
+        let mut events: Vec<serde_json::Value> = Vec::with_capacity(stack.len() * 2);
+        for &idx in &stack {
+            events.push(serde_json::json!({"type":"O","at":open_at,"frame":idx}));
+        }
+        for &idx in stack.iter().rev() {
+            events.push(serde_json::json!({"type":"C","at":close_at,"frame":idx}));
+        }
+        self.add_profile(name, events);
+    }
+
+    fn is_empty(&self) -> bool {
+        self.profiles.is_empty()
+    }
+
     fn build(self) -> String {
-        let frames: Vec<_> = self.frame_names.iter()
+        let frames: Vec<_> = self
+            .frame_names
+            .iter()
             .map(|n| serde_json::json!({"name": n}))
             .collect();
         serde_json::json!({
             "shared": { "frames": frames },
             "profiles": self.profiles,
-        }).to_string()
+        })
+        .to_string()
     }
 }
 
@@ -1337,12 +1402,18 @@ fn perf_script_to_speedscope(text: &str) -> Result<String> {
         //   myapp   12345/12345 [002] 1234.567:    1000 cycles:
         // The timestamp is always "<secs>.<frac>:". Find it and the
         // leading comm/tid cluster.
-        let Some(ts_colon_idx) = raw.find(':') else { continue };
+        let Some(ts_colon_idx) = raw.find(':') else {
+            continue;
+        };
         let before_ts = &raw[..ts_colon_idx];
         // Timestamp is the last whitespace-separated token before `:`
         // that parses as f64.
-        let Some(ts_tok) = before_ts.split_whitespace().last() else { continue };
-        let Ok(ts_sec) = ts_tok.parse::<f64>() else { continue };
+        let Some(ts_tok) = before_ts.split_whitespace().last() else {
+            continue;
+        };
+        let Ok(ts_sec) = ts_tok.parse::<f64>() else {
+            continue;
+        };
         flush(&mut samples, &mut cur_thread, &mut cur_t, &mut cur_stack);
         // Thread id: prefer "pid/tid" → tid; else the first numeric token.
         let thread = before_ts
@@ -1372,28 +1443,9 @@ fn perf_script_to_speedscope(text: &str) -> Result<String> {
     }
 
     let mut builder = SpeedscopeBuilder::new();
-    for (thread, mut samples) in by_thread {
-        samples.sort_by(|a, b| a.t_ms.partial_cmp(&b.t_ms).unwrap_or(std::cmp::Ordering::Equal));
-        let mut events: Vec<serde_json::Value> = Vec::new();
-        let mut prev: Vec<usize> = Vec::new();
-        let mut prev_time = samples.first().map(|s| s.t_ms).unwrap_or(0.0);
-        for s in samples {
-            let stack: Vec<usize> = s.stack.into_iter().map(|n| builder.intern(n)).collect();
-            let common = prev.iter().zip(stack.iter()).take_while(|(a, b)| a == b).count();
-            for j in (common..prev.len()).rev() {
-                events.push(serde_json::json!({"type":"C","at":prev_time,"frame":prev[j]}));
-            }
-            for &idx in &stack[common..] {
-                events.push(serde_json::json!({"type":"O","at":s.t_ms,"frame":idx}));
-            }
-            prev = stack;
-            prev_time = s.t_ms;
-        }
-        // Close any still-open frames at the last timestamp.
-        for j in (0..prev.len()).rev() {
-            events.push(serde_json::json!({"type":"C","at":prev_time,"frame":prev[j]}));
-        }
-        builder.add_profile(format!("tid-{thread}"), events);
+    for (thread, samples) in by_thread {
+        let samples = samples.into_iter().map(|s| (s.t_ms, s.stack)).collect();
+        builder.add_diffed_samples(format!("tid-{thread}"), samples);
     }
     Ok(builder.build())
 }
@@ -1462,7 +1514,9 @@ fn pprof_traces_to_speedscope(text: &str) -> Result<String> {
         let mut parts = trimmed.splitn(2, char::is_whitespace);
         let dur_tok = parts.next().unwrap_or("");
         let first_frame = parts.next().unwrap_or("").trim();
-        let Some(dur_ms) = parse_duration_ms(dur_tok) else { continue };
+        let Some(dur_ms) = parse_duration_ms(dur_tok) else {
+            continue;
+        };
 
         let mut stack_innermost_first: Vec<String> = Vec::new();
         if !first_frame.is_empty() {
@@ -1478,23 +1532,19 @@ fn pprof_traces_to_speedscope(text: &str) -> Result<String> {
             continue;
         }
         stack_innermost_first.reverse();
-        let stack: Vec<usize> = stack_innermost_first.into_iter()
-            .map(|n| builder.intern(n)).collect();
 
         let open_at = now;
         let close_at = now + dur_ms;
-        let mut events: Vec<serde_json::Value> = Vec::new();
-        for &idx in &stack {
-            events.push(serde_json::json!({"type":"O","at":open_at,"frame":idx}));
-        }
-        for &idx in stack.iter().rev() {
-            events.push(serde_json::json!({"type":"C","at":close_at,"frame":idx}));
-        }
-        builder.add_profile(format!("sample-{sample_i}"), events);
+        builder.add_stack_sample_profile(
+            format!("sample-{sample_i}"),
+            stack_innermost_first,
+            open_at,
+            close_at,
+        );
         now = close_at;
     }
 
-    if builder.profiles.is_empty() {
+    if builder.is_empty() {
         anyhow::bail!("no sample blocks found in pprof -traces output");
     }
 
@@ -1734,7 +1784,10 @@ mod tests {
         let mut p = load_two_phase_sample();
         p.handle_command("window 0 50");
         let out = p.handle_command("top");
-        assert!(out.contains("work_a"), "work_a should appear in phase A: {out}");
+        assert!(
+            out.contains("work_a"),
+            "work_a should appear in phase A: {out}"
+        );
         assert!(!out.contains("work_b"), "work_b must not appear: {out}");
     }
 
@@ -2258,7 +2311,10 @@ Duration: 1s
         let out = p.handle_command("top");
         assert!(out.contains("hot") && out.contains("100.0%"), "{out}");
         assert!(!out.contains("idle"), "{out}");
-        assert!(!out.contains("noise"), "noise was under idle's subtree: {out}");
+        assert!(
+            !out.contains("noise"),
+            "noise was under idle's subtree: {out}"
+        );
     }
 
     #[test]
@@ -2337,10 +2393,7 @@ Duration: 1s
     fn tree_with_recursive_profile_no_infinite_loop() {
         // Build a profile with a cycle: A -> B -> A
         // A is the root (no parents entry), B -> A creates the cycle
-        let frames = vec![
-            Frame { name: "A".into() },
-            Frame { name: "B".into() },
-        ];
+        let frames = vec![Frame { name: "A".into() }, Frame { name: "B".into() }];
         let inclusive = vec![10.0, 8.0];
         let exclusive = vec![2.0, 2.0];
         let mut children = HashMap::new();
@@ -2349,9 +2402,7 @@ Duration: 1s
         let mut parents = HashMap::new();
         // Only B has a parent (A) — A is a root
         parents.insert(1, vec![(0, 8.0)]);
-        let stacks = vec![
-            (vec![0, 1], 8.0),
-        ];
+        let stacks = vec![(vec![0, 1], 8.0)];
         let mut p = ProfileData {
             frames,
             inclusive,
@@ -2374,7 +2425,10 @@ Duration: 1s
         assert!(out.contains("B"));
         // A should NOT appear twice (cycle broken)
         let a_count = out.matches("A").count();
-        assert_eq!(a_count, 1, "A appeared {a_count} times — cycle not broken: {out}");
+        assert_eq!(
+            a_count, 1,
+            "A appeared {a_count} times — cycle not broken: {out}"
+        );
     }
 
     fn sample_v8_cpuprofile() -> String {
@@ -2421,7 +2475,10 @@ Duration: 1s
         assert!(top.contains("sort"), "top should list sort: {top}");
 
         let callers = p.handle_command("callers compute");
-        assert!(callers.contains("main"), "compute should be called by main: {callers}");
+        assert!(
+            callers.contains("main"),
+            "compute should be called by main: {callers}"
+        );
 
         let stats = p.handle_command("stats");
         assert!(stats.contains("frames: 4"));
@@ -2451,8 +2508,12 @@ Duration: 1s
         let p = ProfileData::load_v8_cpuprofile(&sample_v8_recursive()).unwrap();
         // Nodes 3, 4, 5 are all "fib" — should be deduplicated to one frame
         let fib_count = p.frames.iter().filter(|f| f.name.contains("fib")).count();
-        assert_eq!(fib_count, 1, "fib should appear once, got {fib_count}; frames: {:?}",
-            p.frames.iter().map(|f| &f.name).collect::<Vec<_>>());
+        assert_eq!(
+            fib_count,
+            1,
+            "fib should appear once, got {fib_count}; frames: {:?}",
+            p.frames.iter().map(|f| &f.name).collect::<Vec<_>>()
+        );
     }
 
     #[test]
@@ -2463,7 +2524,9 @@ Duration: 1s
             assert!(
                 p.inclusive[i] <= p.total_time * 1.01, // 1% tolerance for float
                 "frame '{}' inclusive {:.2}ms exceeds total {:.2}ms",
-                frame.name, p.inclusive[i], p.total_time
+                frame.name,
+                p.inclusive[i],
+                p.total_time
             );
         }
     }
@@ -2482,11 +2545,15 @@ Duration: 1s
         // fib should be called by main, but NOT by itself
         assert!(out.contains("main"), "fib should be called by main: {out}");
         // Check caller lines (skip "callers of ..." header) for self-calls
-        let caller_lines: Vec<&str> = out.lines()
+        let caller_lines: Vec<&str> = out
+            .lines()
             .filter(|l| l.contains("ms") && !l.starts_with("callers of"))
             .collect();
         for line in &caller_lines {
-            assert!(!line.contains("fib"), "fib should not self-call after collapse: {line}");
+            assert!(
+                !line.contains("fib"),
+                "fib should not self-call after collapse: {line}"
+            );
         }
     }
 
@@ -2495,8 +2562,10 @@ Duration: 1s
         let mut p = ProfileData::load_v8_cpuprofile(&sample_v8_recursive()).unwrap();
         let out = p.handle_command("callees fib");
         // After recursion collapse, fib has no callees (only called itself)
-        assert!(out.contains("leaf") || !out.contains("fib ("),
-            "fib should be leaf or not self-callee: {out}");
+        assert!(
+            out.contains("leaf") || !out.contains("fib ("),
+            "fib should be leaf or not self-callee: {out}"
+        );
     }
 
     /// V8 cpuprofile with mutual recursion: root → a → b → a → b
@@ -2522,7 +2591,11 @@ Duration: 1s
     fn v8_mutual_recursion_preserves_both() {
         let p = ProfileData::load_v8_cpuprofile(&sample_v8_mutual_recursion()).unwrap();
         // isEven and isOdd are different functions — both should exist
-        let even = p.frames.iter().filter(|f| f.name.contains("isEven")).count();
+        let even = p
+            .frames
+            .iter()
+            .filter(|f| f.name.contains("isEven"))
+            .count();
         let odd = p.frames.iter().filter(|f| f.name.contains("isOdd")).count();
         assert_eq!(even, 1, "isEven should appear once");
         assert_eq!(odd, 1, "isOdd should appear once");
@@ -2532,7 +2605,10 @@ Duration: 1s
     fn v8_mutual_recursion_callers_correct() {
         let mut p = ProfileData::load_v8_cpuprofile(&sample_v8_mutual_recursion()).unwrap();
         let callers = p.handle_command("callers isOdd");
-        assert!(callers.contains("isEven"), "isOdd should be called by isEven: {callers}");
+        assert!(
+            callers.contains("isEven"),
+            "isOdd should be called by isEven: {callers}"
+        );
     }
 
     #[test]
