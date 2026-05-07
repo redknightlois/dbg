@@ -229,6 +229,9 @@ impl Registry {
         let prev = self.type_map.insert(name.clone(), idx);
         debug_assert!(prev.is_none(), "duplicate backend name: {name}");
         for t in backend.types() {
+            if *t == name {
+                continue;
+            }
             let prev = self.type_map.insert(t.to_string(), idx);
             debug_assert!(prev.is_none(), "duplicate type registration: {t}");
         }
