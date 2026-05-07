@@ -1,7 +1,7 @@
 use super::{
-    GpuDb, escape_sql_like, fmt_us, merge_intervals, parse_count, parse_pattern,
-    require_op_layer, trunc,
+    GpuDb, fmt_us, gpu_busy_us, like_param, parse_count, parse_pattern, require_op_layer, trunc,
 };
+use rusqlite::params_from_iter;
 
 // ---------------------------------------------------------------------------
 // stats
@@ -16,7 +16,9 @@ pub fn cmd_stats(db: &GpuDb) {
 
     println!("GPU Profile Summary");
     println!("  Target:       {target}");
-    if !device.is_empty() { println!("  Device:       {device}"); }
+    if !device.is_empty() {
+        println!("  Device:       {device}");
+    }
     // When wall_time_us is missing / zero, the underlying collection
     // failed (e.g. nsys import errored out). Printing "0.0us" and
     // "0.0% of wall" for every row made broken sessions look merely
@@ -36,7 +38,11 @@ pub fn cmd_stats(db: &GpuDb) {
     };
     println!("  Kernel time:  {} ({})", fmt_us(gpu_us), fmt_pct(gpu_us));
     if xfer_us > 0.0 {
-        println!("  Transfer time: {} ({})", fmt_us(xfer_us), fmt_pct(xfer_us));
+        println!(
+            "  Transfer time: {} ({})",
+            fmt_us(xfer_us),
+            fmt_pct(xfer_us)
+        );
     }
 
     // Efficiency = GPU-not-idle wall time / program wall time.
@@ -45,11 +51,18 @@ pub fn cmd_stats(db: &GpuDb) {
     // kernel/transfer overlap are handled by interval-merging, so no double-counting.
     if wall_us > 0.0 && db.has_layer("nsys") {
         let useful = gpu_busy_us(db);
-        println!("  Efficiency:   {:.1}% ({} useful GPU / {} wall)",
-            useful / wall_us * 100.0, fmt_us(useful), fmt_us(wall_us));
+        println!(
+            "  Efficiency:   {:.1}% ({} useful GPU / {} wall)",
+            useful / wall_us * 100.0,
+            fmt_us(useful),
+            fmt_us(wall_us)
+        );
     }
-    println!("  Kernels:      {} launches, {} unique",
-        db.total_launch_count(), db.unique_kernel_count());
+    println!(
+        "  Kernels:      {} launches, {} unique",
+        db.total_launch_count(),
+        db.unique_kernel_count()
+    );
     println!("  Transfers:    {}", db.transfer_count());
     println!("  Streams:      {}", db.stream_count());
 
@@ -64,9 +77,15 @@ pub fn cmd_stats(db: &GpuDb) {
         println!("  Layers:       {}", layers.join(" + "));
     }
     let mut missing = Vec::new();
-    if !has_nsys { missing.push("nsys"); }
-    if !has_ncu { missing.push("ncu"); }
-    if !has_torch && target.ends_with(".py") { missing.push("torch"); }
+    if !has_nsys {
+        missing.push("nsys");
+    }
+    if !has_ncu {
+        missing.push("ncu");
+    }
+    if !has_torch && target.ends_with(".py") {
+        missing.push("torch");
+    }
     if !missing.is_empty() {
         println!("  Missing:      {} (run 'suggest')", missing.join(", "));
     }
@@ -76,7 +95,9 @@ pub fn cmd_stats(db: &GpuDb) {
     println!("  Deep metrics: {wm}/{uk} kernels");
 
     let wo = db.kernels_with_ops();
-    if wo > 0 { println!("  Op mapping:   {wo}/{uk} kernels"); }
+    if wo > 0 {
+        println!("  Op mapping:   {wo}/{uk} kernels");
+    }
 
     let failures = db.failures();
     if !failures.is_empty() {
@@ -98,16 +119,6 @@ pub fn cmd_stats(db: &GpuDb) {
     }
 }
 
-/// Total time (us) during which the GPU was doing work — either a kernel or a
-/// transfer. Kernel and transfer intervals are unioned and merged, so concurrent
-/// activity is only counted once.
-fn gpu_busy_us(db: &GpuDb) -> f64 {
-    let mut intervals = db.kernel_intervals();
-    intervals.extend(db.transfer_intervals(None));
-    intervals.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
-    merge_intervals(&intervals).iter().map(|(s, e)| e - s).sum()
-}
-
 // ---------------------------------------------------------------------------
 // kernels
 // ---------------------------------------------------------------------------
@@ -115,11 +126,11 @@ fn gpu_busy_us(db: &GpuDb) -> f64 {
 pub fn cmd_kernels(db: &GpuDb, args: &[&str]) {
     let n = parse_count(args);
     let pattern = parse_pattern(args);
-    let filter = db.kernel_filter();
+    let filter = db.kernel_filter_params();
     let tl = db.timeline_filter();
 
     let pattern_clause = pattern
-        .map(|p| format!(r"AND launches.kernel_name LIKE '%{}%' ESCAPE '\'", escape_sql_like(p)))
+        .map(|_| "AND launches.kernel_name LIKE ? ESCAPE '\\'")
         .unwrap_or_default();
 
     let sql = format!(
@@ -134,24 +145,48 @@ pub fn cmd_kernels(db: &GpuDb, args: &[&str]) {
                 m.memory_throughput_pct
          FROM launches
          LEFT JOIN metrics m ON m.kernel_name = launches.kernel_name
-         WHERE {filter} AND {tl} {pattern_clause}
+         WHERE {} AND {tl} {pattern_clause}
          GROUP BY launches.kernel_name
          ORDER BY total DESC
-         LIMIT ?1"
+         LIMIT ?",
+        filter.clause()
     );
 
     let gpu_total = db.total_gpu_time_us();
-    let rows: Vec<_> = db.query_vec(&sql, [n as i64], |row| {
-        Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?,
-            row.get::<_, f64>(2)?, row.get::<_, f64>(3)?, row.get::<_, f64>(4)?,
-            row.get::<_, Option<String>>(5)?, row.get::<_, Option<f64>>(6)?,
-            row.get::<_, Option<f64>>(7)?))
+    let mut query_params = filter.params();
+    let pattern_param;
+    if let Some(p) = pattern {
+        pattern_param = like_param(p);
+        query_params.push(&pattern_param);
+    }
+    let limit = n as i64;
+    query_params.push(&limit);
+
+    let rows: Vec<_> = db.query_vec(&sql, params_from_iter(query_params), |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, i64>(1)?,
+            row.get::<_, f64>(2)?,
+            row.get::<_, f64>(3)?,
+            row.get::<_, f64>(4)?,
+            row.get::<_, Option<String>>(5)?,
+            row.get::<_, Option<f64>>(6)?,
+            row.get::<_, Option<f64>>(7)?,
+        ))
     });
 
-    println!("  #  Kernel                          Time      %     Launches   Avg       Stddev    Tail%  Bound");
-    println!("  ── ──────────────────────────────── ──────── ────── ────────── ───────── ───────── ────── ────────────");
+    println!(
+        "  #  Kernel                          Time      %     Launches   Avg       Stddev    Tail%  Bound"
+    );
+    println!(
+        "  ── ──────────────────────────────── ──────── ────── ────────── ───────── ───────── ────── ────────────"
+    );
     for (i, (name, cnt, total, avg, var, bound, cmp, mem)) in rows.iter().enumerate() {
-        let pct = if gpu_total > 0.0 { total / gpu_total * 100.0 } else { 0.0 };
+        let pct = if gpu_total > 0.0 {
+            total / gpu_total * 100.0
+        } else {
+            0.0
+        };
         let stddev = var.max(0.0).sqrt();
         let tail_pct = tail_over_2x_median(db, name, &tl);
         let bound_str = match bound.as_deref() {
@@ -164,9 +199,18 @@ pub fn cmd_kernels(db: &GpuDb, args: &[&str]) {
             Some(p) => format!("{p:.1}%"),
             None => "—".into(),
         };
-        println!("  {:<2} {:<32} {:>8} {:>5.1}% {:>9} {:>9} {:>9} {:>6} {:<12}",
-            i + 1, trunc(name, 32), fmt_us(*total), pct, cnt,
-            fmt_us(*avg), fmt_us(stddev), tail_str, bound_str);
+        println!(
+            "  {:<2} {:<32} {:>8} {:>5.1}% {:>9} {:>9} {:>9} {:>6} {:<12}",
+            i + 1,
+            trunc(name, 32),
+            fmt_us(*total),
+            pct,
+            cnt,
+            fmt_us(*avg),
+            fmt_us(stddev),
+            tail_str,
+            bound_str
+        );
     }
 }
 
@@ -178,11 +222,15 @@ fn tail_over_2x_median(db: &GpuDb, kernel_name: &str, tl: &str) -> Option<f64> {
          WHERE kernel_name = ?1 AND {tl}"
     );
     let durs: Vec<f64> = db.query_vec(&sql, [kernel_name], |row| row.get(0));
-    if durs.len() < 4 { return None; }
+    if durs.len() < 4 {
+        return None;
+    }
     let mut sorted = durs.clone();
     sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
     let median = sorted[sorted.len() / 2];
-    if median <= 0.0 { return None; }
+    if median <= 0.0 {
+        return None;
+    }
     let thresh = median * 2.0;
     let tail = durs.iter().filter(|&&d| d > thresh).count();
     Some(tail as f64 / durs.len() as f64 * 100.0)
@@ -193,11 +241,13 @@ fn tail_over_2x_median(db: &GpuDb, kernel_name: &str, tl: &str) -> Option<f64> {
 // ---------------------------------------------------------------------------
 
 pub fn cmd_ops(db: &GpuDb, args: &[&str]) {
-    if !require_op_layer(db) { return; }
+    if !require_op_layer(db) {
+        return;
+    }
     let n = parse_count(args);
     let pattern = parse_pattern(args);
     let pattern_clause = pattern
-        .map(|p| format!(r"AND name LIKE '%{}%' ESCAPE '\'", escape_sql_like(p)))
+        .map(|_| "AND name LIKE ?2 ESCAPE '\\'")
         .unwrap_or_default();
 
     let sql = format!(
@@ -206,16 +256,26 @@ pub fn cmd_ops(db: &GpuDb, args: &[&str]) {
          ORDER BY cpu_time_us DESC LIMIT ?1"
     );
 
-    let rows: Vec<(String, Option<String>, f64)> = db.query_vec(
-        &sql, [n as i64],
-        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-    );
+    let rows: Vec<(String, Option<String>, f64)> = match pattern {
+        Some(p) => db.query_vec(
+            &sql,
+            rusqlite::params![n as i64, super::like_param(p)],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        ),
+        None => db.query_vec(&sql, [n as i64], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        }),
+    };
 
     println!("  #  Op                               CPU Time    Module");
     println!("  ── ───────────────────────────────── ────────── ────────────");
     for (i, (name, module, cpu_time)) in rows.iter().enumerate() {
-        println!("  {:<2} {:<34} {:>9}  {}",
-            i + 1, trunc(name, 34), fmt_us(*cpu_time),
-            module.as_deref().unwrap_or(""));
+        println!(
+            "  {:<2} {:<34} {:>9}  {}",
+            i + 1,
+            trunc(name, 34),
+            fmt_us(*cpu_time),
+            module.as_deref().unwrap_or("")
+        );
     }
 }

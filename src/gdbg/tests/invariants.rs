@@ -19,17 +19,20 @@ fn invariant_kernel_totals_sum_to_gpu_time() {
         ("multi_stream", build_multi_stream_session()),
     ] {
         let tl = db.timeline_filter();
-        let sum_of_kernels: f64 = db.conn.query_row(
-            &format!(
-                "SELECT COALESCE(SUM(total), 0) FROM (
+        let sum_of_kernels: f64 = db
+            .conn
+            .query_row(
+                &format!(
+                    "SELECT COALESCE(SUM(total), 0) FROM (
                     SELECT SUM(duration_us) as total
                     FROM launches WHERE {tl}
                     GROUP BY kernel_name
                 )"
-            ),
-            [],
-            |row| row.get(0),
-        ).unwrap();
+                ),
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
 
         let total_gpu = db.total_gpu_time_us();
 
@@ -53,28 +56,34 @@ fn invariant_stream_counts_sum_to_total() {
         ("multi_stream", build_multi_stream_session()),
     ] {
         let tl = db.timeline_filter();
-        let per_stream_sum: i64 = db.conn.query_row(
-            &format!(
-                "SELECT COALESCE(SUM(cnt), 0) FROM (
+        let per_stream_sum: i64 = db
+            .conn
+            .query_row(
+                &format!(
+                    "SELECT COALESCE(SUM(cnt), 0) FROM (
                     SELECT COUNT(*) as cnt
                     FROM launches
                     WHERE stream_id IS NOT NULL AND {tl}
                     GROUP BY stream_id
                 )"
-            ),
-            [],
-            |row| row.get(0),
-        ).unwrap();
+                ),
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
 
         // Launches without stream_id (torch layer launches may lack it)
-        let no_stream: i64 = db.conn.query_row(
-            &format!(
-                "SELECT COUNT(*) FROM launches
+        let no_stream: i64 = db
+            .conn
+            .query_row(
+                &format!(
+                    "SELECT COUNT(*) FROM launches
                  WHERE stream_id IS NULL AND {tl}"
-            ),
-            [],
-            |row| row.get(0),
-        ).unwrap();
+                ),
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
 
         let total = db.total_launch_count() as i64;
 
@@ -98,17 +107,20 @@ fn invariant_stream_time_ge_total() {
         ("multi_stream", build_multi_stream_session()),
     ] {
         let tl = db.timeline_filter();
-        let per_stream_time: f64 = db.conn.query_row(
-            &format!(
-                "SELECT COALESCE(SUM(total), 0) FROM (
+        let per_stream_time: f64 = db
+            .conn
+            .query_row(
+                &format!(
+                    "SELECT COALESCE(SUM(total), 0) FROM (
                     SELECT SUM(duration_us) as total
                     FROM launches WHERE stream_id IS NOT NULL AND {tl}
                     GROUP BY stream_id
                 )"
-            ),
-            [],
-            |row| row.get(0),
-        ).unwrap();
+                ),
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
 
         let total = db.total_gpu_time_us();
 
@@ -152,10 +164,12 @@ fn invariant_gaps_plus_active_eq_span() {
                  ORDER BY start_us"
             ),
             [],
-            |row| Ok((row.get::<_,f64>(0)?, row.get::<_,f64>(1)?)),
+            |row| Ok((row.get::<_, f64>(0)?, row.get::<_, f64>(1)?)),
         );
 
-        if intervals.len() < 2 { continue; }
+        if intervals.len() < 2 {
+            continue;
+        }
 
         let span_start = intervals.first().unwrap().0;
         let span_end = intervals.iter().map(|i| i.1).fold(0.0_f64, f64::max);
@@ -228,21 +242,23 @@ fn invariant_op_gpu_matches_breakdown_sum() {
 
     // For each op with kernel mappings, verify ops.gpu_time matches
     // the sum of timeline-layer kernel durations.
-    let ops: Vec<(i64, String, f64)> = db.query_vec(
-        "SELECT id, name, gpu_time_us FROM ops",
-        [],
-        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-    );
+    let ops: Vec<(i64, String, f64)> =
+        db.query_vec("SELECT id, name, gpu_time_us FROM ops", [], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        });
 
     for (op_id, op_name, stored_gpu) in &ops {
-        let breakdown_sum: f64 = db.conn.query_row(
-            "SELECT COALESCE(SUM(l.duration_us), 0)
+        let breakdown_sum: f64 = db
+            .conn
+            .query_row(
+                "SELECT COALESCE(SUM(l.duration_us), 0)
              FROM op_kernel_map okm
              JOIN launches l ON l.kernel_name = okm.kernel_name AND l.layer_id = ?1
              WHERE okm.op_id = ?2",
-            params![tl_id, op_id],
-            |row| row.get(0),
-        ).unwrap();
+                params![tl_id, op_id],
+                |row| row.get(0),
+            )
+            .unwrap();
 
         assert!(
             (stored_gpu - breakdown_sum).abs() < 0.01,
@@ -264,38 +280,47 @@ fn invariant_topops_pct_denominator_matches_kernels() {
     let total_gpu = db.total_gpu_time_us();
 
     // Manually check: an op's % GPU should be op.gpu_time / total_gpu * 100
-    let linear_gpu: f64 = db.conn.query_row(
-        "SELECT gpu_time_us FROM ops WHERE name = 'aten::linear'",
-        [],
-        |row| row.get(0),
-    ).unwrap();
+    let linear_gpu: f64 = db
+        .conn
+        .query_row(
+            "SELECT gpu_time_us FROM ops WHERE name = 'aten::linear'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
 
     let linear_pct = linear_gpu / total_gpu * 100.0;
 
     // The cutlass kernel contributes to aten::linear.  Its kernel %
     // from cmd_kernels should be cutlass_total / total_gpu * 100.
     let tl = db.timeline_filter();
-    let cutlass_total: f64 = db.conn.query_row(
-        &format!(
-            "SELECT SUM(duration_us) FROM launches
+    let cutlass_total: f64 = db
+        .conn
+        .query_row(
+            &format!(
+                "SELECT SUM(duration_us) FROM launches
              WHERE kernel_name LIKE '%cutlass%' AND {tl}"
-        ),
-        [],
-        |row| row.get(0),
-    ).unwrap();
+            ),
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
     let cutlass_pct = cutlass_total / total_gpu * 100.0;
 
     // The sum of kernel %s for aten::linear's kernels should >= the op's % GPU
     // (because the kernels may fire outside this op too).
     let tl2 = db.timeline_filter();
-    let sgemm_total: f64 = db.conn.query_row(
-        &format!(
-            "SELECT SUM(duration_us) FROM launches
+    let sgemm_total: f64 = db
+        .conn
+        .query_row(
+            &format!(
+                "SELECT SUM(duration_us) FROM launches
              WHERE kernel_name LIKE '%sgemm%' AND {tl2}"
-        ),
-        [],
-        |row| row.get(0),
-    ).unwrap();
+            ),
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
     let sgemm_pct = sgemm_total / total_gpu * 100.0;
 
     // After recompute, linear_gpu should be cutlass + sgemm (nsys totals)
@@ -326,7 +351,9 @@ fn invariant_overlap_matches_stats_utilization() {
     ] {
         let gpu_us = db.total_gpu_time_us();
         let wall_us: f64 = db.meta("wall_time_us").parse().unwrap_or(0.0);
-        if wall_us == 0.0 { continue; }
+        if wall_us == 0.0 {
+            continue;
+        }
 
         let stats_util = gpu_us / wall_us * 100.0;
 
@@ -351,18 +378,21 @@ fn invariant_small_subset_of_total() {
         ("triton", build_triton_inference_session()),
     ] {
         let tl = db.timeline_filter();
-        let small_total: f64 = db.conn.query_row(
-            &format!(
-                "SELECT COALESCE(SUM(total), 0) FROM (
+        let small_total: f64 = db
+            .conn
+            .query_row(
+                &format!(
+                    "SELECT COALESCE(SUM(total), 0) FROM (
                     SELECT SUM(duration_us) as total, AVG(duration_us) as avg
                     FROM launches WHERE {tl}
                     GROUP BY kernel_name
                     HAVING avg < 10.0
                 )"
-            ),
-            [],
-            |row| row.get(0),
-        ).unwrap();
+                ),
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
 
         let total = db.total_gpu_time_us();
 
@@ -382,23 +412,32 @@ fn invariant_small_subset_of_total() {
 fn invariant_no_double_count_multi_layer() {
     let db = build_session();
 
-    let nsys_id: i64 = db.conn.query_row(
-        "SELECT id FROM layers WHERE source = 'nsys' LIMIT 1",
-        [],
-        |row| row.get(0),
-    ).unwrap();
+    let nsys_id: i64 = db
+        .conn
+        .query_row(
+            "SELECT id FROM layers WHERE source = 'nsys' LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
 
-    let nsys_total: f64 = db.conn.query_row(
-        "SELECT COALESCE(SUM(duration_us), 0) FROM launches WHERE layer_id = ?1",
-        params![nsys_id],
-        |row| row.get(0),
-    ).unwrap();
+    let nsys_total: f64 = db
+        .conn
+        .query_row(
+            "SELECT COALESCE(SUM(duration_us), 0) FROM launches WHERE layer_id = ?1",
+            params![nsys_id],
+            |row| row.get(0),
+        )
+        .unwrap();
 
-    let raw_all: f64 = db.conn.query_row(
-        "SELECT COALESCE(SUM(duration_us), 0) FROM launches",
-        [],
-        |row| row.get(0),
-    ).unwrap();
+    let raw_all: f64 = db
+        .conn
+        .query_row(
+            "SELECT COALESCE(SUM(duration_us), 0) FROM launches",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
 
     let reported = db.total_gpu_time_us();
 
@@ -452,26 +491,34 @@ fn invariant_region_filter_monotone() {
 
     // Apply region filter to Step#1 (covers [500, 20500])
     db.region_filter = Some("Step#1".to_string());
-    let filter = db.kernel_filter();
+    let filter = db.kernel_filter_params();
     let tl = db.timeline_filter();
-    let step1_count: i64 = db.conn.query_row(
-        &format!(
-            "SELECT COUNT(*) FROM launches WHERE {filter} AND {tl}"
-        ),
-        [],
-        |row| row.get(0),
-    ).unwrap();
+    let step1_count: i64 = db
+        .conn
+        .query_row(
+            &format!(
+                "SELECT COUNT(*) FROM launches WHERE {} AND {tl}",
+                filter.clause()
+            ),
+            rusqlite::params_from_iter(filter.params()),
+            |row| row.get(0),
+        )
+        .unwrap();
 
     // Apply region filter to Step#2 (covers [20500, 45500])
     db.region_filter = Some("Step#2".to_string());
-    let filter = db.kernel_filter();
-    let step2_count: i64 = db.conn.query_row(
-        &format!(
-            "SELECT COUNT(*) FROM launches WHERE {filter} AND {tl}"
-        ),
-        [],
-        |row| row.get(0),
-    ).unwrap();
+    let filter = db.kernel_filter_params();
+    let step2_count: i64 = db
+        .conn
+        .query_row(
+            &format!(
+                "SELECT COUNT(*) FROM launches WHERE {} AND {tl}",
+                filter.clause()
+            ),
+            rusqlite::params_from_iter(filter.params()),
+            |row| row.get(0),
+        )
+        .unwrap();
 
     // Each region should have fewer launches than total
     assert!(
@@ -504,8 +551,10 @@ fn invariant_fuse_candidates_same_stream() {
     let sql = "WITH ordered AS (
                  SELECT kernel_name, start_us, duration_us, stream_id,
                         ROW_NUMBER() OVER (ORDER BY start_us) as rn
-                 FROM launches WHERE start_us IS NOT NULL AND ".to_string()
-        + &tl + ")
+                 FROM launches WHERE start_us IS NOT NULL AND "
+        .to_string()
+        + &tl
+        + ")
                SELECT a.stream_id, b.stream_id,
                       b.start_us - (a.start_us + a.duration_us) AS gap_us
                FROM ordered a
@@ -513,14 +562,14 @@ fn invariant_fuse_candidates_same_stream() {
                WHERE gap_us >= 0 AND gap_us < 5.0
                  AND a.stream_id IS b.stream_id";
 
-    let pairs: Vec<(Option<u32>, Option<u32>, f64)> = db.query_vec(
-        &sql,
-        [],
-        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-    );
+    let pairs: Vec<(Option<u32>, Option<u32>, f64)> =
+        db.query_vec(&sql, [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)));
 
     for (sa, sb, gap) in &pairs {
-        assert_eq!(sa, sb, "fuse candidate on different streams: {sa:?} vs {sb:?}");
+        assert_eq!(
+            sa, sb,
+            "fuse candidate on different streams: {sa:?} vs {sb:?}"
+        );
         assert!(*gap >= 0.0 && *gap < 5.0, "gap out of range: {gap}");
     }
 }
@@ -540,37 +589,53 @@ fn invariant_recompute_specific_values() {
     // aten::relu_ → elementwise (15.8)
     // aten::nll_loss → no mapping (0)
 
-    let linear_gpu: f64 = db.conn.query_row(
-        "SELECT gpu_time_us FROM ops WHERE name = 'aten::linear'",
-        [], |row| row.get(0),
-    ).unwrap();
+    let linear_gpu: f64 = db
+        .conn
+        .query_row(
+            "SELECT gpu_time_us FROM ops WHERE name = 'aten::linear'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
     assert!(
         (linear_gpu - 3815.0).abs() < 0.1,
         "linear gpu_time should be 3815 (cutlass 3005 + sgemm 810), got {linear_gpu}"
     );
 
-    let bn_gpu: f64 = db.conn.query_row(
-        "SELECT gpu_time_us FROM ops WHERE name = 'aten::batch_norm'",
-        [], |row| row.get(0),
-    ).unwrap();
+    let bn_gpu: f64 = db
+        .conn
+        .query_row(
+            "SELECT gpu_time_us FROM ops WHERE name = 'aten::batch_norm'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
     assert!(
         (bn_gpu - 6500.0).abs() < 0.1,
         "batch_norm gpu_time should be 6500, got {bn_gpu}"
     );
 
-    let relu_gpu: f64 = db.conn.query_row(
-        "SELECT gpu_time_us FROM ops WHERE name = 'aten::relu_'",
-        [], |row| row.get(0),
-    ).unwrap();
+    let relu_gpu: f64 = db
+        .conn
+        .query_row(
+            "SELECT gpu_time_us FROM ops WHERE name = 'aten::relu_'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
     assert!(
         (relu_gpu - 15.8).abs() < 0.1,
         "relu gpu_time should be 15.8, got {relu_gpu}"
     );
 
-    let loss_gpu: f64 = db.conn.query_row(
-        "SELECT gpu_time_us FROM ops WHERE name = 'aten::nll_loss'",
-        [], |row| row.get(0),
-    ).unwrap();
+    let loss_gpu: f64 = db
+        .conn
+        .query_row(
+            "SELECT gpu_time_us FROM ops WHERE name = 'aten::nll_loss'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
     assert!(
         loss_gpu.abs() < 0.01,
         "nll_loss gpu_time should be 0 (no kernel mapping), got {loss_gpu}"
@@ -656,14 +721,17 @@ fn invariant_inspect_matches_kernels_for_all() {
 
     // Get per-kernel stats the way cmd_inspect does
     for (name, k_cnt, k_total) in &kernels_view {
-        let (i_cnt, i_total): (i64, f64) = db.conn.query_row(
-            &format!(
-                "SELECT COUNT(*), SUM(duration_us)
+        let (i_cnt, i_total): (i64, f64) = db
+            .conn
+            .query_row(
+                &format!(
+                    "SELECT COUNT(*), SUM(duration_us)
                  FROM launches WHERE kernel_name = ?1 AND {tl}"
-            ),
-            params![name],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        ).unwrap();
+                ),
+                params![name],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
 
         assert_eq!(
             *k_cnt, i_cnt,

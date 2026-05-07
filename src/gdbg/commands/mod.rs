@@ -1,4 +1,4 @@
-use super::db::{GpuDb, escape_sql_like};
+use super::db::{GpuDb, like_param};
 
 mod analysis;
 mod data;
@@ -25,7 +25,9 @@ pub(crate) fn parse_count(args: &[&str]) -> usize {
 }
 
 pub(crate) fn parse_pattern<'a>(args: &'a [&'a str]) -> Option<&'a str> {
-    if args.is_empty() { return None; }
+    if args.is_empty() {
+        return None;
+    }
     if args[0].parse::<usize>().is_ok() {
         args.get(1).copied()
     } else {
@@ -34,16 +36,25 @@ pub(crate) fn parse_pattern<'a>(args: &'a [&'a str]) -> Option<&'a str> {
 }
 
 pub(crate) fn fmt_us(us: f64) -> String {
-    if us >= 1_000_000.0 { format!("{:.2}s", us / 1_000_000.0) }
-    else if us >= 1_000.0 { format!("{:.1}ms", us / 1_000.0) }
-    else { format!("{:.1}us", us) }
+    if us >= 1_000_000.0 {
+        format!("{:.2}s", us / 1_000_000.0)
+    } else if us >= 1_000.0 {
+        format!("{:.1}ms", us / 1_000.0)
+    } else {
+        format!("{:.1}us", us)
+    }
 }
 
 pub(crate) fn fmt_bytes(b: i64) -> String {
-    if b >= 1_073_741_824 { format!("{:.1} GB", b as f64 / 1_073_741_824.0) }
-    else if b >= 1_048_576 { format!("{:.1} MB", b as f64 / 1_048_576.0) }
-    else if b >= 1024 { format!("{:.1} KB", b as f64 / 1024.0) }
-    else { format!("{b} B") }
+    if b >= 1_073_741_824 {
+        format!("{:.1} GB", b as f64 / 1_073_741_824.0)
+    } else if b >= 1_048_576 {
+        format!("{:.1} MB", b as f64 / 1_048_576.0)
+    } else if b >= 1024 {
+        format!("{:.1} KB", b as f64 / 1024.0)
+    } else {
+        format!("{b} B")
+    }
 }
 
 pub(crate) fn trunc(s: &str, max: usize) -> String {
@@ -53,11 +64,6 @@ pub(crate) fn trunc(s: &str, max: usize) -> String {
         let end: String = s.chars().take(max - 3).collect();
         format!("{end}...")
     }
-}
-
-/// Build a SQL LIKE bind-parameter from a user pattern: `%escaped_pattern%`.
-pub(crate) fn like_param(pattern: &str) -> String {
-    format!("%{}%", escape_sql_like(pattern))
 }
 
 /// Escape regex metacharacters in a kernel name for use in ncu `--kernel-name "regex:..."`.
@@ -78,20 +84,16 @@ pub(crate) fn escape_regex(s: &str) -> String {
 pub(crate) fn compute_gpu_gaps(db: &GpuDb) -> Vec<(f64, f64)> {
     let mut intervals = db.kernel_intervals();
     intervals.extend(db.transfer_intervals(None));
-    intervals.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+    let intervals = merge_intervals(&intervals);
 
     let mut gaps = Vec::new();
     if let Some(&(_, mut cur_end)) = intervals.first() {
         for &(s, e) in &intervals[1..] {
-            if s <= cur_end {
-                if e > cur_end { cur_end = e; }
-            } else {
-                let gap = s - cur_end;
-                if gap > 1.0 {
-                    gaps.push((cur_end, gap));
-                }
-                cur_end = e;
+            let gap = s - cur_end;
+            if gap > 1.0 {
+                gaps.push((cur_end, gap));
             }
+            cur_end = e;
         }
     }
     gaps
@@ -109,13 +111,21 @@ pub(crate) fn require_op_layer(db: &GpuDb) -> bool {
 }
 
 /// Merge overlapping or adjacent intervals into non-overlapping sorted intervals.
+/// Callers may pass intervals in any order; this helper owns the sort step.
 pub(crate) fn merge_intervals(intervals: &[(f64, f64)]) -> Vec<(f64, f64)> {
-    if intervals.is_empty() { return Vec::new(); }
+    if intervals.is_empty() {
+        return Vec::new();
+    }
+    let mut sorted = intervals.to_vec();
+    sorted.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+
     let mut merged: Vec<(f64, f64)> = Vec::new();
-    let (mut cur_s, mut cur_e) = intervals[0];
-    for &(s, e) in &intervals[1..] {
+    let (mut cur_s, mut cur_e) = sorted[0];
+    for &(s, e) in &sorted[1..] {
         if s <= cur_e {
-            if e > cur_e { cur_e = e; }
+            if e > cur_e {
+                cur_e = e;
+            }
         } else {
             merged.push((cur_s, cur_e));
             cur_s = s;
@@ -124,6 +134,15 @@ pub(crate) fn merge_intervals(intervals: &[(f64, f64)]) -> Vec<(f64, f64)> {
     }
     merged.push((cur_s, cur_e));
     merged
+}
+
+/// Total time (us) during which the GPU was doing work — either a kernel or a
+/// transfer. Kernel and transfer intervals are unioned and merged, so concurrent
+/// activity is only counted once.
+pub(crate) fn gpu_busy_us(db: &GpuDb) -> f64 {
+    let mut intervals = db.kernel_intervals();
+    intervals.extend(db.transfer_intervals(None));
+    merge_intervals(&intervals).iter().map(|(s, e)| e - s).sum()
 }
 
 /// Compute (total_transfer_us, kernel_overlap_us) for transfers matching `kind`.
@@ -139,7 +158,9 @@ pub(crate) fn xfer_kernel_overlap(db: &GpuDb, kind: Option<&str>) -> (f64, f64) 
         for &(ks, ke) in &merged {
             let os = ts.max(ks);
             let oe = te.min(ke);
-            if os < oe { overlap += oe - os; }
+            if os < oe {
+                overlap += oe - os;
+            }
         }
     }
     (total_time, overlap)
@@ -151,16 +172,22 @@ pub(crate) fn xfer_kernel_overlap(db: &GpuDb, kind: Option<&str>) -> (f64, f64) 
 /// steady-state median (from the back half) by more than 20%.  Returns 0
 /// when no meaningful warmup is detected.
 pub(crate) fn detect_warmup_count(durations: &[f64]) -> usize {
-    if durations.len() < 5 { return 0; }
+    if durations.len() < 5 {
+        return 0;
+    }
     let half = durations.len() / 2;
     let mut tail: Vec<f64> = durations[half..].to_vec();
     tail.sort_by(|a, b| a.partial_cmp(b).unwrap());
     let steady_median = tail[tail.len() / 2];
-    if steady_median <= 0.0 { return 0; }
+    if steady_median <= 0.0 {
+        return 0;
+    }
 
     let threshold = steady_median * 1.2;
     for (i, &d) in durations.iter().enumerate() {
-        if d <= threshold { return i; }
+        if d <= threshold {
+            return i;
+        }
     }
     0
 }
@@ -183,7 +210,9 @@ pub(crate) fn find_hottest_window(
     window_us: f64,
 ) -> (f64, f64, usize, usize) {
     let n = intervals.len();
-    if n == 0 || window_us <= 0.0 { return (0.0, 0.0, 0, 0); }
+    if n == 0 || window_us <= 0.0 {
+        return (0.0, 0.0, 0, 0);
+    }
 
     let mut candidates: Vec<f64> = Vec::with_capacity(2 * n);
     for &(s, d) in intervals {
@@ -196,7 +225,9 @@ pub(crate) fn find_hottest_window(
     let mut lo = 0usize;
     for &w_start in &candidates {
         let w_end = w_start + window_us;
-        while lo < n && intervals[lo].0 + intervals[lo].1 <= w_start { lo += 1; }
+        while lo < n && intervals[lo].0 + intervals[lo].1 <= w_start {
+            lo += 1;
+        }
         let mut busy = 0.0_f64;
         let mut hi_scan = lo;
         while hi_scan < n && intervals[hi_scan].0 < w_end {
@@ -204,7 +235,9 @@ pub(crate) fn find_hottest_window(
             let e = s + d;
             let os = s.max(w_start);
             let oe = e.min(w_end);
-            if os < oe { busy += oe - os; }
+            if os < oe {
+                busy += oe - os;
+            }
             hi_scan += 1;
         }
         if busy > best.0 {

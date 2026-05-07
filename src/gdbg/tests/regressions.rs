@@ -2,8 +2,10 @@
 //! CUDA kernels.  Each test calls the actual production function that was
 //! fixed, so reverting the fix will break the test.
 
-use crate::commands::{compute_gpu_gaps, detect_warmup_count, find_hottest_window, xfer_kernel_overlap};
-use crate::db::{GpuDb, escape_sql_like};
+use crate::commands::{
+    compute_gpu_gaps, detect_warmup_count, find_hottest_window, xfer_kernel_overlap,
+};
+use crate::db::{GpuDb, like_param};
 use crate::parsers::nsys::import_wall_time;
 use rusqlite::params;
 use tempfile::TempDir;
@@ -14,8 +16,8 @@ use tempfile::TempDir;
 // -----------------------------------------------------------------------
 
 fn make_db(
-    kernels: &[(&str, f64, f64, u32)],    // (name, start, dur, stream)
-    transfers: &[(&str, f64, f64, i64)],  // (kind, start, dur, bytes)
+    kernels: &[(&str, f64, f64, u32)],   // (name, start, dur, stream)
+    transfers: &[(&str, f64, f64, i64)], // (kind, start, dur, bytes)
 ) -> (GpuDb, TempDir) {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("t.gpu.db");
@@ -73,13 +75,13 @@ fn wall_time_includes_transfers() {
 
 #[test]
 fn wall_time_launches_only_when_no_transfers() {
-    let (db, _d) = make_db(
-        &[("k", 100.0, 50.0, 7), ("k", 200.0, 50.0, 7)],
-        &[],
-    );
+    let (db, _d) = make_db(&[("k", 100.0, 50.0, 7), ("k", 200.0, 50.0, 7)], &[]);
     import_wall_time(&db.conn).unwrap();
     let wall: f64 = db.meta("wall_time_us").parse().unwrap();
-    assert!((wall - 150.0).abs() < 0.01, "wall = 250 - 100 = 150us, got {wall}");
+    assert!(
+        (wall - 150.0).abs() < 0.01,
+        "wall = 250 - 100 = 150us, got {wall}"
+    );
 }
 
 // =======================================================================
@@ -107,10 +109,7 @@ fn gaps_exclude_transfer_busy_time() {
 #[test]
 fn gaps_detect_real_idle_between_phases() {
     // Kernel 0..100, big idle, kernel 5100..5200. Real 5000us idle.
-    let (db, _d) = make_db(
-        &[("k", 0.0, 100.0, 7), ("k", 5100.0, 100.0, 7)],
-        &[],
-    );
+    let (db, _d) = make_db(&[("k", 0.0, 100.0, 7), ("k", 5100.0, 100.0, 7)], &[]);
     let gaps = compute_gpu_gaps(&db);
     let total: f64 = gaps.iter().map(|g| g.1).sum();
     assert!(
@@ -181,7 +180,7 @@ fn sql_like_with_underscore_matches_literal() {
         ],
         &[],
     );
-    let pat = format!("%{}%", escape_sql_like("vector_add"));
+    let pat = like_param("vector_add");
     let count: i64 = db
         .conn
         .query_row(
@@ -197,10 +196,13 @@ fn sql_like_with_underscore_matches_literal() {
 fn sql_like_percent_still_escaped() {
     // '%' must still be escaped; a pattern '50%' should only match literal "50%".
     let (db, _d) = make_db(
-        &[("op_50%_done", 0.0, 100.0, 7), ("op_completely_done", 100.0, 100.0, 7)],
+        &[
+            ("op_50%_done", 0.0, 100.0, 7),
+            ("op_completely_done", 100.0, 100.0, 7),
+        ],
         &[],
     );
-    let pat = format!("%{}%", escape_sql_like("50%"));
+    let pat = like_param("50%");
     let count: i64 = db
         .conn
         .query_row(
@@ -223,11 +225,19 @@ fn focus_filter_matches_underscored_kernel() {
         &[],
     );
     db.focus = Some("vector_add".to_string());
-    // kernel_filter() is used directly in WHERE clauses by cmd_kernels etc.
-    let filter = db.kernel_filter();
-    let sql = format!("SELECT COUNT(*) FROM launches WHERE {filter}");
-    let count: i64 = db.conn.query_row(&sql, [], |row| row.get(0)).unwrap();
-    assert_eq!(count, 1, "focus='vector_add' must match 1 launch, got {count}");
+    // kernel_filter_params() is used by cmd_kernels and other filtered commands.
+    let filter = db.kernel_filter_params();
+    let sql = format!("SELECT COUNT(*) FROM launches WHERE {}", filter.clause());
+    let count: i64 = db
+        .conn
+        .query_row(&sql, rusqlite::params_from_iter(filter.params()), |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(
+        count, 1,
+        "focus='vector_add' must match 1 launch, got {count}"
+    );
 }
 
 // =======================================================================
@@ -255,11 +265,19 @@ fn warmup_detects_slow_leading_launches() {
 fn warmup_threshold_is_20_percent() {
     // First launch is only 15% slower than median — should not count.
     let durs = vec![115.0, 100.0, 100.0, 100.0, 100.0, 100.0];
-    assert_eq!(detect_warmup_count(&durs), 0, "under 20% margin should not flag warmup");
+    assert_eq!(
+        detect_warmup_count(&durs),
+        0,
+        "under 20% margin should not flag warmup"
+    );
 
     // First launch is 25% slower — should count as warmup.
     let durs = vec![125.0, 100.0, 100.0, 100.0, 100.0, 100.0];
-    assert_eq!(detect_warmup_count(&durs), 1, "over 20% margin should flag warmup");
+    assert_eq!(
+        detect_warmup_count(&durs),
+        1,
+        "over 20% margin should flag warmup"
+    );
 }
 
 // =======================================================================
@@ -276,10 +294,10 @@ fn gaps_total_across_all_gaps() {
     let (db, _d) = make_db(
         &[
             ("k", 0.0, 100.0, 7),
-            ("k", 200.0, 100.0, 7),     // 100us gap
-            ("k", 500.0, 100.0, 7),     // 200us gap
-            ("k", 900.0, 100.0, 7),     // 300us gap
-            ("k", 1400.0, 100.0, 7),    // 400us gap
+            ("k", 200.0, 100.0, 7),  // 100us gap
+            ("k", 500.0, 100.0, 7),  // 200us gap
+            ("k", 900.0, 100.0, 7),  // 300us gap
+            ("k", 1400.0, 100.0, 7), // 400us gap
         ],
         &[],
     );
@@ -312,8 +330,14 @@ fn hotspot_handles_overlapping_streams() {
     // w=50 is exactly e_A − W = 100 − 50, a breakpoint the start-only sweep misses.
     let intervals = vec![(0.0, 100.0), (80.0, 40.0)];
     let (busy, w_start, _, _) = find_hottest_window(&intervals, 50.0);
-    assert!((busy - 70.0).abs() < 0.01, "expected busy=70 at w=50, got busy={busy} at w={w_start}");
-    assert!((w_start - 50.0).abs() < 0.01, "expected w_start=50, got {w_start}");
+    assert!(
+        (busy - 70.0).abs() < 0.01,
+        "expected busy=70 at w=50, got busy={busy} at w={w_start}"
+    );
+    assert!(
+        (w_start - 50.0).abs() < 0.01,
+        "expected w_start=50, got {w_start}"
+    );
 }
 
 #[test]
@@ -325,7 +349,10 @@ fn hotspot_empty_and_degenerate() {
     // Single launch, window wider than it → captures full duration.
     let intervals = vec![(10.0, 40.0)];
     let (b, _, _, _) = find_hottest_window(&intervals, 100.0);
-    assert!((b - 40.0).abs() < 0.01, "single launch fully inside → busy == its duration");
+    assert!(
+        (b - 40.0).abs() < 0.01,
+        "single launch fully inside → busy == its duration"
+    );
 
     // Zero/negative window → zeros (defensive).
     let (b, _, _, _) = find_hottest_window(&intervals, 0.0);

@@ -20,7 +20,10 @@ fn escape_regex_template_names() {
     let name = "void cutlass::Kernel<cutlass::gemm::kernel::GemmUniversal<float>>";
     let escaped = escape_regex(name);
     // The key thing: no bare metacharacters like |, (), *, +, ?
-    assert!(escaped.contains('<'), "< should be preserved (not a regex metachar)");
+    assert!(
+        escaped.contains('<'),
+        "< should be preserved (not a regex metachar)"
+    );
 
     // Function pointer name with ( ) and *
     let name2 = "void func(float*, int)";
@@ -37,7 +40,10 @@ fn escape_regex_template_names() {
     // Backslash in name
     let name4 = r"foo\bar";
     let escaped4 = escape_regex(name4);
-    assert!(escaped4.starts_with(r"foo\\"), "backslash must be escaped: {escaped4}");
+    assert!(
+        escaped4.starts_with(r"foo\\"),
+        "backslash must be escaped: {escaped4}"
+    );
 
     // Dot must be escaped (matches any char in regex)
     let name5 = "libcuda.so";
@@ -61,43 +67,88 @@ fn ncu_csv_edge_cases() {
     use std::io::Write;
 
     // Header
-    writeln!(tmp, r#""ID","Kernel Name","Metric Name","Metric Unit","Metric Value""#).unwrap();
+    writeln!(
+        tmp,
+        r#""ID","Kernel Name","Metric Name","Metric Unit","Metric Value""#
+    )
+    .unwrap();
     // Normal row
-    writeln!(tmp, r#""1","my_kernel","sm__warps_active.avg.pct_of_peak_sustained_active","%","75.0""#).unwrap();
+    writeln!(
+        tmp,
+        r#""1","my_kernel","sm__warps_active.avg.pct_of_peak_sustained_active","%","75.0""#
+    )
+    .unwrap();
     // Value with comma (e.g., "1,234,567")
-    writeln!(tmp, r#""1","my_kernel","gpu__time_duration.sum","nsecond","1,234,567""#).unwrap();
+    writeln!(
+        tmp,
+        r#""1","my_kernel","gpu__time_duration.sum","nsecond","1,234,567""#
+    )
+    .unwrap();
     // Empty metric value
-    writeln!(tmp, r#""1","my_kernel","sm__throughput.avg.pct_of_peak_sustained_elapsed","%","""#).unwrap();
+    writeln!(
+        tmp,
+        r#""1","my_kernel","sm__throughput.avg.pct_of_peak_sustained_elapsed","%","""#
+    )
+    .unwrap();
     // Row starting with == (ncu separator line)
     writeln!(tmp, "==PROF== Disconnected").unwrap();
     // Empty line
     writeln!(tmp).unwrap();
     // Second kernel with memory metric
-    writeln!(tmp, r#""2","other_kernel","dram__throughput.avg.pct_of_peak_sustained_elapsed","%","65.2""#).unwrap();
-    writeln!(tmp, r#""2","other_kernel","sm__throughput.avg.pct_of_peak_sustained_elapsed","%","12.0""#).unwrap();
+    writeln!(
+        tmp,
+        r#""2","other_kernel","dram__throughput.avg.pct_of_peak_sustained_elapsed","%","65.2""#
+    )
+    .unwrap();
+    writeln!(
+        tmp,
+        r#""2","other_kernel","sm__throughput.avg.pct_of_peak_sustained_elapsed","%","12.0""#
+    )
+    .unwrap();
 
     import_ncu_csv(&db.conn, tmp.path(), lid).unwrap();
 
     // Verify my_kernel got parsed
-    let occ: f64 = db.conn.query_row(
-        "SELECT occupancy_pct FROM metrics WHERE kernel_name = 'my_kernel'",
-        [], |row| row.get(0),
-    ).unwrap();
-    assert!((occ - 75.0).abs() < 0.1, "occupancy should be 75.0, got {occ}");
+    let occ: f64 = db
+        .conn
+        .query_row(
+            "SELECT occupancy_pct FROM metrics WHERE kernel_name = 'my_kernel'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(
+        (occ - 75.0).abs() < 0.1,
+        "occupancy should be 75.0, got {occ}"
+    );
 
     // Verify comma-containing value was parsed (1234567 ns → 1234.567 us)
-    let has_launch: bool = db.conn.query_row(
-        "SELECT COUNT(*) > 0 FROM launches WHERE kernel_name = 'my_kernel'",
-        [], |row| row.get(0),
-    ).unwrap();
-    assert!(has_launch, "ncu should insert launch for kernel with duration");
+    let has_launch: bool = db
+        .conn
+        .query_row(
+            "SELECT COUNT(*) > 0 FROM launches WHERE kernel_name = 'my_kernel'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(
+        has_launch,
+        "ncu should insert launch for kernel with duration"
+    );
 
     // Verify other_kernel got classified as memory-bound
-    let bound: String = db.conn.query_row(
-        "SELECT boundedness FROM metrics WHERE kernel_name = 'other_kernel'",
-        [], |row| row.get(0),
-    ).unwrap();
-    assert_eq!(bound, "memory", "65.2% mem vs 12.0% compute should be memory-bound");
+    let bound: String = db
+        .conn
+        .query_row(
+            "SELECT boundedness FROM metrics WHERE kernel_name = 'other_kernel'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        bound, "memory",
+        "65.2% mem vs 12.0% compute should be memory-bound"
+    );
 }
 
 // -----------------------------------------------------------------------
@@ -109,11 +160,20 @@ fn boundedness_edge_cases() {
     use crate::parsers::ncu::classify_boundedness;
 
     // Both below 10 → latency
-    assert_eq!(classify_boundedness(Some(9.9), Some(9.9)).as_deref(), Some("latency"));
-    assert_eq!(classify_boundedness(Some(0.0), Some(0.0)).as_deref(), Some("latency"));
+    assert_eq!(
+        classify_boundedness(Some(9.9), Some(9.9)).as_deref(),
+        Some("latency")
+    );
+    assert_eq!(
+        classify_boundedness(Some(0.0), Some(0.0)).as_deref(),
+        Some("latency")
+    );
 
     // Exactly at boundary: c=10, m=10 → not latency (both >= 10), m >= c → memory
-    assert_eq!(classify_boundedness(Some(10.0), Some(10.0)).as_deref(), Some("memory"));
+    assert_eq!(
+        classify_boundedness(Some(10.0), Some(10.0)).as_deref(),
+        Some("memory")
+    );
 
     // One None → None
     assert_eq!(classify_boundedness(None, Some(50.0)), None);
@@ -121,11 +181,17 @@ fn boundedness_edge_cases() {
     assert_eq!(classify_boundedness(None, None), None);
 
     // Clear compute bound: c >> m
-    assert_eq!(classify_boundedness(Some(90.0), Some(10.0)).as_deref(), Some("compute"));
+    assert_eq!(
+        classify_boundedness(Some(90.0), Some(10.0)).as_deref(),
+        Some("compute")
+    );
 
     // Tie region: m = c * 1.5 exactly → memory (m > c*1.5 is false, c > m*1.5 is false, m >= c → memory)
     // Actually: c=40, m=60. m > c*1.5 = m > 60 → false. c > m*1.5 = 40 > 90 → false. m >= c → memory.
-    assert_eq!(classify_boundedness(Some(40.0), Some(60.0)).as_deref(), Some("memory"));
+    assert_eq!(
+        classify_boundedness(Some(40.0), Some(60.0)).as_deref(),
+        Some("memory")
+    );
 }
 
 // -----------------------------------------------------------------------
@@ -143,34 +209,55 @@ fn triple_filter_interaction() {
     // Region: Step#1 covers [500, 20500]
     db.region_filter = Some("Step#1".to_string());
 
-    let filter = db.kernel_filter();
+    let filter = db.kernel_filter_params();
     let tl = db.timeline_filter();
 
-    // Should contain all three clauses
-    assert!(filter.contains("LIKE '%kernel%'"), "focus clause missing");
-    assert!(filter.contains("NOT LIKE '%nccl%'"), "ignore clause missing");
-    assert!(filter.contains("regions"), "region clause missing");
+    // Should contain all three clauses and carry matching bind params.
+    assert!(
+        filter.clause().contains("launches.kernel_name LIKE ?"),
+        "focus clause missing"
+    );
+    assert!(
+        filter.clause().contains("launches.kernel_name NOT LIKE ?"),
+        "ignore clause missing"
+    );
+    assert!(filter.clause().contains("regions"), "region clause missing");
+    assert_eq!(
+        filter.params().len(),
+        3,
+        "focus/ignore/region should bind three params"
+    );
 
     // Query should work without SQL errors
-    let count: i64 = db.conn.query_row(
-        &format!("SELECT COUNT(*) FROM launches WHERE {filter} AND {tl}"),
-        [],
-        |row| row.get(0),
-    ).unwrap();
+    let count: i64 = db
+        .conn
+        .query_row(
+            &format!(
+                "SELECT COUNT(*) FROM launches WHERE {} AND {tl}",
+                filter.clause()
+            ),
+            rusqlite::params_from_iter(filter.params()),
+            |row| row.get(0),
+        )
+        .unwrap();
 
     // Should find some launches (elementwise and bn kernels contain "kernel")
     // but not nccl, and only within Step#1 region
     assert!(count >= 0, "query should not error");
 
     // Verify no nccl results
-    let nccl: i64 = db.conn.query_row(
-        &format!(
-            "SELECT COUNT(*) FROM launches
-             WHERE kernel_name LIKE '%nccl%' AND {filter} AND {tl}"
-        ),
-        [],
-        |row| row.get(0),
-    ).unwrap();
+    let nccl: i64 = db
+        .conn
+        .query_row(
+            &format!(
+                "SELECT COUNT(*) FROM launches
+             WHERE kernel_name LIKE '%nccl%' AND {} AND {tl}",
+                filter.clause()
+            ),
+            rusqlite::params_from_iter(filter.params()),
+            |row| row.get(0),
+        )
+        .unwrap();
     assert_eq!(nccl, 0, "nccl should be excluded by ignore filter");
 
     // All commands should work with triple filter
@@ -193,7 +280,9 @@ fn diff_identical_sessions() {
     {
         let mut dest_conn = rusqlite::Connection::open(&dest).unwrap();
         let backup = rusqlite::backup::Backup::new(&db.conn, &mut dest_conn).unwrap();
-        backup.run_to_completion(100, std::time::Duration::from_millis(10), None).unwrap();
+        backup
+            .run_to_completion(100, std::time::Duration::from_millis(10), None)
+            .unwrap();
     }
 
     // Attach and verify kernel times match exactly
@@ -235,19 +324,23 @@ fn ncu_launches_excluded_from_timeline() {
 
     // nsys layer with 1 launch
     let nsys_id = db.add_layer("nsys", "t", None, None, None).unwrap();
-    db.conn.execute(
-        "INSERT INTO launches (kernel_name, duration_us, start_us, stream_id, layer_id)
+    db.conn
+        .execute(
+            "INSERT INTO launches (kernel_name, duration_us, start_us, stream_id, layer_id)
          VALUES ('real_kernel', 100.0, 500.0, 7, ?1)",
-        params![nsys_id],
-    ).unwrap();
+            params![nsys_id],
+        )
+        .unwrap();
 
     // ncu layer with launches that have no start_us (typical for ncu)
     let ncu_id = db.add_layer("ncu", "t", None, None, None).unwrap();
-    db.conn.execute(
-        "INSERT INTO launches (kernel_name, duration_us, layer_id)
+    db.conn
+        .execute(
+            "INSERT INTO launches (kernel_name, duration_us, layer_id)
          VALUES ('real_kernel', 95.0, ?1)",
-        params![ncu_id],
-    ).unwrap();
+            params![ncu_id],
+        )
+        .unwrap();
 
     // total_gpu_time should only see nsys layer (timeline_filter prefers nsys)
     let total = db.total_gpu_time_us();
@@ -257,15 +350,18 @@ fn ncu_launches_excluded_from_timeline() {
     );
 
     // timeline command should only see the nsys launch (with start_us)
-    let timeline_count: i64 = db.conn.query_row(
-        &format!(
-            "SELECT COUNT(*) FROM launches
+    let timeline_count: i64 = db
+        .conn
+        .query_row(
+            &format!(
+                "SELECT COUNT(*) FROM launches
              WHERE start_us IS NOT NULL AND {}",
-            db.timeline_filter()
-        ),
-        [],
-        |row| row.get(0),
-    ).unwrap();
+                db.timeline_filter()
+            ),
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
     assert_eq!(timeline_count, 1, "timeline should see only 1 nsys launch");
 
     // gaps should work (needs nsys layer check)
@@ -305,21 +401,28 @@ fn negative_duration_does_not_corrupt() {
     let lid = db.add_layer("nsys", "t", None, None, None).unwrap();
 
     // Insert a normal launch and a negative-duration launch
-    db.conn.execute(
-        "INSERT INTO launches (kernel_name, duration_us, start_us, stream_id, layer_id)
+    db.conn
+        .execute(
+            "INSERT INTO launches (kernel_name, duration_us, start_us, stream_id, layer_id)
          VALUES ('good', 100.0, 0.0, 7, ?1)",
-        params![lid],
-    ).unwrap();
-    db.conn.execute(
-        "INSERT INTO launches (kernel_name, duration_us, start_us, stream_id, layer_id)
+            params![lid],
+        )
+        .unwrap();
+    db.conn
+        .execute(
+            "INSERT INTO launches (kernel_name, duration_us, start_us, stream_id, layer_id)
          VALUES ('bad', -50.0, 200.0, 7, ?1)",
-        params![lid],
-    ).unwrap();
+            params![lid],
+        )
+        .unwrap();
 
     // total_gpu_time should still be positive
     let total = db.total_gpu_time_us();
     // 100 + (-50) = 50, which is > 0
-    assert!(total > 0.0, "total should be positive even with negative duration: {total}");
+    assert!(
+        total > 0.0,
+        "total should be positive even with negative duration: {total}"
+    );
 
     // All commands should not panic
     commands::cmd_stats(&db);
@@ -342,11 +445,13 @@ fn sql_injection_in_kernel_name() {
 
     // Kernel name that looks like SQL injection
     let evil_name = "'; DROP TABLE launches; --";
-    db.conn.execute(
-        "INSERT INTO launches (kernel_name, duration_us, start_us, layer_id)
+    db.conn
+        .execute(
+            "INSERT INTO launches (kernel_name, duration_us, start_us, layer_id)
          VALUES (?1, 100.0, 0.0, ?2)",
-        params![evil_name, lid],
-    ).unwrap();
+            params![evil_name, lid],
+        )
+        .unwrap();
 
     // These use LIKE with the kernel name as a pattern — should be safe
     commands::cmd_inspect(&db, &["DROP"]);
@@ -396,22 +501,35 @@ fn suggest_ncu_regex_is_valid() {
 
     let tl = db.timeline_filter();
     let names: Vec<String> = db.query_vec(
-        &format!("SELECT kernel_name FROM launches WHERE {tl}
-                  GROUP BY kernel_name ORDER BY SUM(duration_us) DESC LIMIT 5"),
+        &format!(
+            "SELECT kernel_name FROM launches WHERE {tl}
+                  GROUP BY kernel_name ORDER BY SUM(duration_us) DESC LIMIT 5"
+        ),
         [],
         |row| row.get(0),
     );
 
-    let regex_str = names.iter().map(|n| escape_regex(n)).collect::<Vec<_>>().join("|");
+    let regex_str = names
+        .iter()
+        .map(|n| escape_regex(n))
+        .collect::<Vec<_>>()
+        .join("|");
 
     // This should not panic — the regex should be valid
     let re = regex::Regex::new(&regex_str);
-    assert!(re.is_ok(), "suggest regex should be valid: {regex_str}\nerror: {:?}", re.err());
+    assert!(
+        re.is_ok(),
+        "suggest regex should be valid: {regex_str}\nerror: {:?}",
+        re.err()
+    );
 
     // The pattern should match the original names
     let re = re.unwrap();
     for name in &names {
-        assert!(re.is_match(name), "regex should match original name '{name}'");
+        assert!(
+            re.is_match(name),
+            "regex should match original name '{name}'"
+        );
     }
 }
 
@@ -425,7 +543,9 @@ fn chrome_trace_op_cpu_time_aggregation() {
     use crate::parsers::chrome_trace::import_chrome_trace;
 
     let db = GpuDb::create(&tempfile::tempdir().unwrap().keep().join("ct.db")).unwrap();
-    let lid = db.add_layer("torch", "trace.json", None, None, None).unwrap();
+    let lid = db
+        .add_layer("torch", "trace.json", None, None, None)
+        .unwrap();
 
     // Minimal chrome trace with two invocations of the same op
     let trace = serde_json::json!({
@@ -446,36 +566,58 @@ fn chrome_trace_op_cpu_time_aggregation() {
     import_chrome_trace(&db.conn, tmp.path(), lid).unwrap();
 
     // aten::mm should have cpu_time = 80 + 30 = 110
-    let mm_cpu: f64 = db.conn.query_row(
-        "SELECT cpu_time_us FROM ops WHERE name = 'aten::mm'",
-        [], |row| row.get(0),
-    ).unwrap();
+    let mm_cpu: f64 = db
+        .conn
+        .query_row(
+            "SELECT cpu_time_us FROM ops WHERE name = 'aten::mm'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
     assert!(
         (mm_cpu - 110.0).abs() < 0.01,
         "aten::mm CPU time should be 110 (80+30), got {mm_cpu}"
     );
 
     // aten::add should have cpu_time = 10
-    let add_cpu: f64 = db.conn.query_row(
-        "SELECT cpu_time_us FROM ops WHERE name = 'aten::add'",
-        [], |row| row.get(0),
-    ).unwrap();
-    assert!((add_cpu - 10.0).abs() < 0.01, "aten::add CPU should be 10, got {add_cpu}");
+    let add_cpu: f64 = db
+        .conn
+        .query_row(
+            "SELECT cpu_time_us FROM ops WHERE name = 'aten::add'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(
+        (add_cpu - 10.0).abs() < 0.01,
+        "aten::add CPU should be 10, got {add_cpu}"
+    );
 
     // gemm_kernel should be mapped to aten::mm (first containing op)
-    let mapped_op: String = db.conn.query_row(
-        "SELECT o.name FROM op_kernel_map okm JOIN ops o ON o.id = okm.op_id
+    let mapped_op: String = db
+        .conn
+        .query_row(
+            "SELECT o.name FROM op_kernel_map okm JOIN ops o ON o.id = okm.op_id
          WHERE okm.kernel_name = 'gemm_kernel'",
-        [], |row| row.get(0),
-    ).unwrap();
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
     assert_eq!(mapped_op, "aten::mm", "kernel should map to containing op");
 
     // aten::mm gpu_time should reflect the kernel (50us)
-    let mm_gpu: f64 = db.conn.query_row(
-        "SELECT gpu_time_us FROM ops WHERE name = 'aten::mm'",
-        [], |row| row.get(0),
-    ).unwrap();
-    assert!((mm_gpu - 50.0).abs() < 0.01, "aten::mm GPU should be 50, got {mm_gpu}");
+    let mm_gpu: f64 = db
+        .conn
+        .query_row(
+            "SELECT gpu_time_us FROM ops WHERE name = 'aten::mm'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(
+        (mm_gpu - 50.0).abs() < 0.01,
+        "aten::mm GPU should be 50, got {mm_gpu}"
+    );
 }
 
 // -----------------------------------------------------------------------
@@ -488,7 +630,9 @@ fn chrome_trace_innermost_op_wins() {
     use crate::parsers::chrome_trace::import_chrome_trace;
 
     let db = GpuDb::create(&tempfile::tempdir().unwrap().keep().join("nested.db")).unwrap();
-    let lid = db.add_layer("torch", "trace.json", None, None, None).unwrap();
+    let lid = db
+        .add_layer("torch", "trace.json", None, None, None)
+        .unwrap();
 
     // Outer op contains inner op contains kernel
     let trace = serde_json::json!({
@@ -510,18 +654,32 @@ fn chrome_trace_innermost_op_wins() {
     import_chrome_trace(&db.conn, tmp.path(), lid).unwrap();
 
     // sgemm at t=150 should map to aten::mm (innermost containing op)
-    let sgemm_op: String = db.conn.query_row(
-        "SELECT o.name FROM op_kernel_map okm JOIN ops o ON o.id = okm.op_id
+    let sgemm_op: String = db
+        .conn
+        .query_row(
+            "SELECT o.name FROM op_kernel_map okm JOIN ops o ON o.id = okm.op_id
          WHERE okm.kernel_name = 'sgemm'",
-        [], |row| row.get(0),
-    ).unwrap();
-    assert_eq!(sgemm_op, "aten::mm", "sgemm should map to innermost op aten::mm");
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        sgemm_op, "aten::mm",
+        "sgemm should map to innermost op aten::mm"
+    );
 
     // elementwise at t=500 should map to aten::linear
-    let ew_op: String = db.conn.query_row(
-        "SELECT o.name FROM op_kernel_map okm JOIN ops o ON o.id = okm.op_id
+    let ew_op: String = db
+        .conn
+        .query_row(
+            "SELECT o.name FROM op_kernel_map okm JOIN ops o ON o.id = okm.op_id
          WHERE okm.kernel_name = 'elementwise'",
-        [], |row| row.get(0),
-    ).unwrap();
-    assert_eq!(ew_op, "aten::linear", "elementwise should map to outer op aten::linear");
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        ew_op, "aten::linear",
+        "elementwise should map to outer op aten::linear"
+    );
 }

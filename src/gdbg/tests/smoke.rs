@@ -67,14 +67,14 @@ fn smoke_all_commands() {
 
     // Filters
     commands::cmd_focus(&mut db, &["cutlass"]);
-    commands::cmd_kernels(&db, &[]);  // should only show cutlass
+    commands::cmd_kernels(&db, &[]); // should only show cutlass
     commands::cmd_ignore(&mut db, &["sgemm"]);
     commands::cmd_kernels(&db, &[]);
     commands::cmd_region(&mut db, &["Step#1"]);
-    commands::cmd_kernels(&db, &[]);  // should filter to region
-    commands::cmd_region(&mut db, &[]);  // list regions
+    commands::cmd_kernels(&db, &[]); // should filter to region
+    commands::cmd_region(&mut db, &[]); // list regions
     commands::cmd_reset(&mut db);
-    commands::cmd_kernels(&db, &[]);  // back to all
+    commands::cmd_kernels(&db, &[]); // back to all
 
     // New high-value commands
     commands::cmd_bandwidth(&db, &[]);
@@ -84,17 +84,17 @@ fn smoke_all_commands() {
     commands::cmd_critical_path(&db, &["50"]);
     commands::cmd_stream_graph(&db, &[]);
     commands::cmd_stream_graph(&db, &["60"]);
-    commands::cmd_hotspot(&db, &[]);            // missing arg
+    commands::cmd_hotspot(&db, &[]); // missing arg
     commands::cmd_hotspot(&db, &["10000"]);
-    commands::cmd_hotspot(&db, &["500"]);       // very small window
-    commands::cmd_launches(&db, &[]);           // missing arg
+    commands::cmd_hotspot(&db, &["500"]); // very small window
+    commands::cmd_launches(&db, &[]); // missing arg
     commands::cmd_launches(&db, &["sgemm"]);
     commands::cmd_launches(&db, &["cutlass", "3"]);
     commands::cmd_launches(&db, &["nonexistent_kernel_xyz"]);
-    commands::cmd_compare(&db, &["sgemm"]);     // missing second
+    commands::cmd_compare(&db, &["sgemm"]); // missing second
     commands::cmd_compare(&db, &["sgemm", "cutlass"]);
     commands::cmd_compare(&db, &["sgemm", "nonexistent_xyz"]);
-    commands::cmd_regressions(&db, &[]);        // missing arg
+    commands::cmd_regressions(&db, &[]); // missing arg
 
     // No-data edge cases (commands on missing layers)
     commands::cmd_inspect(&db, &["nonexistent_kernel_xyz"]);
@@ -130,31 +130,48 @@ fn breakdown_no_double_count() {
 
     // The timeline_filter prefers nsys, so breakdown should report 3005us total
     // for the cutlass kernel when looking at aten::linear.
-    let nsys_total: f64 = db.conn.query_row(
-        "SELECT SUM(duration_us) FROM launches
+    let nsys_total: f64 = db
+        .conn
+        .query_row(
+            "SELECT SUM(duration_us) FROM launches
          WHERE kernel_name LIKE '%cutlass%' AND layer_id = (
            SELECT id FROM layers WHERE source = 'nsys' LIMIT 1
          )",
-        [],
-        |row| row.get(0),
-    ).unwrap();
-    assert!((nsys_total - 3005.0).abs() < 0.1, "nsys cutlass total: {nsys_total}");
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(
+        (nsys_total - 3005.0).abs() < 0.1,
+        "nsys cutlass total: {nsys_total}"
+    );
 
-    let all_total: f64 = db.conn.query_row(
-        "SELECT SUM(duration_us) FROM launches WHERE kernel_name LIKE '%cutlass%'",
-        [],
-        |row| row.get(0),
-    ).unwrap();
+    let all_total: f64 = db
+        .conn
+        .query_row(
+            "SELECT SUM(duration_us) FROM launches WHERE kernel_name LIKE '%cutlass%'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
     // all_total includes both nsys (3005) and torch (980) = 3985
-    assert!((all_total - 3985.0).abs() < 0.1, "all layers cutlass total: {all_total}");
+    assert!(
+        (all_total - 3985.0).abs() < 0.1,
+        "all layers cutlass total: {all_total}"
+    );
 
     // The breakdown command should NOT report 3985 — it should report 3005
     // (the nsys-only total, since timeline_filter selects nsys).
     // We can't capture stdout easily, but we verify the query logic matches:
     let tl_id: i64 = db.timeline_layer_id().unwrap();
-    let nsys_id: i64 = db.conn.query_row(
-        "SELECT id FROM layers WHERE source = 'nsys' LIMIT 1", [], |r| r.get(0),
-    ).unwrap();
+    let nsys_id: i64 = db
+        .conn
+        .query_row(
+            "SELECT id FROM layers WHERE source = 'nsys' LIMIT 1",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
     assert_eq!(tl_id, nsys_id, "timeline should prefer nsys layer");
 
     // And run it to make sure it doesn't panic
@@ -181,18 +198,27 @@ fn gaps_handles_overlapping_streams() {
     // Naive consecutive: would see gaps between 0→200 and 400→800 etc.
     // Correct merged: only one gap from 600 to 800 = 200us
 
-    db.conn.execute(
-        "INSERT INTO launches (kernel_name, duration_us, start_us, stream_id, layer_id)
-         VALUES ('k1', 400.0, 0.0, 1, ?1)", params![lid],
-    ).unwrap();
-    db.conn.execute(
-        "INSERT INTO launches (kernel_name, duration_us, start_us, stream_id, layer_id)
-         VALUES ('k2', 400.0, 200.0, 2, ?1)", params![lid],
-    ).unwrap();
-    db.conn.execute(
-        "INSERT INTO launches (kernel_name, duration_us, start_us, stream_id, layer_id)
-         VALUES ('k3', 200.0, 800.0, 1, ?1)", params![lid],
-    ).unwrap();
+    db.conn
+        .execute(
+            "INSERT INTO launches (kernel_name, duration_us, start_us, stream_id, layer_id)
+         VALUES ('k1', 400.0, 0.0, 1, ?1)",
+            params![lid],
+        )
+        .unwrap();
+    db.conn
+        .execute(
+            "INSERT INTO launches (kernel_name, duration_us, start_us, stream_id, layer_id)
+         VALUES ('k2', 400.0, 200.0, 2, ?1)",
+            params![lid],
+        )
+        .unwrap();
+    db.conn
+        .execute(
+            "INSERT INTO launches (kernel_name, duration_us, start_us, stream_id, layer_id)
+         VALUES ('k3', 200.0, 800.0, 1, ?1)",
+            params![lid],
+        )
+        .unwrap();
 
     // Run gaps command (should not panic, and should find exactly 1 gap)
     commands::cmd_gaps(&db, &[]);
@@ -207,10 +233,13 @@ fn gaps_handles_overlapping_streams() {
     // Let's test a case where it would definitely fail:
 
     // Add a third stream that fills the 600-800 gap
-    db.conn.execute(
-        "INSERT INTO launches (kernel_name, duration_us, start_us, stream_id, layer_id)
-         VALUES ('k4', 300.0, 550.0, 3, ?1)", params![lid],
-    ).unwrap();
+    db.conn
+        .execute(
+            "INSERT INTO launches (kernel_name, duration_us, start_us, stream_id, layer_id)
+         VALUES ('k4', 300.0, 550.0, 3, ?1)",
+            params![lid],
+        )
+        .unwrap();
     // Now streams cover: [0,400], [200,600], [550,850], [800,1000]
     // Merged: [0, 1000] — no gaps at all!
     // Old LAG code would still see a gap: ordered by start is k1(0), k2(200), k4(550), k3(800)
@@ -272,22 +301,34 @@ fn gaps_handles_overlapping_streams() {
     //   row4: prev_end = 700, start = 900 → 200us gap ← WRONG! real gap is 800→900 = 100us
     // Because LAG only sees the PREVIOUS row's end (700), not the running max (800).
 
-    db2.conn.execute(
-        "INSERT INTO launches (kernel_name, duration_us, start_us, stream_id, layer_id)
-         VALUES ('a', 100.0, 0.0, 1, ?1)", params![lid2],
-    ).unwrap();
-    db2.conn.execute(
-        "INSERT INTO launches (kernel_name, duration_us, start_us, stream_id, layer_id)
-         VALUES ('b', 750.0, 50.0, 2, ?1)", params![lid2],
-    ).unwrap();
-    db2.conn.execute(
-        "INSERT INTO launches (kernel_name, duration_us, start_us, stream_id, layer_id)
-         VALUES ('c', 100.0, 600.0, 1, ?1)", params![lid2],
-    ).unwrap();
-    db2.conn.execute(
-        "INSERT INTO launches (kernel_name, duration_us, start_us, stream_id, layer_id)
-         VALUES ('d', 100.0, 900.0, 1, ?1)", params![lid2],
-    ).unwrap();
+    db2.conn
+        .execute(
+            "INSERT INTO launches (kernel_name, duration_us, start_us, stream_id, layer_id)
+         VALUES ('a', 100.0, 0.0, 1, ?1)",
+            params![lid2],
+        )
+        .unwrap();
+    db2.conn
+        .execute(
+            "INSERT INTO launches (kernel_name, duration_us, start_us, stream_id, layer_id)
+         VALUES ('b', 750.0, 50.0, 2, ?1)",
+            params![lid2],
+        )
+        .unwrap();
+    db2.conn
+        .execute(
+            "INSERT INTO launches (kernel_name, duration_us, start_us, stream_id, layer_id)
+         VALUES ('c', 100.0, 600.0, 1, ?1)",
+            params![lid2],
+        )
+        .unwrap();
+    db2.conn
+        .execute(
+            "INSERT INTO launches (kernel_name, duration_us, start_us, stream_id, layer_id)
+         VALUES ('d', 100.0, 900.0, 1, ?1)",
+            params![lid2],
+        )
+        .unwrap();
     // Merged: [0, 800] then [900, 1000]. One gap: 800→900 = 100us.
     // Old code would report: 900 - 700 = 200us (wrong).
 
@@ -311,11 +352,13 @@ fn gap_merge_correctness() {
         ("c", 100.0, 600.0, 1),
         ("d", 100.0, 900.0, 1),
     ] {
-        db.conn.execute(
-            "INSERT INTO launches (kernel_name, duration_us, start_us, stream_id, layer_id)
+        db.conn
+            .execute(
+                "INSERT INTO launches (kernel_name, duration_us, start_us, stream_id, layer_id)
              VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![name, dur, start, stream, lid],
-        ).unwrap();
+                params![name, dur, start, stream, lid],
+            )
+            .unwrap();
     }
 
     // Run the internal gap computation via the command
@@ -327,7 +370,7 @@ fn gap_merge_correctness() {
          ORDER BY start_us"
     );
     let intervals: Vec<(f64, f64)> = db.query_vec(&sql, [], |row| {
-        Ok((row.get::<_,f64>(0)?, row.get::<_,f64>(1)?))
+        Ok((row.get::<_, f64>(0)?, row.get::<_, f64>(1)?))
     });
 
     // Manually merge and verify
@@ -335,7 +378,9 @@ fn gap_merge_correctness() {
     if let Some(&(_, mut cur_end)) = intervals.first() {
         for &(s, e) in &intervals[1..] {
             if s <= cur_end {
-                if e > cur_end { cur_end = e; }
+                if e > cur_end {
+                    cur_end = e;
+                }
             } else {
                 let gap = s - cur_end;
                 if gap > 1.0 {
@@ -347,8 +392,16 @@ fn gap_merge_correctness() {
     }
 
     assert_eq!(gaps.len(), 1, "expected exactly 1 gap, got: {gaps:?}");
-    assert!((gaps[0].0 - 800.0).abs() < 0.1, "gap should start at 800, got {}", gaps[0].0);
-    assert!((gaps[0].1 - 100.0).abs() < 0.1, "gap should be 100us, got {}", gaps[0].1);
+    assert!(
+        (gaps[0].0 - 800.0).abs() < 0.1,
+        "gap should start at 800, got {}",
+        gaps[0].0
+    );
+    assert!(
+        (gaps[0].1 - 100.0).abs() < 0.1,
+        "gap should be 100us, got {}",
+        gaps[0].1
+    );
 }
 
 // -----------------------------------------------------------------------
@@ -364,24 +417,38 @@ fn region_filter_restricts_launches() {
     let total_before = db.total_launch_count();
 
     db.region_filter = Some("Step#1".to_string());
-    let filter = db.kernel_filter();
+    let filter = db.kernel_filter_params();
 
     // Count launches matching the filter
-    let sql = format!(
-        "SELECT COUNT(*) FROM launches WHERE {filter}"
-    );
-    let filtered_count = db.count(&sql);
+    let sql = format!("SELECT COUNT(*) FROM launches WHERE {}", filter.clause());
+    let filtered_count: i64 = db
+        .conn
+        .query_row(&sql, rusqlite::params_from_iter(filter.params()), |row| {
+            row.get(0)
+        })
+        .unwrap();
 
-    assert!(filtered_count > 0, "region filter should match some launches");
-    assert!(filtered_count < total_before,
-        "region filter should exclude launches outside the region (filtered={filtered_count}, total={total_before})");
+    assert!(
+        filtered_count > 0,
+        "region filter should match some launches"
+    );
+    assert!(
+        filtered_count < total_before as i64,
+        "region filter should exclude launches outside the region (filtered={filtered_count}, total={total_before})"
+    );
 
     // Launches at t=30000, 40000, etc. should be excluded
-    let outside = db.conn.query_row(
-        &format!("SELECT COUNT(*) FROM launches WHERE start_us > 20500 AND {filter}"),
-        [],
-        |row| row.get::<_, i64>(0),
-    ).unwrap();
+    let outside = db
+        .conn
+        .query_row(
+            &format!(
+                "SELECT COUNT(*) FROM launches WHERE start_us > 20500 AND {}",
+                filter.clause()
+            ),
+            rusqlite::params_from_iter(filter.params()),
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap();
     assert_eq!(outside, 0, "launches after region end should be excluded");
 }
 
@@ -471,10 +538,12 @@ fn variance_single_launch() {
     let db = GpuDb::create(&path).unwrap();
     let lid = db.add_layer("nsys", "t", None, None, None).unwrap();
 
-    db.conn.execute(
-        "INSERT INTO launches (kernel_name, duration_us, layer_id) VALUES ('solo', 100.0, ?1)",
-        params![lid],
-    ).unwrap();
+    db.conn
+        .execute(
+            "INSERT INTO launches (kernel_name, duration_us, layer_id) VALUES ('solo', 100.0, ?1)",
+            params![lid],
+        )
+        .unwrap();
 
     // Should print "only 1 launch", not panic
     commands::cmd_variance(&db, &["solo"]);
@@ -602,9 +671,9 @@ fn multi_stream_all_commands_no_panic() {
     commands::cmd_bound(&db, &["gemm"]);
 
     // Filters — region filter with pipeline stages
-    commands::cmd_region(&mut db, &[]);  // list regions
+    commands::cmd_region(&mut db, &[]); // list regions
     commands::cmd_region(&mut db, &["PipelineStage#0"]);
-    commands::cmd_kernels(&db, &[]);  // should be restricted
+    commands::cmd_kernels(&db, &[]); // should be restricted
     commands::cmd_reset(&mut db);
 }
 
@@ -641,18 +710,26 @@ fn ncu_only_session_no_panic() {
 
     // Only ncu metrics, no timeline at all (e.g., user ran ncu directly)
     let ncu_id = db
-        .add_layer("ncu", "/tmp/ncu.csv", Some("ncu --set full"), Some(60.0), None)
+        .add_layer(
+            "ncu",
+            "/tmp/ncu.csv",
+            Some("ncu --set full"),
+            Some(60.0),
+            None,
+        )
         .unwrap();
 
-    db.conn.execute(
-        "INSERT INTO metrics
+    db.conn
+        .execute(
+            "INSERT INTO metrics
          (kernel_name, occupancy_pct, compute_throughput_pct, memory_throughput_pct,
           registers_per_thread, shared_mem_static_bytes, shared_mem_dynamic_bytes,
           l2_hit_rate_pct, achieved_bandwidth_gb_s, peak_bandwidth_gb_s,
           boundedness, layer_id)
          VALUES ('my_kernel', 50.0, 40.0, 60.0, 48, 16384, 0, 55.0, 800.0, 900.0, 'memory', ?1)",
-        params![ncu_id],
-    ).unwrap();
+            params![ncu_id],
+        )
+        .unwrap();
 
     // All commands should handle "no launches" gracefully
     commands::cmd_stats(&db);
@@ -697,8 +774,10 @@ fn stats_gpu_time_equals_kernels_total() {
     // reduce_sum: 800+790 = 1590
     // Total = 11823
     let expected = 10080.0 + 153.0 + 1590.0;
-    assert!((total - expected).abs() < 0.1,
-        "total_gpu_time_us() = {total}, expected {expected}");
+    assert!(
+        (total - expected).abs() < 0.1,
+        "total_gpu_time_us() = {total}, expected {expected}"
+    );
 }
 
 // =======================================================================
@@ -718,16 +797,21 @@ fn multi_layer_kernels_use_timeline_filter() {
     let tl_id = db.timeline_layer_id().unwrap();
 
     // Timeline-filtered GPU time (nsys only)
-    let nsys_total: f64 = db.conn.query_row(
-        "SELECT COALESCE(SUM(duration_us), 0) FROM launches WHERE layer_id = ?1",
-        params![tl_id],
-        |row| row.get(0),
-    ).unwrap();
+    let nsys_total: f64 = db
+        .conn
+        .query_row(
+            "SELECT COALESCE(SUM(duration_us), 0) FROM launches WHERE layer_id = ?1",
+            params![tl_id],
+            |row| row.get(0),
+        )
+        .unwrap();
 
     // total_gpu_time_us() should now match the nsys-only total (not double-count)
     let reported_total = db.total_gpu_time_us();
-    assert!((reported_total - nsys_total).abs() < 0.1,
-        "total_gpu_time_us() should use timeline_filter: got {reported_total}, expected {nsys_total}");
+    assert!(
+        (reported_total - nsys_total).abs() < 0.1,
+        "total_gpu_time_us() should use timeline_filter: got {reported_total}, expected {nsys_total}"
+    );
 }
 
 // =======================================================================
@@ -745,24 +829,32 @@ fn variance_math_correctness() {
     // Mean = 300, Var = E[X^2] - E[X]^2 = 110000 - 90000 = 20000
     // Stddev = 141.42, CV = 141.42/300 = 0.4714
     for &dur in &[100.0_f64, 200.0, 300.0, 400.0, 500.0] {
-        db.conn.execute(
-            "INSERT INTO launches (kernel_name, duration_us, layer_id)
+        db.conn
+            .execute(
+                "INSERT INTO launches (kernel_name, duration_us, layer_id)
              VALUES ('test_kernel', ?1, ?2)",
-            params![dur, lid],
-        ).unwrap();
+                params![dur, lid],
+            )
+            .unwrap();
     }
 
     // Verify the SQL variance calculation matches
-    let (avg, var): (f64, f64) = db.conn.query_row(
-        "SELECT AVG(duration_us),
+    let (avg, var): (f64, f64) = db
+        .conn
+        .query_row(
+            "SELECT AVG(duration_us),
                 AVG(duration_us * duration_us) - AVG(duration_us) * AVG(duration_us)
          FROM launches WHERE kernel_name = 'test_kernel'",
-        [],
-        |row| Ok((row.get(0)?, row.get(1)?)),
-    ).unwrap();
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
 
     assert!((avg - 300.0).abs() < 0.1, "mean should be 300, got {avg}");
-    assert!((var - 20000.0).abs() < 0.1, "variance should be 20000, got {var}");
+    assert!(
+        (var - 20000.0).abs() < 0.1,
+        "variance should be 20000, got {var}"
+    );
 
     let stddev = var.sqrt();
     let cv = stddev / avg;
@@ -788,8 +880,10 @@ fn kernel_percentages_sum_to_100() {
     let sum_of_totals: f64 = db.conn.query_row(sql, [], |row| row.get(0)).unwrap();
     let gpu_total = db.total_gpu_time_us();
 
-    assert!((sum_of_totals - gpu_total).abs() < 0.1,
-        "sum of per-kernel totals ({sum_of_totals}) should equal total GPU time ({gpu_total})");
+    assert!(
+        (sum_of_totals - gpu_total).abs() < 0.1,
+        "sum of per-kernel totals ({sum_of_totals}) should equal total GPU time ({gpu_total})"
+    );
 }
 
 // =======================================================================
@@ -801,22 +895,30 @@ fn inspect_total_matches_kernels_listing() {
     let db = build_cuda_only_session();
 
     // Query the same way cmd_kernels does (no layer filter)
-    let kernel_total: f64 = db.conn.query_row(
-        "SELECT SUM(duration_us) FROM launches WHERE kernel_name LIKE '%sgemm%'",
-        [],
-        |row| row.get(0),
-    ).unwrap();
+    let kernel_total: f64 = db
+        .conn
+        .query_row(
+            "SELECT SUM(duration_us) FROM launches WHERE kernel_name LIKE '%sgemm%'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
 
     // Query the same way cmd_inspect does (also no layer filter)
-    let (inspect_cnt, inspect_total): (i64, f64) = db.conn.query_row(
-        "SELECT COUNT(*), SUM(duration_us) FROM launches WHERE kernel_name LIKE '%sgemm%'",
-        [],
-        |row| Ok((row.get(0)?, row.get(1)?)),
-    ).unwrap();
+    let (inspect_cnt, inspect_total): (i64, f64) = db
+        .conn
+        .query_row(
+            "SELECT COUNT(*), SUM(duration_us) FROM launches WHERE kernel_name LIKE '%sgemm%'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
 
     // In single-layer session these must match exactly
-    assert!((kernel_total - inspect_total).abs() < 0.1,
-        "kernels total ({kernel_total}) vs inspect total ({inspect_total})");
+    assert!(
+        (kernel_total - inspect_total).abs() < 0.1,
+        "kernels total ({kernel_total}) vs inspect total ({inspect_total})"
+    );
     assert_eq!(inspect_cnt, 5);
 }
 
@@ -830,24 +932,33 @@ fn breakdown_sums_consistent_with_top_ops() {
 
     // For "attention" op, breakdown shows kernels and their times.
     // The kernel total from breakdown should match the op's gpu_time_us.
-    let op_gpu: f64 = db.conn.query_row(
-        "SELECT gpu_time_us FROM ops WHERE name = 'attention'",
-        [], |row| row.get(0),
-    ).unwrap();
+    let op_gpu: f64 = db
+        .conn
+        .query_row(
+            "SELECT gpu_time_us FROM ops WHERE name = 'attention'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
 
     // The kernel time for flash_attention (proton layer) via timeline_filter
     let tl_id = db.timeline_layer_id().unwrap();
-    let kernel_total: f64 = db.conn.query_row(
-        "SELECT COALESCE(SUM(l.duration_us), 0)
+    let kernel_total: f64 = db
+        .conn
+        .query_row(
+            "SELECT COALESCE(SUM(l.duration_us), 0)
          FROM op_kernel_map okm
          JOIN launches l ON l.kernel_name = okm.kernel_name AND l.layer_id = ?1
          WHERE okm.op_id = (SELECT id FROM ops WHERE name = 'attention')",
-        params![tl_id],
-        |row| row.get(0),
-    ).unwrap();
+            params![tl_id],
+            |row| row.get(0),
+        )
+        .unwrap();
 
-    assert!((op_gpu - kernel_total).abs() < 0.1,
-        "op gpu_time_us ({op_gpu}) should match breakdown kernel total ({kernel_total})");
+    assert!(
+        (op_gpu - kernel_total).abs() < 0.1,
+        "op gpu_time_us ({op_gpu}) should match breakdown kernel total ({kernel_total})"
+    );
 
     // Command shouldn't panic
     commands::cmd_breakdown(&db, &["attention"]);
@@ -865,8 +976,12 @@ fn focus_filter_restricts_small_command() {
     commands::cmd_focus(&mut db, &["sgemm"]);
     commands::cmd_small(&db, &[]);
     // (Can't capture stdout, but verify filter is applied)
-    let filter = db.kernel_filter();
-    assert!(filter.contains("sgemm"), "focus filter should contain 'sgemm'");
+    let filter = db.kernel_filter_params();
+    assert_eq!(
+        filter.params().len(),
+        1,
+        "focus filter should bind one parameter"
+    );
 
     commands::cmd_reset(&mut db);
 }
@@ -886,8 +1001,11 @@ fn stream_count_consistency() {
         |row| row.get(0),
     );
 
-    assert_eq!(reported_count, actual_streams.len(),
-        "stream_count ({reported_count}) should match distinct stream IDs ({actual_streams:?})");
+    assert_eq!(
+        reported_count,
+        actual_streams.len(),
+        "stream_count ({reported_count}) should match distinct stream IDs ({actual_streams:?})"
+    );
     assert_eq!(reported_count, 4, "multi-stream session has 4 streams");
 
     commands::cmd_streams(&db);
@@ -955,7 +1073,9 @@ fn diff_disjoint_kernels() {
     {
         let mut dest_conn = rusqlite::Connection::open(&dest).unwrap();
         let backup = rusqlite::backup::Backup::new(&other.conn, &mut dest_conn).unwrap();
-        backup.run_to_completion(100, std::time::Duration::from_millis(10), None).unwrap();
+        backup
+            .run_to_completion(100, std::time::Duration::from_millis(10), None)
+            .unwrap();
     }
 
     // Diff should show all kernels as "new" in one or the other

@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, ToSql, params};
 
 /// gdbg's schema version.
 ///
@@ -39,20 +39,42 @@ impl std::fmt::Debug for GpuDb {
     }
 }
 
+#[derive(Default)]
+pub struct SqlFilter {
+    clause: String,
+    params: Vec<String>,
+}
+
+impl SqlFilter {
+    pub fn clause(&self) -> &str {
+        if self.clause.is_empty() {
+            "1=1"
+        } else {
+            &self.clause
+        }
+    }
+
+    pub fn params(&self) -> Vec<&dyn ToSql> {
+        self.params.iter().map(|p| p as &dyn ToSql).collect()
+    }
+}
+
+/// Build a SQL LIKE bind-parameter from a user pattern: `%escaped_pattern%`.
+pub fn like_param(pattern: &str) -> String {
+    format!("%{}%", escape_sql_like(pattern))
+}
+
 impl GpuDb {
     /// Create a new session database at the given path.
     pub fn create(path: &Path) -> Result<Self> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let conn = Connection::open(path)
-            .with_context(|| format!("cannot create {}", path.display()))?;
+        let conn =
+            Connection::open(path).with_context(|| format!("cannot create {}", path.display()))?;
         conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")?;
         init_schema(&conn)?;
-        conn.execute(
-            &format!("PRAGMA user_version = {GDBG_SCHEMA_VERSION}"),
-            [],
-        )?;
+        conn.execute(&format!("PRAGMA user_version = {GDBG_SCHEMA_VERSION}"), [])?;
         Ok(Self {
             conn,
             _path: path.to_path_buf(),
@@ -73,8 +95,8 @@ impl GpuDb {
         if !path.exists() {
             bail!("session not found: {}", path.display());
         }
-        let conn = Connection::open(path)
-            .with_context(|| format!("cannot open {}", path.display()))?;
+        let conn =
+            Connection::open(path).with_context(|| format!("cannot open {}", path.display()))?;
         let found: i64 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap_or(0);
@@ -176,9 +198,11 @@ impl GpuDb {
 
     pub fn meta(&self, key: &str) -> String {
         self.conn
-            .query_row("SELECT value FROM meta WHERE key = ?1", params![key], |row| {
-                row.get(0)
-            })
+            .query_row(
+                "SELECT value FROM meta WHERE key = ?1",
+                params![key],
+                |row| row.get(0),
+            )
             .unwrap_or_default()
     }
 
@@ -288,7 +312,12 @@ impl GpuDb {
             warnings.push(format!(
                 "{} kernels in torch layer but not nsys (different run?): {}",
                 orphans.len(),
-                orphans.iter().take(3).cloned().collect::<Vec<_>>().join(", ")
+                orphans
+                    .iter()
+                    .take(3)
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(", ")
             ));
         }
 
@@ -359,11 +388,9 @@ impl GpuDb {
     }
 
     pub fn failures(&self) -> Vec<(String, String)> {
-        self.query_vec(
-            "SELECT phase, error FROM failures",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
+        self.query_vec("SELECT phase, error FROM failures", [], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })
     }
 
     // -----------------------------------------------------------------------
@@ -379,7 +406,9 @@ impl GpuDb {
     /// `timeline_filter` selects, so that `top-ops`, `compare-ops`, and
     /// `hotpath` stay consistent with `breakdown` and `kernels`.
     pub fn recompute_op_gpu_times(&self) {
-        let Some(tl_id) = self.timeline_layer_id() else { return };
+        let Some(tl_id) = self.timeline_layer_id() else {
+            return;
+        };
 
         // Check whether the timeline layer is already the op layer —
         // if so, nothing to fix.
@@ -388,11 +417,14 @@ impl GpuDb {
             [],
             |row| row.get(0),
         );
-        let tl_source: String = self.conn.query_row(
-            "SELECT source FROM layers WHERE id = ?1",
-            params![tl_id],
-            |row| row.get(0),
-        ).unwrap_or_default();
+        let tl_source: String = self
+            .conn
+            .query_row(
+                "SELECT source FROM layers WHERE id = ?1",
+                params![tl_id],
+                |row| row.get(0),
+            )
+            .unwrap_or_default();
 
         // If the only op layer is also the timeline layer, no recomputation needed.
         if op_layers.len() == 1 && op_layers[0] == tl_source {
@@ -435,7 +467,9 @@ impl GpuDb {
 
     pub fn unique_kernel_count(&self) -> usize {
         let tl = self.timeline_filter();
-        self.count(&format!("SELECT COUNT(DISTINCT kernel_name) FROM launches WHERE {tl}"))
+        self.count(&format!(
+            "SELECT COUNT(DISTINCT kernel_name) FROM launches WHERE {tl}"
+        ))
     }
 
     pub fn total_launch_count(&self) -> usize {
@@ -445,7 +479,9 @@ impl GpuDb {
 
     pub fn total_gpu_time_us(&self) -> f64 {
         let tl = self.timeline_filter();
-        self.scalar_f64(&format!("SELECT COALESCE(SUM(duration_us), 0) FROM launches WHERE {tl}"))
+        self.scalar_f64(&format!(
+            "SELECT COALESCE(SUM(duration_us), 0) FROM launches WHERE {tl}"
+        ))
     }
 
     /// Kernel `(start_us, end_us)` intervals from `launches`, timeline-filtered,
@@ -485,7 +521,9 @@ impl GpuDb {
 
     pub fn stream_count(&self) -> usize {
         let tl = self.timeline_filter();
-        self.count(&format!("SELECT COUNT(DISTINCT stream_id) FROM launches WHERE stream_id IS NOT NULL AND {tl}"))
+        self.count(&format!(
+            "SELECT COUNT(DISTINCT stream_id) FROM launches WHERE stream_id IS NOT NULL AND {tl}"
+        ))
     }
 
     pub fn kernels_with_metrics(&self) -> usize {
@@ -500,30 +538,33 @@ impl GpuDb {
     // Filter helpers — builds WHERE clause fragments
     // -----------------------------------------------------------------------
 
-    pub fn kernel_filter(&self) -> String {
+    pub fn kernel_filter_params(&self) -> SqlFilter {
         let mut clauses = Vec::new();
+        let mut params = Vec::new();
         if let Some(ref f) = self.focus {
-            clauses.push(format!(r"launches.kernel_name LIKE '%{}%' ESCAPE '\'", escape_sql_like(f)));
+            clauses.push(r"launches.kernel_name LIKE ? ESCAPE '\'".to_string());
+            params.push(like_param(f));
         }
         if let Some(ref ig) = self.ignore {
-            clauses.push(format!(r"launches.kernel_name NOT LIKE '%{}%' ESCAPE '\'", escape_sql_like(ig)));
+            clauses.push(r"launches.kernel_name NOT LIKE ? ESCAPE '\'".to_string());
+            params.push(like_param(ig));
         }
         if let Some(ref r) = self.region_filter {
             // Only include launches whose start_us falls within a matching region.
-            clauses.push(format!(
-                r"start_us IS NOT NULL AND EXISTS (
+            clauses.push(
+                r"launches.start_us IS NOT NULL AND EXISTS (
                    SELECT 1 FROM regions
-                   WHERE name LIKE '%{}%' ESCAPE '\'
+                   WHERE name LIKE ? ESCAPE '\'
                      AND launches.start_us >= regions.start_us
                      AND launches.start_us <= regions.start_us + regions.duration_us
-                 )",
-                escape_sql_like(r)
-            ));
+                 )"
+                .to_string(),
+            );
+            params.push(like_param(r));
         }
-        if clauses.is_empty() {
-            "1=1".to_string()
-        } else {
-            clauses.join(" AND ")
+        SqlFilter {
+            clause: clauses.join(" AND "),
+            params,
         }
     }
 
@@ -737,7 +778,15 @@ mod tests {
     #[test]
     fn add_layer() {
         let db = temp_db();
-        let id = db.add_layer("nsys", "/tmp/trace.nsys-rep", Some("nsys profile"), Some(12.5), None).unwrap();
+        let id = db
+            .add_layer(
+                "nsys",
+                "/tmp/trace.nsys-rep",
+                Some("nsys profile"),
+                Some(12.5),
+                None,
+            )
+            .unwrap();
         assert_eq!(id, 1);
         assert!(db.has_layer("nsys"));
         assert!(!db.has_layer("ncu"));
@@ -774,10 +823,12 @@ mod tests {
             "INSERT INTO launches (kernel_name, duration_us, layer_id) VALUES ('k1', 200.0, ?1)",
             params![lid],
         ).unwrap();
-        db.conn.execute(
-            "INSERT INTO launches (kernel_name, duration_us, layer_id) VALUES ('k2', 50.0, ?1)",
-            params![lid],
-        ).unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO launches (kernel_name, duration_us, layer_id) VALUES ('k2', 50.0, ?1)",
+                params![lid],
+            )
+            .unwrap();
 
         assert_eq!(db.unique_kernel_count(), 2);
         assert_eq!(db.total_launch_count(), 3);
@@ -795,15 +846,21 @@ mod tests {
     }
 
     #[test]
-    fn kernel_filter() {
+    fn kernel_filter_params() {
         let mut db = temp_db();
-        assert_eq!(db.kernel_filter(), "1=1");
+        assert_eq!(db.kernel_filter_params().clause(), "1=1");
         db.focus = Some("sgemm".into());
-        assert!(db.kernel_filter().contains("launches.kernel_name LIKE '%sgemm%'"));
+        assert!(
+            db.kernel_filter_params()
+                .clause()
+                .contains("launches.kernel_name LIKE ?")
+        );
         db.ignore = Some("copy".into());
-        assert!(db.kernel_filter().contains("NOT LIKE '%copy%'"));
+        assert!(db.kernel_filter_params().clause().contains("NOT LIKE ?"));
+        let filter = db.kernel_filter_params();
+        assert_eq!(filter.params.len(), 2);
         // Verify table-qualified to avoid ambiguity in JOINs
-        assert!(db.kernel_filter().contains("launches.kernel_name"));
+        assert!(filter.clause().contains("launches.kernel_name"));
     }
 
     #[test]
@@ -822,7 +879,9 @@ mod tests {
         {
             let mut dest_conn = Connection::open(&dest).unwrap();
             let backup = rusqlite::backup::Backup::new(&db.conn, &mut dest_conn).unwrap();
-            backup.run_to_completion(100, std::time::Duration::from_millis(10), None).unwrap();
+            backup
+                .run_to_completion(100, std::time::Duration::from_millis(10), None)
+                .unwrap();
         }
 
         let loaded = GpuDb::open(&dest).unwrap();
@@ -878,8 +937,7 @@ mod tests {
         let dest = dir.path().join("backed_up.gpu.db");
         {
             let mut dest_conn = Connection::open(&dest).unwrap();
-            let backup =
-                rusqlite::backup::Backup::new(&db.conn, &mut dest_conn).unwrap();
+            let backup = rusqlite::backup::Backup::new(&db.conn, &mut dest_conn).unwrap();
             backup
                 .run_to_completion(100, std::time::Duration::from_millis(10), None)
                 .unwrap();
