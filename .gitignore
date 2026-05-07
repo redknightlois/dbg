@@ -37,3 +37,7 @@ test-kernels/
 examples/test-results/
 
 *.log
+
+# Local Forge runtime state, skills, and journals
+.forge/
+
