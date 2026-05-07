@@ -1730,9 +1730,38 @@ pub fn kill_daemon() -> Result<String> {
         return Ok("stopped".into());
     }
     let response = send_command("quit").unwrap_or_else(|_| "stopped".into());
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    // Wait for the daemon to actually exit before reaping its runtime
+    // files. The previous 5s window was too tight for backends with
+    // long finalize phases — dotnet-trace flushing a multi-GB
+    // `.nettrace`, callgrind/massif writing their outputs, jdb
+    // persisting hits — and the unconditional unlink that followed
+    // would orphan a still-alive daemon: socket gone, listener inode
+    // still held open by the running process, every subsequent
+    // `connect()` failing because the path no longer resolves.
+    //
+    // Override via `DBG_KILL_TIMEOUT_SECS` for backends with truly
+    // long shutdowns. The unlink only happens if the daemon is dead
+    // by the deadline; otherwise we leave the files intact and tell
+    // the caller, so they can retry or escalate to SIGKILL rather
+    // than silently corrupting a live session.
+    let timeout_secs = std::env::var("DBG_KILL_TIMEOUT_SECS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(30);
+    let deadline = std::time::Instant::now() + Duration::from_secs(timeout_secs);
     while std::time::Instant::now() < deadline && is_slug_live(&slug) {
         std::thread::sleep(Duration::from_millis(20));
+    }
+    if is_slug_live(&slug) {
+        let pid = std::fs::read_to_string(pid_path_for(&slug))
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        return Ok(format!(
+            "{response} (warning: daemon pid={pid} still alive after {timeout_secs}s — \
+             runtime files left intact to avoid orphaning the session. Retry \
+             `dbg kill`, raise DBG_KILL_TIMEOUT_SECS, or send SIGKILL manually)"
+        ));
     }
     let _ = std::fs::remove_file(socket_path_for(&slug));
     let _ = std::fs::remove_file(pid_path_for(&slug));
@@ -1988,6 +2017,53 @@ mod tests {
             "live daemon mid-startup must keep its pid file"
         );
         unsafe { std::env::remove_var("DBG_SESSION"); }
+    }
+
+    /// Regression: `kill_daemon` used to unlink socket+pid files
+    /// unconditionally after a 5s shutdown wait, even when the daemon
+    /// was still alive. That orphaned the live daemon — its listener
+    /// inode was held open but the path was gone, so new clients
+    /// couldn't connect. The fix: only reap files if the daemon is
+    /// actually dead by the deadline; otherwise return a warning and
+    /// leave runtime files intact.
+    #[test]
+    fn kill_daemon_does_not_unlink_files_when_daemon_still_alive() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = TempDir::new().unwrap();
+        unsafe {
+            std::env::set_var("XDG_RUNTIME_DIR", tmp.path());
+            std::env::set_var("DBG_SESSION", "testkilltimeout");
+            std::env::set_var("DBG_KILL_TIMEOUT_SECS", "1");
+        }
+        // Simulate a stuck daemon: pid file points to our own PID
+        // (which is_slug_live recognizes as live + dbg-comm), but no
+        // listener is bound — send_command will fail with EBADF/
+        // ENOENT and unwrap_or_else absorbs it, sending us into the
+        // poll loop. Loop exits at the 1s deadline with the daemon
+        // still "alive" (us).
+        std::fs::write(pid_path(), std::process::id().to_string()).unwrap();
+        std::fs::write(socket_path(), "").unwrap();
+
+        let result = kill_daemon().expect("kill_daemon must not error");
+        assert!(
+            result.contains("still alive"),
+            "expected warning about stuck daemon, got: {result}"
+        );
+        assert!(
+            pid_path().exists(),
+            "pid file must survive when daemon is still alive at deadline"
+        );
+        assert!(
+            socket_path().exists(),
+            "socket file must survive when daemon is still alive at deadline"
+        );
+        // Cleanup so other tests aren't polluted.
+        let _ = std::fs::remove_file(pid_path());
+        let _ = std::fs::remove_file(socket_path());
+        unsafe {
+            std::env::remove_var("DBG_SESSION");
+            std::env::remove_var("DBG_KILL_TIMEOUT_SECS");
+        }
     }
 
     #[test]
