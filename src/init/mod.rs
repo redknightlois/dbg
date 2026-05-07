@@ -13,8 +13,12 @@ pub fn auto_update(registry: &Registry) {
         Ok(h) => h,
         Err(_) => return,
     };
-    for config_dir in [".claude", ".codex"] {
-        let skill_dir = PathBuf::from(&home).join(config_dir).join("skills/dbg");
+    for (config_dir, agent_name) in [
+        (".claude", "Claude Code"),
+        (".codex", "Codex"),
+        (".forge", "Forge"),
+    ] {
+        let skill_dir = skill_dir_for_home(&PathBuf::from(&home), config_dir);
         let version_file = skill_dir.join(".version");
         if !version_file.exists() {
             continue;
@@ -24,7 +28,6 @@ pub fn auto_update(registry: &Registry) {
             continue;
         }
         // Version mismatch — update silently
-        let agent_name = if config_dir == ".claude" { "Claude Code" } else { "Codex" };
         let _ = init_agent(registry, config_dir, agent_name);
     }
 }
@@ -33,7 +36,8 @@ pub fn run_init(target: &str, registry: &Registry) -> Result<()> {
     match target {
         "claude" => init_agent(registry, ".claude", "Claude Code"),
         "codex" => init_agent(registry, ".codex", "Codex"),
-        _ => bail!("unknown init target: {target} (use: claude, codex, agent-context)"),
+        "forge" => init_agent(registry, ".forge", "Forge"),
+        _ => bail!("unknown init target: {target} (use: claude, codex, forge, agent-context)"),
     }
 }
 
@@ -70,7 +74,7 @@ fn extract_frontmatter(doc: &str) -> Option<&str> {
 
 fn init_agent(registry: &Registry, config_dir: &str, agent_name: &str) -> Result<()> {
     let home = std::env::var("HOME").context("HOME not set")?;
-    let skill_dir = PathBuf::from(&home).join(config_dir).join("skills/dbg");
+    let skill_dir = skill_dir_for_home(&PathBuf::from(&home), config_dir);
     let adapters_dir = skill_dir.join("references/adapters");
 
     let adapters: Vec<(&str, &str)> = registry
@@ -98,8 +102,7 @@ fn init_agent(registry: &Registry, config_dir: &str, agent_name: &str) -> Result
     // Remove stale .hash file from older versions
     let _ = std::fs::remove_file(skill_dir.join(".hash"));
 
-    std::fs::create_dir_all(&adapters_dir)
-        .context("failed to create skill directory")?;
+    std::fs::create_dir_all(&adapters_dir).context("failed to create skill directory")?;
 
     std::fs::write(skill_dir.join("SKILL.md"), SKILL_MD)?;
 
@@ -167,8 +170,36 @@ pub fn ensure_on_path() -> Result<Option<PathBuf>> {
     Ok(Some(dest))
 }
 
+fn skill_dir_for_home(home: &std::path::Path, config_dir: &str) -> PathBuf {
+    home.join(config_dir).join("skills/dbg")
+}
+
 fn dirs_home() -> PathBuf {
     std::env::var("HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from("/tmp"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn init_target_help_mentions_forge() {
+        let registry = Registry::new();
+        let err = run_init("not-an-agent", &registry).unwrap_err().to_string();
+        assert!(
+            err.contains("forge"),
+            "init target help should mention forge: {err}"
+        );
+    }
+
+    #[test]
+    fn forge_skill_dir_is_under_user_home() {
+        let home = PathBuf::from("/home/example");
+        assert_eq!(
+            skill_dir_for_home(&home, ".forge"),
+            PathBuf::from("/home/example/.forge/skills/dbg")
+        );
+    }
 }

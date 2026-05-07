@@ -70,9 +70,9 @@ Run `dbg help <verb>` inside a session for backend-specific details.";
     after_help = SUBCOMMAND_HELP,
 )]
 struct Cli {
-    /// Initialize for an AI agent (`claude`, `codex`), or print the
-    /// skill's YAML frontmatter to stdout (`agent-context`) for piping
-    /// into a harness SessionStart hook.
+    /// Initialize skill integration for an AI agent (`claude`, `codex`, `forge`),
+    /// or print the skill's YAML frontmatter to stdout (`agent-context`) for
+    /// piping into a harness SessionStart hook.
     #[arg(long)]
     init: Option<String>,
 
@@ -1099,7 +1099,7 @@ mod tests {
             "start", "kill", "sessions", "replay",
             "break", "continue", "stack", "locals",
             "hits", "hit-diff", "hit-trend",
-            "cross", "disasm", "raw",
+            "cross", "disasm", "raw", "forge",
         ] {
             assert!(
                 rendered.contains(verb),
