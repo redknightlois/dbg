@@ -623,82 +623,24 @@ fn ensure_running() -> Result<()> {
 /// tty discipline, which is exactly what dotnet-trace / perf-record
 /// expect to receive in order to flush their trace and exit.
 fn cmd_finalize() -> Result<()> {
-    use nix::sys::signal::{Signal, kill};
-    use nix::unistd::{Pid, getpgid};
-
-    let daemon_pid = daemon::current_daemon_pid().ok_or_else(|| {
-        anyhow::anyhow!(
-            "no daemon registered for this cwd — `dbg start` must be running. \
-             If `dbg start` is mid-init the pid file should exist; check \
-             $XDG_RUNTIME_DIR/dbg-$UID/ for stale state."
-        )
-    })?;
-
-    // Daemon → bash (depth 1) → collector (depth 2). The collector is
-    // what we want to SIGINT; bash itself ignores SIGINT in interactive
-    // mode. Fall back to depth-1 children if depth-2 is empty (covers
-    // backends that don't go through bash, or races where the
-    // collector hasn't spawned yet).
-    let depth1 = daemon::proc_children(daemon_pid);
-    if depth1.is_empty() {
-        bail!(
-            "daemon {daemon_pid} has no child processes — has the collector \
-             already exited? Try `dbg status` to see the current state."
-        );
-    }
-    let mut targets: Vec<i32> = depth1
-        .iter()
-        .flat_map(|&p| daemon::proc_children(p))
-        .collect();
-    if targets.is_empty() {
-        targets = depth1.clone();
-    }
-
-    let mut signalled = Vec::new();
-    let mut errors = Vec::new();
-    for pid in &targets {
-        // Send to the process group, not the bare PID: collectors that
-        // fork helper processes (perf record's session manager, etc.)
-        // need every member to see the signal for a clean shutdown.
-        let pgid = getpgid(Some(Pid::from_raw(*pid)))
-            .map(|p| p.as_raw())
-            .unwrap_or(*pid);
-        match kill(Pid::from_raw(-pgid), Signal::SIGINT) {
-            Ok(()) => signalled.push(*pid),
-            // EPERM is rare here (same-uid) but include the bare PID as
-            // a fallback so we still try the direct kill.
-            Err(_) => match kill(Pid::from_raw(*pid), Signal::SIGINT) {
-                Ok(()) => signalled.push(*pid),
-                Err(e) => errors.push((*pid, e)),
-            },
-        }
-    }
-
-    if signalled.is_empty() {
-        let msg: String = errors
-            .iter()
-            .map(|(p, e)| format!("{p}: {e}"))
-            .collect::<Vec<_>>()
-            .join(", ");
-        bail!("finalize: failed to signal any collector ({msg})");
-    }
+    let report = daemon::finalize_collector()?;
 
     println!(
         "finalize: SIGINT sent to {} collector process(es): {:?}",
-        signalled.len(),
-        signalled
+        report.signalled.len(),
+        report.signalled
     );
-    if !errors.is_empty() {
+    if !report.failed.is_empty() {
         eprintln!(
             "finalize: {} child(ren) could not be signalled: {:?}",
-            errors.len(),
-            errors.iter().map(|(p, _)| p).collect::<Vec<_>>()
+            report.failed.len(),
+            report.failed
         );
     }
     println!(
-        "the collector should now flush its trace and exit. The daemon will \
-         convert the trace and start serving profile queries — poll with \
-         `dbg status` or just run `dbg top` (it will block until init completes)."
+        "the collector should now flush its trace and exit. Conversion may still \
+         be running; poll with `dbg status` or run `dbg top` once the daemon \
+         starts serving profile queries."
     );
     Ok(())
 }

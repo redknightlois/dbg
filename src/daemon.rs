@@ -2,8 +2,8 @@ use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicI32, Ordering};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -11,7 +11,9 @@ use dbg_cli::session_db::{self, CreateOptions, SessionDb, SessionKind, TargetCla
 use rusqlite::params;
 
 use crate::backend::Backend;
-use crate::commands::{self, Dispatched, crosstrack, debug as debug_cmds, lifecycle as lifecycle_cmds};
+use crate::commands::{
+    self, Dispatched, crosstrack, debug as debug_cmds, lifecycle as lifecycle_cmds,
+};
 use crate::profile::ProfileData;
 use crate::pty::{DebuggerIo, DebuggerProcess};
 use dbg_cli::session_db::LiveDebugger;
@@ -88,7 +90,13 @@ fn runtime_dir() -> PathBuf {
 /// Sanitize a user-supplied `DBG_SESSION` value to the slug charset.
 fn sanitize_slug(v: &str) -> String {
     v.chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect()
 }
 
@@ -120,8 +128,12 @@ pub fn write_latest_pointer(slug: &str) {
 fn read_live_pointer() -> Option<String> {
     let raw = std::fs::read_to_string(latest_pointer_path()).ok()?;
     let slug = raw.trim();
-    if slug.is_empty() { return None; }
-    if !is_slug_live(slug) { return None; }
+    if slug.is_empty() {
+        return None;
+    }
+    if !is_slug_live(slug) {
+        return None;
+    }
     Some(slug.to_string())
 }
 
@@ -161,8 +173,12 @@ fn pid_path() -> PathBuf {
 
 /// Same liveness check as `is_running`, scoped to a specific slug.
 pub fn is_slug_live(slug: &str) -> bool {
-    let Ok(pid_str) = std::fs::read_to_string(pid_path_for(slug)) else { return false };
-    let Ok(pid) = pid_str.trim().parse::<i32>() else { return false };
+    let Ok(pid_str) = std::fs::read_to_string(pid_path_for(slug)) else {
+        return false;
+    };
+    let Ok(pid) = pid_str.trim().parse::<i32>() else {
+        return false;
+    };
     if nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None).is_err() {
         return false;
     }
@@ -201,14 +217,22 @@ pub fn allocate_slug() -> Result<String> {
 /// Used by `dbg sessions` to enumerate peer daemons.
 pub fn live_slugs_in_cwd() -> Vec<String> {
     let base = cwd_base_slug();
-    let Ok(entries) = std::fs::read_dir(runtime_dir()) else { return Vec::new() };
+    let Ok(entries) = std::fs::read_dir(runtime_dir()) else {
+        return Vec::new();
+    };
     let mut out = Vec::new();
     for entry in entries.flatten() {
         let name = entry.file_name();
         let Some(name) = name.to_str() else { continue };
-        let Some(rest) = name.strip_prefix("dbg-") else { continue };
-        let Some(slug) = rest.strip_suffix(".pid") else { continue };
-        if !slug.starts_with(&base) { continue; }
+        let Some(rest) = name.strip_prefix("dbg-") else {
+            continue;
+        };
+        let Some(slug) = rest.strip_suffix(".pid") else {
+            continue;
+        };
+        if !slug.starts_with(&base) {
+            continue;
+        }
         if is_slug_live(slug) {
             out.push(slug.to_string());
         }
@@ -435,8 +459,7 @@ pub fn run_daemon(
             Some(spec) => backend.dap_attach(spec)?,
             None => backend.dap_launch(target, args)?,
         };
-        let t = crate::dap::DapTransport::spawn(cfg)
-            .context("failed to spawn DAP transport")?;
+        let t = crate::dap::DapTransport::spawn(cfg).context("failed to spawn DAP transport")?;
         (Box::new(t), Vec::new())
     } else {
         let config = backend.spawn_config(target, args)?;
@@ -557,8 +580,7 @@ pub fn run_daemon(
                     persist_profile_source(&db, Path::new(src));
                 }
             }
-            let final_path =
-                session_db::sessions_dir(&cwd).join(format!("{}.db", db.label()));
+            let final_path = session_db::sessions_dir(&cwd).join(format!("{}.db", db.label()));
             (Some(db), Some(final_path))
         }
         Err(e) => {
@@ -629,8 +651,7 @@ pub fn run_daemon(
                     return;
                 }
 
-                let response =
-                    handle_command(&cmd, backend, session, cached_help, log_handle);
+                let response = handle_command(&cmd, backend, session, cached_help, log_handle);
                 let _ = stream.write_all(response.as_bytes());
             });
         }
@@ -804,7 +825,8 @@ fn handle_command(
 
                     let mut cleaned = backend.clean(&native_cmd, &raw);
                     if decorate {
-                        cleaned = debug_cmds::decorate_output_for_op(backend, canonical_op, &cleaned);
+                        cleaned =
+                            debug_cmds::decorate_output_for_op(backend, canonical_op, &cleaned);
                     }
                     log_command(&mut guard, cmd, &cleaned, Some(canonical_op));
                     cleaned
@@ -844,13 +866,11 @@ fn handle_command(
             let captured = {
                 let mut guard = lock_session(session);
                 drain_pending_events(&mut guard, backend);
-                guard.db.as_ref().and_then(|db| db.db_path()).map(|p| {
-                    (
-                        p.to_path_buf(),
-                        guard.target.clone(),
-                        guard.cwd.clone(),
-                    )
-                })
+                guard
+                    .db
+                    .as_ref()
+                    .and_then(|db| db.db_path())
+                    .map(|p| (p.to_path_buf(), guard.target.clone(), guard.cwd.clone()))
             };
             let response = match captured {
                 Some((db_path, target, cwd)) => {
@@ -891,7 +911,11 @@ fn handle_command(
             // unchanged.
             let effective_cmd: String = if cmd.trim() == "run" {
                 let recipe = backend.run_command();
-                if recipe.is_empty() { cmd.to_string() } else { recipe.to_string() }
+                if recipe.is_empty() {
+                    cmd.to_string()
+                } else {
+                    recipe.to_string()
+                }
             } else {
                 cmd.to_string()
             };
@@ -936,7 +960,8 @@ fn log_command(session: &mut Session, input: &str, output: &str, canonical_op: O
 /// unknown — callers fall through to the backend's own help.
 pub fn dbg_verb_help(verb: &str) -> Option<&'static str> {
     Some(match verb {
-        "start" => "\
+        "start" => {
+            "\
 dbg start <type> <target> [--break SPEC] [--args ...] [--run]
   Spawn a debugger session. <type> may be omitted when <target>'s
   extension unambiguously identifies a backend (.py, .go, .java, .rb,
@@ -946,25 +971,35 @@ dbg start <type> <target> [--break SPEC] [--args ...] [--run]
   --run               continue past the debugger's startup prompt;
                       breakpoints still fire.
   --attach-pid N      attach to a running process (DAP backends)
-  --attach-port H:P   attach via host:port (DAP backends)",
-        "kill" | "quit" => "\
+  --attach-port H:P   attach via host:port (DAP backends)"
+        }
+        "kill" | "quit" => {
+            "\
 dbg kill
   Stop the active session, persisting captured data to .dbg/sessions/
-  before exit. Idempotent — safe to run when no session is live.",
-        "status" => "\
+  before exit. Idempotent — safe to run when no session is live."
+        }
+        "status" => {
+            "\
 dbg status
   Show live session info: backend, target, PID, elapsed time. Returns
-  \"no session\" when nothing is running.",
-        "sessions" => "\
+  \"no session\" when nothing is running."
+        }
+        "sessions" => {
+            "\
 dbg sessions
   List persisted sessions under .dbg/sessions/. The currently-live
-  session (if any) is marked with *.",
-        "replay" => "\
+  session (if any) is marked with *."
+        }
+        "replay" => {
+            "\
 dbg replay <label>
   Open a persisted session read-only and run crosstrack queries against
   it. Same vocabulary as a live session: hits, hit-trend, hit-diff,
-  cross, disasm, source. No live debugger — exec verbs are rejected.",
-        "insn-hits" => "\
+  cross, disasm, source. No live debugger — exec verbs are rejected."
+        }
+        "insn-hits" => {
+            "\
 dbg insn-hits <symbol|0xADDR> [--live | --window <duration>]
               [--with-stack] [--with-regs]
               [--backend auto|pt|etm|uprobe|hwbp|ibs|pebs|spe] [--why]
@@ -972,24 +1007,36 @@ dbg insn-hits <symbol|0xADDR> [--live | --window <duration>]
   The planner picks the cheapest backend that satisfies the requested
   flags from those available on the host. Pass --why to see the
   trail (chosen backend, eligible alternatives, why each rejected
-  backend lost).",
-        "run" => "\
+  backend lost)."
+        }
+        "run" => {
+            "\
 dbg run
   Start the debuggee (or restart it). Stops at the first breakpoint
-  that fires.",
-        "continue" | "c" => "\
+  that fires."
+        }
+        "continue" | "c" => {
+            "\
 dbg continue
-  Resume the debuggee until the next breakpoint, signal, or exit.",
-        "step" | "s" => "\
+  Resume the debuggee until the next breakpoint, signal, or exit."
+        }
+        "step" | "s" => {
+            "\
 dbg step
-  Step into the next line (source-level).",
-        "next" | "n" => "\
+  Step into the next line (source-level)."
+        }
+        "next" | "n" => {
+            "\
 dbg next
-  Step over the next line, not descending into function calls.",
-        "finish" => "\
+  Step over the next line, not descending into function calls."
+        }
+        "finish" => {
+            "\
 dbg finish
-  Run until the current function returns.",
-        "break" | "b" => "\
+  Run until the current function returns."
+        }
+        "break" | "b" => {
+            "\
 dbg break <spec>
   Set a breakpoint. <spec> is one of:
     file:line               — e.g. main.c:42, broken.py:20
@@ -997,59 +1044,85 @@ dbg break <spec>
     /abs/file:line          — absolute paths always work unambiguously
   For pdb/delve/others, breaking on a `def` / function-header line
   may not fire until the first body line — dbg auto-advances when it
-  can detect this; otherwise use file:line with a body line.",
-        "locals" => "\
+  can detect this; otherwise use file:line with a body line."
+        }
+        "locals" => {
+            "\
 dbg locals
   Print local variables at the current stop. Also backfills
   locals_json on the most recent captured hit, enabling
-  `dbg hit-trend`/`--group-by` sparklines progressively.",
-        "stack" | "bt" => "\
+  `dbg hit-trend`/`--group-by` sparklines progressively."
+        }
+        "stack" | "bt" => {
+            "\
 dbg stack
-  Print the call stack at the current stop.",
-        "print" | "p" => "\
+  Print the call stack at the current stop."
+        }
+        "print" | "p" => {
+            "\
 dbg print <expr>
-  Evaluate <expr> in the debuggee's current frame.",
-        "hits" => "\
+  Evaluate <expr> in the debuggee's current frame."
+        }
+        "hits" => {
+            "\
 dbg hits <loc> [--group-by FIELD] [--count-by FIELD --top N]
   List captured breakpoint hits at <loc>. With --group-by, aggregate
   by a locals field: `dbg hits broken.py:20 --group-by n` → count per
   distinct n. --count-by is an alias; --top N truncates to the most
-  frequent. Dotted paths supported (self.x).",
-        "hit-diff" => "\
+  frequent. Dotted paths supported (self.x)."
+        }
+        "hit-diff" => {
+            "\
 dbg hit-diff <loc> <seq_a> <seq_b>
-  Show a field-by-field diff of captured locals between two hits.",
-        "hit-trend" => "\
+  Show a field-by-field diff of captured locals between two hits."
+        }
+        "hit-trend" => {
+            "\
 dbg hit-trend <loc> <field>
   Render a sparkline of a locals field across hits. Accepts dotted
   paths (self.x). When the field isn't captured, enumerates available
-  field names in the error so you can pick one.",
-        "cross" => "\
+  field names in the error so you can pick one."
+        }
+        "cross" => {
+            "\
 dbg cross <symbol>
   Show everything known about <symbol>: hit count, profile samples,
-  jit events, disassembly rows, source snapshots.",
-        "disasm" => "\
+  jit events, disassembly rows, source snapshots."
+        }
+        "disasm" => {
+            "\
 dbg disasm [<symbol>] [--refresh]
   Capture and show disassembly for <symbol>. Omit <symbol> at a stop
-  point to disasm the current frame. --refresh forces recollection.",
-        "source" => "\
+  point to disasm the current frame. --refresh forces recollection."
+        }
+        "source" => {
+            "\
 dbg source <symbol> [radius=5]
-  Show the source of <symbol> with ±radius lines of context.",
-        "events" => "\
+  Show the source of <symbol> with ±radius lines of context."
+        }
+        "events" => {
+            "\
 dbg events [--since=SEQ] [--tail=N] [--kind=stop,stdout,...] [--wait=MS]
   Live-tail the session's PTY event log. Does not touch the session
-  mutex, so it works while a `continue` is blocked.",
-        "save" => "\
+  mutex, so it works while a `continue` is blocked."
+        }
+        "save" => {
+            "\
 dbg save [<label> | --label <label>]
   Copy the live session DB to .dbg/sessions/<label>.db so it
   survives `dbg kill` and can be reopened with `dbg replay`.
   Without a label, uses the session's auto-label (see `dbg status`).
-  Marks the persisted DB as user-owned so `dbg prune` won't reap it.",
-        "cancel" => "\
+  Marks the persisted DB as user-owned so `dbg prune` won't reap it."
+        }
+        "cancel" => {
+            "\
 dbg cancel
   Interrupt the currently-running debugger command without tearing
   down the session (sends SIGINT to the debuggee). Use to break out
-  of a `continue` that hasn't hit a breakpoint.",
-        "finalize" => "\
+  of a `continue` that hasn't hit a breakpoint."
+        }
+        "finalize" => {
+            "\
 dbg finalize
   Stop a profile/sample collector cleanly so its trace is flushed and
   the daemon can move into query mode. Walks the daemon's child tree
@@ -1063,7 +1136,8 @@ dbg finalize
     2. drive load against it
     3. dbg finalize          (collector flushes, daemon proceeds)
     4. dbg top / dbg callers ...
-    5. dbg kill",
+    5. dbg kill"
+        }
         _ => return None,
     })
 }
@@ -1229,7 +1303,10 @@ fn format_stop_payload(bytes: &[u8]) -> String {
         Ok(v) => v,
         Err(_) => return format!("(unparseable stop: {s})"),
     };
-    let loc = v.get("location_key").and_then(|x| x.as_str()).unwrap_or("?");
+    let loc = v
+        .get("location_key")
+        .and_then(|x| x.as_str())
+        .unwrap_or("?");
     let seq = v.get("hit_seq").and_then(|x| x.as_i64()).unwrap_or(0);
     let frame = v
         .get("frame_symbol")
@@ -1314,9 +1391,9 @@ fn post_mortem_fallback(session: &Session, canonical_op: &str) -> String {
                 )
                 .ok();
             match row {
-                Some((seq, loc, Some(json))) => format!(
-                    "[post-mortem] stack at last captured hit {loc} #{seq}\n{json}"
-                ),
+                Some((seq, loc, Some(json))) => {
+                    format!("[post-mortem] stack at last captured hit {loc} #{seq}\n{json}")
+                }
                 _ => "[post-mortem] debuggee has exited and no stack was \
                       captured — run a new session with `dbg start`"
                     .to_string(),
@@ -1400,13 +1477,12 @@ fn capture_hit_if_stopped(session: &mut Session, backend: &dyn Backend, output: 
     // can destroy their PTY state. Agents use `dbg locals` explicitly.
     let (locals_json, stack_json) = if ops.auto_capture_locals() {
         const CAPTURE_TIMEOUT: Duration = Duration::from_secs(1);
-        let lj = ops
-            .op_locals()
-            .ok()
-            .and_then(|op| match session.proc.send_and_wait(&op, CAPTURE_TIMEOUT) {
+        let lj = ops.op_locals().ok().and_then(|op| {
+            match session.proc.send_and_wait(&op, CAPTURE_TIMEOUT) {
                 Ok(raw) => ops.parse_locals(&raw).map(|v| v.to_string()),
                 Err(_) => None,
-            });
+            }
+        });
         let sj = ops.op_stack(Some(20)).ok().and_then(|op| {
             match session.proc.send_and_wait(&op, CAPTURE_TIMEOUT) {
                 Ok(raw) => Some(
@@ -1421,9 +1497,10 @@ fn capture_hit_if_stopped(session: &mut Session, backend: &dyn Backend, output: 
         });
         (lj, sj)
     } else {
-        let sj = hit.frame_symbol.as_ref().map(|s| {
-            serde_json::json!({ "frame_symbol": s }).to_string()
-        });
+        let sj = hit
+            .frame_symbol
+            .as_ref()
+            .map(|s| serde_json::json!({ "frame_symbol": s }).to_string());
         (None, sj)
     };
 
@@ -1434,7 +1511,13 @@ fn capture_hit_if_stopped(session: &mut Session, backend: &dyn Backend, output: 
              (SELECT id FROM sessions LIMIT 1),
              ?1, ?2, ?3, datetime('now'), ?4, ?5
          )",
-        params![hit.location_key, hit_seq, hit.thread, locals_json, stack_json],
+        params![
+            hit.location_key,
+            hit_seq,
+            hit.thread,
+            locals_json,
+            stack_json
+        ],
     );
 }
 
@@ -1512,7 +1595,10 @@ fn persist_session_on_exit(session: &mut Session) {
     }
     if let Some(path) = session.save_to.as_ref() {
         if let Err(e) = db.save_to(path) {
-            eprintln!("[dbg] warning: failed to save session DB to {}: {e}", path.display());
+            eprintln!(
+                "[dbg] warning: failed to save session DB to {}: {e}",
+                path.display()
+            );
         }
     }
 }
@@ -1568,9 +1654,7 @@ fn connect_with_retry() -> Result<std::os::unix::net::UnixStream> {
                         ));
                     }
                     let hint = foreign_daemon_hint();
-                    return Err(e).context(format!(
-                        "no session running — use: dbg start{hint}"
-                    ));
+                    return Err(e).context(format!("no session running — use: dbg start{hint}"));
                 }
                 attempts += 1;
                 std::thread::sleep(Duration::from_millis(30));
@@ -1588,9 +1672,7 @@ fn foreign_daemon_hint() -> String {
     let peers = live_slugs_in_cwd();
     if !peers.is_empty() {
         let list = peers.join(", ");
-        return format!(
-            "\n  (peers in this cwd: {list} — select with DBG_SESSION=<slug>)"
-        );
+        return format!("\n  (peers in this cwd: {list} — select with DBG_SESSION=<slug>)");
     }
     let dir = runtime_dir();
     let entries = match std::fs::read_dir(&dir) {
@@ -1599,12 +1681,7 @@ fn foreign_daemon_hint() -> String {
     };
     let other_count = entries
         .flatten()
-        .filter(|e| {
-            e.path()
-                .extension()
-                .and_then(|s| s.to_str())
-                == Some("sock")
-        })
+        .filter(|e| e.path().extension().and_then(|s| s.to_str()) == Some("sock"))
         .count();
     if other_count == 0 {
         String::new()
@@ -1633,15 +1710,99 @@ pub fn current_daemon_pid() -> Option<i32> {
 /// Linux-only — returns an empty vec on other platforms or when the
 /// procfs entry is missing. Used by `dbg finalize` to walk from the
 /// daemon down to the profile collector (daemon → bash → collector).
-pub fn proc_children(pid: i32) -> Vec<i32> {
+fn proc_children(pid: i32) -> Vec<i32> {
+    proc_children_from_reader(pid, |path| std::fs::read_to_string(path))
+}
+
+fn proc_children_from_reader<F>(pid: i32, read_to_string: F) -> Vec<i32>
+where
+    F: FnOnce(&str) -> std::io::Result<String>,
+{
     let path = format!("/proc/{pid}/task/{pid}/children");
-    let Ok(content) = std::fs::read_to_string(&path) else {
+    let Ok(content) = read_to_string(&path) else {
         return Vec::new();
     };
+    parse_proc_children(&content)
+}
+
+fn parse_proc_children(content: &str) -> Vec<i32> {
     content
         .split_whitespace()
         .filter_map(|t| t.parse().ok())
         .collect()
+}
+
+fn collector_signal_targets<F>(daemon_pid: i32, mut children_of: F) -> Result<Vec<i32>>
+where
+    F: FnMut(i32) -> Vec<i32>,
+{
+    // Daemon → bash (depth 1) → collector (depth 2). The collector is
+    // what we want to SIGINT; bash itself ignores SIGINT in interactive
+    // mode. Fall back to depth-1 children if depth-2 is empty (covers
+    // backends that don't go through bash, or races where the
+    // collector hasn't spawned yet).
+    let depth1 = children_of(daemon_pid);
+    if depth1.is_empty() {
+        anyhow::bail!(
+            "daemon {daemon_pid} has no child processes — has the collector \
+             already exited? Try `dbg status` to see the current state."
+        );
+    }
+    let mut targets: Vec<i32> = depth1.iter().flat_map(|&p| children_of(p)).collect();
+    if targets.is_empty() {
+        targets = depth1;
+    }
+    targets.sort_unstable();
+    targets.dedup();
+    Ok(targets)
+}
+
+pub struct FinalizeReport {
+    pub signalled: Vec<i32>,
+    pub failed: Vec<i32>,
+}
+
+/// Signal the profile/sample collector process tree for the active daemon so
+/// blocking collectors can flush their trace and let daemon init complete.
+pub fn finalize_collector() -> Result<FinalizeReport> {
+    use nix::sys::signal::{Signal, kill};
+    use nix::unistd::{Pid, getpgid};
+
+    let daemon_pid = current_daemon_pid().ok_or_else(|| {
+        anyhow::anyhow!(
+            "no daemon registered for this cwd — `dbg start` must be running. \
+             If `dbg start` is mid-init the pid file should exist; check \
+             $XDG_RUNTIME_DIR/dbg-$UID/ for stale state."
+        )
+    })?;
+
+    let targets = collector_signal_targets(daemon_pid, proc_children)?;
+
+    let mut signalled = Vec::new();
+    let mut failed = Vec::new();
+    for pid in &targets {
+        // Send to the process group, not the bare PID: collectors that
+        // fork helper processes (perf record's session manager, etc.)
+        // need every member to see the signal for a clean shutdown.
+        let pgid = getpgid(Some(Pid::from_raw(*pid)))
+            .map(|p| p.as_raw())
+            .unwrap_or(*pid);
+        match kill(Pid::from_raw(-pgid), Signal::SIGINT) {
+            Ok(()) => signalled.push(*pid),
+            // EPERM is rare here (same-uid) but include the bare PID as
+            // a fallback so we still try the direct kill.
+            Err(_) => match kill(Pid::from_raw(*pid), Signal::SIGINT) {
+                Ok(()) => signalled.push(*pid),
+                Err(_) => failed.push(*pid),
+            },
+        }
+    }
+
+    if signalled.is_empty() {
+        anyhow::bail!("finalize: failed to signal any collector ({failed:?})");
+    }
+
+    Ok(FinalizeReport { signalled, failed })
 }
 
 pub fn is_running() -> bool {
@@ -1652,8 +1813,12 @@ pub fn is_running() -> bool {
     // concurrent `dbg status` would delete the pid in the gap and
     // then every subsequent client saw "no session"). Orphan
     // cleanup belongs in `dbg start`/`dbg kill`, not here.
-    let Ok(pid_str) = std::fs::read_to_string(&pid_path()) else { return false };
-    let Ok(pid) = pid_str.trim().parse::<i32>() else { return false };
+    let Ok(pid_str) = std::fs::read_to_string(&pid_path()) else {
+        return false;
+    };
+    let Ok(pid) = pid_str.trim().parse::<i32>() else {
+        return false;
+    };
     let alive = nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None).is_ok();
     if !alive {
         return false;
@@ -1696,16 +1861,15 @@ fn proc_comm_is_dbg(pid: i32) -> bool {
 /// rely on `is_running()` doing it as a side-effect, which caused
 /// the race described above.
 ///
-/// Bail as soon as the pid file names a live process. A live pid
-/// means either a fully-running daemon (socket also exists) or one
-/// mid-startup (pid written, socket bind a few microseconds away);
-/// in both cases its files belong to that process and must not be
-/// removed. Only when the pid file is missing or names a dead pid
-/// do we treat the runtime files as orphans and reap them.
+/// Preserve files only when the pid is live *and* still looks like a dbg
+/// process. A recycled pid owned by an unrelated program is stale state and
+/// should not pin this runtime slot forever.
 pub fn clean_stale_runtime_files() {
     if let Ok(pid_str) = std::fs::read_to_string(&pid_path()) {
         if let Ok(pid) = pid_str.trim().parse::<i32>() {
-            if nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None).is_ok() {
+            if nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None).is_ok()
+                && proc_comm_is_dbg(pid)
+            {
                 return;
             }
         }
@@ -1821,8 +1985,12 @@ mod tests {
         // order here: pid write + socket bind must precede the
         // `for cmd in &init_commands` loop inside run_daemon.
         let src = include_str!("daemon.rs");
-        let pid_write = src.find("std::fs::write(&pid_path()").expect("pid_path write");
-        let bind = src.find("UnixListener::bind(&socket_path()").expect("socket bind");
+        let pid_write = src
+            .find("std::fs::write(&pid_path()")
+            .expect("pid_path write");
+        let bind = src
+            .find("UnixListener::bind(&socket_path()")
+            .expect("socket bind");
         let init_loop = src.find("for cmd in &init_commands").expect("init loop");
         assert!(
             pid_write < init_loop,
@@ -1860,7 +2028,9 @@ mod tests {
             "live pid whose comm != dbg must read as not-running"
         );
         assert!(pid_path().exists(), "is_running must not mutate fs");
-        unsafe { std::env::remove_var("DBG_SESSION"); }
+        unsafe {
+            std::env::remove_var("DBG_SESSION");
+        }
     }
 
     #[test]
@@ -1876,8 +2046,37 @@ mod tests {
         std::fs::write(socket_path(), "").unwrap();
         clean_stale_runtime_files();
         assert!(!pid_path().exists(), "dead-pid file should be reaped");
-        assert!(!socket_path().exists(), "stray socket file should be reaped");
-        unsafe { std::env::remove_var("DBG_SESSION"); }
+        assert!(
+            !socket_path().exists(),
+            "stray socket file should be reaped"
+        );
+        unsafe {
+            std::env::remove_var("DBG_SESSION");
+        }
+    }
+
+    #[test]
+    fn clean_stale_runtime_files_reaps_foreign_live_pid() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = TempDir::new().unwrap();
+        unsafe {
+            std::env::set_var("XDG_RUNTIME_DIR", tmp.path());
+            std::env::set_var("DBG_SESSION", "testforeign");
+        }
+        // PID 1 is alive in normal containers/hosts, but its comm is not dbg.
+        // A stale dbg pid file recycled to such a foreign process must not pin
+        // the runtime slot forever.
+        std::fs::write(pid_path(), "1").unwrap();
+        std::fs::write(socket_path(), "").unwrap();
+        clean_stale_runtime_files();
+        assert!(!pid_path().exists(), "foreign live pid should be reaped");
+        assert!(
+            !socket_path().exists(),
+            "foreign live socket should be reaped"
+        );
+        unsafe {
+            std::env::remove_var("DBG_SESSION");
+        }
     }
 
     #[test]
@@ -1906,7 +2105,10 @@ mod tests {
         std::fs::write(pid_path_for(&base), std::process::id().to_string()).unwrap();
         std::fs::write(socket_path_for(&base), "").unwrap();
         let got = allocate_slug().unwrap();
-        assert!(got.starts_with(&base), "allocated slug should share cwd prefix: {got}");
+        assert!(
+            got.starts_with(&base),
+            "allocated slug should share cwd prefix: {got}"
+        );
         assert_ne!(got, base, "must not reuse the busy bare slot");
         assert!(got.contains('-'), "pid-suffixed slug expected: {got}");
     }
@@ -1923,7 +2125,9 @@ mod tests {
         std::fs::write(socket_path_for("named-slot"), "").unwrap();
         let err = allocate_slug().unwrap_err();
         assert!(err.to_string().contains("already live"), "{err}");
-        unsafe { std::env::remove_var("DBG_SESSION"); }
+        unsafe {
+            std::env::remove_var("DBG_SESSION");
+        }
     }
 
     #[test]
@@ -1939,7 +2143,11 @@ mod tests {
         std::fs::write(pid_path_for(&pid_slug), std::process::id().to_string()).unwrap();
         std::fs::write(socket_path_for(&pid_slug), "").unwrap();
         write_latest_pointer(&pid_slug);
-        assert_eq!(session_slug(), pid_slug, "pointer should win over bare fallback");
+        assert_eq!(
+            session_slug(),
+            pid_slug,
+            "pointer should win over bare fallback"
+        );
     }
 
     #[test]
@@ -1972,9 +2180,18 @@ mod tests {
     #[test]
     fn profile_verbs_intercepted_meta_verbs_fall_through() {
         for v in [
-            "top", "callers compute", "callees main", "traces 5",
-            "tree", "hotpath", "threads", "stats", "search sort",
-            "focus sort", "ignore gc", "reset",
+            "top",
+            "callers compute",
+            "callees main",
+            "traces 5",
+            "tree",
+            "hotpath",
+            "threads",
+            "stats",
+            "search sort",
+            "focus sort",
+            "ignore gc",
+            "reset",
         ] {
             assert!(
                 is_profile_repl_verb(v),
@@ -1982,8 +2199,15 @@ mod tests {
             );
         }
         for v in [
-            "sessions", "status", "save", "kill", "replay session-1",
-            "hits main.py:1", "cross foo", "disasm main", "help",
+            "sessions",
+            "status",
+            "save",
+            "kill",
+            "replay session-1",
+            "hits main.py:1",
+            "cross foo",
+            "disasm main",
+            "help",
             "break main.py:1",
         ] {
             assert!(
@@ -1995,11 +2219,53 @@ mod tests {
 
     /// Regression: between `pid_path` write and `socket_path` bind in
     /// `run_daemon`, a concurrent `dbg start` could call
-    /// `clean_stale_runtime_files`, see "alive pid, socket missing",
-    /// and delete the live daemon's pid file. The fix: bail out as
-    /// soon as the pid file names a live process, regardless of
-    /// socket presence — that's a healthy daemon (or one mid-startup),
-    /// either way its files are not orphans.
+    /// `clean_stale_runtime_files`, see "alive dbg pid, socket missing",
+    /// and delete the live daemon's pid file. The fix: bail out when
+    /// the pid file names a live dbg process, regardless of socket
+    /// presence — that's a healthy daemon (or one mid-startup), either
+    /// way its files are not orphans.
+    #[test]
+    fn proc_children_parser_ignores_invalid_tokens() {
+        assert_eq!(
+            parse_proc_children("101 202 nope 303\n"),
+            vec![101, 202, 303]
+        );
+        assert!(parse_proc_children("").is_empty());
+    }
+
+    #[test]
+    fn collector_signal_targets_prefers_grandchildren() {
+        let targets = collector_signal_targets(10, |pid| match pid {
+            10 => vec![20, 30],
+            20 => vec![200, 201],
+            30 => vec![300],
+            _ => Vec::new(),
+        })
+        .unwrap();
+        assert_eq!(targets, vec![200, 201, 300]);
+    }
+
+    #[test]
+    fn collector_signal_targets_falls_back_to_direct_children() {
+        let targets = collector_signal_targets(10, |pid| match pid {
+            10 => vec![20, 30],
+            _ => Vec::new(),
+        })
+        .unwrap();
+        assert_eq!(targets, vec![20, 30]);
+    }
+
+    #[test]
+    fn collector_signal_targets_rejects_daemon_without_children() {
+        let err = collector_signal_targets(10, |_| Vec::new())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("has no child processes"),
+            "unexpected error: {err}"
+        );
+    }
+
     #[test]
     fn clean_stale_runtime_files_preserves_live_daemon_mid_startup() {
         let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -2016,7 +2282,9 @@ mod tests {
             pid_path().exists(),
             "live daemon mid-startup must keep its pid file"
         );
-        unsafe { std::env::remove_var("DBG_SESSION"); }
+        unsafe {
+            std::env::remove_var("DBG_SESSION");
+        }
     }
 
     /// Regression: `kill_daemon` used to unlink socket+pid files
@@ -2081,15 +2349,20 @@ mod tests {
         clean_stale_runtime_files();
         assert!(pid_path().exists(), "live daemon's pid file must survive");
         assert!(socket_path().exists(), "live daemon's socket must survive");
-        unsafe { std::env::remove_var("DBG_SESSION"); }
+        unsafe {
+            std::env::remove_var("DBG_SESSION");
+        }
     }
 
-#[test]
+    #[test]
     fn backend_target_class_mapping() {
         assert_eq!(backend_target_class("lldb"), TargetClass::NativeCpu);
         assert_eq!(backend_target_class("delve"), TargetClass::NativeCpu);
         assert_eq!(backend_target_class("pdb"), TargetClass::Python);
-        assert_eq!(backend_target_class("netcoredbg"), TargetClass::ManagedDotnet);
+        assert_eq!(
+            backend_target_class("netcoredbg"),
+            TargetClass::ManagedDotnet
+        );
         assert_eq!(backend_target_class("jdb"), TargetClass::Jvm);
         assert_eq!(backend_target_class("node-inspect"), TargetClass::JsNode);
         assert_eq!(backend_target_class("node-proto"), TargetClass::JsNode);
@@ -2156,7 +2429,13 @@ mod tests {
                 "INSERT INTO breakpoint_hits
                     (session_id, location_key, hit_seq, thread, ts, locals_json, stack_json)
                  VALUES ((SELECT id FROM sessions LIMIT 1), ?1, ?2, ?3, datetime('now'), ?4, ?5)",
-                params!["main.c:42", 1_i64, "1", r#"{"x":{"value":"42"}}"#, r#"{"raw":"..."}"#],
+                params![
+                    "main.c:42",
+                    1_i64,
+                    "1",
+                    r#"{"x":{"value":"42"}}"#,
+                    r#"{"raw":"..."}"#
+                ],
             )
             .unwrap();
 
