@@ -57,7 +57,7 @@ If the target imports `torch`, `triton`, `tensorflow`, `jax`, `cupy`, `mxnet`, o
 
 ```
 dbg start [<type>] <target> [--break <spec>] [--args ...] [--run]
-dbg start --attach-pid <PID>              # attach to a running process (DAP backends)
+dbg start <dap-type> <target-hint> --attach-pid <PID>  # attach to a running process
 dbg start --attach-port <PORT>            # attach to a debug port
 dbg <command>                             # send command to running session
 dbg cancel                                # SIGINT the child without tearing down the session
@@ -67,7 +67,7 @@ dbg help <command>                        # ask the backend what a command does
 dbg kill                                  # stop session (always do this when done)
 ```
 
-Multiple daemons can coexist in the same cwd; sessions are keyed by label.
+Multiple daemons can coexist in the same cwd; sessions are keyed by label. Attach mode needs an explicit DAP backend (for .NET use `netcoredbg-proto`) and `--attach-pid` must appear after `<type> <target-hint>`. Use the actual managed child PID, not a shell launcher PID. Relative targets and source breakpoints resolve from the `dbg start` working directory.
 
 ## Canonical command vocabulary
 

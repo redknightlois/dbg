@@ -99,7 +99,11 @@ impl Backend for DelveProtoBackend {
         true
     }
 
-    fn dap_launch(&self, target: &str, args: &[String]) -> anyhow::Result<crate::dap::DapLaunchConfig> {
+    fn dap_launch(
+        &self,
+        target: &str,
+        args: &[String],
+    ) -> anyhow::Result<crate::dap::DapLaunchConfig> {
         // `dlv dap -l 127.0.0.1:0` — lets the kernel pick a free port;
         // delve prints `DAP server listening at: 127.0.0.1:PORT` on
         // stderr. The transport scrapes that.
@@ -121,13 +125,11 @@ impl Backend for DelveProtoBackend {
                 "showLog": false,
             }),
             preassigned_addr: None,
+            debuggee_pid: None,
         })
     }
 
-    fn dap_attach(
-        &self,
-        spec: &super::AttachSpec,
-    ) -> anyhow::Result<crate::dap::DapLaunchConfig> {
+    fn dap_attach(&self, spec: &super::AttachSpec) -> anyhow::Result<crate::dap::DapLaunchConfig> {
         let pid = spec
             .pid
             .ok_or_else(|| anyhow::anyhow!("delve-proto attach needs --attach-pid"))?;
@@ -142,6 +144,7 @@ impl Backend for DelveProtoBackend {
                 "processId": pid,
             }),
             preassigned_addr: None,
+            debuggee_pid: Some(pid),
         })
     }
 }

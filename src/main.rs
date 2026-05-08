@@ -14,7 +14,7 @@ mod transport_common;
 
 use std::time::Duration;
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use clap::Parser;
 use nix::unistd::{ForkResult, fork};
 
@@ -126,10 +126,8 @@ fn main() -> Result<()> {
     // binary guarantees the test exercises production code, not a
     // re-implementation.
     if std::env::var_os("DBG_DETACH_SELF_TEST").is_some() {
-        let log_path = std::env::temp_dir().join(format!(
-            "dbg-detach-selftest-{}.log",
-            std::process::id()
-        ));
+        let log_path =
+            std::env::temp_dir().join(format!("dbg-detach-selftest-{}.log", std::process::id()));
         // Safety: fork duplicates the process
         let fork_result = unsafe { fork() }?;
         match fork_result {
@@ -244,7 +242,12 @@ fn main() -> Result<()> {
             } else {
                 format!("missing: {}", missing.join(", "))
             };
-            println!("  {:<14} {} [{}]", backend.name(), backend.description(), status);
+            println!(
+                "  {:<14} {} [{}]",
+                backend.name(),
+                backend.description(),
+                status
+            );
         }
         return Ok(());
     }
@@ -297,7 +300,10 @@ fn main() -> Result<()> {
             // other pid-suffixed daemons can still be running).
             print_live_daemon_peers();
             let cwd = std::env::current_dir()?;
-            let ctx = commands::lifecycle::LifeCtx { cwd: &cwd, active: None };
+            let ctx = commands::lifecycle::LifeCtx {
+                cwd: &cwd,
+                active: None,
+            };
             let l = commands::lifecycle::Lifecycle::Sessions { group_only: false };
             println!("{}", commands::lifecycle::run(&l, &ctx));
             Ok(())
@@ -327,7 +333,10 @@ fn main() -> Result<()> {
                 }
                 _ => bail!("internal: diff parser returned wrong variant"),
             };
-            let ctx = commands::lifecycle::LifeCtx { cwd: &cwd, active: None };
+            let ctx = commands::lifecycle::LifeCtx {
+                cwd: &cwd,
+                active: None,
+            };
             println!("{}", commands::lifecycle::run(&l, &ctx));
             Ok(())
         }
@@ -356,7 +365,9 @@ fn main() -> Result<()> {
                 println!("  dbg <any debugger command>");
                 println!("  dbg help            list available commands");
                 println!("  dbg help <command>   help for a specific verb\n");
-                println!("session lifecycle:  start, run, continue, step, next, finish, kill, status, cancel, finalize");
+                println!(
+                    "session lifecycle:  start, run, continue, step, next, finish, kill, status, cancel, finalize"
+                );
                 println!("inspection:         break, locals, stack, print");
                 println!("crosstrack (DB):    hits, hit-diff, hit-trend, cross, disasm, source");
                 println!("persistence:        sessions, save, replay");
@@ -421,11 +432,11 @@ fn cmd_replay(args: &[String]) -> Result<()> {
             path.display()
         );
     };
-    let conn = rusqlite::Connection::open_with_flags(
-        &path,
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-    )?;
-    let v: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap_or(-1);
+    let conn =
+        rusqlite::Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let v: i64 = conn
+        .query_row("PRAGMA user_version", [], |r| r.get(0))
+        .unwrap_or(-1);
     if v != dbg_cli::session_db::SCHEMA_VERSION {
         bail!(
             "session `{}` has schema_version={v}, expected {} — re-collect to replay",
@@ -459,9 +470,7 @@ fn cmd_replay(args: &[String]) -> Result<()> {
     let mut profile = load_profile_from_db(&db);
 
     let is_profile = matches!(db.kind(), dbg_cli::session_db::SessionKind::Profile);
-    eprintln!(
-        "replay `{label}` (target={target}, class={target_class}) — read-only REPL"
-    );
+    eprintln!("replay `{label}` (target={target}, class={target_class}) — read-only REPL");
     if is_profile && profile.is_some() {
         eprintln!(
             "supported: top, callers, callees, traces, tree, hotpath, threads, stats, \
@@ -481,7 +490,14 @@ fn cmd_replay(args: &[String]) -> Result<()> {
     // One-shot mode: `dbg replay <label> hits foo:42`
     if args.len() > 1 {
         let cmd = args[1..].join(" ");
-        let out = replay_eval(&cmd, &db, &cwd, &target, target_class_enum, profile.as_mut());
+        let out = replay_eval(
+            &cmd,
+            &db,
+            &cwd,
+            &target,
+            target_class_enum,
+            profile.as_mut(),
+        );
         println!("{out}");
         return Ok(());
     }
@@ -553,17 +569,18 @@ fn replay_eval(
             commands::crosstrack::run(&q, db, &ctx)
         }
         Some(commands::Dispatched::Lifecycle(l)) => {
-            let ctx = commands::lifecycle::LifeCtx { cwd, active: Some(db) };
+            let ctx = commands::lifecycle::LifeCtx {
+                cwd,
+                active: Some(db),
+            };
             commands::lifecycle::run(&l, &ctx)
         }
-        _ => {
-            "replay only supports crosstrack + lifecycle verbs (hits, hit-diff, \
+        _ => "replay only supports crosstrack + lifecycle verbs (hits, hit-diff, \
              hit-trend, cross, disasm, source, sessions, status) plus profile verbs \
              (top, callers, callees, …) on profile-kind sessions. Live debugger \
              verbs (step, continue, break, …) aren't available — start a new \
              session with `dbg start` for those."
-                .to_string()
-        }
+            .to_string(),
     }
 }
 
@@ -654,16 +671,18 @@ fn print_live_daemon_peers() {
     if peers.len() <= 1 {
         return;
     }
-    let active = std::env::var("DBG_SESSION")
-        .ok()
-        .or_else(|| {
-            std::fs::read_to_string(daemon::latest_pointer_path())
-                .ok()
-                .map(|s| s.trim().to_string())
-        });
+    let active = std::env::var("DBG_SESSION").ok().or_else(|| {
+        std::fs::read_to_string(daemon::latest_pointer_path())
+            .ok()
+            .map(|s| s.trim().to_string())
+    });
     println!("live daemons in this cwd:");
     for slug in &peers {
-        let marker = if active.as_deref() == Some(slug.as_str()) { "*" } else { " " };
+        let marker = if active.as_deref() == Some(slug.as_str()) {
+            "*"
+        } else {
+            " "
+        };
         println!("  {marker} {slug}");
     }
     println!("  (set DBG_SESSION=<slug> to target a specific one)\n");
@@ -700,16 +719,31 @@ fn autodetect_backend(target: &str) -> Option<&'static str> {
     }
 }
 
-fn cmd_start(registry: &Registry, args: &[String]) -> Result<()> {
+fn normalize_start_args(registry: &Registry, args: &[String]) -> Result<Vec<String>> {
     if args.is_empty() {
         bail!("usage: dbg start <type> <target> [--break spec] [--args ...] [--run]");
     }
-
+    if args
+        .first()
+        .is_some_and(|a| a == "--attach-pid" || a.starts_with("--attach-pid="))
+    {
+        bail!(
+            "usage: dbg start <type> <target> --attach-pid <PID>\n       --attach-pid must come after <type> <target>; attach mode still needs an explicit DAP backend type and target hint"
+        );
+    }
+    if args
+        .get(1)
+        .is_some_and(|a| a == "--attach-pid" || a.starts_with("--attach-pid="))
+    {
+        bail!(
+            "usage: dbg start <type> <target> --attach-pid <PID>\n       attach mode still needs a target hint before --attach-pid; use an absolute target/path hint when source paths matter"
+        );
+    }
     // Single-arg form: `dbg start <target>` — infer backend from the
     // target's extension. Unambiguous only; unknown extensions bail
     // with the standard usage. `dbg start <type> <target>` (two args)
     // still takes the explicit path.
-    let args: Vec<String> = if args.len() == 1 {
+    let normalized: Vec<String> = if args.len() == 1 {
         match autodetect_backend(&args[0]) {
             Some(t) => {
                 let mut v = vec![t.to_string()];
@@ -736,11 +770,15 @@ fn cmd_start(registry: &Registry, args: &[String]) -> Result<()> {
     } else {
         args.to_vec()
     };
-    let args = args.as_slice();
-
-    if args.len() < 2 {
+    if normalized.len() < 2 {
         bail!("usage: dbg start <type> <target> [--break spec] [--args ...] [--run]");
     }
+    Ok(normalized)
+}
+
+fn cmd_start(registry: &Registry, args: &[String]) -> Result<()> {
+    let args = normalize_start_args(registry, args)?;
+    let args = args.as_slice();
 
     // Reap orphaned pid/socket files from a crashed previous daemon
     // so allocate_slug doesn't treat a dead socket as "live".
@@ -753,7 +791,9 @@ fn cmd_start(registry: &Registry, args: &[String]) -> Result<()> {
     let slug = daemon::allocate_slug()?;
     // SAFETY: set_var is unsafe in threaded contexts. cmd_start is
     // still single-threaded at this point (fork hasn't happened).
-    unsafe { std::env::set_var("DBG_SESSION", &slug); }
+    unsafe {
+        std::env::set_var("DBG_SESSION", &slug);
+    }
     // Publish this as the newest daemon in the cwd so env-less
     // clients in other shells find it by default.
     daemon::write_latest_pointer(&slug);
@@ -761,7 +801,12 @@ fn cmd_start(registry: &Registry, args: &[String]) -> Result<()> {
     if !peers.is_empty() {
         eprintln!(
             "session: {slug}  (coexisting with: {})",
-            peers.iter().filter(|s| *s != &slug).cloned().collect::<Vec<_>>().join(", "),
+            peers
+                .iter()
+                .filter(|s| *s != &slug)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", "),
         );
         eprintln!("  other shells: set DBG_SESSION={slug} to target this session");
     } else {
@@ -773,8 +818,8 @@ fn cmd_start(registry: &Registry, args: &[String]) -> Result<()> {
 
     // Intercept GPU-related types — the agent should use gdbg, not dbg
     match backend_type.as_str() {
-        "gdbg" | "gpu" | "cuda" | "pytorch" | "triton"
-        | "tensorflow" | "tf" | "jax" | "mxnet" | "cupy" => {
+        "gdbg" | "gpu" | "cuda" | "pytorch" | "triton" | "tensorflow" | "tf" | "jax" | "mxnet"
+        | "cupy" => {
             eprintln!("GPU profiling uses gdbg, not dbg.");
             eprintln!();
             eprintln!("  gdbg {target_raw}          # collect + analyze");
@@ -790,14 +835,12 @@ fn cmd_start(registry: &Registry, args: &[String]) -> Result<()> {
         _ => {}
     }
 
-    let backend = registry
-        .get(backend_type)
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "unknown type: {backend_type} (available: {})",
-                registry.available_types().join(", ")
-            )
-        })?;
+    let backend = registry.get(backend_type).ok_or_else(|| {
+        anyhow::anyhow!(
+            "unknown type: {backend_type} (available: {})",
+            registry.available_types().join(", ")
+        )
+    })?;
 
     // Runtime preflight (kernel settings etc.) — separate from binary
     // dependency checks. Surfaces clear, actionable errors before we
@@ -855,8 +898,24 @@ fn cmd_start(registry: &Registry, args: &[String]) -> Result<()> {
             "--attach-pid" => {
                 i += 1;
                 if i < args.len() {
-                    attach_pid = args[i].parse().ok();
+                    attach_pid = Some(
+                        args[i]
+                            .parse()
+                            .with_context(|| format!("invalid --attach-pid `{}`", args[i]))?,
+                    );
+                } else {
+                    bail!("--attach-pid requires a PID");
                 }
+            }
+            other if other.starts_with("--attach-pid=") => {
+                let pid = other.trim_start_matches("--attach-pid=");
+                if pid.is_empty() {
+                    bail!("--attach-pid requires a PID");
+                }
+                attach_pid = Some(
+                    pid.parse()
+                        .with_context(|| format!("invalid --attach-pid `{pid}`"))?,
+                );
             }
             other => {
                 // Bare positionals and unknown `--*` flags both go to
@@ -869,6 +928,11 @@ fn cmd_start(registry: &Registry, args: &[String]) -> Result<()> {
             }
         }
         i += 1;
+    }
+    if attach_pid.is_some() && !backend.uses_dap() {
+        bail!(
+            "--attach-pid requires a DAP backend such as netcoredbg-proto, debugpy-proto, delve-proto, or lldb-dap-proto; `{backend_type}` is not DAP-based"
+        );
     }
     let attach = attach_pid.map(|pid| backend::AttachSpec { pid: Some(pid) });
 
@@ -1071,7 +1135,8 @@ mod tests {
         // its stored `sessions.label` value (`broken-20260419-154358`).
         let path = dir.join("session-10.db");
         let conn = rusqlite::Connection::open(&path).unwrap();
-        conn.execute("CREATE TABLE sessions (label TEXT)", []).unwrap();
+        conn.execute("CREATE TABLE sessions (label TEXT)", [])
+            .unwrap();
         conn.execute(
             "INSERT INTO sessions (label) VALUES (?1)",
             ["broken-20260419-154358"],
@@ -1096,10 +1161,21 @@ mod tests {
         use clap::CommandFactory;
         let rendered = Cli::command().render_help().to_string();
         for verb in [
-            "start", "kill", "sessions", "replay",
-            "break", "continue", "stack", "locals",
-            "hits", "hit-diff", "hit-trend",
-            "cross", "disasm", "raw", "forge",
+            "start",
+            "kill",
+            "sessions",
+            "replay",
+            "break",
+            "continue",
+            "stack",
+            "locals",
+            "hits",
+            "hit-diff",
+            "hit-trend",
+            "cross",
+            "disasm",
+            "raw",
+            "forge",
         ] {
             assert!(
                 rendered.contains(verb),
@@ -1181,6 +1257,124 @@ mod tests {
         })
         .unwrap();
         assert!(load_profile_from_db(&db).is_none());
+    }
+
+    #[test]
+    fn start_rejects_attach_pid_before_type_or_target() {
+        let registry = Registry::new();
+        let err = normalize_start_args(
+            &registry,
+            &[
+                "--attach-pid".into(),
+                "1234".into(),
+                "netcoredbg-proto".into(),
+            ],
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("must come after <type> <target>"),
+            "unexpected error: {err}"
+        );
+
+        let err = normalize_start_args(
+            &registry,
+            &[
+                "--attach-pid=1234".into(),
+                "netcoredbg-proto".into(),
+                "app.dll".into(),
+            ],
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("must come after <type> <target>"),
+            "unexpected error: {err}"
+        );
+
+        let err = normalize_start_args(
+            &registry,
+            &["netcoredbg-proto".into(), "--attach-pid=1234".into()],
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("needs a target hint"),
+            "unexpected error: {err}"
+        );
+
+        let err = normalize_start_args(
+            &registry,
+            &[
+                "netcoredbg-proto".into(),
+                "--attach-pid".into(),
+                "1234".into(),
+            ],
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("needs a target hint"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn start_accepts_space_and_equals_attach_pid_after_target() {
+        let mut registry = Registry::new();
+        registry.register(Box::new(backend::netcoredbg_proto::NetCoreDbgProtoBackend));
+
+        let args = normalize_start_args(
+            &registry,
+            &[
+                "netcoredbg-proto".into(),
+                "app.dll".into(),
+                "--attach-pid".into(),
+                "1234".into(),
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            args,
+            vec!["netcoredbg-proto", "app.dll", "--attach-pid", "1234"]
+        );
+
+        let args = normalize_start_args(
+            &registry,
+            &[
+                "netcoredbg-proto".into(),
+                "app.dll".into(),
+                "--attach-pid=1234".into(),
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            args,
+            vec!["netcoredbg-proto", "app.dll", "--attach-pid=1234"]
+        );
+    }
+
+    #[test]
+    fn dap_attach_configs_remember_debuggee_pid() {
+        use crate::backend::Backend;
+
+        let spec = backend::AttachSpec { pid: Some(4321) };
+        let cfg = backend::netcoredbg_proto::NetCoreDbgProtoBackend
+            .dap_attach(&spec)
+            .unwrap();
+        assert_eq!(cfg.launch_verb, "attach");
+        assert_eq!(cfg.debuggee_pid, Some(4321));
+        assert_eq!(cfg.launch_args["processId"], 4321);
+    }
+
+    #[test]
+    fn netcoredbg_proto_unbreak_maps_to_delete() {
+        use crate::backend::canonical::CanonicalOps;
+
+        let cmd = backend::netcoredbg_proto::NetCoreDbgProtoBackend
+            .op_unbreak(backend::BreakId(7))
+            .unwrap();
+        assert_eq!(cmd, "delete 7");
     }
 
     #[test]

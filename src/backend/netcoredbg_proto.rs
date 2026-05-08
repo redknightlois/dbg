@@ -108,10 +108,7 @@ impl Backend for NetCoreDbgProtoBackend {
         let port = crate::dap::DapLaunchConfig::pick_free_port()?;
         Ok(crate::dap::DapLaunchConfig {
             bin: "netcoredbg".into(),
-            args: vec![
-                "--interpreter=vscode".into(),
-                format!("--server={port}"),
-            ],
+            args: vec!["--interpreter=vscode".into(), format!("--server={port}")],
             listen_marker: String::new(),
             launch_verb: "launch".into(),
             launch_args: json!({
@@ -128,13 +125,11 @@ impl Backend for NetCoreDbgProtoBackend {
                 "justMyCode": false,
             }),
             preassigned_addr: Some(format!("127.0.0.1:{port}")),
+            debuggee_pid: None,
         })
     }
 
-    fn dap_attach(
-        &self,
-        spec: &super::AttachSpec,
-    ) -> anyhow::Result<crate::dap::DapLaunchConfig> {
+    fn dap_attach(&self, spec: &super::AttachSpec) -> anyhow::Result<crate::dap::DapLaunchConfig> {
         let pid = spec
             .pid
             .ok_or_else(|| anyhow::anyhow!("netcoredbg-proto attach needs --attach-pid"))?;
@@ -150,6 +145,7 @@ impl Backend for NetCoreDbgProtoBackend {
                 "justMyCode": false,
             }),
             preassigned_addr: Some(format!("127.0.0.1:{port}")),
+            debuggee_pid: Some(pid),
         })
     }
 }
@@ -178,6 +174,9 @@ impl CanonicalOps for NetCoreDbgProtoBackend {
     }
     fn op_break_log(&self, loc: &BreakLoc, msg: &str) -> anyhow::Result<String> {
         Ok(format!("{} log {msg}", self.op_break(loc)?))
+    }
+    fn op_unbreak(&self, id: super::BreakId) -> anyhow::Result<String> {
+        Ok(format!("delete {}", id.0))
     }
     fn op_pause(&self) -> anyhow::Result<String> {
         Ok("pause".into())

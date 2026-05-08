@@ -56,11 +56,14 @@ dbg --backend rust     # check dependencies for a specific type
 
 ```
 dbg start <type> <target> [--break spec] [--args ...] [--run]
+dbg start <dap-type> <target-hint> --attach-pid <PID>
 dbg <any debugger command>
 dbg help              list available commands
 dbg help <command>    ask the debugger what a command does
 dbg kill
 ```
+
+Attach mode requires an explicit DAP backend such as `netcoredbg-proto`, `debugpy-proto`, `delve-proto`, or `lldb-dap-proto`. Put `--attach-pid` after `<type> <target-hint>`; both `--attach-pid 1234` and `--attach-pid=1234` are accepted. Relative targets and breakpoint paths resolve from the directory where `dbg start` is run, so start from the source root or pass absolute paths when PDB/source paths matter.
 
 ## Try it
 

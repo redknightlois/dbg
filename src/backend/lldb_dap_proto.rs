@@ -95,10 +95,7 @@ impl Backend for LldbDapProtoBackend {
     ) -> anyhow::Result<crate::dap::DapLaunchConfig> {
         Ok(crate::dap::DapLaunchConfig {
             bin: "lldb-dap".into(),
-            args: vec![
-                "--connection".into(),
-                "listen://127.0.0.1:0".into(),
-            ],
+            args: vec!["--connection".into(), "listen://127.0.0.1:0".into()],
             listen_marker: "Listening for:".into(),
             launch_verb: "launch".into(),
             launch_args: json!({
@@ -114,13 +111,11 @@ impl Backend for LldbDapProtoBackend {
                 "runInTerminal": false,
             }),
             preassigned_addr: None,
+            debuggee_pid: None,
         })
     }
 
-    fn dap_attach(
-        &self,
-        spec: &super::AttachSpec,
-    ) -> anyhow::Result<crate::dap::DapLaunchConfig> {
+    fn dap_attach(&self, spec: &super::AttachSpec) -> anyhow::Result<crate::dap::DapLaunchConfig> {
         let pid = spec
             .pid
             .ok_or_else(|| anyhow::anyhow!("lldb-dap-proto attach needs --attach-pid"))?;
@@ -134,6 +129,7 @@ impl Backend for LldbDapProtoBackend {
                 "pid": pid,
             }),
             preassigned_addr: None,
+            debuggee_pid: Some(pid),
         })
     }
 }

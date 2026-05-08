@@ -963,6 +963,7 @@ pub fn dbg_verb_help(verb: &str) -> Option<&'static str> {
         "start" => {
             "\
 dbg start <type> <target> [--break SPEC] [--args ...] [--run]
+dbg start <dap-type> <target-hint> --attach-pid N
   Spawn a debugger session. <type> may be omitted when <target>'s
   extension unambiguously identifies a backend (.py, .go, .java, .rb,
   .php, .csproj, .js, .ts, .hs, .ml).
@@ -970,7 +971,10 @@ dbg start <type> <target> [--break SPEC] [--args ...] [--run]
   --args a b c        forward args to the debuggee
   --run               continue past the debugger's startup prompt;
                       breakpoints still fire.
-  --attach-pid N      attach to a running process (DAP backends)
+  --attach-pid N      attach to a running process with an explicit DAP
+                      backend; put this after <type> <target-hint>.
+                      Use the debuggee child PID, not a launcher shell.
+                      Relative paths resolve from dbg start's cwd.
   --attach-port H:P   attach via host:port (DAP backends)"
         }
         "kill" | "quit" => {
