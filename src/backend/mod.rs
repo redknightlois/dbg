@@ -6,6 +6,7 @@ pub mod dotnettrace;
 pub mod callgrind;
 pub mod ghci;
 pub mod ghcprof;
+pub mod import;
 pub mod jdb;
 pub mod jitdasm;
 pub mod lldb;

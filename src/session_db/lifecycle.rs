@@ -220,7 +220,20 @@ impl SessionDb {
             params![self.session_id],
             |r| r.get(0),
         )?;
-        Ok(layers > 0)
+        if layers > 0 {
+            return Ok(true);
+        }
+        // Profile-mode sessions (dotnet-trace, perf, callgrind, import)
+        // stash their source content in meta.profile_raw rather than
+        // creating a layers row. Treat that as captured data so
+        // `persist_session_on_exit` actually saves the DB and
+        // `dbg replay <label>` can rehydrate the profile.
+        let profile_raw: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM meta WHERE session_id = ?1 AND key = 'profile_raw'",
+            params![self.session_id],
+            |r| r.get(0),
+        )?;
+        Ok(profile_raw > 0)
     }
 
     /// Promote this session so `prune` will never delete it.

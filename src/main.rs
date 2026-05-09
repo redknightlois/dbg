@@ -163,6 +163,7 @@ fn main() -> Result<()> {
     registry.register(Box::new(backend::memcheck::MemcheckBackend));
     registry.register(Box::new(backend::massif::MassifBackend));
     registry.register(Box::new(backend::dotnettrace::DotnetTraceBackend));
+    registry.register(Box::new(backend::import::ImportBackend));
     registry.register(Box::new(backend::jitdasm::JitDasmBackend));
     registry.register(Box::new(backend::phpdbg::PhpdbgBackend));
     registry.register(Box::new(backend::xdebug::XdebugProfileBackend));
@@ -316,6 +317,7 @@ fn main() -> Result<()> {
             Ok(())
         }
         "replay" => cmd_replay(&cli.args[1..]),
+        "import" => cmd_import(&registry, &cli.args[1..]),
         "finalize" => cmd_finalize(),
         "diff" if cli.args.len() == 3 || (!daemon::is_running() && cli.args.len() == 2) => {
             // Client-side diff between two saved sessions (or between
@@ -625,6 +627,126 @@ fn ensure_running() -> Result<()> {
 /// query mode.
 ///
 /// This is a *client-side* operation — it does NOT go through the
+/// Import a previously-collected profile snapshot into a fresh
+/// session. Bridges externally-collected traces (`dotnet-trace
+/// --output foo.nettrace`, `perf script > foo.txt`, V8 `.cpuprofile`,
+/// raw speedscope JSON, …) into the same profile-mode REPL that fresh
+/// `dbg start dotnet-trace` would expose.
+///
+/// `--label <name>` overrides the auto-generated session slug, so the
+/// imported snapshot shows up in `dbg sessions` under a memorable name
+/// and can be reopened later with `dbg replay <name>`.
+fn cmd_import(registry: &Registry, args: &[String]) -> Result<()> {
+    if args.is_empty() {
+        bail!(
+            "usage: dbg import <profile-file> [--label <name>]\n  \
+             accepts: .nettrace, .speedscope.json, .cpuprofile, perf-script text, pprof-traces text"
+        );
+    }
+
+    // Parse cmd_import-specific flags. `--label <name>` is consumed
+    // here; any other token is the profile file. Once we delegate to
+    // `cmd_start` below, no more flag parsing happens at this layer.
+    let mut file: Option<String> = None;
+    let mut label: Option<String> = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--label" => {
+                i += 1;
+                if i >= args.len() {
+                    bail!("--label requires a name");
+                }
+                label = Some(args[i].clone());
+            }
+            other if other.starts_with("--label=") => {
+                let v = other.trim_start_matches("--label=");
+                if v.is_empty() {
+                    bail!("--label requires a name");
+                }
+                label = Some(v.to_string());
+            }
+            other if other.starts_with("--") => {
+                bail!("unknown flag for `dbg import`: {other}");
+            }
+            other if file.is_none() => {
+                file = Some(other.to_string());
+            }
+            other => {
+                bail!("unexpected positional argument: {other}");
+            }
+        }
+        i += 1;
+    }
+    let file = file.ok_or_else(|| anyhow::anyhow!("missing <profile-file>"))?;
+
+    // Verify the file exists and resolve to absolute. The daemon's
+    // cwd may differ (and after fork its perspective is the daemon's
+    // cwd snapshot at start), so a relative path could mis-resolve
+    // inside `bash -c "cp <file> ..."`. Anchor it now.
+    let path = std::path::Path::new(&file);
+    if !path.exists() {
+        bail!("profile file does not exist: {file}");
+    }
+    let abs = std::fs::canonicalize(path)
+        .with_context(|| format!("failed to canonicalize profile path: {file}"))?;
+
+    // Target-aware preflight: `.nettrace` is binary and requires
+    // `dotnet-trace convert`. We don't list this as an unconditional
+    // ImportBackend dependency because users importing speedscope JSON
+    // shouldn't be forced to install dotnet-trace.
+    if backend::import::extension_matches(&abs.display().to_string(), "nettrace")
+        && which::which("dotnet-trace").is_err()
+    {
+        bail!(
+            "importing a `.nettrace` requires `dotnet-trace` on PATH (install: \
+             `dotnet tool install -g dotnet-trace` and add `~/.dotnet/tools` to PATH)"
+        );
+    }
+
+    // Apply the user-chosen label by setting `DBG_SESSION` before
+    // delegating into `cmd_start` — `allocate_slug` reads it and
+    // routes the resulting daemon/session DB filename through it.
+    if let Some(name) = label {
+        // Mirror `daemon::sanitize_slug` (private): keep alphanumerics,
+        // `-`, and `_`; replace anything else with `_`. Reject inputs
+        // that produce an empty / all-underscore slug because those
+        // collide with the auto-generated cwd slug.
+        let sanitized: String = name
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect();
+        if sanitized.is_empty() || sanitized.chars().all(|c| c == '_') {
+            bail!(
+                "--label `{name}` sanitizes to empty/all-underscore (allowed: [A-Za-z0-9-_])"
+            );
+        }
+        // SAFETY: cmd_import runs on the single client thread before
+        // any daemon fork; matching the contract used by cmd_start.
+        // Set both: DBG_SESSION drives the runtime slug (socket / pid
+        // file naming, peer discovery), DBG_LABEL drives the
+        // persisted session-DB label used by `dbg sessions` and
+        // `dbg replay <name>`.
+        unsafe {
+            std::env::set_var("DBG_SESSION", &sanitized);
+            std::env::set_var("DBG_LABEL", &sanitized);
+        }
+    }
+
+    // Reuse the regular start pipeline. `import` is a registered
+    // backend; the only thing that makes this verb its own front door
+    // (vs. typing `dbg start import <file>`) is the convenient label
+    // flag and the file existence preflight above.
+    let start_args: Vec<String> = vec!["import".into(), abs.display().to_string()];
+    cmd_start(registry, &start_args)
+}
+
 /// daemon socket. The daemon's accept loop only starts after init
 /// completes, but profile backends (dotnet-trace, perf, callgrind)
 /// block init for the entire lifetime of the target process. So while

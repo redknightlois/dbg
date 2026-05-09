@@ -560,13 +560,19 @@ pub fn run_daemon(
     } else {
         SessionKind::Debug
     };
+    // Honour a user-chosen session label (e.g. `dbg import --label foo`).
+    // The cmd_* layer sets DBG_LABEL before forking the daemon; we
+    // pass it through to the session DB so `dbg sessions` and
+    // `dbg replay <name>` resolve against the human-friendly name
+    // instead of the auto-generated `<basename>-<timestamp>` form.
+    let user_label = std::env::var("DBG_LABEL").ok().filter(|s| !s.is_empty());
     let (db, save_to) = match SessionDb::create(CreateOptions {
         kind: session_kind,
         target,
         target_class,
         cwd: &cwd,
         db_path: Some(&tmp_db),
-        label: None,
+        label: user_label,
         target_hash: None,
     }) {
         Ok(db) => {
