@@ -123,6 +123,13 @@ struct State {
     initialized: bool,
     /// Flag set when a `terminated` or `exited` event arrives.
     terminated: bool,
+    /// OS pid the adapter reported via the DAP `process` event for a
+    /// launched session. None for attach (where we already know the
+    /// pid via cfg.debuggee_pid). Used as a SIGKILL fallback during
+    /// shutdown when the adapter doesn't terminate the debuggee
+    /// cleanly — netcoredbg leaks the dotnet host to systemd-user
+    /// otherwise.
+    launched_pid: Option<u32>,
 }
 
 impl State {
@@ -141,6 +148,7 @@ impl State {
             alive: true,
             initialized: false,
             terminated: false,
+            launched_pid: None,
         }
     }
 }
@@ -182,6 +190,11 @@ pub struct DapTransport {
     shutdown: Arc<AtomicBool>,
     driver: Mutex<Option<JoinHandle<()>>>,
     debuggee_pid: Option<u32>,
+    /// True when this session attached to an existing process. Attach
+    /// sessions must default to `terminateDebuggee=false` on disconnect
+    /// so we don't kill a process the user only wanted to observe;
+    /// launch sessions default to true so we don't leak children.
+    is_attach: bool,
 }
 
 impl DapTransport {
@@ -191,6 +204,15 @@ impl DapTransport {
     /// Callers that need `stopOnEntry=true` behaviour bake it into
     /// `launch_args`; the transport doesn't assume either way.
     pub fn spawn(cfg: DapLaunchConfig) -> Result<Self> {
+        // Yama-restricted ptrace will silently swallow the attach and
+        // surface only as a `configurationDone` timeout 10s later.
+        // Catch it up front when we can prove the attach won't work.
+        if cfg.launch_verb == "attach" {
+            if let Some(pid) = cfg.debuggee_pid {
+                preflight_attach(pid)?;
+            }
+        }
+
         let mut cmd = Command::new(&cfg.bin);
         cmd.args(&cfg.args)
             .stdin(Stdio::null())
@@ -267,6 +289,7 @@ impl DapTransport {
             })
             .context("failed to spawn DAP driver thread")?;
 
+        let is_attach = cfg.launch_verb == "attach";
         let transport = Self {
             child_pid,
             child: Mutex::new(Some(child)),
@@ -276,6 +299,7 @@ impl DapTransport {
             shutdown,
             driver: Mutex::new(Some(driver)),
             debuggee_pid: cfg.debuggee_pid,
+            is_attach,
         };
 
         // DAP handshake.
@@ -1171,6 +1195,29 @@ impl DebuggerIo for DapTransport {
         lock.lock().unwrap().alive
     }
     fn quit(&self, _quit_cmd: &str) {
+        // 1. Politely ask the adapter to disconnect. Spec-compliant
+        //    adapters (delve, lldb-dap, debugpy) honour
+        //    `terminateDebuggee=true` by killing the inferior here.
+        //    netcoredbg accepts and ACKs the request but does NOT
+        //    take the dotnet host down: its TerminateProcess() only
+        //    calls ICorDebug::Terminate, which can be refused by the
+        //    CLR (native frame on top, hung finalizer, etc.) and has
+        //    no OS-level fallback. The SIGKILL below covers that.
+        //    See vscodeprotocol.cpp + manageddebugger.cpp upstream.
+        let _ = self.call_blocking(
+            "disconnect",
+            json!({ "terminateDebuggee": !self.is_attach }),
+            Duration::from_millis(1500),
+        );
+
+        // 2. Snapshot the launched pid (set by the DAP `process` event)
+        //    *before* tearing down state — we may need to SIGKILL it
+        //    later if the disconnect didn't take.
+        let launched_pid = {
+            let (lock, _) = &*self.state;
+            lock.lock().unwrap().launched_pid
+        };
+
         self.shutdown.store(true, Ordering::Relaxed);
         let _ = self.driver_tx.send(DriverCmd::Shutdown);
         // Wake anybody parked in exec() waiting on pending_hit —
@@ -1190,6 +1237,23 @@ impl DebuggerIo for DapTransport {
         }
         if let Some(h) = self.driver.lock().unwrap().take() {
             let _ = h.join();
+        }
+
+        // 3. Belt-and-braces cleanup: SIGKILL the tracked debuggee
+        //    pid if it's still alive. Empirically, netcoredbg ACKs
+        //    `disconnect terminateDebuggee=true` but does not take
+        //    down the dotnet host — the host gets reparented to
+        //    systemd-user and keeps running with its socket bound.
+        //    We need this fallback for any DAP adapter that doesn't
+        //    follow through. Skip in attach mode — the user explicitly
+        //    opted into not owning the lifecycle.
+        if !self.is_attach {
+            if let Some(pid) = launched_pid {
+                let p = nix::unistd::Pid::from_raw(pid as i32);
+                if nix::sys::signal::kill(p, None).is_ok() {
+                    let _ = nix::sys::signal::kill(p, nix::sys::signal::Signal::SIGKILL);
+                }
+            }
         }
     }
     fn pending_hit(&self) -> Option<HitEvent> {
@@ -1690,6 +1754,18 @@ fn dispatch_incoming(
                     s.alive = false;
                     cvar.notify_all();
                 }
+                "process" => {
+                    // DAP body: { name, systemProcessId, isLocalProcess,
+                    // startMethod, ... }. Recording the OS pid lets the
+                    // shutdown path SIGKILL the debuggee if a graceful
+                    // disconnect+terminate round-trip fails to take it
+                    // down (observed with netcoredbg + dotnet host).
+                    if let Some(spid) = extract_system_process_id(&body) {
+                        let (lock, _) = &**state;
+                        let mut s = lock.lock().unwrap();
+                        s.launched_pid = Some(spid);
+                    }
+                }
                 _ => {}
             }
         }
@@ -1789,6 +1865,67 @@ fn resolve_breakpoint_path_from(cwd: Option<&std::path::Path>, file: &str) -> St
         .unwrap_or_else(|| file.to_string())
 }
 
+/// Decide whether dbg can attach to `pid` before we ask the adapter to
+/// try. On Linux, Yama-restricted ptrace (`/proc/sys/kernel/yama/ptrace_scope`
+/// >= 1) only permits a process's parent to ptrace it. dbg's daemon
+/// is never the parent of an unrelated PID, so the attach silently
+/// hangs inside the adapter and surfaces 10s later as a `configurationDone`
+/// timeout. Reading two procfs files lets us turn that into an
+/// actionable error before we even spawn the adapter.
+///
+/// We deliberately don't fail when the proc files aren't readable —
+/// non-Linux hosts and weird mount setups should fall through to the
+/// existing timeout path rather than break valid attach flows.
+#[cfg(target_os = "linux")]
+fn preflight_attach(pid: u32) -> Result<()> {
+    let pid_alive = std::path::Path::new(&format!("/proc/{pid}")).exists();
+    let scope: i32 = std::fs::read_to_string("/proc/sys/kernel/yama/ptrace_scope")
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(0);
+    preflight_attach_decide(pid, pid_alive, scope)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn preflight_attach(_pid: u32) -> Result<()> {
+    Ok(())
+}
+
+/// Extract `body.systemProcessId` from a DAP `process` event body.
+/// Returns None if the field is absent, non-numeric, or out of range.
+/// Some adapters emit it as JSON number, some as string — both are
+/// accepted (debugpy uses string for large pids on 32-bit platforms).
+fn extract_system_process_id(body: &Value) -> Option<u32> {
+    let raw = body.get("systemProcessId")?;
+    if let Some(n) = raw.as_u64() {
+        return u32::try_from(n).ok();
+    }
+    if let Some(s) = raw.as_str() {
+        return s.parse().ok();
+    }
+    None
+}
+
+/// Pure decision logic for [`preflight_attach`]. Split out so the
+/// regression tests don't need to mutate /proc.
+fn preflight_attach_decide(pid: u32, pid_alive: bool, ptrace_scope: i32) -> Result<()> {
+    if !pid_alive {
+        bail!(
+            "no process with pid {pid} (or /proc not mounted). Verify the PID is correct and still running."
+        );
+    }
+    if ptrace_scope == 0 {
+        return Ok(());
+    }
+    bail!(
+        "cannot attach to pid {pid}: kernel.yama.ptrace_scope = {ptrace_scope} restricts ptrace to the target's parent process, and dbg's daemon is not the parent. \
+Fix one of:\n  \
+  - relaunch the target through `dbg start <type> <target> --args ...` (preferred — daemon becomes parent, no kernel changes)\n  \
+  - `sudo sysctl kernel.yama.ptrace_scope=0` for the duration of this session\n  \
+  - have the target call prctl(PR_SET_PTRACER, <dbg-daemon-pid>) before you attach"
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1847,5 +1984,75 @@ mod tests {
     fn take_frame_returns_none_when_incomplete() {
         let mut inbox = b"Content-Length: 10\r\n\r\n{}".to_vec();
         assert!(take_frame(&mut inbox).is_none());
+    }
+
+    #[test]
+    fn preflight_attach_passes_when_ptrace_unrestricted() {
+        // ptrace_scope=0 → kernel allows any user to ptrace own
+        // processes regardless of parentage; preflight has nothing to
+        // catch and must let the attach proceed.
+        assert!(preflight_attach_decide(1234, true, 0).is_ok());
+    }
+
+    #[test]
+    fn preflight_attach_blocks_when_ptrace_restricted() {
+        // Regression for the netcoredbg "DAP configurationDone: timeout"
+        // we used to surface 10s after attach. With ptrace_scope >= 1
+        // and dbg's daemon not the parent of the target, we now bail
+        // up front with the actionable message.
+        for scope in [1, 2, 3] {
+            let err = preflight_attach_decide(1234, true, scope).unwrap_err();
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains(&format!("kernel.yama.ptrace_scope = {scope}")),
+                "missing scope value in error: {msg}"
+            );
+            assert!(
+                msg.contains("relaunch the target through `dbg start"),
+                "missing primary fix instruction: {msg}"
+            );
+            assert!(
+                msg.contains("sysctl kernel.yama.ptrace_scope=0"),
+                "missing sysctl fix instruction: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn preflight_attach_rejects_dead_pid() {
+        let err = preflight_attach_decide(99999, false, 0).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("no process with pid 99999"),
+            "unexpected error: {err:#}"
+        );
+    }
+
+    #[test]
+    fn extract_system_process_id_accepts_number() {
+        let body = serde_json::json!({ "systemProcessId": 12345, "name": "dotnet" });
+        assert_eq!(extract_system_process_id(&body), Some(12345));
+    }
+
+    #[test]
+    fn extract_system_process_id_accepts_string() {
+        // debugpy emits the pid as a JSON string in some configs.
+        let body = serde_json::json!({ "systemProcessId": "67890" });
+        assert_eq!(extract_system_process_id(&body), Some(67890));
+    }
+
+    #[test]
+    fn extract_system_process_id_rejects_garbage() {
+        let body = serde_json::json!({ "systemProcessId": null });
+        assert_eq!(extract_system_process_id(&body), None);
+
+        let body = serde_json::json!({ "systemProcessId": "not-a-pid" });
+        assert_eq!(extract_system_process_id(&body), None);
+
+        // u32::MAX + 1 — rejected to avoid silently truncating.
+        let body = serde_json::json!({ "systemProcessId": 4_294_967_296_u64 });
+        assert_eq!(extract_system_process_id(&body), None);
+
+        let body = serde_json::json!({ "name": "missing field" });
+        assert_eq!(extract_system_process_id(&body), None);
     }
 }

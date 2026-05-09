@@ -719,6 +719,112 @@ fn autodetect_backend(target: &str) -> Option<&'static str> {
     }
 }
 
+/// Output of [`parse_start_flags`]. Pure data so the parser can be
+/// tested without the surrounding daemon/registry machinery.
+#[derive(Debug)]
+struct ParsedStartFlags {
+    breakpoints: Vec<String>,
+    run_args: Vec<String>,
+    do_run: bool,
+    attach_pid: Option<u32>,
+}
+
+/// Parse the trailing flag tail of `dbg start <type> <target> …`.
+/// `args` is the slice **after** type+target. Behaviour:
+///   - `--break SPEC` / `-b SPEC`: append to `breakpoints`.
+///   - `--run` / `-r`: set `do_run`.
+///   - `--attach-pid N` / `--attach-pid=N`: set `attach_pid`.
+///   - `--args …`: forward everything that follows to the debuggee.
+///     Bails if a known dbg flag (`--break`, `--run`, `--attach-pid`,
+///     `--attach-port`) appears after `--args` — that misroute used
+///     to silently pass the flag to the debuggee.
+///   - any other token: appended to `run_args`.
+fn parse_start_flags(args: &[String]) -> Result<ParsedStartFlags> {
+    let mut breakpoints = Vec::new();
+    let mut run_args = Vec::new();
+    let mut do_run = false;
+    let mut attach_pid: Option<u32> = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--break" | "-b" => {
+                i += 1;
+                if i < args.len() {
+                    breakpoints.push(args[i].clone());
+                }
+            }
+            "--args" | "-a" => {
+                // Everything after `--args` belongs to the debuggee,
+                // including hyphenated flags like `--commit-every`.
+                // Stopping at the next `--` token used to drop those
+                // silently into the catch-all below.
+                //
+                // Catch dbg's own flags *before* we forward — putting
+                // `--break`/`--run`/`--attach-pid` after `--args` is a
+                // common mistake and used to silently misroute the
+                // flag to the debuggee, which then ignored or rejected
+                // it. Better to fail fast with a fix-instruction.
+                i += 1;
+                while i < args.len() {
+                    let tok = args[i].as_str();
+                    let is_dbg_flag = matches!(
+                        tok,
+                        "--break" | "-b" | "--run" | "-r" | "--attach-pid" | "--attach-port"
+                    ) || tok.starts_with("--attach-pid=")
+                        || tok.starts_with("--attach-port=");
+                    if is_dbg_flag {
+                        bail!(
+                            "dbg flag `{tok}` appeared after `--args`. `--args` forwards everything that follows to the debuggee, so dbg flags must come before it. Move `{tok}` (and any `--break`/`--run`/`--attach-*` flags) before `--args`."
+                        );
+                    }
+                    run_args.push(args[i].clone());
+                    i += 1;
+                }
+                continue;
+            }
+            "--run" | "-r" => do_run = true,
+            "--attach-pid" => {
+                i += 1;
+                if i < args.len() {
+                    attach_pid = Some(
+                        args[i]
+                            .parse()
+                            .with_context(|| format!("invalid --attach-pid `{}`", args[i]))?,
+                    );
+                } else {
+                    bail!("--attach-pid requires a PID");
+                }
+            }
+            other if other.starts_with("--attach-pid=") => {
+                let pid = other.trim_start_matches("--attach-pid=");
+                if pid.is_empty() {
+                    bail!("--attach-pid requires a PID");
+                }
+                attach_pid = Some(
+                    pid.parse()
+                        .with_context(|| format!("invalid --attach-pid `{pid}`"))?,
+                );
+            }
+            other => {
+                // Bare positionals and unknown `--*` flags both go to
+                // the debuggee. dbg's own flags are a closed set above
+                // (`--break`, `--args`, `--run`, `--attach-pid`), so any
+                // long option that lands here is meant for the program.
+                // Silently dropping those used to break invocations like
+                // `dbg start <t> <target> ./bench --commit-every 1000`.
+                run_args.push(other.to_string());
+            }
+        }
+        i += 1;
+    }
+    Ok(ParsedStartFlags {
+        breakpoints,
+        run_args,
+        do_run,
+        attach_pid,
+    })
+}
+
 fn normalize_start_args(registry: &Registry, args: &[String]) -> Result<Vec<String>> {
     if args.is_empty() {
         bail!("usage: dbg start <type> <target> [--break spec] [--args ...] [--run]");
@@ -869,66 +975,11 @@ fn cmd_start(registry: &Registry, args: &[String]) -> Result<()> {
     // Broken.csproj 'Program:SumFast' --run` needs so the backend
     // sees the pattern. Previously those tokens were silently
     // dropped, so jitdasm's filter never reached the runtime.
-    let mut breakpoints = Vec::new();
-    let mut run_args = Vec::new();
-    let mut do_run = false;
-    let mut attach_pid: Option<u32> = None;
-    let mut i = 2;
-    while i < args.len() {
-        match args[i].as_str() {
-            "--break" | "-b" => {
-                i += 1;
-                if i < args.len() {
-                    breakpoints.push(args[i].clone());
-                }
-            }
-            "--args" | "-a" => {
-                // Everything after `--args` belongs to the debuggee,
-                // including hyphenated flags like `--commit-every`.
-                // Stopping at the next `--` token used to drop those
-                // silently into the catch-all below.
-                i += 1;
-                while i < args.len() {
-                    run_args.push(args[i].clone());
-                    i += 1;
-                }
-                continue;
-            }
-            "--run" | "-r" => do_run = true,
-            "--attach-pid" => {
-                i += 1;
-                if i < args.len() {
-                    attach_pid = Some(
-                        args[i]
-                            .parse()
-                            .with_context(|| format!("invalid --attach-pid `{}`", args[i]))?,
-                    );
-                } else {
-                    bail!("--attach-pid requires a PID");
-                }
-            }
-            other if other.starts_with("--attach-pid=") => {
-                let pid = other.trim_start_matches("--attach-pid=");
-                if pid.is_empty() {
-                    bail!("--attach-pid requires a PID");
-                }
-                attach_pid = Some(
-                    pid.parse()
-                        .with_context(|| format!("invalid --attach-pid `{pid}`"))?,
-                );
-            }
-            other => {
-                // Bare positionals and unknown `--*` flags both go to
-                // the debuggee. dbg's own flags are a closed set above
-                // (`--break`, `--args`, `--run`, `--attach-pid`), so any
-                // long option that lands here is meant for the program.
-                // Silently dropping those used to break invocations like
-                // `dbg start <t> <target> ./bench --commit-every 1000`.
-                run_args.push(other.to_string());
-            }
-        }
-        i += 1;
-    }
+    let parsed = parse_start_flags(&args[2..])?;
+    let breakpoints = parsed.breakpoints;
+    let run_args = parsed.run_args;
+    let do_run = parsed.do_run;
+    let attach_pid = parsed.attach_pid;
     if attach_pid.is_some() && !backend.uses_dap() {
         bail!(
             "--attach-pid requires a DAP backend such as netcoredbg-proto, debugpy-proto, delve-proto, or lldb-dap-proto; `{backend_type}` is not DAP-based"
@@ -1386,5 +1437,105 @@ mod tests {
         assert!(daemon::dbg_verb_help("start").is_some());
         assert!(daemon::dbg_verb_help("replay").is_some());
         assert!(daemon::dbg_verb_help("not-a-verb").is_none());
+    }
+
+    fn s(args: &[&str]) -> Vec<String> {
+        args.iter().map(|a| a.to_string()).collect()
+    }
+
+    #[test]
+    fn parse_start_flags_collects_breakpoints() {
+        let p = parse_start_flags(&s(&["--break", "main.rs:42", "-b", "lib.rs:7"])).unwrap();
+        assert_eq!(p.breakpoints, vec!["main.rs:42", "lib.rs:7"]);
+        assert!(p.run_args.is_empty());
+    }
+
+    #[test]
+    fn parse_start_flags_run_and_attach_pid() {
+        let p = parse_start_flags(&s(&["--run", "--attach-pid", "12345"])).unwrap();
+        assert!(p.do_run);
+        assert_eq!(p.attach_pid, Some(12345));
+
+        let p = parse_start_flags(&s(&["--attach-pid=999"])).unwrap();
+        assert_eq!(p.attach_pid, Some(999));
+    }
+
+    #[test]
+    fn parse_start_flags_args_forwards_everything() {
+        // Hyphenated debuggee flags must reach run_args verbatim,
+        // including ones that look like other tools' flags.
+        let p = parse_start_flags(&s(&[
+            "--break",
+            "x.rs:1",
+            "--args",
+            "--ServerUrl=http://127.0.0.1:8083",
+            "--commit-every",
+            "1000",
+            "positional",
+        ]))
+        .unwrap();
+        assert_eq!(p.breakpoints, vec!["x.rs:1"]);
+        assert_eq!(
+            p.run_args,
+            vec![
+                "--ServerUrl=http://127.0.0.1:8083",
+                "--commit-every",
+                "1000",
+                "positional"
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_start_flags_rejects_dbg_flags_after_args() {
+        // Regression: putting `--break` after `--args` used to
+        // silently misroute the flag to the debuggee (which would
+        // ignore or reject it). Now bails fast with a fix-instruction.
+        for misordered in [
+            vec!["--args", "foo", "--break", "x.rs:1"],
+            vec!["--args", "foo", "-b", "x.rs:1"],
+            vec!["--args", "foo", "--run"],
+            vec!["--args", "foo", "-r"],
+            vec!["--args", "foo", "--attach-pid", "1"],
+            vec!["--args", "foo", "--attach-pid=1"],
+            vec!["--args", "foo", "--attach-port=:9999"],
+        ] {
+            let err = parse_start_flags(&s(&misordered)).expect_err(&format!(
+                "expected error for misordered `{misordered:?}`"
+            ));
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains("appeared after `--args`"),
+                "error did not name the misorder: {msg}"
+            );
+            assert!(
+                msg.contains("must come before"),
+                "error did not give a fix instruction: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_start_flags_unknown_long_flags_route_to_debuggee() {
+        // Adjacent design rule: any `--whatever` we don't recognize is
+        // assumed to be for the debuggee, so `dbg start cargo run --release`
+        // works without manual --args.
+        let p = parse_start_flags(&s(&["positional", "--release", "--features", "x"])).unwrap();
+        assert_eq!(p.run_args, vec!["positional", "--release", "--features", "x"]);
+        assert!(p.breakpoints.is_empty());
+        assert!(!p.do_run);
+        assert!(p.attach_pid.is_none());
+    }
+
+    #[test]
+    fn parse_start_flags_attach_pid_validates() {
+        let err = parse_start_flags(&s(&["--attach-pid", "not-a-number"])).unwrap_err();
+        assert!(format!("{err:#}").contains("invalid --attach-pid"));
+
+        let err = parse_start_flags(&s(&["--attach-pid="])).unwrap_err();
+        assert!(format!("{err:#}").contains("requires a PID"));
+
+        let err = parse_start_flags(&s(&["--attach-pid"])).unwrap_err();
+        assert!(format!("{err:#}").contains("requires a PID"));
     }
 }

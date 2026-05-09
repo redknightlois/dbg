@@ -12,6 +12,12 @@ for CPU profiling see `dotnet-trace.md`.
 
 Aliases: `csharp`, `fsharp`. The CLI prefers the apphost over `.dll`. `.csproj` targets are built automatically before launch. Source files (`.cs`) are rejected with a hint to build first.
 
+**Launch vs. attach.** Prefer launching through `dbg start` — the daemon becomes the parent, so ptrace is always permitted. `--attach-pid <PID>` works against an already-running .NET process, but only if the kernel allows it (see `ptrace_scope` row below). For a service-managed Raven.Server / aspnet host you can't restart, attach is the only option; otherwise launch.
+
+**Flag ordering.** `--args` consumes everything that follows as debuggee arguments. Put `--break` and `--run` **before** `--args`, never after — `dbg start ... --args --ServerUrl=... --break Foo.cs:42` would silently pass `--break Foo.cs:42` to the debuggee. dbg now errors out instead of misrouting, but the rule still applies.
+
+**Cleanup on .NET launch sessions.** dbg sends DAP `disconnect` with `terminateDebuggee: true` on quit and SIGKILLs the tracked debuggee pid as a fallback. If you still see an orphan after `dbg kill`, verify by apphost name (`pgrep -af Raven.Server`, **not** `Raven.Server.dll`) and SIGKILL it.
+
 ## Preconditions
 
 | Requirement | Check | Fix |
@@ -67,3 +73,6 @@ After a hit, `dbg at-hit disasm` captures the current frame's JIT'd code into th
 | `.dll` fails to launch | Pass the native apphost executable instead. |
 | `dbg list` shows no source | Add `<EmbedAllSources>true</EmbedAllSources>` to csproj. |
 | BenchmarkDotNet target | Not supported — BDN spawns isolated child processes. Write a standalone driver. |
+| `--attach-pid` → `cannot attach to pid N: kernel.yama.ptrace_scope = 1 ...` | dbg's preflight detected Yama-restricted ptrace. Either relaunch through `dbg start` (preferred — daemon becomes parent) or `sudo sysctl kernel.yama.ptrace_scope=0` for the session. |
+| `(no breakpoints set)` after `dbg start` | Pre-fix-A: flag ordering — `--break` must precede `--args`. Current builds error out with a fix-instruction; if you see this on an old binary, upgrade. |
+| Port still bound after `dbg kill` | Adapter didn't terminate the launched dotnet host cleanly. Current builds send DAP `disconnect terminateDebuggee=true` and SIGKILL the tracked pid; if it still leaks, find by apphost name (`pgrep -af Raven.Server`) and SIGKILL manually. |
