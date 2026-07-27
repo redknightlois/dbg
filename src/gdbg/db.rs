@@ -14,7 +14,7 @@ use rusqlite::{Connection, ToSql, params};
 /// Bumping this invalidates every saved `.gpu.db` file: `GpuDb::open`
 /// refuses to load anything that doesn't match, pointing the user at
 /// the raw `.nsys-rep` + `.csv` artifacts to re-ingest.
-pub const GDBG_SCHEMA_VERSION: i64 = 1;
+pub const GDBG_SCHEMA_VERSION: i64 = 2;
 
 /// A GPU profiling session backed by a SQLite database.
 pub struct GpuDb {
@@ -430,15 +430,26 @@ impl GpuDb {
         }
 
         // Re-correlate: for each op, sum kernel durations from the timeline layer.
-        let _ = self.conn.execute(
+        if let Err(e) = self.conn.execute(
             "UPDATE ops SET gpu_time_us = (
                 SELECT COALESCE(SUM(l.duration_us), 0)
                 FROM op_kernel_map okm
-                JOIN launches l ON l.kernel_name = okm.kernel_name AND l.layer_id = ?1
+                JOIN launches l ON l.layer_id = ?1
+                    AND (l.id = okm.launch_id
+                         OR (okm.launch_id IS NULL
+                             AND l.kernel_name = okm.kernel_name)
+                         OR (NOT EXISTS (
+                                SELECT 1 FROM launches mapped
+                                WHERE mapped.id = okm.launch_id
+                                  AND mapped.layer_id = ?1
+                            )
+                             AND l.kernel_name = okm.kernel_name))
                 WHERE okm.op_id = ops.id
             )",
             params![tl_id],
-        );
+        ) {
+            eprintln!("recompute_op_gpu_times failed: {e}");
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -661,7 +672,8 @@ fn init_schema(conn: &Connection) -> Result<()> {
         CREATE TABLE IF NOT EXISTS op_kernel_map (
             op_id       INTEGER REFERENCES ops(id),
             kernel_name TEXT,
-            PRIMARY KEY (op_id, kernel_name)
+            launch_id   INTEGER REFERENCES launches(id),
+            PRIMARY KEY (op_id, kernel_name, launch_id)
         );
 
         CREATE TABLE IF NOT EXISTS allocations (

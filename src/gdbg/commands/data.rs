@@ -218,20 +218,25 @@ pub fn cmd_diff(db: &GpuDb, args: &[&str]) {
         return;
     }
 
-    let sql = "SELECT
+    let current_tl = db.timeline_filter();
+    let other_tl = "other.launches.layer_id = COALESCE(
+        (SELECT id FROM other.layers WHERE source = 'nsys' ORDER BY id LIMIT 1),
+        (SELECT id FROM other.layers WHERE source = 'torch' ORDER BY id LIMIT 1),
+        (SELECT id FROM other.layers WHERE source = 'proton' ORDER BY id LIMIT 1), -1)";
+    let sql = format!("SELECT
         COALESCE(c.kernel_name, o.kernel_name) as name,
         COALESCE(o.total, 0) as before,
         COALESCE(c.total, 0) as after
        FROM
-        (SELECT kernel_name, SUM(duration_us) as total FROM launches GROUP BY kernel_name) c
+        (SELECT kernel_name, SUM(duration_us) as total FROM launches WHERE {current_tl} GROUP BY kernel_name) c
        FULL OUTER JOIN
-        (SELECT kernel_name, SUM(duration_us) as total FROM other.launches GROUP BY kernel_name) o
+        (SELECT kernel_name, SUM(duration_us) as total FROM other.launches WHERE {other_tl} GROUP BY kernel_name) o
        ON c.kernel_name = o.kernel_name
        ORDER BY ABS(COALESCE(c.total,0) - COALESCE(o.total,0)) DESC
-       LIMIT 15";
+       LIMIT 15");
 
     let rows: Vec<(String, f64, f64)> = db.query_vec(
-        sql, [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        &sql, [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
     );
 
     println!("  Diff: current vs {name}\n");

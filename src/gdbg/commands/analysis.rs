@@ -919,7 +919,9 @@ pub fn cmd_breakdown(db: &GpuDb, args: &[&str]) {
                     SUM(l.duration_us) as total_us,
                     AVG(l.duration_us) as avg_us
              FROM op_kernel_map okm
-             JOIN launches l ON l.kernel_name = okm.kernel_name AND {tl_l}
+             JOIN launches l ON {tl_l}
+                AND ((okm.launch_id IS NOT NULL AND l.id = okm.launch_id)
+                     OR (okm.launch_id IS NULL AND l.kernel_name = okm.kernel_name))
              WHERE okm.op_id = ?1
              GROUP BY okm.kernel_name
              ORDER BY total_us DESC"
@@ -2110,17 +2112,22 @@ pub fn cmd_regressions(db: &GpuDb, args: &[&str]) {
         return;
     }
 
-    let sql = "SELECT COALESCE(c.kernel_name, o.kernel_name),
+    let current_tl = db.timeline_filter();
+    let other_tl = "other.launches.layer_id = COALESCE(
+        (SELECT id FROM other.layers WHERE source = 'nsys' ORDER BY id LIMIT 1),
+        (SELECT id FROM other.layers WHERE source = 'torch' ORDER BY id LIMIT 1),
+        (SELECT id FROM other.layers WHERE source = 'proton' ORDER BY id LIMIT 1), -1)";
+    let sql = format!("SELECT COALESCE(c.kernel_name, o.kernel_name),
                       COALESCE(o.total, 0), COALESCE(c.total, 0),
                       COALESCE(o.cnt,   0), COALESCE(c.cnt,   0)
                FROM
                  (SELECT kernel_name, SUM(duration_us) AS total, COUNT(*) AS cnt
-                  FROM launches GROUP BY kernel_name) c
+                  FROM launches WHERE {current_tl} GROUP BY kernel_name) c
                FULL OUTER JOIN
                  (SELECT kernel_name, SUM(duration_us) AS total, COUNT(*) AS cnt
-                  FROM other.launches GROUP BY kernel_name) o
-               ON c.kernel_name = o.kernel_name";
-    let all: Vec<_> = db.query_vec(sql, [], |row| {
+                  FROM other.launches WHERE {other_tl} GROUP BY kernel_name) o
+               ON c.kernel_name = o.kernel_name");
+    let all: Vec<_> = db.query_vec(&sql, [], |row| {
         Ok((
             row.get::<_, String>(0)?,
             row.get::<_, f64>(1)?,

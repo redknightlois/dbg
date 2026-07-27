@@ -32,11 +32,20 @@ fn main() -> Result<()> {
     }
 
     match cli.args[0].as_str() {
-        "list" | "ls" => { commands::cmd_list(); Ok(()) }
+        "list" | "ls" => {
+            commands::cmd_list();
+            Ok(())
+        }
         "diff" => cmd_diff(&cli.args[1..]),
-        "check" => { print!("{}", check::format_report()); Ok(()) }
+        "check" => {
+            print!("{}", check::format_report());
+            Ok(())
+        }
         "--from" => cmd_from(&cli.args[1..]),
-        "help" | "--help" | "-h" => { print_usage(); Ok(()) }
+        "help" | "--help" | "-h" => {
+            print_usage();
+            Ok(())
+        }
         _ => cmd_profile(&cli.args),
     }
 }
@@ -76,7 +85,11 @@ fn cmd_from(args: &[String]) -> Result<()> {
     }
     eprintln!("loading session '{}'...", args[0]);
     let mut db = GpuDb::load(&args[0])?;
-    eprintln!("restored: {} kernels, {} launches", db.unique_kernel_count(), db.total_launch_count());
+    eprintln!(
+        "restored: {} kernels, {} launches",
+        db.unique_kernel_count(),
+        db.total_launch_count()
+    );
     repl::run(&mut db)
 }
 
@@ -99,9 +112,7 @@ fn cmd_profile(args: &[String]) -> Result<()> {
     }
 
     // Create session DB in temp dir
-    let db_path = std::env::temp_dir()
-        .join(format!("gdbg-{}", std::process::id()))
-        .join("session.gpu.db");
+    let db_path = collect::session_dir().join("session.gpu.db");
     let mut db = GpuDb::create(&db_path)?;
 
     db.set_meta("target", target)?;

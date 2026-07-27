@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::path::Path;
 
 use anyhow::{Context, Result};
@@ -51,7 +50,7 @@ fn import_kernel_events(dest: &Connection, events: &[TraceEvent], layer_id: i64)
             (kernel_name, duration_us, grid_x, grid_y, grid_z,
              block_x, block_y, block_z, stream_id, start_us,
              correlation_id, layer_id)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)"
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
     )?;
 
     for event in events {
@@ -64,16 +63,20 @@ fn import_kernel_events(dest: &Connection, events: &[TraceEvent], layer_id: i64)
 
         let grid = extract_tuple(&event.args, "grid", "grid_x", "grid_y", "grid_z");
         let block = extract_tuple(&event.args, "block", "block_x", "block_y", "block_z");
-        let stream = extract_u32(&event.args, "stream")
-            .or_else(|| extract_u32(&event.args, "stream_id"));
+        let stream =
+            extract_u32(&event.args, "stream").or_else(|| extract_u32(&event.args, "stream_id"));
         let corr = extract_u64(&event.args, "correlation")
             .or_else(|| extract_u64(&event.args, "external id"));
 
         stmt.execute(params![
             event.name,
             event.dur,
-            grid.map(|g| g.0), grid.map(|g| g.1), grid.map(|g| g.2),
-            block.map(|b| b.0), block.map(|b| b.1), block.map(|b| b.2),
+            grid.map(|g| g.0),
+            grid.map(|g| g.1),
+            grid.map(|g| g.2),
+            block.map(|b| b.0),
+            block.map(|b| b.1),
+            block.map(|b| b.2),
             stream,
             event.ts,
             corr.map(|c| c as i64),
@@ -122,35 +125,34 @@ fn import_ops(dest: &Connection, events: &[TraceEvent], layer_id: i64) -> Result
         });
     }
 
-    // Step 2: Aggregate by name for the ops table
-    let mut op_agg: HashMap<String, (f64, Option<String>, Option<String>)> = HashMap::new();
-    for inv in &invocations {
-        let entry = op_agg.entry(inv.name.clone()).or_insert((0.0, None, None));
-        entry.0 += inv.end_us - inv.start_us;
-        if entry.1.is_none() { entry.1 = inv.module_path.clone(); }
-        if entry.2.is_none() { entry.2 = inv.input_shapes.clone(); }
-    }
-
+    // Keep one row per invocation. The same operator name can occur more
+    // than once in a trace; merging by name loses the identity needed to
+    // assign a kernel launch to the correct invocation.
     let mut op_stmt = dest.prepare(
         "INSERT INTO ops (name, module_path, cpu_time_us, gpu_time_us, input_shapes, layer_id)
-         VALUES (?1, ?2, ?3, 0, ?4, ?5)"
+         VALUES (?1, ?2, ?3, 0, ?4, ?5)",
     )?;
-
-    // Track op name → id for the correlation step
-    let mut op_ids: HashMap<String, i64> = HashMap::new();
-    for (name, (cpu_time, module_path, input_shapes)) in &op_agg {
-        op_stmt.execute(params![name, module_path, cpu_time, input_shapes, layer_id])?;
-        op_ids.insert(name.clone(), dest.last_insert_rowid());
+    let mut op_ids = Vec::with_capacity(invocations.len());
+    for inv in &invocations {
+        op_stmt.execute(params![
+            inv.name,
+            inv.module_path,
+            inv.end_us - inv.start_us,
+            inv.input_shapes,
+            layer_id
+        ])?;
+        op_ids.push(dest.last_insert_rowid());
     }
 
     // Step 3: Correlate kernel launches to ops by temporal containment.
     // A kernel belongs to the innermost (shortest) op whose time window contains
     // the kernel's start timestamp.
     // Sort invocations by duration ascending so innermost ops are checked first.
-    invocations.sort_by(|a, b| {
-        let da = a.end_us - a.start_us;
-        let db = b.end_us - b.start_us;
-        da.partial_cmp(&db).unwrap()
+    let mut containment_order: Vec<usize> = (0..invocations.len()).collect();
+    containment_order.sort_by(|&a, &b| {
+        let da = invocations[a].end_us - invocations[a].start_us;
+        let db = invocations[b].end_us - invocations[b].start_us;
+        da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
     });
 
     // Collect kernel launches from this layer
@@ -165,14 +167,15 @@ fn import_ops(dest: &Connection, events: &[TraceEvent], layer_id: i64) -> Result
         .collect();
 
     let mut map_stmt = dest.prepare(
-        "INSERT OR IGNORE INTO op_kernel_map (op_id, kernel_name) VALUES (?1, ?2)"
+        "INSERT OR IGNORE INTO op_kernel_map (op_id, kernel_name, launch_id) VALUES (?1, ?2, ?3)",
     )?;
-    for (_, kernel_name, k_start) in &kernels {
+    for (launch_id, kernel_name, k_start) in &kernels {
         // Find innermost containing op
-        for inv in &invocations {
+        for &index in &containment_order {
+            let inv = &invocations[index];
             if *k_start >= inv.start_us && *k_start <= inv.end_us {
-                if let Some(&op_id) = op_ids.get(&inv.name) {
-                    map_stmt.execute(params![op_id, kernel_name])?;
+                if let Some(&op_id) = op_ids.get(index) {
+                    map_stmt.execute(params![op_id, kernel_name, launch_id])?;
                     // Accumulate GPU time for this op
                     // (We don't have per-launch duration easily here, query it)
                     break;
@@ -185,7 +188,9 @@ fn import_ops(dest: &Connection, events: &[TraceEvent], layer_id: i64) -> Result
     let update_sql = "UPDATE ops SET gpu_time_us = (
         SELECT COALESCE(SUM(l.duration_us), 0)
         FROM op_kernel_map okm
-        JOIN launches l ON l.kernel_name = okm.kernel_name AND l.layer_id = ?1
+        JOIN launches l ON l.layer_id = ?1
+            AND ((okm.launch_id IS NOT NULL AND l.id = okm.launch_id)
+                 OR (okm.launch_id IS NULL AND l.kernel_name = okm.kernel_name))
         WHERE okm.op_id = ops.id
     ) WHERE layer_id = ?1";
     dest.execute(update_sql, params![layer_id])?;
@@ -242,7 +247,9 @@ mod tests {
     #[test]
     fn import_chrome_trace_basic() {
         let db = GpuDb::create(&tempfile::tempdir().unwrap().keep().join("t.db")).unwrap();
-        let lid = db.add_layer("torch", "test.json", None, None, None).unwrap();
+        let lid = db
+            .add_layer("torch", "test.json", None, None, None)
+            .unwrap();
 
         let trace = r#"{
             "traceEvents": [
@@ -274,9 +281,10 @@ mod tests {
         assert_eq!(db.unique_kernel_count(), 1);
         assert_eq!(db.total_launch_count(), 1);
 
-        let op_count: i64 = db.conn.query_row(
-            "SELECT COUNT(*) FROM ops", [], |row| row.get(0),
-        ).unwrap();
+        let op_count: i64 = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM ops", [], |row| row.get(0))
+            .unwrap();
         assert_eq!(op_count, 1);
     }
 }

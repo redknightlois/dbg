@@ -1,5 +1,6 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+use std::sync::OnceLock;
 use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
@@ -121,10 +122,25 @@ pub fn detect_target(target: &str) -> TargetKind {
 // Session temp directory
 // ---------------------------------------------------------------------------
 
-fn session_dir() -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("gdbg-{}", std::process::id()));
-    let _ = std::fs::create_dir_all(&dir);
-    dir
+pub(crate) fn session_dir() -> PathBuf {
+    static DIR: OnceLock<PathBuf> = OnceLock::new();
+    DIR.get_or_init(|| {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        for attempt in 0..100u32 {
+            let dir =
+                std::env::temp_dir().join(format!("gdbg-{}-{stamp}-{attempt}", std::process::id()));
+            if std::fs::create_dir(&dir).is_ok() {
+                return dir;
+            }
+        }
+        // Keep the error at the first file creation instead of silently
+        // opening a stale directory from a previous process.
+        std::env::temp_dir().join(format!("gdbg-unusable-{}-{stamp}", std::process::id()))
+    })
+    .clone()
 }
 
 // ---------------------------------------------------------------------------
@@ -180,7 +196,9 @@ pub fn collect_all(db: &GpuDb, target: &str, args: &[String]) -> Result<()> {
 
     // Phase 1: nsys timeline
     eprintln!("--- phase 1: timeline capture (nsys) ---");
-    run_phase("nsys", &|| collect_nsys(db, target, args, kind, &session, target_hash.as_deref()));
+    run_phase("nsys", &|| {
+        collect_nsys(db, target, args, kind, &session, target_hash.as_deref())
+    });
 
     // Identify top kernels for ncu
     let top_names = top_kernel_names(db, 5);
@@ -188,8 +206,22 @@ pub fn collect_all(db: &GpuDb, target: &str, args: &[String]) -> Result<()> {
     // Phase 2: ncu deep metrics (on top kernels only)
     if !top_names.is_empty() {
         eprintln!("--- phase 2: deep kernel metrics (ncu) ---");
-        eprintln!("  profiling {} kernels: {}", top_names.len(), top_names.join(", "));
-        run_phase("ncu", &|| collect_ncu(db, target, args, &top_names, &session, target_hash.as_deref()));
+        eprintln!(
+            "  profiling {} kernels: {}",
+            top_names.len(),
+            top_names.join(", ")
+        );
+        run_phase("ncu", &|| {
+            collect_ncu(
+                db,
+                target,
+                args,
+                &top_names,
+                kind,
+                &session,
+                target_hash.as_deref(),
+            )
+        });
     } else {
         eprintln!("--- phase 2: skipped (no kernels found in phase 1) ---");
     }
@@ -198,11 +230,15 @@ pub fn collect_all(db: &GpuDb, target: &str, args: &[String]) -> Result<()> {
     match kind {
         TargetKind::PythonTorch => {
             eprintln!("--- phase 3: op mapping (torch.profiler) ---");
-            run_phase("torch", &|| collect_torch(db, target, args, &session, target_hash.as_deref(), "torch"));
+            run_phase("torch", &|| {
+                collect_torch(db, target, args, &session, target_hash.as_deref(), "torch")
+            });
         }
         TargetKind::PythonTriton => {
             eprintln!("--- phase 3: op mapping (proton) ---");
-            run_phase("proton", &|| collect_torch(db, target, args, &session, target_hash.as_deref(), "proton"));
+            run_phase("proton", &|| {
+                collect_proton(db, target, args, &session, target_hash.as_deref())
+            });
         }
         _ => {
             eprintln!("--- phase 3: skipped (not a Python target) ---");
@@ -222,7 +258,6 @@ pub fn collect_all(db: &GpuDb, target: &str, args: &[String]) -> Result<()> {
 // ---------------------------------------------------------------------------
 // nsys collection
 // ---------------------------------------------------------------------------
-
 
 fn collect_nsys(
     db: &GpuDb,
@@ -265,17 +300,18 @@ fn collect_nsys(
     if !trace_rep.exists() {
         let qdstrm = session.join("trace.qdstrm");
         if qdstrm.exists() {
-            let importer = find_bundled_tool(&NSIGHT_SYSTEMS, "QdstrmImporter").ok_or_else(|| {
-                let stderr = String::from_utf8_lossy(&profile_output.stderr);
-                anyhow::anyhow!(
-                    "nsys produced {} but no trace.nsys-rep (silent QdstrmImporter failure).\n\
+            let importer =
+                find_bundled_tool(&NSIGHT_SYSTEMS, "QdstrmImporter").ok_or_else(|| {
+                    let stderr = String::from_utf8_lossy(&profile_output.stderr);
+                    anyhow::anyhow!(
+                        "nsys produced {} but no trace.nsys-rep (silent QdstrmImporter failure).\n\
                      Could not locate QdstrmImporter binary on this system.\n\
                      Install nsight-systems with its runtime deps, or upgrade nsys to 2024+.\n\
                      nsys stderr:\n{}",
-                    qdstrm.display(),
-                    stderr
-                )
-            })?;
+                        qdstrm.display(),
+                        stderr
+                    )
+                })?;
             run_cmd(
                 Command::new(&importer).arg("-i").arg(&qdstrm),
                 "QdstrmImporter fallback failed",
@@ -318,8 +354,11 @@ fn collect_nsys(
         return Err(e);
     }
 
-    eprintln!("  nsys done in {elapsed:.1}s ({} kernels, {} launches)",
-        db.unique_kernel_count(), db.total_launch_count());
+    eprintln!(
+        "  nsys done in {elapsed:.1}s ({} kernels, {} launches)",
+        db.unique_kernel_count(),
+        db.total_launch_count()
+    );
     Ok(())
 }
 
@@ -332,6 +371,7 @@ fn collect_ncu(
     target: &str,
     args: &[String],
     kernel_names: &[String],
+    kind: TargetKind,
     session: &Path,
     target_hash: Option<&str>,
 ) -> Result<()> {
@@ -343,7 +383,14 @@ fn collect_ncu(
     let mut cmd = Command::new("ncu");
     cmd.args(["--set", "full", "--csv"]);
     cmd.args(["--kernel-name", &format!("regex:{regex}")]);
-    cmd.arg(target);
+    if matches!(
+        kind,
+        TargetKind::Python | TargetKind::PythonTorch | TargetKind::PythonTriton
+    ) {
+        cmd.arg("python3").arg(target);
+    } else {
+        cmd.arg(target);
+    }
     for a in args {
         cmd.arg(a);
     }
@@ -355,14 +402,55 @@ fn collect_ncu(
     let layer_id = db.add_layer(
         "ncu",
         &csv_path.display().to_string(),
-        Some(&format!("ncu --set full --kernel-name regex:{regex} {target}")),
+        Some(&format!(
+            "ncu --set full --kernel-name regex:{regex} {target}"
+        )),
         Some(elapsed),
         target_hash,
     )?;
 
     parsers::ncu::import_ncu_csv(&db.conn, &csv_path, layer_id)?;
 
-    eprintln!("  ncu done in {elapsed:.1}s ({} kernels with metrics)", db.kernels_with_metrics());
+    eprintln!(
+        "  ncu done in {elapsed:.1}s ({} kernels with metrics)",
+        db.kernels_with_metrics()
+    );
+    Ok(())
+}
+
+/// Collect Triton's operator mapping with Proton. Triton targets must not
+/// use the torch.profiler wrapper: that records a torch layer even when the
+/// requested collector is Proton and produces misleading cross-track data.
+fn collect_proton(
+    db: &GpuDb,
+    target: &str,
+    args: &[String],
+    session: &Path,
+    target_hash: Option<&str>,
+) -> Result<()> {
+    let trace_json = session.join("proton_trace.json");
+    let start = Instant::now();
+    let mut cmd = Command::new("proton");
+    cmd.args(["profile", "-o"])
+        .arg(&trace_json)
+        .arg("--")
+        .arg("python3")
+        .arg(target)
+        .args(args);
+    run_cmd(&mut cmd, "proton failed")?;
+    if !trace_json.exists() {
+        bail!("proton did not produce {}", trace_json.display());
+    }
+    let elapsed = start.elapsed().as_secs_f64();
+    let layer_id = db.add_layer(
+        "proton",
+        &trace_json.display().to_string(),
+        Some(&format!("proton profile {target}")),
+        Some(elapsed),
+        target_hash,
+    )?;
+    parsers::chrome_trace::import_chrome_trace(&db.conn, &trace_json, layer_id)?;
+    eprintln!("  proton done in {elapsed:.1}s");
     Ok(())
 }
 
@@ -400,11 +488,20 @@ fn collect_torch(
     wrapper.push_str("    record_shapes=True,\n");
     wrapper.push_str("    with_stack=True,\n");
     wrapper.push_str(") as prof:\n");
-    wrapper.push_str(&format!("    runpy.run_path({}, run_name='__main__')\n", escape_python_str(target)));
-    wrapper.push_str(&format!("prof.export_chrome_trace({})\n", escape_python_str(trace_json.display().to_string().as_str())));
+    wrapper.push_str(&format!(
+        "    runpy.run_path({}, run_name='__main__')\n",
+        escape_python_str(target)
+    ));
+    wrapper.push_str(&format!(
+        "prof.export_chrome_trace({})\n",
+        escape_python_str(trace_json.display().to_string().as_str())
+    ));
     std::fs::write(&wrapper_path, &wrapper)?;
 
-    run_cmd(Command::new("python3").arg(&wrapper_path), "torch.profiler wrapper failed")?;
+    run_cmd(
+        Command::new("python3").arg(&wrapper_path),
+        "torch.profiler wrapper failed",
+    )?;
     let elapsed = start.elapsed().as_secs_f64();
 
     if !trace_json.exists() {
@@ -530,8 +627,14 @@ mod tests {
     /// needs.
     #[test]
     fn python_preflight_module_matches_target_kind() {
-        assert_eq!(python_preflight_module(TargetKind::PythonTorch), Some("torch"));
-        assert_eq!(python_preflight_module(TargetKind::PythonTriton), Some("triton"));
+        assert_eq!(
+            python_preflight_module(TargetKind::PythonTorch),
+            Some("torch")
+        );
+        assert_eq!(
+            python_preflight_module(TargetKind::PythonTriton),
+            Some("triton")
+        );
         // Plain Python and non-Python targets: no pre-flight — the
         // script either runs under nsys directly or there's no Python
         // dep to verify.
