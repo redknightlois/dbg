@@ -446,7 +446,7 @@ fn cmd_replay(args: &[String]) -> Result<()> {
             dbg_cli::session_db::SCHEMA_VERSION
         );
     }
-    let db = dbg_cli::session_db::SessionDb::open(&path)?;
+    let db = dbg_cli::session_db::SessionDb::open_read_only(&path)?;
 
     // Dump high-level info, then either execute a one-shot query from
     // any trailing args or drop into a minimal REPL.
@@ -562,6 +562,9 @@ fn replay_eval(
     match commands::dispatch_no_backend(cmd) {
         Some(commands::Dispatched::Immediate(s)) => s,
         Some(commands::Dispatched::Query(q)) => {
+            if matches!(q, commands::crosstrack::Query::Disasm { .. } | commands::crosstrack::Query::AtHitDisasm) {
+                return "replay is read-only: disassembly collection is unavailable; use cached disasm rows or run `dbg disasm` in a live session".into();
+            }
             let ctx = commands::crosstrack::RunCtx {
                 target,
                 target_class,
@@ -571,6 +574,12 @@ fn replay_eval(
             commands::crosstrack::run(&q, db, &ctx)
         }
         Some(commands::Dispatched::Lifecycle(l)) => {
+            if matches!(l, commands::lifecycle::Lifecycle::Save { .. }
+                | commands::lifecycle::Lifecycle::Prune { .. }
+                | commands::lifecycle::Lifecycle::Replay { .. })
+            {
+                return "replay is read-only: save, prune, and nested replay are unavailable".into();
+            }
             let ctx = commands::lifecycle::LifeCtx {
                 cwd,
                 active: Some(db),
@@ -1272,6 +1281,7 @@ mod tests {
         assert_eq!(autodetect_backend("app.js"), Some("node-proto"));
         assert_eq!(autodetect_backend("app.ts"), Some("node-proto"));
         assert_eq!(autodetect_backend("foo.hs"), Some("ghci"));
+        assert_eq!(autodetect_backend("main.ml"), Some("ocamldebug"));
         assert_eq!(autodetect_backend("bin/no-ext"), None);
     }
 

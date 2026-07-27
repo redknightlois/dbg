@@ -132,10 +132,19 @@ impl SessionDb {
     /// Open an existing SessionDb from disk. Refuses to open DBs with a
     /// mismatched `PRAGMA user_version`: the caller must re-collect.
     pub fn open(path: &Path) -> Result<Self> {
+        Self::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE)
+    }
+
+    /// Open an existing session without granting SQLite write access.
+    pub fn open_read_only(path: &Path) -> Result<Self> {
+        Self::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+    }
+
+    fn open_with_flags(path: &Path, flags: rusqlite::OpenFlags) -> Result<Self> {
         if !path.exists() {
             bail!("session DB not found: {}", path.display());
         }
-        let conn = Connection::open(path)
+        let conn = Connection::open_with_flags(path, flags)
             .with_context(|| format!("opening session DB {}", path.display()))?;
 
         let found: i64 = conn
@@ -233,7 +242,15 @@ impl SessionDb {
             params![self.session_id],
             |r| r.get(0),
         )?;
-        Ok(profile_raw > 0)
+        if profile_raw > 0 {
+            return Ok(true);
+        }
+        let disassembly: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM disassembly WHERE session_id = ?1",
+            params![self.session_id],
+            |r| r.get(0),
+        )?;
+        Ok(disassembly > 0)
     }
 
     /// Promote this session so `prune` will never delete it.
@@ -420,13 +437,14 @@ fn is_auto_session(path: &Path) -> Result<bool> {
     let v: i64 = conn
         .query_row("PRAGMA user_version", [], |r| r.get(0))
         .unwrap_or(-1);
-    if v != SCHEMA_VERSION {
-        // Unknown/old format — treat as auto so prune can clean it up.
-        return Ok(true);
-    }
     let created_by: String = conn
         .query_row("SELECT created_by FROM sessions LIMIT 1", [], |r| r.get(0))
         .unwrap_or_else(|_| "auto".to_string());
+    if v != SCHEMA_VERSION {
+        // A user-promoted DB must remain protected even when it needs a
+        // migration. Unknown files without that marker remain pruneable.
+        return Ok(created_by != "user");
+    }
     Ok(created_by == "auto")
 }
 
@@ -546,6 +564,16 @@ mod tests {
     }
 
     #[test]
+    fn read_only_open_rejects_mutation() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("readonly.db");
+        let src = SessionDb::create(opts(tmp.path(), "/bin/ls")).unwrap();
+        src.save_to(&path).unwrap();
+        let ro = SessionDb::open_read_only(&path).unwrap();
+        assert!(ro.promote_to_user().is_err());
+    }
+
+    #[test]
     fn set_and_get_meta() {
         let tmp = TempDir::new().unwrap();
         let db = SessionDb::create(opts(tmp.path(), "/bin/ls")).unwrap();
@@ -594,6 +622,21 @@ mod tests {
         assert!(deleted[0].ends_with("auto.db"));
         assert!(user_path.exists());
         assert!(!auto_path.exists());
+    }
+
+    #[test]
+    fn prune_auto_only_keeps_promoted_unknown_schema() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("promoted.db");
+        let db = SessionDb::create(opts(tmp.path(), "/bin/ls")).unwrap();
+        db.promote_to_user().unwrap();
+        db.save_to(&path).unwrap();
+        let conn = Connection::open(&path).unwrap();
+        conn.execute("PRAGMA user_version = 9999", []).unwrap();
+        std::thread::sleep(Duration::from_millis(10));
+        let deleted = prune(tmp.path(), Duration::ZERO, PrunePolicy::AutoOnly).unwrap();
+        assert!(deleted.is_empty());
+        assert!(path.exists());
     }
 
     #[test]

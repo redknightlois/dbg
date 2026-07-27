@@ -9,7 +9,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 use dbg_cli::session_db::{PrunePolicy, SessionDb, SessionKind, prune, sessions_dir};
 use rusqlite::{OptionalExtension, params};
 
@@ -101,7 +101,10 @@ pub fn try_dispatch(input: &str) -> Option<super::Dispatched> {
             Lifecycle::Save { label }
         }
         "prune" => {
-            let (older_than, policy) = parse_prune_args(rest);
+            let (older_than, policy) = match parse_prune_args(rest) {
+                Ok(v) => v,
+                Err(e) => return Some(super::Dispatched::Immediate(format!("[error: {e}]"))),
+            };
             Lifecycle::Prune { older_than, policy }
         }
         "diff" => {
@@ -141,7 +144,7 @@ pub fn try_dispatch(input: &str) -> Option<super::Dispatched> {
     Some(super::Dispatched::Lifecycle(l))
 }
 
-fn parse_prune_args(rest: &str) -> (Duration, PrunePolicy) {
+fn parse_prune_args(rest: &str) -> Result<(Duration, PrunePolicy)> {
     let mut older_than = Duration::from_secs(7 * 86_400);
     let mut policy = PrunePolicy::AutoOnly;
     let toks: Vec<&str> = rest.split_whitespace().collect();
@@ -150,18 +153,16 @@ fn parse_prune_args(rest: &str) -> (Duration, PrunePolicy) {
         match toks[i] {
             "--all" => policy = PrunePolicy::All,
             "--older-than" => {
-                if let Some(v) = toks.get(i + 1) {
-                    if let Some(d) = parse_duration(v) {
-                        older_than = d;
-                    }
-                    i += 1;
-                }
+                let v = toks.get(i + 1).ok_or_else(|| anyhow::anyhow!("--older-than needs a value"))?;
+                older_than = parse_duration(v)
+                    .ok_or_else(|| anyhow::anyhow!("invalid duration `{v}`"))?;
+                i += 1;
             }
-            _ => {}
+            other => bail!("unknown prune argument `{other}`"),
         }
         i += 1;
     }
-    (older_than, policy)
+    Ok((older_than, policy))
 }
 
 /// Parse `1h`, `2d`, `30m`, `45s`, `604800` (seconds).
@@ -178,9 +179,9 @@ pub(crate) fn parse_duration(s: &str) -> Option<Duration> {
     let n: u64 = num_str.parse().ok()?;
     let secs = match unit {
         's' => n,
-        'm' => n * 60,
-        'h' => n * 3600,
-        'd' => n * 86_400,
+        'm' => n.checked_mul(60)?,
+        'h' => n.checked_mul(3600)?,
+        'd' => n.checked_mul(86_400)?,
         _ => return None,
     };
     Some(Duration::from_secs(secs))
@@ -444,12 +445,10 @@ fn cmd_save(ctx: &LifeCtx<'_>, label: Option<&str>) -> String {
         return "no active session to save (start one with `dbg start`)".into();
     };
     let lbl = label.unwrap_or_else(|| db.label());
-    let path = sessions_dir(ctx.cwd).join(format!("{lbl}.db"));
-    if let Some(parent) = path.parent() {
-        if let Err(e) = std::fs::create_dir_all(parent) {
-            return format!("[error creating {}: {e}]", parent.display());
-        }
-    }
+    let path = match safe_session_path(ctx.cwd, lbl) {
+        Ok(path) => path,
+        Err(e) => return format!("[error: {e}]"),
+    };
     if let Err(e) = db.save_to(&path) {
         return format!("[error writing {}: {e}]", path.display());
     }
@@ -501,7 +500,7 @@ fn cmd_diff(ctx: &LifeCtx<'_>, a_label: Option<&str>, b_label: &str) -> String {
         if let Some(msg) = check_schema_version(&a_path) {
             return msg;
         }
-        let a_db = match SessionDb::open(&a_path) {
+        let a_db = match SessionDb::open_read_only(&a_path) {
             Ok(db) => db,
             Err(e) => return format!("[error opening {}: {e}]", a_path.display()),
         };
@@ -554,7 +553,7 @@ fn diff_two_dbs(ctx: &LifeCtx<'_>, a_db: &SessionDb, a_label: &str, b_label: &st
     // compare" and forced manual %×total_ms math.
     let a_is_profile = a_db.kind() == SessionKind::Profile;
     if a_is_profile {
-        let b_db = match SessionDb::open(&b_path) {
+    let b_db = match SessionDb::open_read_only(&b_path) {
             Ok(db) => db,
             Err(e) => return format!("[error opening {}: {e}]", b_path.display()),
         };
@@ -747,6 +746,33 @@ fn resolve_session_path(cwd: &Path, other: &str) -> PathBuf {
     sessions_dir(cwd).join(format!("{other}.db"))
 }
 
+fn safe_session_path(cwd: &Path, label: &str) -> Result<PathBuf> {
+    if label.is_empty()
+        || label == "."
+        || label == ".."
+        || label.contains('/')
+        || label.contains('\\')
+        || Path::new(label).is_absolute()
+    {
+        bail!("invalid session label `{label}`: use a single file name")
+    }
+    let dir = sessions_dir(cwd);
+    fs::create_dir_all(&dir)?;
+    let root = fs::canonicalize(&dir)?;
+    let path = root.join(format!("{label}.db"));
+    if let Ok(meta) = fs::symlink_metadata(&path) {
+        if meta.file_type().is_symlink() {
+            bail!("session label `{label}` points to a symbolic link")
+        }
+    }
+    if let Ok(real) = fs::canonicalize(&path) {
+        if real.parent() != Some(root.as_path()) {
+            bail!("session label `{label}` escapes the sessions directory")
+        }
+    }
+    Ok(path)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -779,16 +805,33 @@ mod tests {
 
     #[test]
     fn parse_prune_args_defaults_seven_days_auto_only() {
-        let (d, p) = parse_prune_args("");
+        let (d, p) = parse_prune_args("").unwrap();
         assert_eq!(d.as_secs(), 7 * 86_400);
         assert_eq!(p, PrunePolicy::AutoOnly);
     }
 
     #[test]
     fn parse_prune_args_all_and_custom_age() {
-        let (d, p) = parse_prune_args("--older-than 1h --all");
+        let (d, p) = parse_prune_args("--older-than 1h --all").unwrap();
         assert_eq!(d.as_secs(), 3600);
         assert_eq!(p, PrunePolicy::All);
+    }
+
+    #[test]
+    fn malformed_prune_duration_fails_closed() {
+        assert!(parse_prune_args("--older-than nope --all").is_err());
+        assert!(parse_duration("18446744073709551615d").is_none());
+    }
+
+    #[test]
+    fn save_rejects_path_escape_labels() {
+        let tmp = TempDir::new().unwrap();
+        let db = mk_db(&tmp, "active");
+        let ctx = LifeCtx { cwd: tmp.path(), active: Some(&db) };
+        for label in ["../outside", "/tmp/outside", "a\\b"] {
+            let out = cmd_save(&ctx, Some(label));
+            assert!(out.contains("invalid session label"), "{label}: {out}");
+        }
     }
 
     #[test]
