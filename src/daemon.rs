@@ -1,9 +1,12 @@
 use std::collections::HashMap;
+use std::collections::hash_map::Entry;
+use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
+use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -20,10 +23,14 @@ use dbg_cli::session_db::LiveDebugger;
 
 const CMD_TIMEOUT: Duration = Duration::from_secs(60);
 
-fn cleanup_and_exit() -> ! {
+fn cleanup_and_exit(keep_session_tmp: bool) -> ! {
     let me = session_slug();
     let _ = std::fs::remove_file(socket_path());
     let _ = std::fs::remove_file(pid_path());
+    // Keep the reservation inode. Its flock is released when this process
+    // exits, so a later starter can safely reuse the same inode. Unlinking
+    // it here would let a new starter create a replacement inode while this
+    // process was still shutting down.
     // Clear the "latest" pointer only if it still names us — another
     // daemon may have become the newest since we started, and we
     // mustn't blow away its pointer.
@@ -33,7 +40,14 @@ fn cleanup_and_exit() -> ! {
         }
     }
     let session_dir = session_tmp_dir();
-    let _ = std::fs::remove_dir_all(&session_dir);
+    if keep_session_tmp {
+        eprintln!(
+            "[dbg] warning: raw session evidence was not removed; recover it from {}",
+            session_dir.display()
+        );
+    } else {
+        let _ = std::fs::remove_dir_all(&session_dir);
+    }
     std::process::exit(0);
 }
 
@@ -45,21 +59,18 @@ fn session_tmp_dir() -> PathBuf {
 }
 
 fn users_uid() -> u32 {
-    // Read from /proc/self/status; the value only needs to be stable
-    // per-user within the host, not authoritative.
-    std::env::var("UID")
+    // Do not trust the conventional `$UID` environment variable. A caller
+    // can set it to another user's value and otherwise redirect the IPC
+    // pathname into a directory that is not theirs. `/proc` reports the
+    // effective UID assigned by the kernel.
+    std::fs::read_to_string("/proc/self/status")
         .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or_else(|| {
-            std::fs::read_to_string("/proc/self/status")
-                .ok()
-                .and_then(|s| {
-                    s.lines()
-                        .find(|l| l.starts_with("Uid:"))
-                        .and_then(|l| l.split_ascii_whitespace().nth(1)?.parse().ok())
-                })
-                .unwrap_or(0)
+        .and_then(|s| {
+            s.lines()
+                .find(|l| l.starts_with("Uid:"))
+                .and_then(|l| l.split_ascii_whitespace().nth(1)?.parse().ok())
         })
+        .unwrap_or(0)
 }
 
 /// Per-user IPC directory. Prefers `$XDG_RUNTIME_DIR/dbg-<uid>` (tmpfs,
@@ -78,11 +89,33 @@ fn runtime_dir() -> PathBuf {
         .unwrap_or_else(|_| PathBuf::from("/tmp"));
     let dir = base.join(format!("dbg-{uid}"));
     if let Err(e) = std::fs::create_dir_all(&dir) {
-        // Fall back — we can't abort here (callers treat this as
-        // infallible). The bind() will fail with a clearer error.
-        eprintln!("dbg: cannot create {}: {e}", dir.display());
-    } else {
-        let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+        panic!(
+            "dbg: cannot create secure runtime directory {}: {e}",
+            dir.display()
+        );
+    }
+    let metadata = std::fs::symlink_metadata(&dir).unwrap_or_else(|e| {
+        panic!(
+            "dbg: cannot inspect runtime directory {}: {e}",
+            dir.display()
+        )
+    });
+    use std::os::unix::fs::MetadataExt;
+    if !metadata.is_dir() || metadata.uid() != uid {
+        panic!("dbg: refusing insecure runtime directory {}", dir.display());
+    }
+    if let Err(e) = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)) {
+        panic!(
+            "dbg: cannot secure runtime directory {}: {e}",
+            dir.display()
+        );
+    }
+    let mode = std::fs::symlink_metadata(&dir).unwrap().mode();
+    if mode & 0o077 != 0 {
+        panic!(
+            "dbg: runtime directory {} is writable by another user",
+            dir.display()
+        );
     }
     dir
 }
@@ -163,6 +196,10 @@ pub fn pid_path_for(slug: &str) -> PathBuf {
     runtime_dir().join(format!("dbg-{slug}.pid"))
 }
 
+fn reservation_path_for(slug: &str) -> PathBuf {
+    runtime_dir().join(format!("dbg-{slug}.lock"))
+}
+
 fn socket_path() -> PathBuf {
     socket_path_for(&session_slug())
 }
@@ -202,13 +239,111 @@ pub fn allocate_slug() -> Result<String> {
                  `DBG_SESSION={name} dbg kill` first"
             );
         }
+        claim_slug(&name)?;
         return Ok(name);
     }
     let base = cwd_base_slug();
-    if is_slug_live(&base) {
-        Ok(format!("{base}-{}", std::process::id()))
-    } else {
-        Ok(base)
+    if !is_slug_live(&base) && claim_slug(&base).is_ok() {
+        return Ok(base);
+    }
+    for suffix in 0..1000u32 {
+        let name = if suffix == 0 {
+            format!("{base}-{}", std::process::id())
+        } else {
+            format!("{base}-{}-{suffix}", std::process::id())
+        };
+        if !is_slug_live(&name) && claim_slug(&name).is_ok() {
+            return Ok(name);
+        }
+    }
+    anyhow::bail!("cannot allocate a free debugger session slot")
+}
+
+type SlugReservation = nix::fcntl::Flock<File>;
+
+/// The reservation file is deliberately never removed. Ownership is the
+/// kernel's exclusive flock on this stable inode, not a PID written into a
+/// pathname. This makes stale recovery safe: after an owner dies, the next
+/// starter acquires the same inode; it can never remove a path that another
+/// starter acquired in the meantime.
+static SLUG_RESERVATIONS: OnceLock<Mutex<HashMap<PathBuf, SlugReservation>>> = OnceLock::new();
+
+fn slug_reservations() -> &'static Mutex<HashMap<PathBuf, SlugReservation>> {
+    SLUG_RESERVATIONS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Atomically reserve a slug before the caller forks. This closes the
+/// check-then-create window between `allocate_slug` and daemon startup.
+fn claim_slug(slug: &str) -> Result<()> {
+    let path = reservation_path_for(slug);
+    let mut reservations = slug_reservations()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if let Entry::Occupied(_) = reservations.entry(path.clone()) {
+        anyhow::bail!("session slot `{slug}` is already reserved")
+    }
+
+    // O_NOFOLLOW prevents a malicious or damaged runtime entry from
+    // redirecting this open outside the per-user runtime directory.
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .custom_flags(nix::libc::O_NOFOLLOW)
+        .open(&path)
+        .with_context(|| format!("cannot open slug reservation {}", path.display()))?;
+    #[cfg(test)]
+    test_reservation_contender_ready();
+    let lock = match nix::fcntl::Flock::lock(file, nix::fcntl::FlockArg::LockExclusiveNonblock) {
+        Ok(lock) => lock,
+        Err((_file, _err)) => {
+            anyhow::bail!("session slot `{slug}` is already reserved")
+        }
+    };
+    #[cfg(test)]
+    test_reservation_lock_acquired();
+
+    // A daemon started by an older binary may have a live PID marker but no
+    // flock. Check it only while we own the stable reservation inode. No
+    // pathname can be removed and replaced between this check and claim.
+    if is_slug_live(slug) {
+        anyhow::bail!("session slot `{slug}` is already live")
+    }
+
+    reservations.insert(path, lock);
+    Ok(())
+}
+
+#[cfg(test)]
+fn test_reservation_contender_ready() {
+    let Ok(raw) = std::env::var("DBG_TEST_RESERVATION_BARRIER") else {
+        return;
+    };
+    let barrier = PathBuf::from(raw);
+    std::fs::create_dir_all(&barrier).expect("create reservation test barrier");
+    std::fs::write(
+        barrier.join(format!("contender-{}", std::process::id())),
+        b"ready",
+    )
+    .expect("publish reservation contender");
+    while !barrier.join("begin").exists() {
+        std::thread::sleep(Duration::from_millis(2));
+    }
+}
+
+#[cfg(test)]
+fn test_reservation_lock_acquired() {
+    let Ok(raw) = std::env::var("DBG_TEST_RESERVATION_BARRIER") else {
+        return;
+    };
+    let barrier = PathBuf::from(raw);
+    std::fs::write(
+        barrier.join(format!("locked-{}", std::process::id())),
+        b"locked",
+    )
+    .expect("publish reservation lock");
+    while !barrier.join("release").exists() {
+        std::thread::sleep(Duration::from_millis(2));
     }
 }
 
@@ -521,8 +656,17 @@ pub fn run_daemon(
     // case where the parent's write was lost/raced.
     write_latest_pointer(&session_slug());
 
+    let shutdown_requested = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let shutdown_flag = shutdown_requested.clone();
+    let wake_path = socket_path();
+    let signal_pid = child_pid.load(Ordering::Relaxed);
     ctrlc::set_handler(move || {
-        cleanup_and_exit();
+        shutdown_flag.store(true, Ordering::Release);
+        let _ = nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(signal_pid),
+            nix::sys::signal::Signal::SIGINT,
+        );
+        let _ = std::os::unix::net::UnixStream::connect(&wake_path);
     })
     .ok();
 
@@ -586,8 +730,8 @@ pub fn run_daemon(
                     persist_profile_source(&db, Path::new(src));
                 }
             }
-            let final_path = session_db::sessions_dir(&cwd).join(format!("{}.db", db.label()));
-            (Some(db), Some(final_path))
+            let final_path = session_save_path(&cwd, db.label());
+            (Some(db), final_path)
         }
         Err(e) => {
             eprintln!("[dbg] warning: session DB unavailable ({e}); proceeding without capture");
@@ -606,6 +750,11 @@ pub fn run_daemon(
         target_class,
     });
 
+    if shutdown_requested.load(Ordering::Acquire) {
+        let (_, keep_session_tmp) = handle_quit(backend, &session, &child_pid);
+        cleanup_and_exit(keep_session_tmp);
+    }
+
     // Blocking accept — the daemon does nothing useful between
     // connections, and ctrl-c is delivered to the signal handler
     // regardless of whether accept is blocked. Polling burned ~100
@@ -616,6 +765,11 @@ pub fn run_daemon(
                 Ok((s, _)) => s,
                 Err(_) => continue,
             };
+
+            if shutdown_requested.load(Ordering::Acquire) {
+                let (_, keep_session_tmp) = handle_quit(backend, &session, &child_pid);
+                cleanup_and_exit(keep_session_tmp);
+            }
 
             let session = &session;
             let cached_help = &cached_help;
@@ -635,7 +789,7 @@ pub fn run_daemon(
                 }
 
                 if cmd == "quit" {
-                    let response = handle_quit(backend, session, child_pid);
+                    let (response, keep_session_tmp) = handle_quit(backend, session, child_pid);
                     let _ = stream.write_all(response.as_bytes());
                     let _ = stream.flush();
                     // Close the write half so the client's read_to_string
@@ -648,7 +802,7 @@ pub fn run_daemon(
                     std::thread::sleep(Duration::from_millis(20));
                     // Exit immediately — scoped threads would otherwise wait
                     // for any blocked command (e.g. `continue`) to finish.
-                    cleanup_and_exit();
+                    cleanup_and_exit(keep_session_tmp);
                 }
 
                 if cmd == "cancel" {
@@ -663,7 +817,7 @@ pub fn run_daemon(
         }
     });
 
-    cleanup_and_exit();
+    cleanup_and_exit(false);
 }
 
 /// Lock the session mutex, recovering from poisoning so the daemon
@@ -676,7 +830,11 @@ fn lock_session(session: &Mutex<Session>) -> std::sync::MutexGuard<'_, Session> 
 /// returns, acquire the session lock, persist the DB, then quit the
 /// debugger. This fixes the jdb timing issue where the 2s lock timeout
 /// wasn't enough for a slow `continue` to finish.
-fn handle_quit(backend: &dyn Backend, session: &Mutex<Session>, child_pid: &AtomicI32) -> String {
+fn handle_quit(
+    backend: &dyn Backend,
+    session: &Mutex<Session>,
+    child_pid: &AtomicI32,
+) -> (String, bool) {
     // SIGINT the child to interrupt any blocked PTY read (e.g. jdb
     // waiting for a breakpoint during `continue`). This causes the
     // `send_and_wait` in the command thread to return promptly,
@@ -684,22 +842,17 @@ fn handle_quit(backend: &dyn Backend, session: &Mutex<Session>, child_pid: &Atom
     let pid = nix::unistd::Pid::from_raw(child_pid.load(Ordering::Relaxed));
     let _ = nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGINT);
 
-    // Give the interrupted command thread time to release the lock.
-    // 5s is generous — after the SIGINT the prompt usually appears
-    // within 100-200ms, so the lock drops well before the deadline.
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    // Give the interrupted command thread time to release the lock. Do not
+    // report success and remove the temp directory while it is still held:
+    // the database is the only durable copy of captured evidence.
     loop {
         if let Ok(mut guard) = session.try_lock() {
-            persist_session_on_exit(&mut guard);
+            let keep_session_tmp = !persist_session_on_exit(&mut guard);
             guard.proc.quit(backend.quit_command());
-            break;
-        }
-        if std::time::Instant::now() >= deadline {
-            break;
+            break ("stopped".to_string(), keep_session_tmp);
         }
         std::thread::sleep(Duration::from_millis(50));
     }
-    "stopped".to_string()
 }
 
 /// Interrupt the running command by SIGINT'ing the child without
@@ -816,7 +969,13 @@ fn handle_command(
             };
             match send_result {
                 Ok(raw) => {
-                    if op_may_stop(canonical_op) {
+                    // A stop banner can arrive after the command that
+                    // caused it has already acknowledged its prompt. It
+                    // can therefore be consumed by an inspection request
+                    // that was queued next. Parse every response so that
+                    // such a stop is not discarded just because the
+                    // inspection verb itself is non-executing.
+                    if op_may_stop(canonical_op) || !raw.trim().is_empty() {
                         capture_hit_if_stopped(&mut guard, backend, &raw);
                     }
                     // When the agent explicitly runs `dbg locals`,
@@ -928,7 +1087,7 @@ fn handle_command(
 
             match guard.proc.send_and_wait(&effective_cmd, CMD_TIMEOUT) {
                 Ok(raw) => {
-                    if command_may_stop(cmd) {
+                    if command_may_stop(cmd) || !raw.trim().is_empty() {
                         capture_hit_if_stopped(&mut guard, backend, &raw);
                     }
                     let cleaned = backend.clean(cmd, &raw);
@@ -1594,23 +1753,497 @@ fn backfill_locals(session: &mut Session, backend: &dyn Backend, raw_output: &st
 /// session is still marked auto and has captured any data. If the
 /// session is empty we leave nothing behind — the tmpdir is wiped by
 /// `cleanup_and_exit`.
-fn persist_session_on_exit(session: &mut Session) {
+/// Persist all session evidence before the daemon removes its private temp
+/// directory. Returns false when any durable write failed; callers must then
+/// keep that directory so the only remaining evidence is recoverable.
+fn persist_session_on_exit(session: &mut Session) -> bool {
     let db = match session.db.as_ref() {
         Some(d) => d,
-        None => return,
+        None => return false,
     };
-    let has_data = db.has_captured_data().unwrap_or(false);
+    let has_data = match db.has_captured_data() {
+        Ok(has_data) => has_data,
+        Err(e) => {
+            // An inspection failure is not evidence that the session is
+            // empty. Keep the private directory because it may contain the
+            // only copy of a native capture.
+            eprintln!("[dbg] warning: failed to inspect captured session data: {e}");
+            return false;
+        }
+    };
     if !has_data {
-        return;
+        return true;
     }
-    if let Some(path) = session.save_to.as_ref() {
-        if let Err(e) = db.save_to(path) {
-            eprintln!(
-                "[dbg] warning: failed to save session DB to {}: {e}",
-                path.display()
-            );
+    let Some(path) = session.save_to.as_ref() else {
+        eprintln!("[dbg] warning: session has captured data but no safe save destination");
+        return false;
+    };
+    if let Err(e) = persist_raw_evidence(db, &session.cwd, db.label()) {
+        eprintln!("[dbg] warning: failed to preserve raw session evidence: {e}");
+        return false;
+    }
+    if let Err(e) = db.save_to(path) {
+        eprintln!(
+            "[dbg] warning: failed to save session DB to {}: {e}",
+            path.display()
+        );
+        return false;
+    }
+    true
+}
+
+fn session_save_path(cwd: &Path, label: &str) -> Option<PathBuf> {
+    if label.is_empty()
+        || label == "."
+        || label == ".."
+        || label.contains('/')
+        || label.contains('\\')
+    {
+        eprintln!("[dbg] warning: refusing unsafe session label `{label}`");
+        return None;
+    }
+    let dir = session_db::sessions_dir(cwd);
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        eprintln!("[dbg] warning: cannot create {}: {e}", dir.display());
+        return None;
+    }
+    let root = match std::fs::canonicalize(&dir) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("[dbg] warning: cannot resolve {}: {e}", dir.display());
+            return None;
+        }
+    };
+    let path = root.join(format!("{label}.db"));
+    if std::fs::symlink_metadata(&path).is_ok_and(|m| m.file_type().is_symlink()) {
+        eprintln!(
+            "[dbg] warning: refusing symbolic-link session destination {}",
+            path.display()
+        );
+        return None;
+    }
+    Some(path)
+}
+
+/// Copy raw profiler/debugger artifacts beside the durable SQLite session.
+/// SQLite metadata alone cannot regenerate native captures such as perf.data
+/// or .nettrace files, so cleanup must happen only after this copy succeeds.
+fn persist_raw_evidence(db: &SessionDb, cwd: &Path, label: &str) -> Result<()> {
+    if label.is_empty()
+        || label.contains('/')
+        || label.contains('\\')
+        || label == "."
+        || label == ".."
+    {
+        anyhow::bail!("unsafe session label {label:?}");
+    }
+    let source = session_tmp_dir();
+    let destination = session_db::raw_dir(cwd, label);
+    copy_raw_tree(&source, &destination)?;
+
+    // Saved databases must refer to the durable copy, not the daemon's
+    // private directory that cleanup removes after shutdown.
+    let mut stmt = db
+        .conn()
+        .prepare("SELECT id, file FROM layers WHERE file IS NOT NULL")?;
+    let rows: Vec<(i64, String)> = stmt
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    for (id, file) in rows {
+        if let Ok(relative) = Path::new(&file).strip_prefix(&source) {
+            let durable = destination.join(relative);
+            db.conn().execute(
+                "UPDATE layers SET file = ?1 WHERE id = ?2",
+                rusqlite::params![durable.display().to_string(), id],
+            )?;
         }
     }
+    Ok(())
+}
+
+fn copy_raw_tree(src: &Path, dst: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        return copy_raw_tree_unix(src, dst);
+    }
+
+    #[cfg(not(unix))]
+    copy_raw_tree_portable(src, dst)
+}
+
+#[cfg(not(unix))]
+fn copy_raw_tree_portable(src: &Path, dst: &Path) -> std::io::Result<()> {
+    let src_meta = std::fs::symlink_metadata(src)?;
+    if src_meta.file_type().is_symlink() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("raw evidence source is a symbolic link: {}", src.display()),
+        ));
+    }
+    if !src_meta.is_dir() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotADirectory,
+            format!("raw evidence source is not a directory: {}", src.display()),
+        ));
+    }
+
+    match std::fs::symlink_metadata(dst) {
+        Ok(meta) if meta.file_type().is_symlink() => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "raw evidence destination is a symbolic link: {}",
+                    dst.display()
+                ),
+            ));
+        }
+        Ok(meta) if !meta.is_dir() => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                format!(
+                    "raw evidence destination is not a directory: {}",
+                    dst.display()
+                ),
+            ));
+        }
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => std::fs::create_dir_all(dst)?,
+        Err(e) => return Err(e),
+    }
+
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let from = entry.path();
+        let to = dst.join(entry.file_name());
+        let meta = std::fs::symlink_metadata(&from)?;
+        if meta.file_type().is_symlink() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("raw evidence contains a symbolic link: {}", from.display()),
+            ));
+        }
+        if from.file_name().and_then(|n| n.to_str()) == Some("session.db") {
+            continue;
+        }
+        if meta.is_dir() {
+            copy_raw_tree(&from, &to)?;
+        } else if meta.is_file() {
+            if std::fs::symlink_metadata(&to)
+                .is_ok_and(|existing| existing.file_type().is_symlink())
+            {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!(
+                        "raw evidence destination is a symbolic link: {}",
+                        to.display()
+                    ),
+                ));
+            }
+            std::fs::copy(&from, &to)?;
+        } else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "raw evidence contains an unsupported file: {}",
+                    from.display()
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn copy_raw_tree_unix(src: &Path, dst: &Path) -> std::io::Result<()> {
+    use std::ffi::CStr;
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::ffi::OsStrExt;
+
+    let source = open_source_directory(src, None)?;
+    let destination = open_destination_directory(dst)?;
+    copy_raw_directory_fd(
+        source.as_raw_fd(),
+        src,
+        destination.as_raw_fd(),
+        dst,
+    )?;
+    // Keep the source directory fd alive until all children have been
+    // opened. This makes each child lookup relative to the directory inode,
+    // not to a pathname which an attacker can replace.
+    drop(source);
+
+    fn open_source_directory(path: &Path, parent_fd: Option<i32>) -> std::io::Result<File> {
+        let raw_path = path.as_os_str().as_bytes();
+        let c_path = std::ffi::CString::new(raw_path).map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "source path contains NUL")
+        })?;
+        let fd = unsafe {
+            match parent_fd {
+                Some(parent) => nix::libc::openat(
+                    parent,
+                    c_path.as_ptr(),
+                    nix::libc::O_RDONLY
+                        | nix::libc::O_DIRECTORY
+                        | nix::libc::O_NOFOLLOW
+                        | nix::libc::O_CLOEXEC,
+                    0,
+                ),
+                None => nix::libc::open(
+                    c_path.as_ptr(),
+                    nix::libc::O_RDONLY
+                        | nix::libc::O_DIRECTORY
+                        | nix::libc::O_NOFOLLOW
+                        | nix::libc::O_CLOEXEC,
+                ),
+            }
+        };
+        if fd < 0 {
+            let error = std::io::Error::last_os_error();
+            let source_is_symlink = std::fs::symlink_metadata(path)
+                .is_ok_and(|metadata| metadata.file_type().is_symlink());
+            if error.raw_os_error() == Some(nix::libc::ELOOP) || source_is_symlink {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("raw evidence source is a symbolic link: {}", path.display()),
+                ));
+            }
+            return Err(error);
+        }
+        // SAFETY: open/openat returned a unique owned descriptor.
+        Ok(unsafe { File::from_raw_fd(fd) })
+    }
+
+    fn open_source_entry(parent_fd: i32, name: &std::ffi::OsStr) -> std::io::Result<File> {
+        let c_name = std::ffi::CString::new(name.as_bytes()).map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "source name contains NUL")
+        })?;
+        let fd = unsafe {
+            nix::libc::openat(
+                parent_fd,
+                c_name.as_ptr(),
+                nix::libc::O_RDONLY
+                    | nix::libc::O_NONBLOCK
+                    | nix::libc::O_NOFOLLOW
+                    | nix::libc::O_CLOEXEC,
+                0,
+            )
+        };
+        if fd < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() == Some(nix::libc::ELOOP) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("raw evidence contains a symbolic link: {}", name.display()),
+                ));
+            }
+            return Err(error);
+        }
+        // SAFETY: openat returned a unique owned descriptor.
+        Ok(unsafe { File::from_raw_fd(fd) })
+    }
+
+    fn open_directory_at(parent_fd: i32, name: &std::ffi::OsStr) -> std::io::Result<File> {
+        let c_name = std::ffi::CString::new(name.as_bytes()).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "destination name contains NUL",
+            )
+        })?;
+        let fd = unsafe {
+            nix::libc::openat(
+                parent_fd,
+                c_name.as_ptr(),
+                nix::libc::O_RDONLY
+                    | nix::libc::O_DIRECTORY
+                    | nix::libc::O_NOFOLLOW
+                    | nix::libc::O_CLOEXEC,
+                0,
+            )
+        };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        // SAFETY: openat returned a unique owned descriptor.
+        Ok(unsafe { File::from_raw_fd(fd) })
+    }
+
+    fn open_or_create_directory_at(
+        parent_fd: i32,
+        name: &std::ffi::OsStr,
+    ) -> std::io::Result<File> {
+        match open_directory_at(parent_fd, name) {
+            Ok(directory) => Ok(directory),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let c_name = std::ffi::CString::new(name.as_bytes()).map_err(|_| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "destination name contains NUL",
+                    )
+                })?;
+                let mkdir_result = unsafe {
+                    nix::libc::mkdirat(parent_fd, c_name.as_ptr(), 0o700)
+                };
+                if mkdir_result < 0 {
+                    let mkdir_error = std::io::Error::last_os_error();
+                    if mkdir_error.kind() != std::io::ErrorKind::AlreadyExists {
+                        return Err(mkdir_error);
+                    }
+                }
+                // Reopen with O_NOFOLLOW after mkdir. If a race installed a
+                // symlink or a non-directory, this fails without following
+                // it. The returned descriptor pins the directory inode.
+                open_directory_at(parent_fd, name)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn open_destination_directory(path: &Path) -> std::io::Result<File> {
+        let mut current = if path.is_absolute() {
+            open_directory_at(
+                nix::libc::AT_FDCWD,
+                std::ffi::OsStr::new("/"),
+            )?
+        } else {
+            open_directory_at(
+                nix::libc::AT_FDCWD,
+                std::ffi::OsStr::new("."),
+            )?
+        };
+        for component in path.components() {
+            use std::path::Component;
+            let name = match component {
+                Component::RootDir | Component::CurDir => continue,
+                Component::Normal(name) => name,
+                Component::ParentDir => std::ffi::OsStr::new(".."),
+                Component::Prefix(_) => continue,
+            };
+            current = open_or_create_directory_at(current.as_raw_fd(), name)?;
+        }
+        Ok(current)
+    }
+
+    fn open_destination_file(
+        parent_fd: i32,
+        name: &std::ffi::OsStr,
+    ) -> std::io::Result<File> {
+        let c_name = std::ffi::CString::new(name.as_bytes()).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "destination name contains NUL",
+            )
+        })?;
+        let fd = unsafe {
+            nix::libc::openat(
+                parent_fd,
+                c_name.as_ptr(),
+                nix::libc::O_WRONLY
+                    | nix::libc::O_CREAT
+                    | nix::libc::O_TRUNC
+                    | nix::libc::O_NOFOLLOW
+                    | nix::libc::O_CLOEXEC,
+                0o600,
+            )
+        };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        // SAFETY: openat returned a unique owned descriptor.
+        Ok(unsafe { File::from_raw_fd(fd) })
+    }
+
+    fn visit_source_entries(
+        parent_fd: i32,
+        mut visit: impl FnMut(std::ffi::OsString) -> std::io::Result<()>,
+    ) -> std::io::Result<()> {
+        // Duplicate the descriptor because fdopendir takes ownership. This
+        // enumerates the held source directory directly and does not require
+        // /proc/self/fd to be mounted.
+        let duplicate = unsafe { nix::libc::dup(parent_fd) };
+        if duplicate < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let directory = unsafe { nix::libc::fdopendir(duplicate) };
+        if directory.is_null() {
+            let error = std::io::Error::last_os_error();
+            unsafe { nix::libc::close(duplicate) };
+            return Err(error);
+        }
+        struct Directory(*mut nix::libc::DIR);
+
+        impl Drop for Directory {
+            fn drop(&mut self) {
+                if !self.0.is_null() {
+                    unsafe { nix::libc::closedir(self.0) };
+                }
+            }
+        }
+
+        let directory = Directory(directory);
+        loop {
+            nix::errno::Errno::clear();
+            let entry = unsafe { nix::libc::readdir(directory.0) };
+            if entry.is_null() {
+                let error = nix::errno::Errno::last_raw();
+                if error != 0 {
+                    return Err(std::io::Error::from_raw_os_error(error));
+                }
+                break;
+            }
+            let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) }.to_bytes();
+            if name == b"." || name == b".." {
+                continue;
+            }
+            visit(std::ffi::OsStr::from_bytes(name).to_os_string())?;
+        }
+        Ok(())
+    }
+
+    fn copy_raw_directory_fd(
+        parent_fd: i32,
+        source_path: &Path,
+        destination_fd: i32,
+        destination_path: &Path,
+    ) -> std::io::Result<()> {
+        visit_source_entries(parent_fd, |name| {
+            if name.to_str() == Some("session.db") {
+                // Open even the ignored database entry. A symlink named
+                // session.db must be rejected like every other source
+                // symlink, while a regular database remains ignored.
+                let source_entry = open_source_entry(parent_fd, &name)?;
+                let _ = source_entry.metadata()?;
+                return Ok(());
+            }
+            let source_entry = open_source_entry(parent_fd, &name)?;
+            let metadata = source_entry.metadata()?;
+            let target = destination_path.join(&name);
+            if metadata.is_dir() {
+                let destination_entry =
+                    open_or_create_directory_at(destination_fd, &name)?;
+                copy_raw_directory_fd(
+                    source_entry.as_raw_fd(),
+                    &source_path.join(&name),
+                    destination_entry.as_raw_fd(),
+                    &target,
+                )?;
+            } else if metadata.is_file() {
+                let mut output = open_destination_file(destination_fd, &name)?;
+                let mut input = source_entry;
+                std::io::copy(&mut input, &mut output)?;
+            } else {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!(
+                        "raw evidence contains an unsupported file: {}",
+                        source_path.join(&name).display()
+                    ),
+                ));
+            }
+            Ok(())
+        })
+    }
+
+    Ok(())
 }
 
 /// Send a command to a running daemon. Returns the response.
@@ -1972,7 +2605,7 @@ mod tests {
         // the listener bind, before std::thread::scope's closing.
         let bind_pos = src.find("UnixListener::bind").expect("bind site");
         let scope_end = src[bind_pos..]
-            .find("cleanup_and_exit();\n}")
+            .find("cleanup_and_exit(false);\n}")
             .map(|p| bind_pos + p)
             .unwrap_or(src.len());
         let region = &src[bind_pos..scope_end];
@@ -2138,6 +2771,178 @@ mod tests {
         unsafe {
             std::env::remove_var("DBG_SESSION");
         }
+    }
+
+    #[test]
+    fn concurrent_starters_cannot_share_a_slug_reservation() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = TempDir::new().unwrap();
+        unsafe {
+            std::env::set_var("XDG_RUNTIME_DIR", tmp.path());
+            std::env::remove_var("DBG_SESSION");
+        }
+
+        // Both contenders start at the same synchronization point. One
+        // owns the bare slot; the other must receive a different slot. A
+        // stale-marker check followed by unlink would allow both to report
+        // the same slot in this interleaving.
+        let gate = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let results = std::thread::scope(|scope| {
+            let mut workers = Vec::new();
+            for _ in 0..2 {
+                let gate = std::sync::Arc::clone(&gate);
+                workers.push(scope.spawn(move || {
+                    gate.wait();
+                    allocate_slug().unwrap()
+                }));
+            }
+            workers
+                .into_iter()
+                .map(|worker| worker.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        assert_ne!(results[0], results[1], "starters must own distinct slugs");
+        unsafe {
+            std::env::remove_var("DBG_SESSION");
+        }
+    }
+
+    #[test]
+    fn stale_reservation_recovery_is_atomic_across_processes() {
+        use std::process::Command;
+
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = TempDir::new().unwrap();
+        let barrier = tmp.path().join("reservation-barrier");
+        unsafe {
+            std::env::set_var("XDG_RUNTIME_DIR", tmp.path());
+            std::env::set_var("DBG_SESSION", "stale-race");
+        }
+
+        // This is a stale reservation left by a crashed starter. Both new
+        // starters must contend for this same inode. The test helper pauses
+        // one owner while the other reaches flock, so the interleaving is
+        // deterministic and uses independent processes.
+        let reservation = reservation_path_for("stale-race");
+        std::fs::write(&reservation, b"2147483000\n").unwrap();
+
+        let executable = std::env::current_exe().unwrap();
+        let mut children = Vec::new();
+        for n in 0..2 {
+            let result = tmp.path().join(format!("result-{n}"));
+            children.push(
+                Command::new(&executable)
+                    .arg("--exact")
+                    .arg("daemon::tests::claim_slug_helper")
+                    .arg("--nocapture")
+                    .env("XDG_RUNTIME_DIR", tmp.path())
+                    .env("DBG_SESSION", "stale-race")
+                    .env("DBG_CLAIM_HELPER", "1")
+                    .env("DBG_CLAIM_RESULT", &result)
+                    .env("DBG_TEST_RESERVATION_BARRIER", &barrier)
+                    .spawn()
+                    .unwrap(),
+            );
+        }
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while std::fs::read_dir(&barrier)
+            .ok()
+            .map(|entries| {
+                entries
+                    .flatten()
+                    .filter(|e| e.file_name().to_string_lossy().starts_with("contender-"))
+                    .count()
+            })
+            .unwrap_or(0)
+            < 2
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        std::fs::create_dir_all(&barrier).unwrap();
+        std::fs::write(barrier.join("begin"), b"begin").unwrap();
+
+        let locked = loop {
+            let count = std::fs::read_dir(&barrier)
+                .ok()
+                .map(|entries| {
+                    entries
+                        .flatten()
+                        .filter(|e| e.file_name().to_string_lossy().starts_with("locked-"))
+                        .count()
+                })
+                .unwrap_or(0);
+            if count > 0 || std::time::Instant::now() >= deadline {
+                break count;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        };
+
+        // The losing process must already have observed the held lock before
+        // the winner is allowed to release it. Otherwise a sequential stale
+        // recovery could look like two simultaneous owners.
+        let loser_reported = loop {
+            let reported = (0..2).any(|n| {
+                std::fs::read_to_string(tmp.path().join(format!("result-{n}")))
+                    .is_ok_and(|result| result.starts_with("err:"))
+            });
+            if reported || std::time::Instant::now() >= deadline {
+                break reported;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        };
+        std::fs::write(barrier.join("release"), b"release").unwrap();
+
+        let mut statuses = Vec::new();
+        for child in children {
+            let output = child.wait_with_output().unwrap();
+            statuses.push((output.status, output.stdout, output.stderr));
+        }
+        assert_eq!(locked, 1, "exactly one process must acquire the stale lock");
+        assert!(
+            loser_reported,
+            "the second process must lose while the lock is held"
+        );
+        let outcomes: Vec<_> = (0..2)
+            .map(|n| std::fs::read_to_string(tmp.path().join(format!("result-{n}"))).unwrap())
+            .collect();
+        assert!(statuses.iter().all(|(status, _, _)| status.success()));
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|result| result.as_str() == "ok")
+                .count(),
+            1
+        );
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|result| result.starts_with("err:"))
+                .count(),
+            1
+        );
+        assert!(
+            reservation.exists(),
+            "stale recovery must retain the stable inode"
+        );
+
+        unsafe {
+            std::env::remove_var("DBG_SESSION");
+        }
+    }
+
+    #[test]
+    fn claim_slug_helper() {
+        if std::env::var_os("DBG_CLAIM_HELPER").is_none() {
+            return;
+        }
+        let result = std::env::var("DBG_CLAIM_RESULT").unwrap();
+        let outcome = match allocate_slug() {
+            Ok(_) => "ok".to_string(),
+            Err(error) => format!("err:{error}"),
+        };
+        std::fs::write(result, outcome).unwrap();
     }
 
     #[test]
@@ -2404,6 +3209,88 @@ mod tests {
         assert!(!command_may_stop("breakpoint list"));
         assert!(!command_may_stop("frame variable"));
         assert!(!command_may_stop("help"));
+    }
+
+    #[test]
+    fn raw_copy_failure_is_reported_without_removing_source() {
+        let tmp = TempDir::new().unwrap();
+        let source = tmp.path().join("source");
+        std::fs::create_dir(&source).unwrap();
+        let artifact = source.join("perf.data");
+        std::fs::write(&artifact, b"capture").unwrap();
+
+        // A file at the destination makes the copy fail. The source must
+        // remain available because cleanup is allowed only after a full
+        // durable copy succeeds.
+        let destination = tmp.path().join("destination");
+        std::fs::write(&destination, b"not a directory").unwrap();
+        assert!(copy_raw_tree(&source, &destination).is_err());
+        assert!(artifact.exists());
+    }
+
+    #[test]
+    fn raw_copy_rejects_file_symlinks_without_following_them() {
+        let tmp = TempDir::new().unwrap();
+        let source = tmp.path().join("source");
+        let destination = tmp.path().join("destination");
+        std::fs::create_dir(&source).unwrap();
+        let outside = tmp.path().join("outside-secret");
+        std::fs::write(&outside, b"must not be copied").unwrap();
+        std::os::unix::fs::symlink(&outside, source.join("capture.data")).unwrap();
+
+        let error = copy_raw_tree(&source, &destination).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(!destination.join("capture.data").exists());
+        assert!(outside.exists(), "the symlink target must remain untouched");
+    }
+
+    #[test]
+    fn raw_copy_rejects_directory_symlinks_without_traversing_them() {
+        let tmp = TempDir::new().unwrap();
+        let source = tmp.path().join("source");
+        let destination = tmp.path().join("destination");
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir(&source).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::write(outside.join("secret.nettrace"), b"must not be copied").unwrap();
+        std::os::unix::fs::symlink(&outside, source.join("nested")).unwrap();
+
+        let error = copy_raw_tree(&source, &destination).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(!destination.join("nested").exists());
+        assert!(outside.join("secret.nettrace").exists());
+    }
+
+    #[test]
+    fn raw_copy_rejects_source_root_symlinks_without_traversing_them() {
+        let tmp = TempDir::new().unwrap();
+        let real_source = tmp.path().join("real-source");
+        let source = tmp.path().join("source-link");
+        let destination = tmp.path().join("destination");
+        std::fs::create_dir(&real_source).unwrap();
+        std::fs::write(real_source.join("capture.data"), b"must not be copied").unwrap();
+        std::os::unix::fs::symlink(&real_source, &source).unwrap();
+
+        let error = copy_raw_tree(&source, &destination).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(!destination.exists());
+        assert!(real_source.join("capture.data").exists());
+    }
+
+    #[test]
+    fn raw_copy_rejects_destination_directory_symlinks_without_writing_outside() {
+        let tmp = TempDir::new().unwrap();
+        let source = tmp.path().join("source");
+        let destination = tmp.path().join("destination");
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(source.join("nested")).unwrap();
+        std::fs::write(source.join("nested/capture.data"), b"must stay inside").unwrap();
+        std::fs::create_dir(&destination).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, destination.join("nested")).unwrap();
+
+        assert!(copy_raw_tree(&source, &destination).is_err());
+        assert!(!outside.join("capture.data").exists());
     }
 
     /// End-to-end of the SessionDb capture path without spawning a real
