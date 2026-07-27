@@ -215,9 +215,10 @@ impl Backend for JitDasmBackend {
             project_arg = shell_escape(&project),
         );
         let run_cmd = format!(
-            "echo 'Disassembling: {pattern}' && {locate_dll} && \
-             DOTNET_TieredCompilation=0 DOTNET_JitDisasm='{pattern}' DOTNET_JitDiffableDasm=1 \
+            "echo Disassembling: {pattern_arg} && {locate_dll} && \
+             DOTNET_TieredCompilation=0 DOTNET_JitDisasm={pattern_arg} DOTNET_JitDiffableDasm=1 \
              {timeout_prefix}dotnet exec \"$dll\"{extra} > {out_file} 2>&1",
+            pattern_arg = shell_escape(&pattern),
             out_file = shell_escape(&out_file_str),
         );
 
@@ -231,12 +232,16 @@ impl Backend for JitDasmBackend {
         // — strip any leading `Namespace.Type:` prefix and wildcards.
         let repl_default = repl_default_pattern(&raw_pattern);
         let exec_repl = if repl_default.is_empty() {
-            format!("exec {} --jitdasm-repl {}", dbg_bin, out_file_str)
+            format!(
+                "exec {} --jitdasm-repl {}",
+                shell_escape(&dbg_bin),
+                shell_escape(&out_file_str)
+            )
         } else {
             format!(
                 "exec {} --jitdasm-repl {} --jitdasm-pattern {}",
-                dbg_bin,
-                out_file_str,
+                shell_escape(&dbg_bin),
+                shell_escape(&out_file_str),
                 shell_escape(&repl_default),
             )
         };
@@ -551,5 +556,15 @@ mod tests {
             first_char == '\'' || first_char == '"',
             "redirect target with spaces must be quoted: {run}"
         );
+    }
+
+    #[test]
+    fn run_command_shell_escapes_the_user_pattern() {
+        let cfg = JitDasmBackend
+            .spawn_config("app.csproj", &["$(touch /tmp/pwned);'".into()])
+            .unwrap();
+        let run = &cfg.init_commands[2];
+        assert!(run.contains("DOTNET_JitDisasm='app.$(touch /tmp/pwned);'\\''"), "{run}");
+        assert!(!run.contains("DOTNET_JitDisasm='app.$(touch /tmp/pwned);' &&"));
     }
 }
