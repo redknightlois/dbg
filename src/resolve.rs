@@ -31,7 +31,7 @@ pub fn resolve(backend_type: &str, target: &str) -> Result<String> {
         }
         "go" => resolve_go(target),
         "haskell" | "hs" | "haskell-profile" | "hs-profile" => resolve_existing_file(target),
-        "ocaml" | "ml" => resolve_ocaml(target),
+        "ocaml" | "ml" | "ocamldebug" => resolve_ocaml(target),
         "java" | "kotlin" | "pprof" | "perf" | "callgrind" | "pyprofile" | "memcheck"
         | "valgrind" | "massif" => Ok(target.to_string()),
         _ => {
