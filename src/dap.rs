@@ -830,7 +830,7 @@ impl DapTransport {
                 })
                 .collect()
         };
-        self.call_blocking(
+        let response = self.call_blocking(
             "setBreakpoints",
             json!({
                 "source": { "path": resolved_path },
@@ -839,6 +839,16 @@ impl DapTransport {
             }),
             timeout,
         )?;
+        let requested_index = lines.iter().position(|candidate| candidate == line);
+        let verified = response
+            .get("breakpoints")
+            .and_then(Value::as_array)
+            .and_then(|items| requested_index.and_then(|i| items.get(i)))
+            .and_then(|bp| bp.get("verified").and_then(Value::as_bool))
+            .unwrap_or(false);
+        if !verified {
+            bail!("breakpoint at {file}:{line} was not verified by the adapter")
+        }
         match (condition, log_message) {
             (Some(c), Some(m)) => Ok(format!("Logpoint set at {file}:{line} if {c}: {m}")),
             (None, Some(m)) => Ok(format!("Logpoint set at {file}:{line}: {m}")),

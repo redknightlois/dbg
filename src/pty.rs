@@ -259,6 +259,7 @@ pub trait DebuggerIo: Send + Sync {
 pub struct DebuggerProcess {
     master: OwnedFd,
     child_pid: Pid,
+    child_reaped: Arc<AtomicBool>,
     /// Wrapped in a Mutex so `DebuggerProcess: Sync`. The Receiver
     /// itself isn't `Sync`, but all access paths hold the daemon's
     /// session lock, so contention here is zero.
@@ -307,8 +308,7 @@ impl DebuggerProcess {
                     std::env::set_var("TERM", "dumb");
                 }
 
-                let c_bin =
-                    std::ffi::CString::new(bin).unwrap_or_else(|_| std::process::exit(127));
+                let c_bin = std::ffi::CString::new(bin).unwrap_or_else(|_| std::process::exit(127));
                 let mut c_args = vec![c_bin.clone()];
                 for a in args {
                     c_args.push(
@@ -323,13 +323,14 @@ impl DebuggerProcess {
             ForkResult::Parent { child } => {
                 drop(slave);
 
-                let prompt_re =
-                    Regex::new(prompt_pattern).context("invalid prompt pattern")?;
+                let prompt_re = Regex::new(prompt_pattern).context("invalid prompt pattern")?;
                 let reader_prompt_re = prompt_re.clone();
                 let master_fd = master.as_raw_fd();
                 let (tx, rx) = mpsc::channel::<PtyEvent>();
                 let shutdown = Arc::new(AtomicBool::new(false));
+                let child_reaped = Arc::new(AtomicBool::new(false));
                 let reader_shutdown = shutdown.clone();
+                let reader_reaped = child_reaped.clone();
                 let log = LogHandle::new();
                 let reader_log = log.clone();
 
@@ -342,6 +343,7 @@ impl DebuggerProcess {
                             tx,
                             reader_shutdown,
                             reader_log,
+                            reader_reaped,
                         )
                     })
                     .context("failed to spawn reader thread")?;
@@ -349,6 +351,7 @@ impl DebuggerProcess {
                 Ok(Self {
                     master,
                     child_pid: child,
+                    child_reaped,
                     rx: Mutex::new(rx),
                     log,
                     shutdown,
@@ -365,10 +368,7 @@ impl DebuggerProcess {
         let fd = self.master.as_raw_fd();
         let mut written = 0;
         while written < data.len() {
-            match nix::unistd::write(
-                unsafe { BorrowedFd::borrow_raw(fd) },
-                &data[written..],
-            ) {
+            match nix::unistd::write(unsafe { BorrowedFd::borrow_raw(fd) }, &data[written..]) {
                 Ok(n) => written += n,
                 Err(nix::errno::Errno::EINTR) => continue,
                 Err(e) => return Err(e.into()),
@@ -447,9 +447,12 @@ impl DebuggerProcess {
         // (typical after the debuggee runs to completion) from a
         // genuine protocol error.
         if !self.is_alive() {
-            return Ok("(debuggee has exited — live inspection is over, but captured state is \
+            return Ok(
+                "(debuggee has exited — live inspection is over, but captured state is \
 still available: `dbg hits <loc>`, `dbg stack`, `dbg locals`, `dbg cross <sym>`, \
-`dbg sessions`. Start a fresh session with `dbg start` when ready.)".to_string());
+`dbg sessions`. Start a fresh session with `dbg start` when ready.)"
+                    .to_string(),
+            );
         }
         if let Err(e) = self.write_master(format!("{cmd}\n").as_bytes()) {
             // EIO / EPIPE on write almost always means the PTY master
@@ -457,9 +460,12 @@ still available: `dbg hits <loc>`, `dbg stack`, `dbg locals`, `dbg cross <sym>`,
             // alive-check above and the write. Surface the same clean
             // sticky message rather than the raw errno.
             if !self.is_alive() {
-                return Ok("(debuggee has exited — live inspection is over, but captured state is \
+                return Ok(
+                    "(debuggee has exited — live inspection is over, but captured state is \
 still available: `dbg hits <loc>`, `dbg stack`, `dbg locals`, `dbg cross <sym>`, \
-`dbg sessions`. Start a fresh session with `dbg start` when ready.)".to_string());
+`dbg sessions`. Start a fresh session with `dbg start` when ready.)"
+                        .to_string(),
+                );
             }
             return Err(e);
         }
@@ -484,12 +490,18 @@ still available: `dbg hits <loc>`, `dbg stack`, `dbg locals`, `dbg cross <sym>`,
                     return Ok(
                         "(debuggee has exited — live inspection is over, but captured state is \
 still available: `dbg hits <loc>`, `dbg stack`, `dbg locals`, `dbg cross <sym>`, \
-`dbg sessions`. Start a fresh session with `dbg start` when ready.)".to_string(),
+`dbg sessions`. Start a fresh session with `dbg start` when ready.)"
+                            .to_string(),
                     );
                 }
             }
         }
 
+        // Do not sleep and then drain here. Output that arrives after this
+        // prompt belongs to the next asynchronous event and remains in the
+        // receiver for `drain_pending`. Output that arrived before the
+        // prompt is already in `collected` and the daemon parses it for
+        // stop banners even when this command is an inspection request.
         let raw = String::from_utf8_lossy(&collected).to_string();
         let clean = strip_ansi(&raw);
         let no_prompts = self.prompt_re.replace_all(&clean, "");
@@ -523,8 +535,25 @@ still available: `dbg hits <loc>`, `dbg stack`, `dbg locals`, `dbg cross <sym>`,
 
     /// Check if the child process is still alive.
     pub fn is_alive(&self) -> bool {
-        nix::sys::wait::waitpid(self.child_pid, Some(nix::sys::wait::WaitPidFlag::WNOHANG))
-            .is_ok_and(|s| matches!(s, nix::sys::wait::WaitStatus::StillAlive))
+        if self.child_reaped.load(Ordering::Acquire) {
+            return false;
+        }
+        match nix::sys::wait::waitpid(self.child_pid, Some(nix::sys::wait::WaitPidFlag::WNOHANG)) {
+            Ok(nix::sys::wait::WaitStatus::StillAlive) => true,
+            Ok(
+                nix::sys::wait::WaitStatus::Exited(_, _)
+                | nix::sys::wait::WaitStatus::Signaled(_, _, _),
+            ) => {
+                self.child_reaped.store(true, Ordering::Release);
+                false
+            }
+            Ok(_) => true,
+            Err(nix::errno::Errno::ECHILD) => {
+                self.child_reaped.store(true, Ordering::Release);
+                false
+            }
+            Err(_) => false,
+        }
     }
 
     /// Send quit command and wait for exit.
@@ -577,6 +606,7 @@ fn reader_loop(
     tx: Sender<PtyEvent>,
     shutdown: Arc<AtomicBool>,
     log: LogHandle,
+    child_reaped: Arc<AtomicBool>,
 ) {
     let mut buf = [0u8; 4096];
     // Pending output bytes not yet emitted. Flushed to a single Output
@@ -584,15 +614,14 @@ fn reader_loop(
     // exit.
     let mut pending: Vec<u8> = Vec::new();
 
-    let flush_output =
-        |pending: &mut Vec<u8>, tx: &Sender<PtyEvent>, log: &LogHandle| -> bool {
-            if pending.is_empty() {
-                return true;
-            }
-            let bytes = std::mem::take(pending);
-            log.push(EventKind::Output, bytes.clone());
-            tx.send(PtyEvent::Data(bytes)).is_ok()
-        };
+    let flush_output = |pending: &mut Vec<u8>, tx: &Sender<PtyEvent>, log: &LogHandle| -> bool {
+        if pending.is_empty() {
+            return true;
+        }
+        let bytes = std::mem::take(pending);
+        log.push(EventKind::Output, bytes.clone());
+        tx.send(PtyEvent::Data(bytes)).is_ok()
+    };
 
     let emit_marker = |kind: EventKind, tx: &Sender<PtyEvent>, log: &LogHandle| -> bool {
         log.push(kind, Vec::new());
@@ -621,6 +650,7 @@ fn reader_loop(
             Ok(_) => {}
             Err(nix::errno::Errno::EINTR) => continue,
             Err(_) => {
+                child_reaped.store(true, Ordering::Release);
                 let _ = flush_output(&mut pending, &tx, &log);
                 let _ = emit_marker(EventKind::Exit, &tx, &log);
                 return;
@@ -629,6 +659,7 @@ fn reader_loop(
 
         let n = match nix::unistd::read(master_fd, &mut buf) {
             Ok(0) => {
+                child_reaped.store(true, Ordering::Release);
                 let _ = flush_output(&mut pending, &tx, &log);
                 let _ = emit_marker(EventKind::Exit, &tx, &log);
                 return;
@@ -636,6 +667,7 @@ fn reader_loop(
             Ok(n) => n,
             Err(nix::errno::Errno::EINTR) => continue,
             Err(_) => {
+                child_reaped.store(true, Ordering::Release);
                 let _ = flush_output(&mut pending, &tx, &log);
                 let _ = emit_marker(EventKind::Exit, &tx, &log);
                 return;
@@ -676,7 +708,9 @@ fn strip_ansi(s: &str) -> String {
 impl Drop for DebuggerProcess {
     fn drop(&mut self) {
         self.shutdown.store(true, Ordering::Relaxed);
-        let _ = nix::sys::signal::kill(self.child_pid, Signal::SIGTERM);
+        if !self.child_reaped.load(Ordering::Acquire) && self.is_alive() {
+            let _ = nix::sys::signal::kill(self.child_pid, Signal::SIGTERM);
+        }
         if let Some(h) = self.reader.take() {
             // Best-effort: reader polls shutdown flag every 100ms.
             let _ = h.join();
