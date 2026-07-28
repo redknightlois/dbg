@@ -12,7 +12,10 @@ pub fn cmd_stats(db: &GpuDb) {
     let device = db.meta("device");
     let wall_us: f64 = db.meta("wall_time_us").parse().unwrap_or(0.0);
     let gpu_us = db.total_gpu_time_us();
-    let xfer_us: f64 = db.scalar_f64("SELECT COALESCE(SUM(duration_us),0) FROM transfers");
+    let transfer_filter = db.timeline_filter_for("transfers");
+    let xfer_us: f64 = db.scalar_f64(&format!(
+        "SELECT COALESCE(SUM(duration_us),0) FROM transfers WHERE {transfer_filter}"
+    ));
 
     println!("GPU Profile Summary");
     println!("  Target:       {target}");
@@ -132,6 +135,7 @@ pub fn cmd_kernels(db: &GpuDb, args: &[&str]) {
     let pattern_clause = pattern
         .map(|_| "AND launches.kernel_name LIKE ? ESCAPE '\\'")
         .unwrap_or_default();
+    let metrics_filter = db.metric_filter_for("m");
 
     let sql = format!(
         "SELECT launches.kernel_name,
@@ -144,7 +148,7 @@ pub fn cmd_kernels(db: &GpuDb, args: &[&str]) {
                 m.compute_throughput_pct,
                 m.memory_throughput_pct
          FROM launches
-         LEFT JOIN metrics m ON m.kernel_name = launches.kernel_name
+         LEFT JOIN metrics m ON m.kernel_name = launches.kernel_name AND {metrics_filter}
          WHERE {} AND {tl} {pattern_clause}
          GROUP BY launches.kernel_name
          ORDER BY total DESC

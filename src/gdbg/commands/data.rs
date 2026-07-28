@@ -151,7 +151,10 @@ pub fn cmd_suggest(db: &GpuDb) {
 
     if has_nsys {
         let gpu_us = db.total_gpu_time_us();
-        let xfer_us: f64 = db.scalar_f64("SELECT COALESCE(SUM(duration_us),0) FROM transfers");
+        let transfer_filter = db.timeline_filter_for("transfers");
+        let xfer_us: f64 = db.scalar_f64(&format!(
+            "SELECT COALESCE(SUM(duration_us),0) FROM transfers WHERE {transfer_filter}"
+        ));
 
         if gpu_us > 0.0 && xfer_us > 0.0 {
             let ratio = xfer_us / gpu_us;
@@ -248,11 +251,28 @@ pub fn cmd_list() {
                     trunc(dev, 15),
                     s.kernel_count,
                     s.layers.join("+"),
-                    &s.created[..s.created.len().min(16)]
+                    created_prefix(&s.created)
                 );
             }
         }
         Err(e) => println!("list failed: {e}"),
+    }
+}
+
+fn created_prefix(created: &str) -> String {
+    created.chars().take(16).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::created_prefix;
+
+    #[test]
+    fn saved_date_prefix_is_utf8_safe() {
+        let created = "2026-07-28T12:évidence";
+        let prefix = created_prefix(created);
+        assert_eq!(prefix.chars().count(), 16);
+        assert!(created.starts_with(&prefix));
     }
 }
 

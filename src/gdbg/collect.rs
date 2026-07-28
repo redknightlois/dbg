@@ -371,7 +371,15 @@ fn collect_ncu(
     let csv_path = session.join("ncu_metrics.csv");
     let start = Instant::now();
 
-    let regex = kernel_names.join("|");
+    // Kernel names are data, not regex syntax. The same escaping used by
+    // `suggest` must be used for the actual ncu command, otherwise names
+    // such as `foo.bar` select unrelated kernels and make the imported ncu
+    // layer disagree with the displayed recommendation.
+    let regex = kernel_names
+        .iter()
+        .map(|name| crate::commands::escape_regex(name))
+        .collect::<Vec<_>>()
+        .join("|");
 
     let mut cmd = Command::new("ncu");
     cmd.args(["--set", "full", "--csv"]);

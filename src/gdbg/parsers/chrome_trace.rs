@@ -19,10 +19,8 @@ struct TraceEvent {
     cat: String,
     #[serde(default)]
     ph: String,
-    #[serde(default)]
-    ts: f64,
-    #[serde(default)]
-    dur: f64,
+    ts: Option<f64>,
+    dur: Option<f64>,
     #[serde(default)]
     args: Option<serde_json::Value>,
 }
@@ -52,10 +50,63 @@ pub fn import_chrome_trace(dest: &Connection, json_path: &Path, layer_id: i64) -
         );
     }
 
+    validate_supported_events(&trace.trace_events)?;
+
     import_kernel_events(dest, &trace.trace_events, layer_id)?;
     import_ops(dest, &trace.trace_events, layer_id)?;
 
     Ok(())
+}
+
+/// Validate only the event forms this importer persists. Metadata and flow
+/// events are allowed to omit timing, but a supported complete event must
+/// not turn serde defaults into a fabricated zero-time database row.
+fn validate_supported_events(events: &[TraceEvent]) -> Result<()> {
+    let mut supported = 0;
+    for event in events {
+        if event.ph != "X"
+            || !matches!(
+                event.cat.as_str(),
+                "kernel" | "cpu_op" | "user_annotation" | "Operator"
+            )
+        {
+            continue;
+        }
+        supported += 1;
+        if event.name.trim().is_empty() {
+            bail!("Chrome trace supported event has an empty name");
+        }
+        if let Some(args) = &event.args {
+            if !args.is_object() {
+                bail!("Chrome trace event args must be an object");
+            }
+        }
+        if event.cat == "kernel" {
+            extract_tuple(&event.args, "grid", "grid_x", "grid_y", "grid_z")?;
+            extract_tuple(&event.args, "block", "block_x", "block_y", "block_z")?;
+        }
+        let (ts, dur) = event_timing(event)?;
+        if !ts.is_finite() || ts < 0.0 || !dur.is_finite() || dur < 0.0 {
+            bail!("Chrome trace event has invalid timing: ts={ts}, dur={dur}");
+        }
+        if ts + dur > f64::MAX {
+            bail!("Chrome trace event timing overflows its end timestamp");
+        }
+    }
+    if supported == 0 {
+        bail!("Chrome trace contains no supported complete events");
+    }
+    Ok(())
+}
+
+fn event_timing(event: &TraceEvent) -> Result<(f64, f64)> {
+    let ts = event
+        .ts
+        .ok_or_else(|| anyhow::anyhow!("Chrome trace event is missing ts"))?;
+    let dur = event
+        .dur
+        .ok_or_else(|| anyhow::anyhow!("Chrome trace event is missing dur"))?;
+    Ok((ts, dur))
 }
 
 /// Read an import without allowing a file that grows after the metadata
@@ -114,6 +165,8 @@ fn import_kernel_events(dest: &Connection, events: &[TraceEvent], layer_id: i64)
             continue;
         }
 
+        let (ts, dur) = event_timing(event)?;
+
         let grid = extract_tuple(&event.args, "grid", "grid_x", "grid_y", "grid_z")?;
         let block = extract_tuple(&event.args, "block", "block_x", "block_y", "block_z")?;
         let stream = match value_for(&event.args, "stream") {
@@ -131,7 +184,7 @@ fn import_kernel_events(dest: &Connection, events: &[TraceEvent], layer_id: i64)
 
         stmt.execute(params![
             event.name,
-            event.dur,
+            dur,
             grid.map(|g| g.0),
             grid.map(|g| g.1),
             grid.map(|g| g.2),
@@ -139,7 +192,7 @@ fn import_kernel_events(dest: &Connection, events: &[TraceEvent], layer_id: i64)
             block.map(|b| b.1),
             block.map(|b| b.2),
             stream,
-            event.ts,
+            ts,
             corr,
             layer_id,
         ])?;
@@ -172,10 +225,11 @@ fn import_ops(dest: &Connection, events: &[TraceEvent], layer_id: i64) -> Result
             "cpu_op" | "user_annotation" | "Operator" => {}
             _ => continue,
         }
+        let (ts, dur) = event_timing(event)?;
         invocations.push(OpInvocation {
             name: event.name.clone(),
-            start_us: event.ts,
-            end_us: event.ts + event.dur,
+            start_us: ts,
+            end_us: ts + dur,
             module_path: extract_string(&event.args, "Python module id")
                 .or_else(|| extract_string(&event.args, "module")),
             input_shapes: event.args.as_ref().and_then(|a| {
@@ -382,5 +436,36 @@ mod tests {
         oversized.write_all(b"123456789").unwrap();
         let error = read_bounded_text_with_limit(oversized.path(), "Chrome trace", 8).unwrap_err();
         assert!(error.to_string().contains("maximum input size of 8 bytes"));
+    }
+
+    #[test]
+    fn malformed_supported_event_is_rejected_without_a_zero_row() {
+        let db = GpuDb::create(&tempfile::tempdir().unwrap().keep().join("bad.db")).unwrap();
+        let lid = db.add_layer("torch", "bad.json", None, None, None).unwrap();
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(
+            tmp.path(),
+            r#"{"traceEvents":[{"name":"k","cat":"kernel","ph":"X","dur":1.0}]}"#,
+        )
+        .unwrap();
+        let error = import_chrome_trace(&db.conn, tmp.path(), lid).unwrap_err();
+        assert!(error.to_string().contains("missing ts"));
+        assert_eq!(db.total_launch_count(), 0);
+    }
+
+    #[test]
+    fn trace_with_no_supported_events_is_rejected() {
+        let db = GpuDb::create(&tempfile::tempdir().unwrap().keep().join("empty.db")).unwrap();
+        let lid = db
+            .add_layer("torch", "empty.json", None, None, None)
+            .unwrap();
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(
+            tmp.path(),
+            r#"{"traceEvents":[{"ph":"M","name":"process_name"}]}"#,
+        )
+        .unwrap();
+        let error = import_chrome_trace(&db.conn, tmp.path(), lid).unwrap_err();
+        assert!(error.to_string().contains("no supported complete events"));
     }
 }

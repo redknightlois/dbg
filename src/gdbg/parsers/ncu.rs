@@ -31,7 +31,7 @@ pub fn import_ncu_csv(dest: &Connection, csv_path: &Path, layer_id: i64) -> Resu
         }
     };
 
-    let headers: Vec<&str> = parse_csv_line(header);
+    let headers = parse_csv_line(header);
     let kernel_idx = find_col(&headers, "Kernel Name");
     let metric_name_idx = find_col(&headers, "Metric Name");
     let metric_value_idx = find_col(&headers, "Metric Value");
@@ -73,7 +73,10 @@ pub fn import_ncu_csv(dest: &Connection, csv_path: &Path, layer_id: i64) -> Resu
         let metric_value = fields
             .get(metric_value_idx)
             .and_then(|v| v.replace(',', "").parse::<f64>().ok())
-            .unwrap_or(0.0);
+            .filter(|v| v.is_finite());
+        let Some(metric_value) = metric_value else {
+            continue;
+        };
 
         kernel_metrics
             .entry(kernel)
@@ -110,13 +113,15 @@ pub fn import_ncu_csv(dest: &Connection, csv_path: &Path, layer_id: i64) -> Resu
         let memory_tp = m
             .get("dram__throughput.avg.pct_of_peak_sustained_elapsed")
             .or_else(|| m.get("gpu__dram_throughput.avg.pct_of_peak_sustained_elapsed"));
-        let registers = m.get("launch__registers_per_thread").map(|v| *v as i64);
+        let registers = m
+            .get("launch__registers_per_thread")
+            .and_then(|v| nonnegative_i64(*v));
         let shmem_static = m
             .get("launch__shared_mem_per_block_static")
-            .map(|v| *v as i64);
+            .and_then(|v| nonnegative_i64(*v));
         let shmem_dynamic = m
             .get("launch__shared_mem_per_block_dynamic")
-            .map(|v| *v as i64);
+            .and_then(|v| nonnegative_i64(*v));
         let l2_hit = m
             .get("lts__t_sector_hit_rate.pct")
             .or_else(|| m.get("l2__t_sector_hit_rate.pct"));
@@ -145,24 +150,42 @@ pub fn import_ncu_csv(dest: &Connection, csv_path: &Path, layer_id: i64) -> Resu
             .or_else(|| m.get("Duration"))
             .copied()
             .unwrap_or(0.0);
-        if duration_ns > 0.0 {
-            let gx = m.get("launch__grid_size_x").unwrap_or(&0.0);
-            let gy = m.get("launch__grid_size_y").unwrap_or(&0.0);
-            let gz = m.get("launch__grid_size_z").unwrap_or(&0.0);
-            let bx = m.get("launch__block_size_x").unwrap_or(&0.0);
-            let by = m.get("launch__block_size_y").unwrap_or(&0.0);
-            let bz = m.get("launch__block_size_z").unwrap_or(&0.0);
+        if duration_ns.is_finite() && duration_ns > 0.0 {
+            let gx = valid_dim(
+                m.get("launch__grid_size_x").copied().unwrap_or(0.0),
+                "grid_x",
+            )?;
+            let gy = valid_dim(
+                m.get("launch__grid_size_y").copied().unwrap_or(0.0),
+                "grid_y",
+            )?;
+            let gz = valid_dim(
+                m.get("launch__grid_size_z").copied().unwrap_or(0.0),
+                "grid_z",
+            )?;
+            let bx = valid_dim(
+                m.get("launch__block_size_x").copied().unwrap_or(0.0),
+                "block_x",
+            )?;
+            let by = valid_dim(
+                m.get("launch__block_size_y").copied().unwrap_or(0.0),
+                "block_y",
+            )?;
+            let bz = valid_dim(
+                m.get("launch__block_size_z").copied().unwrap_or(0.0),
+                "block_z",
+            )?;
             let sid = m.get("launch__stream_id").map(|v| *v as i64);
 
             launch_stmt.execute(params![
                 name,
                 duration_ns / 1000.0,
-                *gx as u32,
-                *gy as u32,
-                *gz as u32,
-                *bx as u32,
-                *by as u32,
-                *bz as u32,
+                gx,
+                gy,
+                gz,
+                bx,
+                by,
+                bz,
                 sid,
                 layer_id,
             ])?;
@@ -208,6 +231,9 @@ pub fn classify_boundedness(compute: Option<f64>, memory: Option<f64>) -> Option
         (Some(c), Some(m)) => (c, m),
         _ => return None,
     };
+    if !c.is_finite() || !m.is_finite() || c < 0.0 || m < 0.0 {
+        return None;
+    }
     if c < 10.0 && m < 10.0 {
         Some("latency".into())
     } else if m > c * 1.5 {
@@ -221,27 +247,53 @@ pub fn classify_boundedness(compute: Option<f64>, memory: Option<f64>) -> Option
     }
 }
 
-fn find_col(headers: &[&str], name: &str) -> Option<usize> {
-    headers.iter().position(|h| h.contains(name))
+fn find_col(headers: &[String], name: &str) -> Option<usize> {
+    headers.iter().position(|h| {
+        h.trim()
+            .trim_start_matches('\u{feff}')
+            .eq_ignore_ascii_case(name)
+    })
 }
 
-fn parse_csv_line(line: &str) -> Vec<&str> {
+fn parse_csv_line(line: &str) -> Vec<String> {
     let mut fields = Vec::new();
-    let mut start = 0;
+    let mut field = String::new();
     let mut in_quotes = false;
-
-    for (i, ch) in line.char_indices() {
+    let mut chars = line.chars().peekable();
+    while let Some(ch) = chars.next() {
         match ch {
+            '"' if in_quotes && chars.peek() == Some(&'"') => {
+                field.push('"');
+                chars.next();
+            }
             '"' => in_quotes = !in_quotes,
             ',' if !in_quotes => {
-                fields.push(line[start..i].trim().trim_matches('"'));
-                start = i + 1;
+                fields.push(field.trim().to_string());
+                field.clear();
             }
-            _ => {}
+            _ => field.push(ch),
         }
     }
-    fields.push(line[start..].trim().trim_matches('"'));
+    if in_quotes {
+        return Vec::new();
+    }
+    fields.push(field.trim().to_string());
     fields
+}
+
+fn nonnegative_i64(value: f64) -> Option<i64> {
+    if value.is_finite() && value >= 0.0 && value <= i64::MAX as f64 {
+        Some(value as i64)
+    } else {
+        None
+    }
+}
+
+fn valid_dim(value: f64, name: &str) -> Result<u32> {
+    if !value.is_finite() || value < 0.0 || value > u32::MAX as f64 || value.fract() != 0.0 {
+        bail!("NCU {name} is not a valid non-negative integer: {value}");
+    }
+    Ok(value as u32)
 }
 
 #[cfg(test)]

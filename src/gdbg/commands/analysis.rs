@@ -19,12 +19,15 @@ pub fn cmd_bound(db: &GpuDb, args: &[&str]) {
         }
     };
 
-    let sql = "SELECT m.kernel_name, m.boundedness,
+    let sql = format!(
+        "SELECT m.kernel_name, m.boundedness,
                       m.compute_throughput_pct, m.memory_throughput_pct,
                       m.l2_hit_rate_pct, m.achieved_bandwidth_gb_s, m.peak_bandwidth_gb_s,
                       m.occupancy_pct
-               FROM metrics m WHERE m.kernel_name LIKE ?1 ESCAPE '\'";
-    let rows: Vec<_> = db.query_vec(sql, [like_param(pattern)], |row| {
+               FROM metrics m WHERE m.kernel_name LIKE ?1 ESCAPE '\' AND {}",
+        db.metric_filter_for("m")
+    );
+    let rows: Vec<_> = db.query_vec(&sql, [like_param(pattern)], |row| {
         Ok((
             row.get::<_, String>(0)?,
             row.get::<_, Option<String>>(1)?,
@@ -94,11 +97,14 @@ pub fn cmd_roofline(db: &GpuDb, args: &[&str]) {
     let pattern = parse_pattern(args);
     let pat = pattern.map(like_param).unwrap_or_else(|| "%".into());
 
-    let sql = "SELECT kernel_name, boundedness, compute_throughput_pct,
+    let sql = format!(
+        "SELECT kernel_name, boundedness, compute_throughput_pct,
                       memory_throughput_pct, occupancy_pct
-               FROM metrics WHERE kernel_name LIKE ?1 ESCAPE '\'
-               ORDER BY kernel_name";
-    let rows: Vec<_> = db.query_vec(sql, [&pat], |row| {
+               FROM metrics m WHERE kernel_name LIKE ?1 ESCAPE '\' AND {}
+               ORDER BY kernel_name",
+        db.metric_filter_for("m")
+    );
+    let rows: Vec<_> = db.query_vec(&sql, [&pat], |row| {
         Ok((
             row.get::<_, String>(0)?,
             row.get::<_, Option<String>>(1)?,
@@ -134,13 +140,17 @@ pub fn cmd_occupancy(db: &GpuDb, args: &[&str]) {
     }
     let n = parse_count(args);
 
-    let sql = "SELECT kernel_name, occupancy_pct, registers_per_thread,
+    let sql = format!(
+        "SELECT kernel_name, occupancy_pct, registers_per_thread,
                       shared_mem_static_bytes + shared_mem_dynamic_bytes as shmem
-               FROM metrics WHERE occupancy_pct IS NOT NULL
-               ORDER BY occupancy_pct ASC LIMIT ?1";
-    let rows: Vec<(String, f64, Option<i64>, Option<i64>)> = db.query_vec(sql, [n as i64], |row| {
-        Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
-    });
+               FROM metrics m WHERE occupancy_pct IS NOT NULL AND {}
+               ORDER BY occupancy_pct ASC LIMIT ?1",
+        db.metric_filter_for("m")
+    );
+    let rows: Vec<(String, f64, Option<i64>, Option<i64>)> =
+        db.query_vec(&sql, [n as i64], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+        });
 
     println!("  Kernel                            Occupancy  Regs  ShmemK  Limiting");
     println!("  ────────────────────────────────── ───────── ───── ─────── ────────");
@@ -1415,12 +1425,12 @@ pub fn cmd_bandwidth(db: &GpuDb, args: &[&str]) {
     let pat_clause = pattern
         .map(|_| "AND kernel_name LIKE ?1 ESCAPE '\\'")
         .unwrap_or_default();
-
     let sql = format!(
         "SELECT kernel_name, achieved_bandwidth_gb_s, peak_bandwidth_gb_s, boundedness
          FROM metrics
-         WHERE achieved_bandwidth_gb_s IS NOT NULL {pat_clause}
-         ORDER BY achieved_bandwidth_gb_s DESC"
+         WHERE achieved_bandwidth_gb_s IS NOT NULL {pat_clause} AND {}
+         ORDER BY achieved_bandwidth_gb_s DESC",
+        db.metric_filter_for("metrics")
     );
     let rows: Vec<(String, f64, Option<f64>, Option<String>)> = match pattern {
         Some(p) => db.query_vec(&sql, [like_param(p)], |row| {
@@ -1977,9 +1987,12 @@ pub fn cmd_compare(db: &GpuDb, args: &[&str]) {
     let metrics_of = |name: &str| {
         db.conn
             .query_row(
-                "SELECT occupancy_pct, compute_throughput_pct, memory_throughput_pct,
+                &format!(
+                    "SELECT occupancy_pct, compute_throughput_pct, memory_throughput_pct,
                     achieved_bandwidth_gb_s, boundedness
-             FROM metrics WHERE kernel_name = ?1",
+             FROM metrics WHERE kernel_name = ?1 AND {}",
+                    db.metric_filter_for("metrics")
+                ),
                 [name],
                 |row| {
                     Ok((

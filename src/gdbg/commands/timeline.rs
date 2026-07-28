@@ -13,12 +13,13 @@ pub fn cmd_transfers(db: &GpuDb, args: &[&str]) {
         return;
     }
     let n = parse_count(args);
+    let transfer_filter = db.timeline_filter_for("transfers");
 
     // --- Overall totals ---
     let (total_bytes, total_time): (i64, f64) = db
         .conn
         .query_row(
-            "SELECT COALESCE(SUM(bytes),0), COALESCE(SUM(duration_us),0) FROM transfers",
+            &format!("SELECT COALESCE(SUM(bytes),0), COALESCE(SUM(duration_us),0) FROM transfers WHERE {transfer_filter}"),
             [],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
@@ -56,10 +57,10 @@ pub fn cmd_transfers(db: &GpuDb, args: &[&str]) {
     println!();
 
     // --- Breakdown by kind ---
-    let kind_sql = "SELECT kind, COUNT(*), SUM(bytes), SUM(duration_us),
+    let kind_sql = format!("SELECT kind, COUNT(*), SUM(bytes), SUM(duration_us),
                            MIN(bytes), MAX(bytes)
-                    FROM transfers GROUP BY kind ORDER BY SUM(duration_us) DESC";
-    let kinds: Vec<(String, i64, i64, f64, i64, i64)> = db.query_vec(kind_sql, [], |row| {
+                    FROM transfers WHERE {transfer_filter} GROUP BY kind ORDER BY SUM(duration_us) DESC");
+    let kinds: Vec<(String, i64, i64, f64, i64, i64)> = db.query_vec(&kind_sql, [], |row| {
         Ok((
             row.get(0)?,
             row.get(1)?,
@@ -100,8 +101,10 @@ pub fn cmd_transfers(db: &GpuDb, args: &[&str]) {
     let (small_cnt, small_bytes, small_time): (i64, i64, f64) = db
         .conn
         .query_row(
-            "SELECT COUNT(*), COALESCE(SUM(bytes),0), COALESCE(SUM(duration_us),0)
-         FROM transfers WHERE bytes < 1048576", // < 1 MB
+            &format!(
+                "SELECT COUNT(*), COALESCE(SUM(bytes),0), COALESCE(SUM(duration_us),0)
+         FROM transfers WHERE bytes < 1048576 AND {transfer_filter}"
+            ), // < 1 MB
             [],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
@@ -129,9 +132,11 @@ pub fn cmd_transfers(db: &GpuDb, args: &[&str]) {
     }
 
     // --- Top N by duration ---
-    let sql = "SELECT kind, bytes, duration_us, stream_id
-               FROM transfers ORDER BY duration_us DESC LIMIT ?1";
-    let rows: Vec<(String, i64, f64, Option<u32>)> = db.query_vec(sql, [n as i64], |row| {
+    let sql = format!(
+        "SELECT kind, bytes, duration_us, stream_id
+               FROM transfers WHERE {transfer_filter} ORDER BY duration_us DESC LIMIT ?1"
+    );
+    let rows: Vec<(String, i64, f64, Option<u32>)> = db.query_vec(&sql, [n as i64], |row| {
         Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
     });
 
@@ -185,10 +190,13 @@ fn print_transfer_cdf(db: &GpuDb, total_time: f64) {
         (1024 * 1024 * 1024, "<1 GB"),
         (i64::MAX, ">=1 GB"),
     ];
+    let transfer_filter = db.timeline_filter_for("transfers");
 
     // Pull (bytes, duration_us) ordered by size for a true CDF.
     let rows: Vec<(i64, f64)> = db.query_vec(
-        "SELECT bytes, duration_us FROM transfers ORDER BY bytes ASC",
+        &format!(
+            "SELECT bytes, duration_us FROM transfers WHERE {transfer_filter} ORDER BY bytes ASC"
+        ),
         [],
         |row| Ok((row.get(0)?, row.get(1)?)),
     );
@@ -328,7 +336,10 @@ pub fn cmd_overlap(db: &GpuDb) {
     let xfer_time: f64 = db
         .conn
         .query_row(
-            "SELECT COALESCE(SUM(duration_us),0) FROM transfers",
+            &format!(
+                "SELECT COALESCE(SUM(duration_us),0) FROM transfers WHERE {}",
+                db.timeline_filter_for("transfers")
+            ),
             [],
             |row| row.get(0),
         )
@@ -356,7 +367,10 @@ pub fn cmd_overlap(db: &GpuDb) {
     // Break down overlap by transfer direction — only H2D typically overlaps
     // compute meaningfully (prefetch pattern), so call out D2H separately.
     let kinds: Vec<String> = db.query_vec(
-        "SELECT DISTINCT kind FROM transfers WHERE start_us IS NOT NULL",
+        &format!(
+            "SELECT DISTINCT kind FROM transfers WHERE start_us IS NOT NULL AND {}",
+            db.timeline_filter_for("transfers")
+        ),
         [],
         |row| row.get(0),
     );

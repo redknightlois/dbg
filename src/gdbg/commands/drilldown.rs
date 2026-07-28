@@ -86,12 +86,15 @@ pub fn cmd_inspect(db: &GpuDb, args: &[&str]) {
     }
 
     // Metrics
-    let m_sql = "SELECT occupancy_pct, compute_throughput_pct, memory_throughput_pct,
+    let m_sql = format!(
+        "SELECT occupancy_pct, compute_throughput_pct, memory_throughput_pct,
                         registers_per_thread, shared_mem_static_bytes, shared_mem_dynamic_bytes,
                         l2_hit_rate_pct, achieved_bandwidth_gb_s, peak_bandwidth_gb_s,
                         boundedness
-                 FROM metrics WHERE kernel_name = ?1";
-    if let Ok(m) = db.conn.query_row(m_sql, [&name], |row| {
+                 FROM metrics m WHERE kernel_name = ?1 AND {}",
+        db.metric_filter_for("m")
+    );
+    if let Ok(m) = db.conn.query_row(&m_sql, [&name], |row| {
         Ok((
             row.get::<_, Option<f64>>(0)?,
             row.get::<_, Option<f64>>(1)?,

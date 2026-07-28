@@ -3,13 +3,42 @@ use std::path::Path;
 use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, params};
 
+const MAX_IMPORT_BYTES: u64 = 1 * 1024 * 1024 * 1024;
+const MAX_NSYS_ROWS: usize = 1_000_000;
+const MAX_NSYS_ROWS_PLUS_ONE: usize = MAX_NSYS_ROWS + 1;
+
 /// Parse an nsys-rep SQLite database and INSERT into our session DB.
 pub fn import_nsys_rep(dest: &Connection, nsys_path: &Path, layer_id: i64) -> Result<()> {
+    let size = std::fs::metadata(nsys_path)
+        .with_context(|| format!("stat {}", nsys_path.display()))?
+        .len();
+    if size > MAX_IMPORT_BYTES {
+        bail!(
+            "NSYS capture {} is too large ({} bytes; maximum is {} bytes)",
+            nsys_path.display(),
+            size,
+            MAX_IMPORT_BYTES
+        );
+    }
     let src = Connection::open_with_flags(
         nsys_path,
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )
     .with_context(|| format!("cannot open {}", nsys_path.display()))?;
+
+    let recognized = [
+        "CUPTI_ACTIVITY_KIND_KERNEL",
+        "CUPTI_ACTIVITY_KIND_CONCURRENT_KERNEL",
+        "CUPTI_ACTIVITY_KIND_MEMCPY",
+        "CUDA_GPU_MEMORY_USAGE_EVENTS",
+        "NVTX_EVENTS",
+        "CUPTI_ACTIVITY_KIND_RUNTIME",
+    ]
+    .iter()
+    .any(|table| find_table(&src, &[*table]).is_ok());
+    if !recognized {
+        bail!("NSYS report contains no recognized activity tables");
+    }
 
     let has_kernels = import_kernels(dest, &src, layer_id)?;
     import_transfers(dest, &src, layer_id)?;
@@ -24,6 +53,19 @@ pub fn import_nsys_rep(dest: &Connection, nsys_path: &Path, layer_id: i64) -> Re
     }
 
     import_wall_time(dest)?;
+
+    let imported: i64 = dest.query_row(
+        "SELECT
+            (SELECT COUNT(*) FROM launches WHERE layer_id=?1) +
+            (SELECT COUNT(*) FROM transfers WHERE layer_id=?1) +
+            (SELECT COUNT(*) FROM allocations WHERE layer_id=?1) +
+            (SELECT COUNT(*) FROM regions WHERE layer_id=?1)",
+        params![layer_id],
+        |row| row.get(0),
+    )?;
+    if imported == 0 {
+        bail!("NSYS report contains no recognized activity rows");
+    }
 
     Ok(())
 }
@@ -60,7 +102,8 @@ fn import_kernels(dest: &Connection, src: &Connection, layer_id: i64) -> Result<
                     k.streamId, k.correlationId
              FROM {table} k
              JOIN StringIds s ON s.id = k.demangledName
-             ORDER BY k.start"
+             ORDER BY k.start LIMIT {}",
+            MAX_NSYS_ROWS_PLUS_ONE
         )
     } else {
         format!(
@@ -69,7 +112,8 @@ fn import_kernels(dest: &Connection, src: &Connection, layer_id: i64) -> Result<
                     blockX, blockY, blockZ,
                     streamId, correlationId
              FROM {table}
-             ORDER BY start"
+             ORDER BY start LIMIT {}",
+            MAX_NSYS_ROWS_PLUS_ONE
         )
     };
 
@@ -99,7 +143,12 @@ fn import_kernels(dest: &Connection, src: &Connection, layer_id: i64) -> Result<
         ))
     })?;
 
+    let mut row_count = 0;
     for row in rows {
+        row_count += 1;
+        if row_count > MAX_NSYS_ROWS {
+            bail!("NSYS kernel table exceeds the maximum of {MAX_NSYS_ROWS} rows");
+        }
         let (name, start_ns, end_ns, gx, gy, gz, bx, by, bz, sid, cid) = row?;
         let duration_us = duration_us(start_ns, end_ns, "kernel")?;
         let start_us = start_ns as f64 / 1000.0;
@@ -119,7 +168,10 @@ fn import_kernels(dest: &Connection, src: &Connection, layer_id: i64) -> Result<
         ])?;
     }
 
-    Ok(true)
+    // A present activity table is not the same as usable kernel data. An
+    // empty table (or a StringIds join with no matching names) must allow the
+    // runtime-api fallback to run.
+    Ok(row_count > 0)
 }
 
 // ---------------------------------------------------------------------------
@@ -133,7 +185,7 @@ fn import_transfers(dest: &Connection, src: &Connection, layer_id: i64) -> Resul
     };
 
     let mut read = src.prepare(&format!(
-        "SELECT copyKind, start, end, bytes, streamId FROM {table} ORDER BY start"
+        "SELECT copyKind, start, end, bytes, streamId FROM {table} ORDER BY start LIMIT {MAX_NSYS_ROWS_PLUS_ONE}"
     ))?;
 
     let mut write = dest.prepare(
@@ -151,7 +203,12 @@ fn import_transfers(dest: &Connection, src: &Connection, layer_id: i64) -> Resul
         ))
     })?;
 
+    let mut row_count = 0;
     for row in rows {
+        row_count += 1;
+        if row_count > MAX_NSYS_ROWS {
+            bail!("NSYS transfer table exceeds the maximum of {MAX_NSYS_ROWS} rows");
+        }
         let (kind, start_ns, end_ns, bytes, sid) = row?;
         let kind_str = match kind {
             1 => "H2D",
@@ -198,7 +255,7 @@ fn import_allocations(dest: &Connection, src: &Connection, layer_id: i64) -> Res
         "NULL"
     };
     let mut read = src.prepare(&format!(
-        "SELECT start, memoryOperationType, address, bytes, {select_sid} FROM {table} ORDER BY start"
+        "SELECT start, memoryOperationType, address, bytes, {select_sid} FROM {table} ORDER BY start LIMIT {MAX_NSYS_ROWS_PLUS_ONE}"
     ))?;
 
     let mut write = dest.prepare(
@@ -216,7 +273,12 @@ fn import_allocations(dest: &Connection, src: &Connection, layer_id: i64) -> Res
         ))
     })?;
 
+    let mut row_count = 0;
     for row in rows {
+        row_count += 1;
+        if row_count > MAX_NSYS_ROWS {
+            bail!("NSYS allocation table exceeds the maximum of {MAX_NSYS_ROWS} rows");
+        }
         let (start_ns, oper, addr, bytes, sid) = row?;
         // nsys: 0 = Allocation, 1 = Deallocation. Skip any future oper types
         // rather than silently misclassifying them as frees and corrupting
@@ -251,7 +313,7 @@ fn import_nvtx_regions(dest: &Connection, src: &Connection, layer_id: i64) -> Re
     let mut read = src.prepare(&format!(
         "SELECT text, start, end FROM {table}
          WHERE text IS NOT NULL
-         ORDER BY start"
+         ORDER BY start LIMIT {MAX_NSYS_ROWS_PLUS_ONE}"
     ))?;
 
     let mut write = dest.prepare(
@@ -267,7 +329,12 @@ fn import_nvtx_regions(dest: &Connection, src: &Connection, layer_id: i64) -> Re
         ))
     })?;
 
+    let mut row_count = 0;
     for row in rows {
+        row_count += 1;
+        if row_count > MAX_NSYS_ROWS {
+            bail!("NSYS NVTX table exceeds the maximum of {MAX_NSYS_ROWS} rows");
+        }
         let (name, start_ns, end_ns) = row?;
         write.execute(params![
             name,
@@ -302,7 +369,7 @@ fn import_runtime_api(dest: &Connection, src: &Connection, layer_id: i64) -> Res
          FROM {table} r
          JOIN StringIds s ON s.id = r.nameId
          WHERE s.value LIKE 'cudaLaunchKernel%'
-         ORDER BY r.start"
+         ORDER BY r.start LIMIT {MAX_NSYS_ROWS_PLUS_ONE}"
     );
 
     let mut read = src.prepare(&sql)?;
@@ -322,7 +389,12 @@ fn import_runtime_api(dest: &Connection, src: &Connection, layer_id: i64) -> Res
     })?;
 
     let mut count = 0;
+    let mut row_count = 0;
     for row in rows {
+        row_count += 1;
+        if row_count > MAX_NSYS_ROWS {
+            bail!("NSYS runtime table exceeds the maximum of {MAX_NSYS_ROWS} rows");
+        }
         let (_api_name, start_ns, end_ns, corr_id) = row?;
         let duration_us = duration_us(start_ns, end_ns, "runtime API event")?;
         let start_us = start_ns as f64 / 1000.0;
@@ -586,5 +658,53 @@ mod tests {
         let db = GpuDb::create(&tempfile::tempdir().unwrap().keep().join("t.db")).unwrap();
         import_wall_time(&db.conn).unwrap();
         assert_eq!(db.meta("wall_time_us"), "0");
+    }
+
+    #[test]
+    fn empty_or_unrecognized_nsys_report_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("empty.sqlite");
+        Connection::open(&path).unwrap();
+        let db = GpuDb::create(&dir.path().join("dest.db")).unwrap();
+        let layer = db
+            .add_layer("nsys", &path.to_string_lossy(), None, None, None)
+            .unwrap();
+        let error = import_nsys_rep(&db.conn, &path, layer).unwrap_err();
+        assert!(error.to_string().contains("no recognized activity tables"));
+    }
+
+    #[test]
+    fn empty_kernel_table_does_not_suppress_runtime_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("runtime.sqlite");
+        let src = Connection::open(&path).unwrap();
+        src.execute_batch(
+            "CREATE TABLE CUPTI_ACTIVITY_KIND_KERNEL (
+                 demangledName TEXT, start INTEGER, end INTEGER,
+                 gridX INTEGER, gridY INTEGER, gridZ INTEGER,
+                 blockX INTEGER, blockY INTEGER, blockZ INTEGER,
+                 streamId INTEGER, correlationId INTEGER
+             );
+             CREATE TABLE StringIds (id INTEGER, value TEXT);
+             CREATE TABLE CUPTI_ACTIVITY_KIND_RUNTIME (
+                 nameId INTEGER, start INTEGER, end INTEGER, correlationId INTEGER
+             );
+             INSERT INTO StringIds VALUES (1, 'cudaLaunchKernel');
+             INSERT INTO CUPTI_ACTIVITY_KIND_RUNTIME VALUES (1, 100, 200, 7);",
+        )
+        .unwrap();
+        drop(src);
+
+        let db = GpuDb::create(&dir.path().join("dest.db")).unwrap();
+        let layer = db
+            .add_layer("nsys", &path.to_string_lossy(), None, None, None)
+            .unwrap();
+        import_nsys_rep(&db.conn, &path, layer).unwrap();
+        assert_eq!(db.total_launch_count(), 1);
+        let name: String = db
+            .conn
+            .query_row("SELECT kernel_name FROM launches", [], |row| row.get(0))
+            .unwrap();
+        assert!(name.contains("GPU trace unavailable"));
     }
 }

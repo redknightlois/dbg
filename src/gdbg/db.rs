@@ -16,7 +16,7 @@ use rusqlite::{Connection, ToSql, params};
 /// Bumping this invalidates every saved `.gpu.db` file: `GpuDb::open`
 /// refuses to load anything that doesn't match, pointing the user at
 /// the raw `.nsys-rep` + `.csv` artifacts to re-ingest.
-pub const GDBG_SCHEMA_VERSION: i64 = 2;
+pub const GDBG_SCHEMA_VERSION: i64 = 3;
 
 /// A GPU profiling session backed by a SQLite database.
 pub struct GpuDb {
@@ -496,10 +496,18 @@ impl GpuDb {
     /// Get the layer ID to use for timeline queries (prefer nsys, fall back to torch).
     /// Returns None if no timeline layer exists.
     pub fn timeline_layer_id(&self) -> Option<i64> {
-        // Prefer nsys (has real timestamps), fall back to torch
+        // Prefer nsys (has real timestamps), but only when it contains
+        // timeline rows. A failed or empty preferred layer must not mask a
+        // populated torch/proton layer.
         for source in &["nsys", "torch", "proton"] {
             if let Ok(id) = self.conn.query_row(
-                "SELECT id FROM layers WHERE source = ?1 ORDER BY id LIMIT 1",
+                "SELECT id FROM layers AS layer
+                 WHERE source = ?1 AND (
+                    EXISTS (SELECT 1 FROM launches WHERE layer_id = layer.id)
+                    OR EXISTS (SELECT 1 FROM transfers WHERE layer_id = layer.id)
+                    OR EXISTS (SELECT 1 FROM regions WHERE layer_id = layer.id)
+                 )
+                 ORDER BY id LIMIT 1",
                 params![source],
                 |row| row.get::<_, i64>(0),
             ) {
@@ -519,10 +527,54 @@ impl GpuDb {
 
     /// Like `timeline_filter`, but with a custom table alias.
     pub fn timeline_filter_for(&self, alias: &str) -> String {
+        if !alias.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+            return "0=1".to_string();
+        }
         match self.timeline_layer_id() {
             Some(id) => format!("{alias}.layer_id = {id}"),
             None => "1=1".to_string(),
         }
+    }
+
+    /// Restrict metric rows to the newest NCU layer. Rows without a layer
+    /// are retained for small hand-built compatibility databases.
+    pub fn metric_filter_for(&self, alias: &str) -> String {
+        if !alias.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+            return "0=1".to_string();
+        }
+        match self.conn.query_row(
+            "SELECT layer.id FROM layers AS layer
+             WHERE layer.source='ncu'
+               AND EXISTS (SELECT 1 FROM metrics WHERE layer_id = layer.id)
+             ORDER BY layer.id DESC LIMIT 1",
+            [],
+            |r| r.get::<_, i64>(0),
+        ) {
+            Ok(id) => format!("({alias}.layer_id = {id} OR {alias}.layer_id IS NULL)"),
+            Err(_) => "1=1".to_string(),
+        }
+    }
+
+    /// Select the hardware-metrics layer used by the current session.
+    pub fn metrics_layer_id(&self) -> Option<i64> {
+        self.conn
+            .query_row(
+                "SELECT layer.id FROM layers AS layer
+                 WHERE layer.source = 'ncu'
+                   AND EXISTS (SELECT 1 FROM metrics WHERE layer_id = layer.id)
+                 ORDER BY layer.id DESC LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .ok()
+    }
+
+    pub fn metrics_filter(&self) -> String {
+        self.metrics_filter_for("metrics")
+    }
+
+    pub fn metrics_filter_for(&self, alias: &str) -> String {
+        self.metric_filter_for(alias)
     }
 
     // -----------------------------------------------------------------------
@@ -660,16 +712,21 @@ impl GpuDb {
     /// Skips rows where `start_us IS NULL`. If `kind` is `Some`, restricts to that
     /// transfer kind (e.g. "H2D", "D2H", "D2D").
     pub fn transfer_intervals(&self, kind: Option<&str>) -> Vec<(f64, f64)> {
+        let filter = self.timeline_filter_for("transfers");
         match kind {
             Some(k) => self.query_vec(
-                "SELECT start_us, start_us + duration_us FROM transfers
-                 WHERE start_us IS NOT NULL AND kind = ?1 ORDER BY start_us",
+                &format!(
+                    "SELECT start_us, start_us + duration_us FROM transfers
+                 WHERE start_us IS NOT NULL AND kind = ?1 AND {filter} ORDER BY start_us"
+                ),
                 [k],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             ),
             None => self.query_vec(
-                "SELECT start_us, start_us + duration_us FROM transfers
-                 WHERE start_us IS NOT NULL ORDER BY start_us",
+                &format!(
+                    "SELECT start_us, start_us + duration_us FROM transfers
+                 WHERE start_us IS NOT NULL AND {filter} ORDER BY start_us"
+                ),
                 [],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             ),
@@ -677,7 +734,8 @@ impl GpuDb {
     }
 
     pub fn transfer_count(&self) -> usize {
-        self.count("SELECT COUNT(*) FROM transfers")
+        let filter = self.timeline_filter_for("transfers");
+        self.count(&format!("SELECT COUNT(*) FROM transfers WHERE {filter}"))
     }
 
     pub fn stream_count(&self) -> usize {
@@ -688,7 +746,10 @@ impl GpuDb {
     }
 
     pub fn kernels_with_metrics(&self) -> usize {
-        self.count("SELECT COUNT(*) FROM metrics")
+        self.count(&format!(
+            "SELECT COUNT(*) FROM metrics m WHERE {}",
+            self.metric_filter_for("m")
+        ))
     }
 
     pub fn kernels_with_ops(&self) -> usize {
@@ -718,6 +779,7 @@ impl GpuDb {
                    WHERE name LIKE ? ESCAPE '\'
                      AND launches.start_us >= regions.start_us
                      AND launches.start_us <= regions.start_us + regions.duration_us
+                     AND (regions.layer_id IS NULL OR regions.layer_id = launches.layer_id)
                  )"
                 .to_string(),
             );
@@ -1031,7 +1093,7 @@ fn init_schema(conn: &Connection) -> Result<()> {
         );
 
         CREATE TABLE IF NOT EXISTS metrics (
-            kernel_name              TEXT PRIMARY KEY,
+            kernel_name              TEXT NOT NULL,
             occupancy_pct            REAL,
             compute_throughput_pct   REAL,
             memory_throughput_pct    REAL,
@@ -1042,7 +1104,8 @@ fn init_schema(conn: &Connection) -> Result<()> {
             achieved_bandwidth_gb_s  REAL,
             peak_bandwidth_gb_s      REAL,
             boundedness              TEXT,
-            layer_id                 INTEGER REFERENCES layers(id)
+            layer_id                 INTEGER REFERENCES layers(id),
+            PRIMARY KEY (kernel_name, layer_id)
         );
 
         CREATE TABLE IF NOT EXISTS transfers (
@@ -1244,6 +1307,24 @@ mod tests {
         assert!(db.has_layer("nsys"));
         assert!(!db.has_layer("ncu"));
         assert_eq!(db.layer_names(), vec!["nsys"]);
+    }
+
+    #[test]
+    fn timeline_skips_empty_preferred_layer() {
+        let db = temp_db();
+        let empty = db.add_layer("nsys", "empty.rep", None, None, None).unwrap();
+        let populated = db
+            .add_layer("torch", "trace.json", None, None, None)
+            .unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO launches (kernel_name, duration_us, layer_id) VALUES ('k', 2.0, ?1)",
+                params![populated],
+            )
+            .unwrap();
+        assert_ne!(db.timeline_layer_id(), Some(empty));
+        assert_eq!(db.timeline_layer_id(), Some(populated));
+        assert_eq!(db.total_launch_count(), 1);
     }
 
     #[test]

@@ -32,7 +32,10 @@ pub fn cmd_region(db: &mut GpuDb, args: &[&str]) {
         }
         None => {
             let rows: Vec<(String, f64)> = db.query_vec(
-                "SELECT name, duration_us FROM regions ORDER BY start_us",
+                &format!(
+                    "SELECT name, duration_us FROM regions WHERE {} ORDER BY start_us",
+                    db.timeline_filter_for("regions")
+                ),
                 [],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             );
