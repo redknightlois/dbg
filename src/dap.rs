@@ -65,7 +65,11 @@ struct ProcessIdentity {
 
 fn process_identity(pid: u32) -> Option<ProcessIdentity> {
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-    let fields = stat.rsplit_once(") ")?.1.split_whitespace().collect::<Vec<_>>();
+    let fields = stat
+        .rsplit_once(") ")?
+        .1
+        .split_whitespace()
+        .collect::<Vec<_>>();
     let start_time = fields.get(19)?.parse().ok()?;
     let metadata = std::fs::metadata(format!("/proc/{pid}/exe")).ok()?;
     use std::os::unix::fs::MetadataExt;
@@ -99,14 +103,55 @@ fn capture_owned_descendants(pid: u32) -> Vec<(u32, ProcessIdentity)> {
     tree
 }
 
+fn find_new_descendant(
+    before: &[(u32, ProcessIdentity)],
+    after: Vec<(u32, ProcessIdentity)>,
+) -> Option<(u32, ProcessIdentity)> {
+    after
+        .into_iter()
+        .find(|candidate| !before.iter().any(|old| old == candidate))
+}
+
 fn kill_captured_processes(tree: Vec<(u32, ProcessIdentity)>) {
     for (current, expected_identity) in tree.into_iter().rev() {
-        if process_identity(current) == Some(expected_identity) {
-            let _ = nix::sys::signal::kill(
-                Pid::from_raw(current as i32),
-                nix::sys::signal::Signal::SIGKILL,
-            );
+        kill_process_instance(current, expected_identity);
+    }
+}
+
+fn kill_process_instance(pid: u32, expected_identity: ProcessIdentity) {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+        // Bind the signal to this process instance. A check followed by
+        // kill(pid) still has a PID-reuse window.
+        let raw = unsafe { nix::libc::syscall(nix::libc::SYS_pidfd_open, pid, 0) } as i32;
+        if raw < 0 {
+            return;
         }
+        // SAFETY: pidfd_open returned an owned descriptor.
+        let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+        // Recheck the instance bound by this descriptor. A check before
+        // pidfd_open alone leaves a PID-reuse window.
+        if process_identity(pid) != Some(expected_identity) {
+            return;
+        }
+        let _ = unsafe {
+            nix::libc::syscall(
+                nix::libc::SYS_pidfd_send_signal,
+                fd.as_raw_fd(),
+                nix::libc::SIGKILL,
+                std::ptr::null::<nix::libc::siginfo_t>(),
+                0,
+            )
+        };
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        if process_identity(pid) != Some(expected_identity) {
+            return;
+        }
+        let _ =
+            nix::sys::signal::kill(Pid::from_raw(pid as i32), nix::sys::signal::Signal::SIGKILL);
     }
 }
 
@@ -178,6 +223,7 @@ struct State {
     call_frames: Vec<Value>,
     /// Set by the driver when a DAP `stopped` event lands.
     pending_hit: Option<HitEvent>,
+    pending_action_generation: u64,
     /// Tracked user breakpoints: "file:line" → nothing (DAP
     /// setBreakpoints is path-keyed, not id-keyed).
     breakpoints: HashMap<String, Vec<u32>>,
@@ -213,7 +259,11 @@ struct State {
     /// helpers carry this value so a late response from an earlier stop
     /// cannot populate a later continue's state.
     action_generation: u64,
+    /// Generation which has reached the adapter request queue. Inbound
+    /// stopped frames are dispatched before a new action is armed.
+    armed_action_generation: u64,
     stop_generation: u64,
+    enriched_stop_generation: u64,
 }
 
 impl State {
@@ -223,6 +273,7 @@ impl State {
             top_frame: None,
             call_frames: Vec::new(),
             pending_hit: None,
+            pending_action_generation: 0,
             breakpoints: HashMap::new(),
             function_breakpoints: Vec::new(),
             breakpoint_conditions: HashMap::new(),
@@ -235,7 +286,9 @@ impl State {
             launched_pid: None,
             launched_identity: None,
             action_generation: 0,
+            armed_action_generation: 0,
             stop_generation: 0,
+            enriched_stop_generation: 0,
         }
     }
 }
@@ -250,6 +303,12 @@ impl crate::transport_common::StopState for State {
     }
     fn stop_generation(&self) -> u64 {
         self.stop_generation
+    }
+    fn action_generation(&self) -> u64 {
+        self.action_generation
+    }
+    fn pending_action_generation(&self) -> u64 {
+        self.pending_action_generation
     }
     fn alive(&self) -> bool {
         self.alive
@@ -267,6 +326,7 @@ enum DriverCmd {
         command: String,
         arguments: Value,
         resp: Sender<Result<Value, String>>,
+        arm_action: bool,
     },
     Shutdown,
 }
@@ -363,8 +423,15 @@ impl DapTransport {
 
         // Retry TCP connect a few times — some adapters announce the
         // listen port just before bind() completes.
-        let stream = connect_with_retry(&addr, Duration::from_secs(5))
-            .with_context(|| format!("failed to connect to adapter at {addr}"))?;
+        let require_listener_owner =
+            cfg.preassigned_addr.is_some() && cfg.bin.to_ascii_lowercase().contains("netcoredbg");
+        let stream = connect_with_retry_owned(
+            &addr,
+            Duration::from_secs(5),
+            require_listener_owner,
+            child_pid.as_raw() as u32,
+        )
+        .with_context(|| format!("failed to connect to adapter at {addr}"))?;
         stream.set_nonblocking(true)?;
 
         let state = Arc::new((Mutex::new(State::new()), Condvar::new()));
@@ -384,7 +451,9 @@ impl DapTransport {
         let is_attach = cfg.launch_verb == "attach";
         let transport = Self {
             child_pid,
-            child: Mutex::new(Some(child_guard.0.take().expect("child guard is populated"))),
+            child: Mutex::new(Some(
+                child_guard.0.take().expect("child guard is populated"),
+            )),
             driver_tx,
             log,
             state,
@@ -469,18 +538,39 @@ impl DapTransport {
                 command: command.to_string(),
                 arguments,
                 resp: tx,
+                arm_action: false,
             })
             .map_err(|_| anyhow!("DAP driver thread gone"))?;
         Ok(rx)
     }
 
     fn call_blocking(&self, command: &str, arguments: Value, timeout: Duration) -> Result<Value> {
+        self.call_blocking_inner(command, arguments, timeout, false)
+    }
+
+    fn call_blocking_action(
+        &self,
+        command: &str,
+        arguments: Value,
+        timeout: Duration,
+    ) -> Result<Value> {
+        self.call_blocking_inner(command, arguments, timeout, true)
+    }
+
+    fn call_blocking_inner(
+        &self,
+        command: &str,
+        arguments: Value,
+        timeout: Duration,
+        arm_action: bool,
+    ) -> Result<Value> {
         let (tx, rx) = mpsc::channel();
         self.driver_tx
             .send(DriverCmd::Call {
                 command: command.to_string(),
                 arguments,
                 resp: tx,
+                arm_action,
             })
             .map_err(|_| anyhow!("DAP driver thread gone"))?;
         match rx.recv_timeout(timeout) {
@@ -495,28 +585,28 @@ impl DapTransport {
         if matches!(trimmed, "cont" | "c" | "continue") {
             let tid = self.current_thread().unwrap_or(1);
             return self.exec(
-                |s| s.call_blocking("continue", json!({"threadId": tid}), timeout),
+                |s| s.call_blocking_action("continue", json!({"threadId": tid}), timeout),
                 timeout,
             );
         }
         if matches!(trimmed, "step" | "s" | "stepi") {
             let tid = self.current_thread().unwrap_or(1);
             return self.exec(
-                |s| s.call_blocking("stepIn", json!({"threadId": tid}), timeout),
+                |s| s.call_blocking_action("stepIn", json!({"threadId": tid}), timeout),
                 timeout,
             );
         }
         if matches!(trimmed, "next" | "n") {
             let tid = self.current_thread().unwrap_or(1);
             return self.exec(
-                |s| s.call_blocking("next", json!({"threadId": tid}), timeout),
+                |s| s.call_blocking_action("next", json!({"threadId": tid}), timeout),
                 timeout,
             );
         }
         if matches!(trimmed, "out" | "finish") {
             let tid = self.current_thread().unwrap_or(1);
             return self.exec(
-                |s| s.call_blocking("stepOut", json!({"threadId": tid}), timeout),
+                |s| s.call_blocking_action("stepOut", json!({"threadId": tid}), timeout),
                 timeout,
             );
         }
@@ -535,15 +625,25 @@ impl DapTransport {
             // post-restart `stopped` event (if any) repopulates from
             // scratch instead of returning stale frameIds to
             // `locals`/`print`.
+            let descendants_before = capture_owned_descendants(self.child_pid.as_raw() as u32);
             {
                 let (lock, _) = &*self.state;
                 let mut s = lock.lock().unwrap();
+                s.action_generation = s.action_generation.wrapping_add(1);
                 s.paused = false;
                 s.top_frame = None;
                 s.call_frames.clear();
                 s.pending_hit = None;
+                s.pending_action_generation = s.action_generation;
+                s.armed_action_generation = s.action_generation;
+                // A restart replaces the launched process. Do not retain
+                // the old PID as a shutdown fallback while the replacement
+                // process event is still in flight.
+                s.launched_pid = None;
+                s.launched_identity = None;
             }
             self.call_blocking("restart", json!({}), timeout)?;
+            self.track_restarted_debuggee(&descendants_before, timeout);
             return Ok("restart requested".into());
         }
         if trimmed == "catch" || trimmed == "catch off" {
@@ -640,6 +740,38 @@ impl DapTransport {
         lock.lock().unwrap().current_thread
     }
 
+    /// Some adapters restart the inferior without sending a DAP `process`
+    /// event. Keep quit cleanup correct by finding a new adapter descendant
+    /// after the restart request. The search is bounded because a restart
+    /// request must not turn into an unbounded process wait.
+    fn track_restarted_debuggee(
+        &self,
+        descendants_before: &[(u32, ProcessIdentity)],
+        timeout: Duration,
+    ) {
+        if self.is_attach {
+            return;
+        }
+        let deadline = Instant::now() + timeout.min(Duration::from_secs(2));
+        loop {
+            let candidate = find_new_descendant(
+                descendants_before,
+                capture_owned_descendants(self.child_pid.as_raw() as u32),
+            );
+            if let Some((pid, identity)) = candidate {
+                let (lock, _) = &*self.state;
+                let mut s = lock.lock().unwrap();
+                s.launched_pid = Some(pid);
+                s.launched_identity = Some(identity);
+                return;
+            }
+            if Instant::now() >= deadline {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
     fn list_threads(&self, timeout: Duration) -> Result<String> {
         let resp = self.call_blocking("threads", json!({}), timeout)?;
         let arr = resp
@@ -719,12 +851,19 @@ impl DapTransport {
         if tids.is_empty() {
             bail!("pause: adapter reported no DAP threads to pause");
         }
+        {
+            let (lock, _) = &*self.state;
+            let mut s = lock.lock().unwrap();
+            s.action_generation = s.action_generation.wrapping_add(1);
+        }
         match crate::transport_common::wait_for_stop(
             &self.state,
             || {
                 let mut last_err = None;
                 for tid in &tids {
-                    if let Err(e) = self.call_blocking("pause", json!({"threadId": tid}), timeout) {
+                    if let Err(e) =
+                        self.call_blocking_action("pause", json!({"threadId": tid}), timeout)
+                    {
                         last_err = Some(e);
                     }
                 }
@@ -838,7 +977,10 @@ impl DapTransport {
         let snapshot = {
             let (lock, _) = &*self.state;
             let s = lock.lock().unwrap();
-            (s.function_breakpoints.clone(), s.function_breakpoint_conditions.clone())
+            (
+                s.function_breakpoints.clone(),
+                s.function_breakpoint_conditions.clone(),
+            )
         };
         let all: Vec<String> = {
             let (lock, _) = &*self.state;
@@ -895,7 +1037,11 @@ impl DapTransport {
         let snapshot = {
             let (lock, _) = &*self.state;
             let s = lock.lock().unwrap();
-            (s.breakpoints.clone(), s.breakpoint_conditions.clone(), s.breakpoint_log_messages.clone())
+            (
+                s.breakpoints.clone(),
+                s.breakpoint_conditions.clone(),
+                s.breakpoint_log_messages.clone(),
+            )
         };
         // DAP requires the full set of breakpoints for a source each
         // call — it doesn't merge. Accumulate in state.breakpoints
@@ -1349,6 +1495,11 @@ impl DebuggerIo for DapTransport {
         lock.lock().unwrap().alive
     }
     fn quit(&self, _quit_cmd: &str) {
+        // Capture descendants before disconnecting or killing the adapter.
+        // This is the fallback for adapters which launch the debuggee but
+        // never send a DAP `process` event, and it also covers a replacement
+        // debuggee created by `restart` before its event is dispatched.
+        let adapter_descendants = capture_owned_descendants(self.child_pid.as_raw() as u32);
         // 1. Politely ask the adapter to disconnect. Spec-compliant
         //    adapters (delve, lldb-dap, debugpy) honour
         //    `terminateDebuggee=true` by killing the inferior here.
@@ -1389,6 +1540,7 @@ impl DebuggerIo for DapTransport {
             let _ = child.kill();
             let _ = child.wait();
         }
+        kill_captured_processes(adapter_descendants);
         if let Some(h) = self.driver.lock().unwrap().take() {
             let _ = h.join();
         }
@@ -1645,8 +1797,24 @@ fn extract_host_port(line: &str) -> Option<String> {
 }
 
 fn connect_with_retry(addr: &str, timeout: Duration) -> Result<TcpStream> {
+    connect_with_retry_owned(addr, timeout, false, 0)
+}
+
+fn connect_with_retry_owned(
+    addr: &str,
+    timeout: Duration,
+    require_owner: bool,
+    adapter_pid: u32,
+) -> Result<TcpStream> {
     let deadline = Instant::now() + timeout;
     loop {
+        if require_owner && !listener_owned_by(addr, adapter_pid) {
+            if Instant::now() >= deadline {
+                bail!("listener at {addr} is not owned by spawned adapter PID {adapter_pid}");
+            }
+            std::thread::sleep(Duration::from_millis(25));
+            continue;
+        }
         match TcpStream::connect(addr) {
             Ok(s) => return Ok(s),
             Err(_) if Instant::now() < deadline => {
@@ -1655,6 +1823,40 @@ fn connect_with_retry(addr: &str, timeout: Duration) -> Result<TcpStream> {
             Err(e) => return Err(e.into()),
         }
     }
+}
+
+#[cfg(target_os = "linux")]
+fn listener_owned_by(addr: &str, adapter_pid: u32) -> bool {
+    let Some(port) = addr
+        .rsplit_once(':')
+        .and_then(|(_, p)| p.parse::<u16>().ok())
+    else {
+        return false;
+    };
+    let wanted = format!("{port:04X}");
+    let Some(inode) = ["/proc/net/tcp", "/proc/net/tcp6"].iter().find_map(|path| {
+        let text = std::fs::read_to_string(path).ok()?;
+        text.lines().skip(1).find_map(|line| {
+            let fields: Vec<_> = line.split_whitespace().collect();
+            (fields.get(1)?.rsplit_once(':')?.1 == wanted && *fields.get(3)? == "0A")
+                .then(|| fields.get(9)?.parse::<u64>().ok())
+                .flatten()
+        })
+    }) else {
+        return false;
+    };
+    let Ok(entries) = std::fs::read_dir(format!("/proc/{adapter_pid}/fd")) else {
+        return false;
+    };
+    entries.flatten().any(|entry| {
+        std::fs::read_link(entry.path())
+            .is_ok_and(|link| link.to_string_lossy() == format!("socket:[{inode}]"))
+    })
+}
+
+#[cfg(not(target_os = "linux"))]
+fn listener_owned_by(_addr: &str, _adapter_pid: u32) -> bool {
+    false
 }
 
 /// Driver: reads DAP frames from the TCP stream, writes outbound
@@ -1727,7 +1929,13 @@ fn driver_loop(
                     command,
                     arguments,
                     resp,
+                    arm_action,
                 }) => {
+                    if arm_action {
+                        let (lock, _) = &*state;
+                        let mut s = lock.lock().unwrap();
+                        s.armed_action_generation = s.action_generation;
+                    }
                     let seq = next_seq;
                     next_seq += 1;
                     let frame = json!({
@@ -1965,13 +2173,8 @@ fn dispatch_incoming(
                         // stop must remain available to the next action,
                         // but its delayed helper must not create a hit for
                         // a later continue.
-                        s.pending_hit = Some(HitEvent {
-                            location_key: thread_id
-                                .map(|id| format!("dap:thread:{id}"))
-                                .unwrap_or_else(|| "dap:thread:?".into()),
-                            thread: thread_id.map(|id| id.to_string()),
-                            ..HitEvent::default()
-                        });
+                        s.pending_hit = None;
+                        s.pending_action_generation = s.armed_action_generation;
                         s.stop_generation
                     };
                     if let Some(tid) = thread_id {
@@ -1998,6 +2201,11 @@ fn dispatch_incoming(
                                 handle_stack_response(body, &state2, stop_generation);
                             }
                         });
+                    } else {
+                        let (lock, cvar) = &**state;
+                        let mut s = lock.lock().unwrap();
+                        s.pending_hit = Some(HitEvent::default());
+                        cvar.notify_all();
                     }
                 }
                 "continued" => {
@@ -2057,11 +2265,7 @@ fn dispatch_incoming(
     }
 }
 
-fn handle_stack_response(
-    body: Value,
-    state: &Arc<(Mutex<State>, Condvar)>,
-    stop_generation: u64,
-) {
+fn handle_stack_response(body: Value, state: &Arc<(Mutex<State>, Condvar)>, stop_generation: u64) {
     let frames = body
         .get("stackFrames")
         .and_then(|v| v.as_array())
@@ -2098,14 +2302,25 @@ fn handle_stack_response(
     // A stack helper owns exactly the stop event which created it. If the
     // daemon already consumed that stop, or another stop arrived, this
     // delayed response must not create a hit for a later continue.
-    if s.stop_generation != stop_generation || s.pending_hit.is_none() {
+    if s.stop_generation != stop_generation
+        || s.pending_action_generation != s.action_generation
+        || s.enriched_stop_generation == stop_generation
+    {
         return;
     }
     s.call_frames = frames;
     s.top_frame = top;
     if let Some(hit) = hit {
         s.pending_hit = Some(hit);
+    } else {
+        // The adapter answered the enrichment request but supplied no
+        // frames. Publish a structured placeholder only after that answer;
+        // this keeps the wait ordering deterministic without inventing a
+        // hit before enrichment completes.
+        s.pending_hit = Some(HitEvent::default());
     }
+    s.pending_action_generation = s.action_generation;
+    s.enriched_stop_generation = stop_generation;
     cvar.notify_all();
 }
 
@@ -2226,6 +2441,36 @@ Fix one of:\n  \
 mod tests {
     use super::*;
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn netcoredbg_listener_ownership() {
+        use std::io::BufRead;
+        use std::process::Command;
+
+        // A different process owns the selected port. A connect-only check
+        // would accept this listener; netcoredbg launch must reject it
+        // unless the spawned adapter (or one of its descendants) owns it.
+        let mut unrelated = Command::new("python3")
+            .args([
+                "-c",
+                "import socket,time; s=socket.socket(); s.bind(('127.0.0.1',0)); s.listen(1); print(s.getsockname()[1], flush=True); time.sleep(30)",
+            ])
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .expect("python3 is required for the listener ownership regression");
+        let mut line = String::new();
+        std::io::BufReader::new(unrelated.stdout.take().unwrap())
+            .read_line(&mut line)
+            .unwrap();
+        let addr = format!("127.0.0.1:{}", line.trim());
+        let error =
+            connect_with_retry_owned(&addr, Duration::from_millis(100), true, std::process::id())
+                .unwrap_err();
+        assert!(error.to_string().contains("not owned by spawned adapter"));
+        let _ = unrelated.kill();
+        let _ = unrelated.wait();
+    }
+
     #[test]
     fn parse_break_file_line() {
         let b = parse_break("break app.go:10").unwrap();
@@ -2305,7 +2550,9 @@ mod tests {
         decoder
             .inbox
             .extend(std::iter::repeat(b'x').take(MAX_DAP_FRAME_BYTES + 1));
-        decoder.inbox.extend_from_slice(b"Content-Length: 2\r\n\r\n{}");
+        decoder
+            .inbox
+            .extend_from_slice(b"Content-Length: 2\r\n\r\n{}");
         assert!(decoder.next_frame().is_err());
         assert_eq!(decoder.next_frame().unwrap().as_deref(), Some(&b"{}"[..]));
     }
@@ -2316,7 +2563,9 @@ mod tests {
         decoder
             .inbox
             .extend_from_slice(b"Content-Length: 18446744073709551615\r\n\r\n");
-        decoder.inbox.extend_from_slice(b"Content-Length: 2\r\n\r\n{}");
+        decoder
+            .inbox
+            .extend_from_slice(b"Content-Length: 2\r\n\r\n{}");
 
         assert!(decoder.next_frame().is_err());
         assert_eq!(decoder.next_frame().unwrap().as_deref(), Some(&b"{}"[..]));
@@ -2330,11 +2579,15 @@ mod tests {
             .extend_from_slice(b"Content-Length: 999999999999999999\r\n\r\n");
         assert!(decoder.next_frame().is_err());
 
-        decoder.inbox.extend(std::iter::repeat(b'x').take(1_000_000));
+        decoder
+            .inbox
+            .extend(std::iter::repeat(b'x').take(1_000_000));
         assert!(decoder.next_frame().unwrap().is_none());
         assert!(decoder.inbox.len() < b"Content-Length:".len());
 
-        decoder.inbox.extend_from_slice(b"Content-Length: 2\r\n\r\n{}");
+        decoder
+            .inbox
+            .extend_from_slice(b"Content-Length: 2\r\n\r\n{}");
         assert_eq!(decoder.next_frame().unwrap().as_deref(), Some(&b"{}"[..]));
     }
 
@@ -2357,7 +2610,16 @@ mod tests {
         handle_stack_response(body.clone(), &state, 7);
         {
             let (lock, _) = &*state;
-            assert_eq!(lock.lock().unwrap().pending_hit.take().unwrap().file.as_deref(), Some("old.rs"));
+            assert_eq!(
+                lock.lock()
+                    .unwrap()
+                    .pending_hit
+                    .take()
+                    .unwrap()
+                    .file
+                    .as_deref(),
+                Some("old.rs")
+            );
         }
 
         // The daemon consumed the stop and began a later action. A delayed
@@ -2365,6 +2627,75 @@ mod tests {
         handle_stack_response(body, &state, 7);
         let (lock, _) = &*state;
         assert!(lock.lock().unwrap().pending_hit.is_none());
+    }
+
+    #[test]
+    fn stopped_frame_queued_before_action_keeps_the_previous_generation() {
+        let state = Arc::new((Mutex::new(State::new()), Condvar::new()));
+        {
+            let (lock, _) = &*state;
+            let mut guard = lock.lock().unwrap();
+            guard.action_generation = 1;
+            guard.armed_action_generation = 0;
+        }
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let peer = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (mut stream, _) = listener.accept().unwrap();
+        let _peer = peer;
+        let mut pending = HashMap::new();
+        let log = LogHandle::new();
+        let mut next_seq = 1;
+        dispatch_incoming(
+            json!({
+                "type": "event",
+                "event": "stopped",
+                "body": { "reason": "breakpoint" }
+            }),
+            &mut pending,
+            &state,
+            &log,
+            &mut stream,
+            &mut next_seq,
+        );
+        let (lock, _) = &*state;
+        assert_eq!(lock.lock().unwrap().pending_action_generation, 0);
+
+        {
+            let mut guard = lock.lock().unwrap();
+            guard.armed_action_generation = 1;
+        }
+        dispatch_incoming(
+            json!({
+                "type": "event",
+                "event": "stopped",
+                "body": { "reason": "breakpoint" }
+            }),
+            &mut pending,
+            &state,
+            &log,
+            &mut stream,
+            &mut next_seq,
+        );
+        assert_eq!(lock.lock().unwrap().pending_action_generation, 1);
+    }
+
+    #[test]
+    fn restart_tracking_accepts_a_reused_pid_only_with_new_identity() {
+        let old = ProcessIdentity {
+            start_time: 1,
+            exe_device: 2,
+            exe_inode: 3,
+        };
+        let replacement = ProcessIdentity {
+            start_time: 4,
+            exe_device: 2,
+            exe_inode: 3,
+        };
+        assert_eq!(find_new_descendant(&[(10, old)], vec![(10, old)]), None);
+        assert_eq!(
+            find_new_descendant(&[(10, old)], vec![(10, replacement)]),
+            Some((10, replacement))
+        );
     }
 
     #[test]
