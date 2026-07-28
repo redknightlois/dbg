@@ -207,6 +207,28 @@ impl SessionDb {
                 owner_count
             );
         }
+        let violations: Vec<String> = {
+            let mut foreign_key_check = conn.prepare("PRAGMA foreign_key_check")?;
+            foreign_key_check
+                .query_map([], |row| {
+                    Ok(format!(
+                        "table={}, rowid={}, parent={}, fk_index={}",
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<i64>>(1)?
+                            .map_or_else(|| "NULL".into(), |v| v.to_string()),
+                        row.get::<_, String>(2)?,
+                        row.get::<_, i64>(3)?,
+                    ))
+                })?
+                .collect::<rusqlite::Result<_>>()?
+        };
+        if !violations.is_empty() {
+            bail!(
+                "session DB {} contains foreign-key violations: {}",
+                path.display(),
+                violations.join("; ")
+            );
+        }
 
         // A well-formed DB has exactly one session row (the owning session).
         let (session_id, label, kind_s, class_s, target): (String, String, String, String, String) =
@@ -349,6 +371,14 @@ impl SessionDb {
             "INSERT INTO meta (session_id, key, value) VALUES (?1, ?2, ?3)
              ON CONFLICT(session_id, key) DO UPDATE SET value = excluded.value",
             params![self.session_id, key, value],
+        )?;
+        Ok(())
+    }
+
+    pub fn add_failure(&self, phase: &str, error: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO failures (session_id, phase, error) VALUES (?1, ?2, ?3)",
+            params![self.session_id, phase, error],
         )?;
         Ok(())
     }
@@ -994,11 +1024,13 @@ pub fn prune(
 
         // Remove the DB plus any adjacent raw-capture directory named
         // after the label (file stem).
-        fs::remove_file(&path).ok();
+        fs::remove_file(&path)
+            .with_context(|| format!("deleting session DB {}", public_path.display()))?;
         if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
             let raw = scan_root.join(stem);
             if fs::symlink_metadata(&raw).is_ok_and(|m| m.is_dir()) {
-                fs::remove_dir_all(&raw).ok();
+                fs::remove_dir_all(&raw)
+                    .with_context(|| format!("deleting raw capture {}", raw.display()))?;
             }
         }
         deleted.push(public_path);
@@ -1330,6 +1362,25 @@ mod tests {
     }
 
     #[test]
+    fn sessiondb_open_rejects_foreign_key_violations() {
+        let tmp = TempDir::new().unwrap();
+        let source = SessionDb::create(opts(tmp.path(), "/bin/ls")).unwrap();
+        let path = tmp.path().join("violated.db");
+        source.save_to(&path).unwrap();
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch("PRAGMA foreign_keys=OFF;").unwrap();
+            conn.execute(
+                "INSERT INTO layers (session_id, source) VALUES ('missing-owner', 'hostile')",
+                [],
+            )
+            .unwrap();
+        }
+        let error = SessionDb::open(&path).unwrap_err().to_string();
+        assert!(error.contains("foreign-key violations"), "{error}");
+    }
+
+    #[test]
     fn open_requires_exactly_one_owner_row_and_required_tables() {
         let tmp = TempDir::new().unwrap();
         let source = SessionDb::create(opts(tmp.path(), "/bin/ls")).unwrap();
@@ -1478,6 +1529,22 @@ mod tests {
         assert!(deleted[0].ends_with("auto.db"));
         assert!(user_path.exists());
         assert!(!auto_path.exists());
+    }
+
+    #[test]
+    fn prune_does_not_report_or_remove_raw_capture_after_db_failure() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        let db_path = root.join("broken.db");
+        std::fs::create_dir(&db_path).unwrap();
+        let raw = root.join("broken");
+        std::fs::create_dir(&raw).unwrap();
+        std::fs::write(raw.join("capture.raw"), "evidence").unwrap();
+
+        let error = prune(root, Duration::ZERO, PrunePolicy::All).unwrap_err();
+        assert!(error.to_string().contains("deleting session DB"));
+        assert!(db_path.exists());
+        assert!(raw.exists());
     }
 
     #[cfg(unix)]
