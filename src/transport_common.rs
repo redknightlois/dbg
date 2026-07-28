@@ -29,6 +29,9 @@ pub trait StopState {
     fn pending_action_generation(&self) -> u64 {
         self.action_generation()
     }
+    fn pending_is_unscoped(&self) -> bool {
+        false
+    }
 }
 
 /// Clear the pending-hit flag, fire `action`, then block the current
@@ -53,7 +56,9 @@ where
         let mut guard = lock.lock().unwrap();
         // A stop which arrived after a previous timeout is still useful
         // to the next action. Consume it before issuing another resume.
-        if guard.has_pending_hit() && guard.pending_action_generation() >= guard.action_generation()
+        if guard.has_pending_hit()
+            && (guard.pending_is_unscoped()
+                || guard.pending_action_generation() >= guard.action_generation())
         {
             return Ok(String::new());
         }
@@ -67,7 +72,8 @@ where
     while guard.alive()
         && (!guard.has_pending_hit()
             || guard.stop_generation() <= baseline
-            || guard.pending_action_generation() < guard.action_generation())
+            || (guard.pending_action_generation() < guard.action_generation()
+                && !guard.pending_is_unscoped()))
         && !guard.terminated()
     {
         let remaining = deadline.saturating_duration_since(Instant::now());

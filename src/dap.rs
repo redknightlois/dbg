@@ -27,6 +27,7 @@
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::TcpStream;
+use std::path::Path;
 use std::process::{Child, ChildStderr, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
@@ -81,11 +82,29 @@ fn process_identity(pid: u32) -> Option<ProcessIdentity> {
 }
 
 fn process_children(pid: u32) -> Vec<u32> {
-    std::fs::read_to_string(format!("/proc/{pid}/task/{pid}/children"))
-        .unwrap_or_default()
-        .split_whitespace()
-        .filter_map(|child| child.parse().ok())
-        .collect()
+    process_children_from_root(Path::new("/proc"), pid)
+}
+
+fn process_children_from_root(proc_root: &Path, pid: u32) -> Vec<u32> {
+    let task_dir = proc_root.join(format!("{pid}/task"));
+    let mut children = Vec::new();
+    let Ok(tasks) = std::fs::read_dir(task_dir) else {
+        return children;
+    };
+    for task in tasks.flatten() {
+        let path = task.path().join("children");
+        let Ok(content) = std::fs::read_to_string(path) else {
+            continue;
+        };
+        children.extend(
+            content
+                .split_whitespace()
+                .filter_map(|child| child.parse::<u32>().ok()),
+        );
+    }
+    children.sort_unstable();
+    children.dedup();
+    children
 }
 
 fn capture_owned_descendants(pid: u32) -> Vec<(u32, ProcessIdentity)> {
@@ -223,21 +242,26 @@ struct State {
     call_frames: Vec<Value>,
     /// Set by the driver when a DAP `stopped` event lands.
     pending_hit: Option<HitEvent>,
+    pending_is_unscoped: bool,
     pending_action_generation: u64,
     /// Tracked user breakpoints: "file:line" → nothing (DAP
     /// setBreakpoints is path-keyed, not id-keyed).
     breakpoints: HashMap<String, Vec<u32>>,
+    line_breakpoint_ids: HashMap<String, u32>,
     /// Accumulated function-breakpoint names. DAP `setFunctionBreakpoints`
     /// replaces the whole set on each call, so we replay them all.
     function_breakpoints: Vec<String>,
+    function_breakpoint_ids: HashMap<String, u32>,
     /// "absolute-path:line" → condition expression, for replaying
     /// conditional line breakpoints across the full-set setBreakpoints call.
     breakpoint_conditions: HashMap<String, String>,
     /// Function-name → condition expression, same idea for setFunctionBreakpoints.
     function_breakpoint_conditions: HashMap<String, String>,
+    function_breakpoint_log_messages: HashMap<String, String>,
     /// "absolute-path:line" → logMessage template. Logpoints emit
     /// formatted output without stopping the debuggee.
     breakpoint_log_messages: HashMap<String, String>,
+    next_breakpoint_id: u32,
     /// True between `stopped` and the next `continue`/step.
     paused: bool,
     /// Flipped when the adapter disconnects or terminates.
@@ -273,12 +297,17 @@ impl State {
             top_frame: None,
             call_frames: Vec::new(),
             pending_hit: None,
+            pending_is_unscoped: false,
             pending_action_generation: 0,
             breakpoints: HashMap::new(),
+            line_breakpoint_ids: HashMap::new(),
             function_breakpoints: Vec::new(),
+            function_breakpoint_ids: HashMap::new(),
             breakpoint_conditions: HashMap::new(),
             function_breakpoint_conditions: HashMap::new(),
+            function_breakpoint_log_messages: HashMap::new(),
             breakpoint_log_messages: HashMap::new(),
+            next_breakpoint_id: 1,
             paused: false,
             alive: true,
             initialized: false,
@@ -296,6 +325,7 @@ impl State {
 impl crate::transport_common::StopState for State {
     fn clear_pending(&mut self) {
         self.pending_hit = None;
+        self.pending_is_unscoped = false;
         self.paused = false;
     }
     fn has_pending_hit(&self) -> bool {
@@ -309,6 +339,9 @@ impl crate::transport_common::StopState for State {
     }
     fn pending_action_generation(&self) -> u64 {
         self.pending_action_generation
+    }
+    fn pending_is_unscoped(&self) -> bool {
+        self.pending_is_unscoped
     }
     fn alive(&self) -> bool {
         self.alive
@@ -337,6 +370,10 @@ pub struct DapTransport {
     driver_tx: Sender<DriverCmd>,
     log: LogHandle,
     state: Arc<(Mutex<State>, Condvar)>,
+    /// Serializes breakpoint state transactions through the adapter.
+    /// Without this guard, a late rollback can overwrite a concurrent
+    /// breakpoint update that has already committed.
+    breakpoint_transaction: Mutex<()>,
     shutdown: Arc<AtomicBool>,
     driver: Mutex<Option<JoinHandle<()>>>,
     debuggee_pid: Option<u32>,
@@ -457,6 +494,7 @@ impl DapTransport {
             driver_tx,
             log,
             state,
+            breakpoint_transaction: Mutex::new(()),
             shutdown,
             driver: Mutex::new(Some(driver)),
             debuggee_pid: cfg.debuggee_pid,
@@ -704,7 +742,7 @@ impl DapTransport {
                 Some(i) => (rest[..i].trim(), Some(rest[i + 4..].trim())),
                 None => (rest.trim(), None),
             };
-            return self.set_function_breakpoint(name, cond, timeout);
+            return self.set_function_breakpoint(name, cond, None, timeout);
         }
         if let Some(spec) = parse_break(trimmed) {
             return self.set_breakpoint(&spec, timeout);
@@ -969,8 +1007,10 @@ impl DapTransport {
         &self,
         name: &str,
         cond: Option<&str>,
+        log_message: Option<&str>,
         timeout: Duration,
     ) -> Result<String> {
+        let _transaction = self.breakpoint_transaction.lock().unwrap();
         // DAP `setFunctionBreakpoints` replaces the whole set per call,
         // same semantics as `setBreakpoints`. Accumulate in state so
         // adding a second fn bp doesn't remove the first.
@@ -979,20 +1019,38 @@ impl DapTransport {
             let s = lock.lock().unwrap();
             (
                 s.function_breakpoints.clone(),
+                s.function_breakpoint_ids.clone(),
                 s.function_breakpoint_conditions.clone(),
+                s.function_breakpoint_log_messages.clone(),
+                s.next_breakpoint_id,
             )
         };
         let all: Vec<String> = {
             let (lock, _) = &*self.state;
             let mut s = lock.lock().unwrap();
-            if !s.function_breakpoints.contains(&name.to_string()) {
+            let already_present = s
+                .function_breakpoints
+                .iter()
+                .any(|candidate| candidate == name);
+            if !already_present {
+                // Reserve the public id before changing any function
+                // breakpoint state. In particular, an exhausted allocator
+                // must not leave a condition or log message behind.
+                let id = allocate_breakpoint_id(&mut s)?;
                 s.function_breakpoints.push(name.to_string());
+                s.function_breakpoint_ids.insert(name.to_string(), id);
             }
             if let Some(c) = cond {
                 s.function_breakpoint_conditions
                     .insert(name.to_string(), c.to_string());
             } else {
                 s.function_breakpoint_conditions.remove(name);
+            }
+            if let Some(message) = log_message {
+                s.function_breakpoint_log_messages
+                    .insert(name.to_string(), message.to_string());
+            } else {
+                s.function_breakpoint_log_messages.remove(name);
             }
             s.function_breakpoints.clone()
         };
@@ -1001,33 +1059,62 @@ impl DapTransport {
             let s = lock.lock().unwrap();
             all.iter()
                 .map(|n| {
-                    let mut b = serde_json::Map::new();
-                    b.insert("name".into(), Value::String(n.clone()));
-                    if let Some(c) = s.function_breakpoint_conditions.get(n) {
-                        b.insert("condition".into(), Value::String(c.clone()));
-                    }
-                    Value::Object(b)
+                    function_breakpoint_value(
+                        n,
+                        s.function_breakpoint_conditions.get(n).map(String::as_str),
+                        s.function_breakpoint_log_messages
+                            .get(n)
+                            .map(String::as_str),
+                    )
                 })
                 .collect()
         };
-        if let Err(e) = self.call_blocking(
+        let response = match self.call_blocking(
             "setFunctionBreakpoints",
             json!({ "breakpoints": fns }),
             timeout,
         ) {
-            let (lock, _) = &*self.state;
-            let mut s = lock.lock().unwrap();
-            s.function_breakpoints = snapshot.0;
-            s.function_breakpoint_conditions = snapshot.1;
-            return Err(e);
+            Ok(response) => response,
+            Err(error) => {
+                self.restore_function_breakpoint_state(snapshot);
+                return Err(error);
+            }
+        };
+        if !function_breakpoints_verified(&response, fns.len()) {
+            self.restore_function_breakpoint_state(snapshot);
+            bail!("function breakpoint `{name}` was not verified by the adapter");
         }
-        match cond {
-            Some(c) => Ok(format!("Function breakpoint set: {name} if {c}")),
-            None => Ok(format!("Function breakpoint set: {name}")),
+        match (cond, log_message) {
+            (Some(c), Some(message)) => {
+                Ok(format!("Function logpoint set: {name} if {c}: {message}"))
+            }
+            (None, Some(message)) => Ok(format!("Function logpoint set: {name}: {message}")),
+            (Some(c), None) => Ok(format!("Function breakpoint set: {name} if {c}")),
+            (None, None) => Ok(format!("Function breakpoint set: {name}")),
         }
     }
 
+    fn restore_function_breakpoint_state(
+        &self,
+        snapshot: (
+            Vec<String>,
+            HashMap<String, u32>,
+            HashMap<String, String>,
+            HashMap<String, String>,
+            u32,
+        ),
+    ) {
+        let (lock, _) = &*self.state;
+        let mut s = lock.lock().unwrap();
+        s.function_breakpoints = snapshot.0;
+        s.function_breakpoint_ids = snapshot.1;
+        s.function_breakpoint_conditions = snapshot.2;
+        s.function_breakpoint_log_messages = snapshot.3;
+        s.next_breakpoint_id = snapshot.4;
+    }
+
     fn set_breakpoint(&self, spec: &BreakSpec, timeout: Duration) -> Result<String> {
+        let _transaction = self.breakpoint_transaction.lock().unwrap();
         let BreakSpec {
             file,
             line,
@@ -1039,8 +1126,10 @@ impl DapTransport {
             let s = lock.lock().unwrap();
             (
                 s.breakpoints.clone(),
+                s.line_breakpoint_ids.clone(),
                 s.breakpoint_conditions.clone(),
                 s.breakpoint_log_messages.clone(),
+                s.next_breakpoint_id,
             )
         };
         // DAP requires the full set of breakpoints for a source each
@@ -1050,13 +1139,23 @@ impl DapTransport {
         let lines: Vec<u32> = {
             let (lock, _) = &*self.state;
             let mut s = lock.lock().unwrap();
-            let lines_snapshot = {
-                let entry = s.breakpoints.entry(resolved_path.clone()).or_default();
-                if !entry.contains(line) {
-                    entry.push(*line);
-                }
-                entry.clone()
-            };
+            let already_present = s
+                .breakpoints
+                .get(&resolved_path)
+                .is_some_and(|lines| lines.contains(line));
+            if !already_present {
+                // Reserve the public id before changing any line
+                // breakpoint state. This keeps exhaustion a true
+                // transaction boundary.
+                let id = allocate_breakpoint_id(&mut s)?;
+                s.breakpoints
+                    .entry(resolved_path.clone())
+                    .or_default()
+                    .push(*line);
+                let key = format!("{resolved_path}:{line}");
+                s.line_breakpoint_ids.insert(key, id);
+            }
+            let lines_snapshot = s.breakpoints[&resolved_path].clone();
             let key = format!("{resolved_path}:{line}");
             if let Some(c) = condition {
                 s.breakpoint_conditions.insert(key.clone(), c.clone());
@@ -1103,24 +1202,24 @@ impl DapTransport {
                 let (lock, _) = &*self.state;
                 let mut s = lock.lock().unwrap();
                 s.breakpoints = snapshot.0;
-                s.breakpoint_conditions = snapshot.1;
-                s.breakpoint_log_messages = snapshot.2;
+                s.line_breakpoint_ids = snapshot.1;
+                s.breakpoint_conditions = snapshot.2;
+                s.breakpoint_log_messages = snapshot.3;
+                s.next_breakpoint_id = snapshot.4;
                 return Err(e);
             }
         };
         let requested_index = lines.iter().position(|candidate| candidate == line);
-        let verified = response
-            .get("breakpoints")
-            .and_then(Value::as_array)
-            .and_then(|items| requested_index.and_then(|i| items.get(i)))
-            .and_then(|bp| bp.get("verified").and_then(Value::as_bool))
-            .unwrap_or(false);
+        let verified =
+            breakpoint_response_verified(&response, lines.len()) && requested_index.is_some();
         if !verified {
             let (lock, _) = &*self.state;
             let mut s = lock.lock().unwrap();
             s.breakpoints = snapshot.0;
-            s.breakpoint_conditions = snapshot.1;
-            s.breakpoint_log_messages = snapshot.2;
+            s.line_breakpoint_ids = snapshot.1;
+            s.breakpoint_conditions = snapshot.2;
+            s.breakpoint_log_messages = snapshot.3;
+            s.next_breakpoint_id = snapshot.4;
             bail!("breakpoint at {file}:{line} was not verified by the adapter")
         }
         match (condition, log_message) {
@@ -1349,52 +1448,132 @@ impl DapTransport {
     fn format_breakpoints(&self) -> String {
         let (lock, _) = &*self.state;
         let s = lock.lock().unwrap();
-        if s.breakpoints.is_empty() {
-            return "(no breakpoints set)".into();
-        }
-        let mut out = String::new();
-        let mut id = 0u32;
+        let mut entries = Vec::new();
         for (file, lines) in &s.breakpoints {
             for line in lines {
-                id += 1;
-                out.push_str(&format!("{id}: {file}:{line}\n"));
+                let key = format!("{file}:{line}");
+                if let Some(id) = s.line_breakpoint_ids.get(&key) {
+                    entries.push((*id, format!("{file}:{line}")));
+                }
             }
         }
+        for name in &s.function_breakpoints {
+            if let Some(id) = s.function_breakpoint_ids.get(name) {
+                entries.push((*id, format!("function {name}")));
+            }
+        }
+        if entries.is_empty() {
+            return "(no breakpoints set)".into();
+        }
+        entries.sort_by_key(|(id, _)| *id);
+        let out = entries
+            .into_iter()
+            .map(|(id, location)| format!("{id}: {location}"))
+            .collect::<Vec<_>>()
+            .join("\n");
         out.trim_end().to_string()
     }
 
     fn delete_breakpoint(&self, id: u32, timeout: Duration) -> Result<String> {
+        let _transaction = self.breakpoint_transaction.lock().unwrap();
         if id == 0 {
             bail!("delete: breakpoint ids start at 1");
         }
-        let mut target: Option<(String, u32)> = None;
+        enum Target {
+            Line(String, u32),
+            Function(String),
+        }
+        let mut target = None;
         {
             let (lock, _) = &*self.state;
             let s = lock.lock().unwrap();
-            let mut cur = 0u32;
-            'outer: for (file, lines) in &s.breakpoints {
+            for (file, lines) in &s.breakpoints {
                 for line in lines {
-                    cur += 1;
-                    if cur == id {
-                        target = Some((file.clone(), *line));
-                        break 'outer;
+                    if s.line_breakpoint_ids.get(&format!("{file}:{line}")) == Some(&id) {
+                        target = Some(Target::Line(file.clone(), *line));
                     }
                 }
             }
+            for name in &s.function_breakpoints {
+                if s.function_breakpoint_ids.get(name) == Some(&id) {
+                    target = Some(Target::Function(name.clone()));
+                }
+            }
         }
-        let Some((file, line)) = target else {
+        let Some(target) = target else {
             bail!("delete: no breakpoint id {id}; run `dbg breaks` to list ids");
         };
-        let source_path = file.clone();
         let snapshot = {
             let (lock, _) = &*self.state;
             let s = lock.lock().unwrap();
             (
                 s.breakpoints.clone(),
+                s.line_breakpoint_ids.clone(),
+                s.function_breakpoints.clone(),
+                s.function_breakpoint_ids.clone(),
                 s.breakpoint_conditions.clone(),
+                s.function_breakpoint_conditions.clone(),
+                s.function_breakpoint_log_messages.clone(),
                 s.breakpoint_log_messages.clone(),
+                s.next_breakpoint_id,
             )
         };
+        if let Target::Function(ref name) = target {
+            let fns = {
+                let (lock, _) = &*self.state;
+                let mut s = lock.lock().unwrap();
+                s.function_breakpoints.retain(|candidate| candidate != name);
+                s.function_breakpoint_ids.remove(name);
+                s.function_breakpoint_conditions.remove(name);
+                s.function_breakpoint_log_messages.remove(name);
+                s.function_breakpoints
+                    .iter()
+                    .map(|candidate| {
+                        function_breakpoint_value(
+                            candidate,
+                            s.function_breakpoint_conditions
+                                .get(candidate)
+                                .map(String::as_str),
+                            s.function_breakpoint_log_messages
+                                .get(candidate)
+                                .map(String::as_str),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            };
+            let response = self.call_blocking(
+                "setFunctionBreakpoints",
+                json!({"breakpoints": fns}),
+                timeout,
+            );
+            if response.as_ref().is_err()
+                || !response
+                    .as_ref()
+                    .ok()
+                    .is_some_and(|body| function_breakpoints_verified(body, fns.len()))
+            {
+                let (lock, _) = &*self.state;
+                let mut s = lock.lock().unwrap();
+                s.breakpoints = snapshot.0;
+                s.line_breakpoint_ids = snapshot.1;
+                s.function_breakpoints = snapshot.2;
+                s.function_breakpoint_ids = snapshot.3;
+                s.breakpoint_conditions = snapshot.4;
+                s.function_breakpoint_conditions = snapshot.5;
+                s.function_breakpoint_log_messages = snapshot.6;
+                s.breakpoint_log_messages = snapshot.7;
+                s.next_breakpoint_id = snapshot.8;
+                if let Err(error) = response {
+                    return Err(error);
+                }
+                bail!("function breakpoint `{name}` was not verified by the adapter");
+            }
+            return Ok(format!("Breakpoint {id} cleared (function {name})"));
+        }
+        let Target::Line(file, line) = target else {
+            unreachable!()
+        };
+        let source_path = file.clone();
         let remaining: Vec<u32> = {
             let (lock, _) = &*self.state;
             let mut s = lock.lock().unwrap();
@@ -1430,7 +1609,7 @@ impl DapTransport {
                 })
                 .collect()
         };
-        if let Err(error) = self.call_blocking(
+        let response = match self.call_blocking(
             "setBreakpoints",
             json!({
                 "source": { "path": source_path },
@@ -1439,13 +1618,41 @@ impl DapTransport {
             }),
             timeout,
         ) {
+            Ok(response) => response,
+            Err(error) => {
+                let (lock, _) = &*self.state;
+                let mut s = lock.lock().unwrap();
+                s.breakpoints = snapshot.0;
+                s.line_breakpoint_ids = snapshot.1;
+                s.function_breakpoints = snapshot.2;
+                s.function_breakpoint_ids = snapshot.3;
+                s.breakpoint_conditions = snapshot.4;
+                s.function_breakpoint_conditions = snapshot.5;
+                s.function_breakpoint_log_messages = snapshot.6;
+                s.breakpoint_log_messages = snapshot.7;
+                s.next_breakpoint_id = snapshot.8;
+                return Err(error);
+            }
+        };
+        if !breakpoint_response_verified(&response, remaining.len()) {
             let (lock, _) = &*self.state;
             let mut s = lock.lock().unwrap();
             s.breakpoints = snapshot.0;
-            s.breakpoint_conditions = snapshot.1;
-            s.breakpoint_log_messages = snapshot.2;
-            return Err(error);
+            s.line_breakpoint_ids = snapshot.1;
+            s.function_breakpoints = snapshot.2;
+            s.function_breakpoint_ids = snapshot.3;
+            s.breakpoint_conditions = snapshot.4;
+            s.function_breakpoint_conditions = snapshot.5;
+            s.function_breakpoint_log_messages = snapshot.6;
+            s.breakpoint_log_messages = snapshot.7;
+            s.next_breakpoint_id = snapshot.8;
+            bail!("breakpoint {id} was not verified by the adapter")
         }
+        let (lock, _) = &*self.state;
+        lock.lock()
+            .unwrap()
+            .line_breakpoint_ids
+            .remove(&format!("{file}:{line}"));
         Ok(format!("Breakpoint {id} cleared ({line})"))
     }
 }
@@ -1584,16 +1791,12 @@ impl DebuggerIo for DapTransport {
                     };
                     Some(self.set_breakpoint(&spec, timeout))
                 }
-                BreakLoc::Fqn(name) => {
-                    // Function breakpoints don't carry a log template
-                    // in the current DAP path; logpoints on a symbol
-                    // fall back to the native string (`bfn` has no
-                    // log field) so PTY-style callers still work.
-                    if log.is_some() {
-                        return None;
-                    }
-                    Some(self.set_function_breakpoint(name, cond.as_deref(), timeout))
-                }
+                BreakLoc::Fqn(name) => Some(self.set_function_breakpoint(
+                    name,
+                    cond.as_deref(),
+                    log.as_deref(),
+                    timeout,
+                )),
                 BreakLoc::ModuleMethod { .. } => None,
             },
         }
@@ -2174,10 +2377,15 @@ fn dispatch_incoming(
                         // but its delayed helper must not create a hit for
                         // a later continue.
                         s.pending_hit = None;
-                        s.pending_action_generation = s.armed_action_generation;
                         s.stop_generation
                     };
                     if let Some(tid) = thread_id {
+                        {
+                            let (lock, _) = &**state;
+                            let mut s = lock.lock().unwrap();
+                            s.pending_action_generation = s.armed_action_generation;
+                            s.pending_is_unscoped = false;
+                        }
                         // Fire an out-of-band stackTrace request so the
                         // handler can build a structured HitEvent. We
                         // bypass the call_blocking path (driver can't
@@ -2205,6 +2413,8 @@ fn dispatch_incoming(
                         let (lock, cvar) = &**state;
                         let mut s = lock.lock().unwrap();
                         s.pending_hit = Some(HitEvent::default());
+                        s.pending_is_unscoped = true;
+                        s.pending_action_generation = s.armed_action_generation;
                         cvar.notify_all();
                     }
                 }
@@ -2332,6 +2542,73 @@ struct BreakSpec {
     log_message: Option<String>,
 }
 
+fn function_breakpoints_verified(response: &Value, expected: usize) -> bool {
+    let Some(items) = response.get("breakpoints").and_then(Value::as_array) else {
+        return expected == 0;
+    };
+    items.len() == expected
+        && items
+            .iter()
+            .all(|bp| bp.get("verified").and_then(Value::as_bool) == Some(true))
+}
+
+fn breakpoint_response_verified(response: &Value, expected: usize) -> bool {
+    let Some(items) = response.get("breakpoints").and_then(Value::as_array) else {
+        return expected == 0;
+    };
+    items.len() == expected
+        && items
+            .iter()
+            .all(|bp| bp.get("verified").and_then(Value::as_bool) == Some(true))
+}
+
+fn function_breakpoint_value(
+    name: &str,
+    condition: Option<&str>,
+    log_message: Option<&str>,
+) -> Value {
+    let mut breakpoint = serde_json::Map::new();
+    breakpoint.insert("name".into(), Value::String(name.to_string()));
+    if let Some(condition) = condition {
+        breakpoint.insert("condition".into(), Value::String(condition.to_string()));
+    }
+    if let Some(log_message) = log_message {
+        breakpoint.insert("logMessage".into(), Value::String(log_message.to_string()));
+    }
+    Value::Object(breakpoint)
+}
+
+fn allocate_breakpoint_id(state: &mut State) -> Result<u32> {
+    // Zero is reserved as the post-u32::MAX exhausted sentinel. Keep this
+    // sentinel separate from the maps so deleting the maximum ID cannot
+    // make it available for reuse.
+    if state.next_breakpoint_id == 0 {
+        bail!("breakpoint id space exhausted");
+    }
+
+    let mut candidate = state.next_breakpoint_id;
+    loop {
+        let already_used = state
+            .line_breakpoint_ids
+            .values()
+            .any(|id| *id == candidate)
+            || state
+                .function_breakpoint_ids
+                .values()
+                .any(|id| *id == candidate);
+        if !already_used {
+            state.next_breakpoint_id = candidate.checked_add(1).unwrap_or(0);
+            return Ok(candidate);
+        }
+        if candidate == u32::MAX {
+            // Do not change the cursor on failure. The caller can therefore
+            // retry without changing committed allocation state.
+            bail!("breakpoint id space exhausted");
+        }
+        candidate += 1;
+    }
+}
+
 fn parse_break(cmd: &str) -> Option<BreakSpec> {
     // Accepts `break file:line` or `b file:line`, optionally followed by
     // ` if <expr>` and/or ` log <template>`. Peel the log suffix first
@@ -2441,6 +2718,475 @@ Fix one of:\n  \
 mod tests {
     use super::*;
 
+    fn test_transport(
+        responses: Vec<std::result::Result<Value, String>>,
+    ) -> (DapTransport, Arc<std::sync::atomic::AtomicUsize>) {
+        use std::sync::atomic::AtomicUsize;
+
+        let state = Arc::new((Mutex::new(State::new()), Condvar::new()));
+        let (driver_tx, driver_rx) = mpsc::channel();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_for_driver = calls.clone();
+        let driver = std::thread::spawn(move || {
+            let mut responses = responses.into_iter();
+            while let Ok(command) = driver_rx.recv() {
+                match command {
+                    DriverCmd::Call { resp, .. } => {
+                        calls_for_driver.fetch_add(1, Ordering::Relaxed);
+                        let response = responses
+                            .next()
+                            .unwrap_or_else(|| Ok(json!({ "breakpoints": [] })));
+                        let _ = resp.send(response);
+                    }
+                    DriverCmd::Shutdown => break,
+                }
+            }
+        });
+        let transport = DapTransport {
+            child_pid: Pid::from_raw(-1),
+            child: Mutex::new(None),
+            driver_tx,
+            log: LogHandle::new(),
+            state,
+            breakpoint_transaction: Mutex::new(()),
+            shutdown: Arc::new(AtomicBool::new(false)),
+            driver: Mutex::new(Some(driver)),
+            debuggee_pid: None,
+            is_attach: true,
+        };
+        (transport, calls)
+    }
+
+    fn verified_breakpoint_response(count: usize) -> Value {
+        json!({
+            "breakpoints": (0..count)
+                .map(|_| json!({ "verified": true }))
+                .collect::<Vec<_>>()
+        })
+    }
+
+    fn assert_no_breakpoint_state(transport: &DapTransport, next_id: u32) {
+        let (lock, _) = &*transport.state;
+        let state = lock.lock().unwrap();
+        assert!(state.breakpoints.is_empty());
+        assert!(state.line_breakpoint_ids.is_empty());
+        assert!(state.function_breakpoints.is_empty());
+        assert!(state.function_breakpoint_ids.is_empty());
+        assert!(state.breakpoint_conditions.is_empty());
+        assert!(state.function_breakpoint_conditions.is_empty());
+        assert!(state.breakpoint_log_messages.is_empty());
+        assert!(state.function_breakpoint_log_messages.is_empty());
+        assert_eq!(state.next_breakpoint_id, next_id);
+    }
+
+    #[test]
+    fn line_breakpoint_id_exhaustion() {
+        let (transport, calls) = test_transport(Vec::new());
+        {
+            let (lock, _) = &*transport.state;
+            // Zero is the exhausted sentinel reached after u32::MAX was
+            // already allocated.
+            lock.lock().unwrap().next_breakpoint_id = 0;
+        }
+        let error = transport
+            .set_breakpoint(
+                &BreakSpec {
+                    file: "main.rs".into(),
+                    line: 10,
+                    condition: Some("ready".into()),
+                    log_message: Some("hit".into()),
+                },
+                Duration::from_millis(100),
+            )
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("id space exhausted"),
+            "unexpected error: {error:#}"
+        );
+        assert_eq!(calls.load(Ordering::Relaxed), 0);
+        assert_no_breakpoint_state(&transport, 0);
+    }
+
+    #[test]
+    fn function_breakpoint_id_exhaustion() {
+        let (transport, calls) = test_transport(Vec::new());
+        {
+            let (lock, _) = &*transport.state;
+            lock.lock().unwrap().next_breakpoint_id = 0;
+        }
+        let error = transport
+            .set_function_breakpoint(
+                "worker",
+                Some("ready"),
+                Some("hit"),
+                Duration::from_millis(100),
+            )
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("id space exhausted"),
+            "unexpected error: {error:#}"
+        );
+        assert_eq!(calls.load(Ordering::Relaxed), 0);
+        assert_no_breakpoint_state(&transport, 0);
+    }
+
+    #[test]
+    fn breakpoint_id_exhaustion_does_not_reuse_ids() {
+        let mut occupied = State::new();
+        occupied.next_breakpoint_id = 42;
+        occupied
+            .line_breakpoint_ids
+            .insert("occupied.rs:1".into(), 42);
+        occupied
+            .function_breakpoint_ids
+            .insert("occupied".into(), 43);
+        assert_eq!(allocate_breakpoint_id(&mut occupied).unwrap(), 44);
+        assert_eq!(occupied.line_breakpoint_ids["occupied.rs:1"], 42);
+        assert_eq!(occupied.function_breakpoint_ids["occupied"], 43);
+
+        occupied.next_breakpoint_id = u32::MAX;
+        occupied
+            .function_breakpoint_ids
+            .insert("maximum".into(), u32::MAX);
+        assert!(allocate_breakpoint_id(&mut occupied).is_err());
+        assert_eq!(occupied.next_breakpoint_id, u32::MAX);
+        assert_eq!(occupied.function_breakpoint_ids["maximum"], u32::MAX);
+
+        let (transport, calls) = test_transport(vec![Ok(verified_breakpoint_response(1))]);
+        {
+            let (lock, _) = &*transport.state;
+            lock.lock().unwrap().next_breakpoint_id = u32::MAX;
+        }
+        transport
+            .set_breakpoint(
+                &BreakSpec {
+                    file: "first.rs".into(),
+                    line: 1,
+                    condition: None,
+                    log_message: None,
+                },
+                Duration::from_millis(100),
+            )
+            .unwrap();
+        let error = transport
+            .set_breakpoint(
+                &BreakSpec {
+                    file: "second.rs".into(),
+                    line: 2,
+                    condition: Some("retry".into()),
+                    log_message: Some("retry".into()),
+                },
+                Duration::from_millis(100),
+            )
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("id space exhausted"),
+            "unexpected error: {error:#}"
+        );
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        let listing = transport
+            .run_command("breakpoints", Duration::from_millis(100))
+            .unwrap();
+        assert!(listing.contains(&u32::MAX.to_string()));
+        assert!(!listing.contains("second.rs"));
+        let (lock, _) = &*transport.state;
+        let state = lock.lock().unwrap();
+        assert_eq!(state.next_breakpoint_id, 0);
+        assert_eq!(state.line_breakpoint_ids.len(), 1);
+    }
+
+    #[test]
+    fn breakpoint_adapter_rejection_rolls_back_and_retry_succeeds() {
+        let (transport, calls) = test_transport(vec![
+            Err("adapter rejected breakpoint".into()),
+            Ok(verified_breakpoint_response(1)),
+            Ok(verified_breakpoint_response(0)),
+            Ok(verified_breakpoint_response(1)),
+        ]);
+        let spec = BreakSpec {
+            file: "retry.rs".into(),
+            line: 7,
+            condition: Some("ready".into()),
+            log_message: Some("hit".into()),
+        };
+        assert!(
+            transport
+                .set_breakpoint(&spec, Duration::from_millis(100))
+                .is_err()
+        );
+        assert_no_breakpoint_state(&transport, 1);
+
+        transport
+            .set_breakpoint(&spec, Duration::from_millis(100))
+            .unwrap();
+        let listing = transport
+            .run_command("breakpoints", Duration::from_millis(100))
+            .unwrap();
+        assert!(listing.contains("retry.rs:7"));
+        assert!(listing.starts_with("1:"));
+
+        transport
+            .run_command("breakpoint delete 1", Duration::from_millis(100))
+            .unwrap();
+        assert_eq!(
+            transport
+                .run_command("breakpoints", Duration::from_millis(100))
+                .unwrap(),
+            "(no breakpoints set)"
+        );
+
+        transport
+            .set_breakpoint(
+                &BreakSpec {
+                    file: "after.rs".into(),
+                    line: 3,
+                    condition: None,
+                    log_message: None,
+                },
+                Duration::from_millis(100),
+            )
+            .unwrap();
+        let listing = transport
+            .run_command("breakpoints", Duration::from_millis(100))
+            .unwrap();
+        assert!(listing.starts_with("2:"));
+        assert!(listing.contains("after.rs:3"));
+        assert_eq!(calls.load(Ordering::Relaxed), 4);
+    }
+
+    #[test]
+    fn function_breakpoint_adapter_rejection_rolls_back_and_retry_succeeds() {
+        let (transport, calls) = test_transport(vec![
+            Ok(json!({"breakpoints": [{"verified": false}]})),
+            Ok(verified_breakpoint_response(1)),
+        ]);
+
+        assert!(
+            transport
+                .set_function_breakpoint(
+                    "worker",
+                    Some("ready"),
+                    Some("hit"),
+                    Duration::from_millis(100),
+                )
+                .is_err()
+        );
+        assert_no_breakpoint_state(&transport, 1);
+
+        transport
+            .set_function_breakpoint(
+                "worker",
+                Some("ready"),
+                Some("hit"),
+                Duration::from_millis(100),
+            )
+            .unwrap();
+        assert_eq!(
+            transport
+                .run_command("breakpoints", Duration::from_millis(100))
+                .unwrap(),
+            "1: function worker"
+        );
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn line_breakpoint_partial_adapter_rejection_rolls_back_and_retry_succeeds() {
+        let (transport, calls) = test_transport(vec![
+            Ok(verified_breakpoint_response(1)),
+            Ok(json!({
+                "breakpoints": [
+                    {"verified": false},
+                    {"verified": true}
+                ]
+            })),
+            Ok(verified_breakpoint_response(2)),
+        ]);
+        let first = BreakSpec {
+            file: "partial.rs".into(),
+            line: 3,
+            condition: None,
+            log_message: None,
+        };
+        let second = BreakSpec {
+            file: "partial.rs".into(),
+            line: 7,
+            condition: Some("ready".into()),
+            log_message: Some("hit".into()),
+        };
+
+        transport
+            .set_breakpoint(&first, Duration::from_millis(100))
+            .unwrap();
+        assert!(
+            transport
+                .set_breakpoint(&second, Duration::from_millis(100))
+                .is_err()
+        );
+        let listing = transport
+            .run_command("breakpoints", Duration::from_millis(100))
+            .unwrap();
+        assert!(listing.starts_with("1: "));
+        assert!(listing.ends_with("partial.rs:3"));
+        {
+            let (lock, _) = &*transport.state;
+            let state = lock.lock().unwrap();
+            assert_eq!(state.next_breakpoint_id, 2);
+            assert!(!state.breakpoint_conditions.contains_key("partial.rs:7"));
+            assert!(!state.breakpoint_log_messages.contains_key("partial.rs:7"));
+        }
+
+        transport
+            .set_breakpoint(&second, Duration::from_millis(100))
+            .unwrap();
+        let listing = transport
+            .run_command("breakpoints", Duration::from_millis(100))
+            .unwrap();
+        let mut entries = listing.lines();
+        assert!(entries.next().unwrap().ends_with("partial.rs:3"));
+        assert!(entries.next().unwrap().ends_with("partial.rs:7"));
+        assert!(entries.next().is_none());
+        assert_eq!(calls.load(Ordering::Relaxed), 3);
+    }
+
+    #[test]
+    fn breakpoint_transactions_do_not_overlap_adapter_requests() {
+        let state = Arc::new((Mutex::new(State::new()), Condvar::new()));
+        let (driver_tx, driver_rx) = mpsc::channel();
+        let (first_seen_tx, first_seen_rx) = mpsc::channel();
+        let (probe_tx, probe_rx) = mpsc::channel();
+        let (overlap_tx, overlap_rx) = mpsc::channel();
+        let driver = std::thread::spawn(move || {
+            let DriverCmd::Call {
+                resp: first_resp, ..
+            } = driver_rx.recv().unwrap()
+            else {
+                panic!("expected first breakpoint request")
+            };
+            first_seen_tx.send(()).unwrap();
+            probe_rx.recv().unwrap();
+            let overlapping = driver_rx.recv_timeout(Duration::from_millis(200)).ok();
+            overlap_tx.send(overlapping.is_some()).unwrap();
+            first_resp
+                .send(Err("adapter rejected first request".into()))
+                .unwrap();
+
+            let second = overlapping.unwrap_or_else(|| driver_rx.recv().unwrap());
+            let DriverCmd::Call {
+                resp: second_resp, ..
+            } = second
+            else {
+                panic!("expected second breakpoint request")
+            };
+            second_resp
+                .send(Ok(verified_breakpoint_response(1)))
+                .unwrap();
+            while let Ok(command) = driver_rx.recv() {
+                if matches!(command, DriverCmd::Shutdown) {
+                    break;
+                }
+            }
+        });
+        let transport = Arc::new(DapTransport {
+            child_pid: Pid::from_raw(-1),
+            child: Mutex::new(None),
+            driver_tx,
+            log: LogHandle::new(),
+            state,
+            breakpoint_transaction: Mutex::new(()),
+            shutdown: Arc::new(AtomicBool::new(false)),
+            driver: Mutex::new(Some(driver)),
+            debuggee_pid: None,
+            is_attach: true,
+        });
+
+        let first_transport = transport.clone();
+        let first = std::thread::spawn(move || {
+            first_transport.set_breakpoint(
+                &BreakSpec {
+                    file: "first.rs".into(),
+                    line: 1,
+                    condition: None,
+                    log_message: None,
+                },
+                Duration::from_secs(1),
+            )
+        });
+        first_seen_rx.recv().unwrap();
+
+        let (second_started_tx, second_started_rx) = mpsc::channel();
+        let second_transport = transport.clone();
+        let second = std::thread::spawn(move || {
+            second_started_tx.send(()).unwrap();
+            second_transport.set_breakpoint(
+                &BreakSpec {
+                    file: "second.rs".into(),
+                    line: 2,
+                    condition: None,
+                    log_message: None,
+                },
+                Duration::from_secs(1),
+            )
+        });
+        second_started_rx.recv().unwrap();
+        probe_tx.send(()).unwrap();
+
+        assert!(!overlap_rx.recv().unwrap());
+        assert!(first.join().unwrap().is_err());
+        second.join().unwrap().unwrap();
+        let listing = transport
+            .run_command("breakpoints", Duration::from_millis(100))
+            .unwrap();
+        assert!(listing.starts_with("1: "));
+        assert!(listing.ends_with("second.rs:2"));
+    }
+
+    #[test]
+    fn breakpoint_failure_keeps_break_unbreak_listing_consistent() {
+        let (transport, _) = test_transport(vec![
+            Ok(verified_breakpoint_response(1)),
+            Ok(json!({"breakpoints": [{"verified": false}]})),
+            Ok(verified_breakpoint_response(0)),
+        ]);
+        transport
+            .set_breakpoint(
+                &BreakSpec {
+                    file: "consistent.rs".into(),
+                    line: 4,
+                    condition: None,
+                    log_message: None,
+                },
+                Duration::from_millis(100),
+            )
+            .unwrap();
+        assert!(
+            transport
+                .run_command("breakpoint delete 1", Duration::from_millis(100))
+                .is_err()
+        );
+        assert!(
+            transport
+                .run_command("breakpoints", Duration::from_millis(100))
+                .unwrap()
+                .contains("consistent.rs:4")
+        );
+
+        transport
+            .run_command("breakpoint delete 1", Duration::from_millis(100))
+            .unwrap();
+        assert_eq!(
+            transport
+                .run_command("breakpoints", Duration::from_millis(100))
+                .unwrap(),
+            "(no breakpoints set)"
+        );
+        assert!(
+            transport
+                .run_command("breakpoint delete 1", Duration::from_millis(100))
+                .is_err()
+        );
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn netcoredbg_listener_ownership() {
@@ -2476,6 +3222,95 @@ mod tests {
         let b = parse_break("break app.go:10").unwrap();
         assert_eq!(b.file, "app.go");
         assert_eq!(b.line, 10);
+    }
+
+    #[test]
+    fn dap_capture_includes_thread_descendants() {
+        let tmp = tempfile::tempdir().unwrap();
+        let task_dir = tmp.path().join("42/task");
+        std::fs::create_dir_all(task_dir.join("42")).unwrap();
+        std::fs::create_dir(task_dir.join("43")).unwrap();
+        std::fs::write(task_dir.join("42/children"), "100 101\n").unwrap();
+        std::fs::write(task_dir.join("43/children"), "101 102\n").unwrap();
+
+        assert_eq!(
+            process_children_from_root(tmp.path(), 42),
+            vec![100, 101, 102]
+        );
+    }
+
+    #[test]
+    fn dap_stopped_without_thread_id_wakes_waiters() {
+        let state = Arc::new((Mutex::new(State::new()), Condvar::new()));
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let peer = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut pending = HashMap::new();
+        let log = LogHandle::new();
+        let mut next_seq = 1;
+        {
+            let (lock, _) = &*state;
+            let mut guard = lock.lock().unwrap();
+            // Model the race where exec advances its generation before the
+            // driver has armed the request which will follow.
+            guard.action_generation = 1;
+            guard.armed_action_generation = 0;
+        }
+        dispatch_incoming(
+            json!({"type":"event", "event":"stopped", "body":{"reason":"pause"}}),
+            &mut pending,
+            &state,
+            &log,
+            &mut stream,
+            &mut next_seq,
+        );
+        drop(peer);
+        crate::transport_common::wait_for_stop(&state, || Ok(()), Duration::from_millis(20))
+            .unwrap();
+        let (lock, _) = &*state;
+        assert!(lock.lock().unwrap().pending_is_unscoped);
+    }
+
+    #[test]
+    fn dap_function_logpoint_uses_log_message() {
+        let value = function_breakpoint_value("worker", None, Some("hit {x}"));
+        assert_eq!(value.get("name").and_then(Value::as_str), Some("worker"));
+        assert_eq!(
+            value.get("logMessage").and_then(Value::as_str),
+            Some("hit {x}")
+        );
+        assert!(value.get("name").unwrap().as_str().unwrap() != "hit {x}");
+    }
+
+    #[test]
+    fn dap_rejects_unverified_function_breakpoints() {
+        assert!(!function_breakpoints_verified(
+            &json!({"breakpoints":[{"verified":false}]}),
+            1
+        ));
+        assert!(function_breakpoints_verified(
+            &json!({"breakpoints":[{"verified":true}]}),
+            1
+        ));
+    }
+
+    #[test]
+    fn dap_breakpoint_ids_cover_line_and_function_breakpoints() {
+        let mut state = State::new();
+        state
+            .line_breakpoint_ids
+            .insert("/tmp/main.rs:10".into(), 1);
+        state.function_breakpoint_ids.insert("worker".into(), 2);
+        state.breakpoints.insert("/tmp/main.rs".into(), vec![10]);
+        state.function_breakpoints.push("worker".into());
+        let ids: Vec<u32> = state
+            .line_breakpoint_ids
+            .values()
+            .chain(state.function_breakpoint_ids.values())
+            .copied()
+            .collect();
+        assert_eq!(ids, vec![1, 2]);
+        assert_ne!(ids[0], ids[1]);
     }
 
     #[test]
