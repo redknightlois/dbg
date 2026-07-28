@@ -101,7 +101,7 @@ fn import_kernels(dest: &Connection, src: &Connection, layer_id: i64) -> Result<
 
     for row in rows {
         let (name, start_ns, end_ns, gx, gy, gz, bx, by, bz, sid, cid) = row?;
-        let duration_us = (end_ns - start_ns) as f64 / 1000.0;
+        let duration_us = duration_us(start_ns, end_ns, "kernel")?;
         let start_us = start_ns as f64 / 1000.0;
         write.execute(params![
             name,
@@ -162,7 +162,7 @@ fn import_transfers(dest: &Connection, src: &Connection, layer_id: i64) -> Resul
         write.execute(params![
             kind_str,
             bytes,
-            (end_ns - start_ns) as f64 / 1000.0,
+            duration_us(start_ns, end_ns, "memory transfer")?,
             start_ns as f64 / 1000.0,
             sid,
             layer_id
@@ -250,7 +250,7 @@ fn import_nvtx_regions(dest: &Connection, src: &Connection, layer_id: i64) -> Re
 
     let mut read = src.prepare(&format!(
         "SELECT text, start, end FROM {table}
-         WHERE end > start AND text IS NOT NULL
+         WHERE text IS NOT NULL
          ORDER BY start"
     ))?;
 
@@ -272,7 +272,7 @@ fn import_nvtx_regions(dest: &Connection, src: &Connection, layer_id: i64) -> Re
         write.execute(params![
             name,
             start_ns as f64 / 1000.0,
-            (end_ns - start_ns) as f64 / 1000.0,
+            duration_us(start_ns, end_ns, "NVTX region")?,
             layer_id
         ])?;
     }
@@ -324,7 +324,7 @@ fn import_runtime_api(dest: &Connection, src: &Connection, layer_id: i64) -> Res
     let mut count = 0;
     for row in rows {
         let (_api_name, start_ns, end_ns, corr_id) = row?;
-        let duration_us = (end_ns - start_ns) as f64 / 1000.0;
+        let duration_us = duration_us(start_ns, end_ns, "runtime API event")?;
         let start_us = start_ns as f64 / 1000.0;
         // We only know this is a cudaLaunchKernel call — the actual kernel name
         // is in the GPU activity trace which isn't available.
@@ -384,19 +384,20 @@ fn import_device_info(dest: &Connection, src: &Connection) -> Result<()> {
 pub(crate) fn import_wall_time(dest: &Connection) -> Result<()> {
     // Span covers both kernel launches and memory transfers — whichever
     // starts earliest to whichever ends latest.
-    let wall: f64 = dest
-        .query_row(
-            "SELECT COALESCE(MAX(end_us) - MIN(start_us), 0) FROM (
+    let wall: f64 = dest.query_row(
+        "SELECT COALESCE(MAX(end_us) - MIN(start_us), 0) FROM (
                  SELECT start_us, start_us + duration_us AS end_us
                  FROM launches WHERE start_us IS NOT NULL
                  UNION ALL
                  SELECT start_us, start_us + duration_us AS end_us
                  FROM transfers WHERE start_us IS NOT NULL
              )",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap_or(0.0);
+        [],
+        |row| row.get(0),
+    )?;
+    if !wall.is_finite() || wall < 0.0 {
+        bail!("NSYS wall-time span is invalid: {wall}");
+    }
 
     dest.execute(
         "INSERT OR REPLACE INTO meta (key, value) VALUES ('wall_time_us', ?1)",
@@ -404,6 +405,16 @@ pub(crate) fn import_wall_time(dest: &Connection) -> Result<()> {
     )?;
 
     Ok(())
+}
+
+fn duration_us(start_ns: i64, end_ns: i64, kind: &str) -> Result<f64> {
+    if end_ns < start_ns {
+        bail!("NSYS {kind} has invalid temporal ordering: end {end_ns} precedes start {start_ns}");
+    }
+    let delta = end_ns
+        .checked_sub(start_ns)
+        .ok_or_else(|| anyhow::anyhow!("NSYS {kind} timestamp difference overflows i64"))?;
+    Ok(delta as f64 / 1000.0)
 }
 
 // ---------------------------------------------------------------------------
@@ -477,6 +488,16 @@ mod tests {
     fn find_table_missing() {
         let conn = Connection::open_in_memory().unwrap();
         assert!(find_table(&conn, &["NOPE"]).is_err());
+    }
+
+    #[test]
+    fn nsys_rejects_invalid_order_and_extreme_timestamp_difference() {
+        let error = duration_us(20, 10, "kernel").unwrap_err().to_string();
+        assert!(error.contains("invalid temporal ordering"));
+        let error = duration_us(i64::MIN, i64::MAX, "kernel")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("overflows i64"));
     }
 
     /// Regression: nsys 2023.x exports `CUDA_GPU_MEMORY_USAGE_EVENTS`

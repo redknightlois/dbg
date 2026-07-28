@@ -1,6 +1,7 @@
 use std::path::Path;
+use std::{fs::File, io::Read};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, params};
 use serde::Deserialize;
 
@@ -26,18 +27,70 @@ struct TraceEvent {
     args: Option<serde_json::Value>,
 }
 
+const MAX_IMPORT_BYTES: u64 = 256 * 1024 * 1024;
+const MAX_TRACE_EVENTS: usize = 1_000_000;
+
 /// Parse a Chrome Trace JSON (torch.profiler export) and INSERT into session DB.
 pub fn import_chrome_trace(dest: &Connection, json_path: &Path, layer_id: i64) -> Result<()> {
-    let content = std::fs::read_to_string(json_path)
-        .with_context(|| format!("cannot read {}", json_path.display()))?;
+    let size = std::fs::metadata(json_path)
+        .with_context(|| format!("stat {}", json_path.display()))?
+        .len();
+    if size > MAX_IMPORT_BYTES {
+        bail!(
+            "Chrome trace {} is too large ({size} bytes; maximum is {MAX_IMPORT_BYTES})",
+            json_path.display()
+        );
+    }
+    let content = read_bounded_text(json_path, "Chrome trace")?;
 
     let trace: ChromeTrace = serde_json::from_str(&content)
         .with_context(|| format!("cannot parse {}", json_path.display()))?;
+    if trace.trace_events.len() > MAX_TRACE_EVENTS {
+        bail!(
+            "Chrome trace contains {} events; maximum is {MAX_TRACE_EVENTS}",
+            trace.trace_events.len()
+        );
+    }
 
     import_kernel_events(dest, &trace.trace_events, layer_id)?;
     import_ops(dest, &trace.trace_events, layer_id)?;
 
     Ok(())
+}
+
+/// Read an import without allowing a file that grows after the metadata
+/// check to make the process accumulate unbounded input. Reads are capped to
+/// the remaining capacity, and a one-byte probe detects growth at the exact
+/// limit without appending that byte to the buffer.
+fn read_bounded_text(path: &Path, kind: &str) -> Result<String> {
+    read_bounded_text_with_limit(path, kind, MAX_IMPORT_BYTES)
+}
+
+fn read_bounded_text_with_limit(path: &Path, kind: &str, limit: u64) -> Result<String> {
+    let mut file = File::open(path).with_context(|| format!("cannot read {}", path.display()))?;
+    let mut bytes = Vec::new();
+    let mut chunk = [0_u8; 8192];
+    loop {
+        let remaining = limit.saturating_sub(bytes.len() as u64);
+        if remaining == 0 {
+            let mut probe = [0_u8; 1];
+            if file.read(&mut probe)? != 0 {
+                bail!(
+                    "{kind} {} grew beyond the maximum input size of {limit} bytes",
+                    path.display()
+                );
+            }
+            break;
+        }
+        let chunk_len = (remaining as usize).min(chunk.len());
+        let read = file.read(&mut chunk[..chunk_len])?;
+        if read == 0 {
+            break;
+        }
+        bytes.extend_from_slice(&chunk[..read]);
+    }
+    String::from_utf8(bytes)
+        .with_context(|| format!("{kind} {} is not valid UTF-8", path.display()))
 }
 
 // ---------------------------------------------------------------------------
@@ -61,12 +114,20 @@ fn import_kernel_events(dest: &Connection, events: &[TraceEvent], layer_id: i64)
             continue;
         }
 
-        let grid = extract_tuple(&event.args, "grid", "grid_x", "grid_y", "grid_z");
-        let block = extract_tuple(&event.args, "block", "block_x", "block_y", "block_z");
-        let stream =
-            extract_u32(&event.args, "stream").or_else(|| extract_u32(&event.args, "stream_id"));
-        let corr = extract_u64(&event.args, "correlation")
-            .or_else(|| extract_u64(&event.args, "external id"));
+        let grid = extract_tuple(&event.args, "grid", "grid_x", "grid_y", "grid_z")?;
+        let block = extract_tuple(&event.args, "block", "block_x", "block_y", "block_z")?;
+        let stream = match value_for(&event.args, "stream") {
+            Some(value) => Some(parse_u32(value, "stream")?),
+            None => value_for(&event.args, "stream_id")
+                .map(|value| parse_u32(value, "stream_id"))
+                .transpose()?,
+        };
+        let corr = match value_for(&event.args, "correlation") {
+            Some(value) => Some(parse_i64(value, "correlation")?),
+            None => value_for(&event.args, "external id")
+                .map(|value| parse_i64(value, "external id"))
+                .transpose()?,
+        };
 
         stmt.execute(params![
             event.name,
@@ -79,7 +140,7 @@ fn import_kernel_events(dest: &Connection, events: &[TraceEvent], layer_id: i64)
             block.map(|b| b.2),
             stream,
             event.ts,
-            corr.map(|c| c as i64),
+            corr,
             layer_id,
         ])?;
     }
@@ -208,30 +269,50 @@ fn extract_tuple(
     x_key: &str,
     y_key: &str,
     z_key: &str,
-) -> Option<(u32, u32, u32)> {
-    let args = args.as_ref()?;
-    if let Some(arr) = args.get(array_key).and_then(|v| v.as_array()) {
-        if arr.len() >= 3 {
-            return Some((
-                arr[0].as_u64()? as u32,
-                arr[1].as_u64()? as u32,
-                arr[2].as_u64()? as u32,
-            ));
+) -> Result<Option<(u32, u32, u32)>> {
+    let Some(args) = args.as_ref() else {
+        return Ok(None);
+    };
+    if let Some(value) = args.get(array_key) {
+        let Some(arr) = value.as_array() else {
+            bail!("Chrome trace field {array_key} must be an array")
+        };
+        if arr.len() < 3 {
+            bail!("Chrome trace field {array_key} must contain three integers")
         }
+        return Ok(Some((
+            parse_u32(&arr[0], &format!("{array_key}[0]"))?,
+            parse_u32(&arr[1], &format!("{array_key}[1]"))?,
+            parse_u32(&arr[2], &format!("{array_key}[2]"))?,
+        )));
     }
-    Some((
-        args.get(x_key)?.as_u64()? as u32,
-        args.get(y_key)?.as_u64()? as u32,
-        args.get(z_key)?.as_u64()? as u32,
-    ))
+    let (Some(x), Some(y), Some(z)) = (args.get(x_key), args.get(y_key), args.get(z_key)) else {
+        return Ok(None);
+    };
+    Ok(Some((
+        parse_u32(x, x_key)?,
+        parse_u32(y, y_key)?,
+        parse_u32(z, z_key)?,
+    )))
 }
 
-fn extract_u32(args: &Option<serde_json::Value>, key: &str) -> Option<u32> {
-    args.as_ref()?.get(key)?.as_u64().map(|v| v as u32)
+fn value_for<'a>(args: &'a Option<serde_json::Value>, key: &str) -> Option<&'a serde_json::Value> {
+    args.as_ref()?.get(key)
 }
 
-fn extract_u64(args: &Option<serde_json::Value>, key: &str) -> Option<u64> {
-    args.as_ref()?.get(key)?.as_u64()
+fn parse_u32(value: &serde_json::Value, key: &str) -> Result<u32> {
+    let number = value.as_u64().ok_or_else(|| {
+        anyhow::anyhow!("Chrome trace field {key} must be a non-negative integer")
+    })?;
+    u32::try_from(number).map_err(|_| anyhow::anyhow!("Chrome trace field {key} exceeds u32::MAX"))
+}
+
+fn parse_i64(value: &serde_json::Value, key: &str) -> Result<i64> {
+    let number = value.as_u64().ok_or_else(|| {
+        anyhow::anyhow!("Chrome trace field {key} must be a non-negative integer")
+    })?;
+    i64::try_from(number)
+        .map_err(|_| anyhow::anyhow!("Chrome trace field {key} exceeds SQLite integer range"))
 }
 
 fn extract_string(args: &Option<serde_json::Value>, key: &str) -> Option<String> {
@@ -286,5 +367,20 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM ops", [], |row| row.get(0))
             .unwrap();
         assert_eq!(op_count, 1);
+    }
+
+    #[test]
+    fn bounded_read_accepts_exact_limit_and_rejects_one_more_byte() {
+        let mut exact = tempfile::NamedTempFile::new().unwrap();
+        exact.write_all(b"12345678").unwrap();
+        assert_eq!(
+            read_bounded_text_with_limit(exact.path(), "Chrome trace", 8).unwrap(),
+            "12345678"
+        );
+
+        let mut oversized = tempfile::NamedTempFile::new().unwrap();
+        oversized.write_all(b"123456789").unwrap();
+        let error = read_bounded_text_with_limit(oversized.path(), "Chrome trace", 8).unwrap_err();
+        assert!(error.to_string().contains("maximum input size of 8 bytes"));
     }
 }

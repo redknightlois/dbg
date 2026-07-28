@@ -6,6 +6,8 @@
 use super::fixtures::*;
 use crate::commands;
 use crate::db::GpuDb;
+use crate::parsers::chrome_trace::import_chrome_trace;
+use crate::parsers::ncu::import_ncu_csv;
 use rusqlite::params;
 
 // -----------------------------------------------------------------------
@@ -148,6 +150,93 @@ fn ncu_csv_edge_cases() {
     assert_eq!(
         bound, "memory",
         "65.2% mem vs 12.0% compute should be memory-bound"
+    );
+}
+
+#[test]
+fn chrome_trace_ncu_oversized_input_fails_closed() {
+    const MAX: u64 = 256 * 1024 * 1024;
+    let dir = tempfile::tempdir().unwrap();
+    let chrome = dir.path().join("oversized.json");
+    let ncu = dir.path().join("oversized.csv");
+    std::fs::File::create(&chrome)
+        .unwrap()
+        .set_len(MAX + 1)
+        .unwrap();
+    std::fs::File::create(&ncu)
+        .unwrap()
+        .set_len(MAX + 1)
+        .unwrap();
+    let db = GpuDb::create(&dir.path().join("session.gpu.db")).unwrap();
+    let chrome_layer = db
+        .add_layer("torch", "oversized.json", None, None, None)
+        .unwrap();
+    let ncu_layer = db
+        .add_layer("ncu", "oversized.csv", None, None, None)
+        .unwrap();
+
+    assert!(
+        import_chrome_trace(&db.conn, &chrome, chrome_layer)
+            .unwrap_err()
+            .to_string()
+            .contains("too large")
+    );
+    assert!(
+        import_ncu_csv(&db.conn, &ncu, ncu_layer)
+            .unwrap_err()
+            .to_string()
+            .contains("too large")
+    );
+}
+
+#[test]
+fn chrome_trace_rejects_oversized_integer_fields() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("bad-grid.json");
+    std::fs::write(
+        &path,
+        r#"{"traceEvents":[{"name":"k","cat":"kernel","ph":"X","args":{"grid":[4294967296,1,1],"block":[1,1,1]}}]}"#,
+    )
+    .unwrap();
+    let db = GpuDb::create(&dir.path().join("session.gpu.db")).unwrap();
+    let layer = db
+        .add_layer("torch", "bad-grid.json", None, None, None)
+        .unwrap();
+    let error = import_chrome_trace(&db.conn, &path, layer)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("grid[0]") || error.contains("u32"),
+        "{error}"
+    );
+}
+
+#[test]
+fn ncu_requires_candidate_header_and_required_columns() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = GpuDb::create(&dir.path().join("session.gpu.db")).unwrap();
+    let no_header = dir.path().join("no-header.csv");
+    std::fs::write(&no_header, "hello\nworld\n").unwrap();
+    let layer = db
+        .add_layer("ncu", "no-header.csv", None, None, None)
+        .unwrap();
+    assert!(
+        import_ncu_csv(&db.conn, &no_header, layer)
+            .unwrap_err()
+            .to_string()
+            .contains("no candidate header")
+    );
+
+    let missing = dir.path().join("missing.csv");
+    std::fs::write(&missing, "Kernel Name,Metric Name\nk,m\n").unwrap();
+    let layer = db
+        .add_layer("ncu", "missing.csv", None, None, None)
+        .unwrap();
+    assert!(
+        import_ncu_csv(&db.conn, &missing, layer)
+            .unwrap_err()
+            .to_string()
+            .contains("missing one or more required columns")
     );
 }
 
