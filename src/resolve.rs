@@ -18,7 +18,8 @@ fn path_stem_str(p: &Path) -> Result<String> {
 pub fn resolve(backend_type: &str, target: &str) -> Result<String> {
     match backend_type {
         // `gdb` is an alias for the lldb/native backend.
-        "rust" | "c" | "cpp" | "zig" | "gdb" => resolve_native(target),
+        "rust" => resolve_rust(target),
+        "c" | "cpp" | "zig" | "gdb" => resolve_native(target),
         "d" => resolve_d(target),
         "nim" => resolve_nim(target),
         "node" | "nodejs" | "js" | "javascript" | "ts" | "typescript" | "bun" | "deno"
@@ -89,6 +90,68 @@ fn resolve_native(target: &str) -> Result<String> {
     bail!("cannot find binary for {target} after build")
 }
 
+fn resolve_rust(target: &str) -> Result<String> {
+    if Path::new(target).is_file() {
+        if let Some(hint) = source_file_hint(target) {
+            bail!("{hint}");
+        }
+        return Ok(target.to_string());
+    }
+
+    let target_dir = cargo_target_directory()?;
+    let underscore = target.replace('-', "_");
+    for name in [&underscore, target] {
+        let path = target_dir.join("debug").join(name);
+        if path.is_file() {
+            return Ok(path.display().to_string());
+        }
+    }
+
+    eprintln!("building {target}...");
+    let status = Command::new("cargo")
+        .args(["build", "-p", target])
+        .status()
+        .context("cargo not found")?;
+    if !status.success() {
+        bail!("cargo build -p {target} failed");
+    }
+    for name in [&underscore, target] {
+        let path = target_dir.join("debug").join(name);
+        if path.is_file() {
+            return Ok(path.display().to_string());
+        }
+    }
+    bail!(
+        "cannot find Rust binary for {target} in {}",
+        target_dir.display()
+    )
+}
+
+fn cargo_target_directory() -> Result<PathBuf> {
+    cargo_target_directory_in(Path::new("."))
+}
+
+fn cargo_target_directory_in(directory: &Path) -> Result<PathBuf> {
+    let output = Command::new("cargo")
+        .args(["metadata", "--format-version", "1", "--no-deps"])
+        .current_dir(directory)
+        .output()
+        .context("cargo not found")?;
+    if !output.status.success() {
+        bail!(
+            "cargo metadata failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    let metadata: serde_json::Value =
+        serde_json::from_slice(&output.stdout).context("cargo metadata returned invalid JSON")?;
+    metadata
+        .get("target_directory")
+        .and_then(|value| value.as_str())
+        .map(PathBuf::from)
+        .context("cargo metadata did not report target_directory")
+}
+
 /// Detect common C/C++/Rust source extensions. If the user passed a
 /// source file to a native-debugger start command, we refuse with a
 /// concrete build hint rather than handing the file to lldb and
@@ -131,7 +194,7 @@ fn resolve_dotnet(target: &str) -> Result<String> {
         // netcoredbg rejects it with COR_E_FILENOTFOUND. Build the
         // project and hand back the resulting DLL/apphost from the
         // project's own bin/Debug/ tree (not the cwd's).
-        if path.extension().and_then(|s| s.to_str()) == Some("csproj") {
+        if is_dotnet_project(path) {
             let name = path_stem_str(path)?;
             let csproj_str = path
                 .to_str()
@@ -186,14 +249,38 @@ fn resolve_dotnet(target: &str) -> Result<String> {
 }
 
 fn find_csproj(dir: &Path) -> Result<PathBuf> {
+    let mut projects = Vec::new();
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
         let path = entry.path();
-        if path.extension().is_some_and(|e| e == "csproj") {
-            return Ok(path);
+        if is_dotnet_project(&path) {
+            projects.push(path);
         }
     }
-    bail!("no .csproj found in {}", dir.display())
+    projects.sort();
+    match projects.as_slice() {
+        [] => bail!("no .csproj, .fsproj, or .vbproj found in {}", dir.display()),
+        [project] => Ok(project.clone()),
+        _ => bail!(
+            "directory {} contains multiple .NET projects; specify one explicitly: {}",
+            dir.display(),
+            projects
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    }
+}
+
+fn is_dotnet_project(path: &Path) -> bool {
+    path.is_file()
+        && path.extension().and_then(|e| e.to_str()).is_some_and(|e| {
+            matches!(
+                e.to_ascii_lowercase().as_str(),
+                "csproj" | "fsproj" | "vbproj"
+            )
+        })
 }
 
 fn find_dotnet_output(dir: &Path, name: &str) -> Result<String> {
@@ -377,11 +464,8 @@ fn resolve_go(target: &str) -> Result<String> {
             .unwrap_or(Path::new("."));
         let stem = p.file_stem().and_then(|s| s.to_str()).unwrap_or("app");
         let output_path = parent.join(stem);
-        let output_str = output_path
-            .to_str()
-            .context("output path contains non-UTF8 characters")?;
         let file_name = p.file_name().and_then(|s| s.to_str()).unwrap_or(target);
-        let args = ["build", "-gcflags=all=-N -l", "-o", output_str, file_name];
+        let args = ["build", "-gcflags=all=-N -l", "-o", stem, file_name];
         let output = run_go_build(parent, &args)?;
         if !output.status.success() {
             bail!(go_build_error(&output.stderr));
@@ -404,10 +488,7 @@ fn resolve_go(target: &str) -> Result<String> {
             .to_str()
             .unwrap_or("app");
         let output_path = dir.join(output_name);
-        let output_str = output_path
-            .to_str()
-            .context("output path contains non-UTF8 characters")?;
-        let args = ["build", "-gcflags=all=-N -l", "-o", output_str, "."];
+        let args = ["build", "-gcflags=all=-N -l", "-o", output_name, "."];
         let output = run_go_build(dir, &args)?;
         if !output.status.success() {
             bail!(go_build_error(&output.stderr));
@@ -533,6 +614,43 @@ mod tests {
         assert!(Path::new(&out).is_file(), "binary missing: {out}");
     }
 
+    #[test]
+    fn resolve_go_nested_relative_target() {
+        if Command::new("go").arg("version").output().is_err() || !go_toolchain_can_build() {
+            return;
+        }
+        let tmp = TempDir::new().unwrap();
+        let nested = tmp.path().join("nested");
+        std::fs::create_dir(&nested).unwrap();
+        let source = nested.join("main.go");
+        std::fs::write(&source, "package main\nfunc main() {}\n").unwrap();
+        let out = resolve_go(source.to_str().unwrap()).unwrap();
+        assert_eq!(Path::new(&out), nested.join("main"));
+        assert!(
+            !out.contains("nested/nested"),
+            "duplicated output path: {out}"
+        );
+    }
+
+    #[test]
+    fn resolve_rust_workspace_target_directory() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join("app/src")).unwrap();
+        std::fs::write(
+            tmp.path().join("Cargo.toml"),
+            "[workspace]\nmembers = [\"app\"]\nresolver = \"2\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            tmp.path().join("app/Cargo.toml"),
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        std::fs::write(tmp.path().join("app/src/main.rs"), "fn main() {}\n").unwrap();
+        let target = cargo_target_directory_in(tmp.path()).unwrap();
+        assert_eq!(target, tmp.path().join("target"));
+    }
+
     /// Regression: `dbg start rust src/main.rs` (source file, not compiled
     /// binary) silently exited with no user-facing error because lldb
     /// accepted the path and then failed internally. `resolve_native`
@@ -565,6 +683,29 @@ mod tests {
                     || err.to_string().to_lowercase().contains("header"),
                 "wrong hint for .{ext}: {err}"
             );
+        }
+    }
+
+    #[test]
+    fn resolve_dotnet_rejects_ambiguous_directory() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("z.csproj"), "<Project/>").unwrap();
+        std::fs::write(tmp.path().join("a.fsproj"), "<Project/>").unwrap();
+        let error = find_csproj(tmp.path()).unwrap_err().to_string();
+        assert!(error.contains("multiple .NET projects"), "{error}");
+        assert!(error.contains("a.fsproj") && error.contains("z.csproj"));
+    }
+
+    #[test]
+    fn resolve_fsproj_and_vbproj_targets() {
+        let tmp = TempDir::new().unwrap();
+        for (name, extension) in [("fsharp", "fsproj"), ("visualbasic", "vbproj")] {
+            let dir = tmp.path().join(name);
+            std::fs::create_dir(&dir).unwrap();
+            let project = dir.join(format!("{name}.{extension}"));
+            std::fs::write(&project, "<Project/>").unwrap();
+            assert_eq!(find_csproj(&dir).unwrap(), project);
+            assert!(is_dotnet_project(&project));
         }
     }
 }
