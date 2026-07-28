@@ -129,7 +129,24 @@ impl SessionDb {
             .cwd
             .canonicalize()
             .unwrap_or_else(|_| opts.cwd.to_path_buf());
-        let group = group_key(&cwd_canonical, target_hash.as_deref().unwrap_or(""));
+        let target_identity = Path::new(opts.target).canonicalize().unwrap_or_else(|_| {
+            if Path::new(opts.target).is_absolute() {
+                PathBuf::from(opts.target)
+            } else {
+                cwd_canonical.join(opts.target)
+            }
+        });
+        // Include session kind and target class. A profile and a live debug
+        // session can use the same target and hash, but they have different
+        // lifecycle and grouping semantics and must not merge.
+        let group = format!(
+            "{}|{}|{}|{}|{}",
+            opts.kind.as_str(),
+            opts.target_class.as_str(),
+            cwd_canonical.display(),
+            target_identity.display(),
+            target_hash.as_deref().unwrap_or("")
+        );
         conn.execute(
             "INSERT INTO meta (session_id, key, value) VALUES (?1, 'session_group_key', ?2)",
             params![session_id, group],
@@ -1662,6 +1679,36 @@ mod tests {
         assert_eq!(
             a.meta("session_group_key").unwrap(),
             b.meta("session_group_key").unwrap()
+        );
+    }
+
+    #[test]
+    fn group_key_keeps_distinct_unhashed_targets_separate() {
+        let tmp = TempDir::new().unwrap();
+        let mut a = opts(tmp.path(), "attach:100");
+        a.target_hash = None;
+        let mut b = opts(tmp.path(), "attach:200");
+        b.target_hash = None;
+        let a = SessionDb::create(a).unwrap();
+        let b = SessionDb::create(b).unwrap();
+        assert_ne!(
+            a.meta("session_group_key").unwrap(),
+            b.meta("session_group_key").unwrap()
+        );
+    }
+
+    #[test]
+    fn group_key_keeps_session_kinds_separate() {
+        let tmp = TempDir::new().unwrap();
+        let debug = SessionDb::create(opts(tmp.path(), "/bin/ls")).unwrap();
+        let profile = SessionDb::create(CreateOptions {
+            kind: SessionKind::Profile,
+            ..opts(tmp.path(), "/bin/ls")
+        })
+        .unwrap();
+        assert_ne!(
+            debug.meta("session_group_key").unwrap(),
+            profile.meta("session_group_key").unwrap()
         );
     }
 }

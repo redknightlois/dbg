@@ -573,6 +573,20 @@ fn diff_two_dbs(ctx: &LifeCtx<'_>, a_db: &SessionDb, a_label: &str, b_label: &st
         return profile_diff(a_db, &b_db, a_label, b_label);
     }
 
+    // Debug hit counts and profile frame timings have different semantics.
+    // Do not attach a profile DB and present an empty hit diff as a valid
+    // comparison.
+    let b_db = match SessionDb::open_read_only(&b_path) {
+        Ok(db) => db,
+        Err(e) => return format!("[error opening {}: {e}]", b_path.display()),
+    };
+    let b_kind = b_db.kind();
+    if b_kind != SessionKind::Debug {
+        return format!(
+            "diff {a_label} ↔ {b_label}  — kind mismatch (a=debug, b=profile): cannot diff debug against profile"
+        );
+    }
+
     diff_hits(a_db, &b_path, a_label, b_label)
 }
 
