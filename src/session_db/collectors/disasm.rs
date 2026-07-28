@@ -6,8 +6,9 @@
 //! the DB directly — that keeps the shell-out + parse logic testable
 //! in isolation and lets the daemon batch multiple collections.
 
-use std::process::{Command, Stdio};
+use std::process::{Command, Output, Stdio};
 use std::sync::OnceLock;
+use std::sync::mpsc::{self, Receiver};
 
 use anyhow::{Context, Result, bail};
 use regex::Regex;
@@ -15,6 +16,11 @@ use regex::Regex;
 use super::{CollectCtx, DisasmOutput, LiveDebugger, OnDemandCollector};
 use crate::jitdasm::JitIndex;
 use crate::session_db::TargetClass;
+
+/// Keep debugger output bounded even when a tool emits an unexpectedly large
+/// response. The reader still drains the pipe after this limit so the child
+/// cannot block on a full pipe while the parent waits for it to exit.
+const MAX_CAPTURE_BYTES: usize = 8 * 1024 * 1024;
 
 // ============================================================
 // lldb `disassemble --name <sym>`
@@ -41,7 +47,7 @@ impl OnDemandCollector for LldbDisassembleCollector {
             Some(l) => l.send(&cmd)?,
             None => run_oneshot_lldb(ctx.target, &cmd)?,
         };
-        let asm_text = raw.trim().to_string();
+        let asm_text = limit_text(raw).trim().to_string();
         if asm_text.is_empty() {
             bail!("lldb produced no disassembly for {}", ctx.symbol);
         }
@@ -58,21 +64,22 @@ impl OnDemandCollector for LldbDisassembleCollector {
 
 fn run_oneshot_lldb(target: &str, disasm_cmd: &str) -> Result<String> {
     let bin = std::env::var("LLDB_BIN").unwrap_or_else(|_| "lldb".into());
-    let output = Command::new(&bin)
-        .args([
-            "--batch",
-            "--no-use-colors",
-            "-o",
-            &format!("target create {}", lldb_arg(target)),
-            "-o",
-            disasm_cmd,
-            "-o",
-            "quit",
-        ])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .with_context(|| format!("invoking {bin} for disasm"))?;
+    let output = run_command_with_timeout(
+        Command::new(&bin)
+            .args([
+                "--batch",
+                "--no-use-colors",
+                "-o",
+                &format!("target create {}", lldb_arg(target)),
+                "-o",
+                disasm_cmd,
+                "-o",
+                "quit",
+            ])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped()),
+        &format!("invoking {bin} for disasm"),
+    )?;
     if !output.status.success() && output.stdout.is_empty() {
         bail!(
             "{bin} exited {}: {}",
@@ -109,9 +116,10 @@ fn lldb_arg(value: &str) -> String {
 /// both x86-64 and aarch64 dumps).
 fn count_instruction_bytes(asm: &str) -> Option<i64> {
     let re = lldb_addr_regex();
-    let mut addrs = asm
-        .lines()
-        .filter_map(|l| re.captures(l).and_then(|c| u64::from_str_radix(&c[1], 16).ok()));
+    let mut addrs = asm.lines().filter_map(|l| {
+        re.captures(l)
+            .and_then(|c| u64::from_str_radix(&c[1], 16).ok())
+    });
     let first = addrs.next()?;
     // `next_back()` walks from the end; `last()` would re-scan the
     // entire iterator just to find the final element.
@@ -154,11 +162,13 @@ impl OnDemandCollector for JitDasmCollector {
         let capture = std::env::var_os("DBG_JITDASM_CAPTURE").map(std::path::PathBuf::from);
         let (text, source_desc) = match capture.as_ref().filter(|p| p.is_file()) {
             Some(p) => (
-                std::fs::read_to_string(p)
-                    .with_context(|| format!("reading {}", p.display()))?,
+                read_bounded_text(p).with_context(|| format!("reading {}", p.display()))?,
                 p.display().to_string(),
             ),
-            None => (run_jitdasm_fresh(ctx.target, ctx.symbol)?, "fresh dotnet run".into()),
+            None => (
+                run_jitdasm_fresh(ctx.target, ctx.symbol)?,
+                "fresh dotnet run".into(),
+            ),
         };
 
         // `::` is a C++/docs-style separator; .NET uses a single `:`.
@@ -210,12 +220,13 @@ fn run_jitdasm_fresh(target: &str, symbol: &str) -> Result<String> {
     let dll_path: std::path::PathBuf = if target.ends_with(".csproj") || target.ends_with(".fsproj")
     {
         // Build the project so bin/Release/net*/ is populated.
-        let build = Command::new(&dotnet)
-            .args(["build", target, "-c", "Release", "--nologo", "-v", "q"])
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .output()
-            .with_context(|| format!("invoking {dotnet} build for {target}"))?;
+        let build = run_command_with_timeout(
+            Command::new(&dotnet)
+                .args(["build", target, "-c", "Release", "--nologo", "-v", "q"])
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped()),
+            &format!("invoking {dotnet} build for {target}"),
+        )?;
         if !build.status.success() {
             bail!(
                 "dotnet build {} failed:\n{}",
@@ -236,21 +247,31 @@ fn run_jitdasm_fresh(target: &str, symbol: &str) -> Result<String> {
         std::path::PathBuf::from(target)
     };
 
-    let output = Command::new(&dotnet)
-        .arg("exec")
-        .arg(&dll_path)
-        .env("DOTNET_JitDisasm", symbol)
-        .env("DOTNET_TieredCompilation", "0") // deterministic tier
-        .env("DOTNET_JitDiffableDasm", "1")
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .with_context(|| format!("invoking {dotnet} exec {}", dll_path.display()))?;
+    let output = run_command_with_timeout(
+        Command::new(&dotnet)
+            .arg("exec")
+            .arg(&dll_path)
+            .env("DOTNET_JitDisasm", symbol)
+            .env("DOTNET_TieredCompilation", "0") // deterministic tier
+            .env("DOTNET_JitDiffableDasm", "1")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped()),
+        &format!("invoking {dotnet} exec {}", dll_path.display()),
+    )?;
     // JitDisasm writes to stdout under `dotnet exec` (stderr-vs-stdout
     // varies by host); concatenate both so the parser sees everything.
     let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
     text.push('\n');
     text.push_str(&String::from_utf8_lossy(&output.stderr));
+    // The capture file is the durable evidence for an on-demand attempt.
+    // Write it before parsing: a non-zero child or an unrecognised method
+    // must not turn useful assembly into an empty temporary session.
+    if let Some(path) = std::env::var_os("DBG_JITDASM_CAPTURE").map(std::path::PathBuf::from) {
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let _ = std::fs::write(path, &text);
+    }
     if text.trim().is_empty() {
         bail!("dotnet exited {} with no output", output.status);
     }
@@ -275,7 +296,9 @@ fn locate_executable_dll(proj_dir: &std::path::Path) -> Result<std::path::PathBu
         if !tfm_path.is_dir() {
             continue;
         }
-        let Ok(entries) = std::fs::read_dir(&tfm_path) else { continue };
+        let Ok(entries) = std::fs::read_dir(&tfm_path) else {
+            continue;
+        };
         for entry in entries.flatten() {
             let p = entry.path();
             if p.extension().and_then(|e| e.to_str()) == Some("json")
@@ -299,7 +322,12 @@ fn locate_executable_dll(proj_dir: &std::path::Path) -> Result<std::path::PathBu
         .into_iter()
         .next()
         .map(|(_, p)| p)
-        .ok_or_else(|| anyhow::anyhow!("no <name>.runtimeconfig.json found under {}/net*/", release_root.display()))
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "no <name>.runtimeconfig.json found under {}/net*/",
+                release_root.display()
+            )
+        })
 }
 
 fn parse_jitdasm_tier(asm: &str) -> Option<String> {
@@ -311,6 +339,97 @@ fn parse_jitdasm_tier(asm: &str) -> Option<String> {
         }
     }
     None
+}
+
+fn run_command_with_timeout(command: &mut Command, description: &str) -> Result<Output> {
+    let timeout = std::env::var("DBG_DISASM_TIMEOUT_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .map(std::time::Duration::from_millis)
+        .unwrap_or_else(|| std::time::Duration::from_secs(60));
+    let mut child = command.spawn().with_context(|| description.to_string())?;
+    // A child or one of its descendants can retain an inherited pipe after
+    // the direct child exits. Reader threads are therefore detached behind
+    // bounded channels: joining them here would keep the session mutex
+    // locked indefinitely while waiting for EOF that may never arrive.
+    let stdout = spawn_pipe_reader(child.stdout.take());
+    let stderr = spawn_pipe_reader(child.stderr.take());
+    let deadline = std::time::Instant::now() + timeout;
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let status = child.wait()?;
+            let stdout = receive_pipe(stdout, std::time::Duration::from_millis(100));
+            let stderr = receive_pipe(stderr, std::time::Duration::from_millis(100));
+            return Ok(Output {
+                status,
+                stdout,
+                stderr,
+            });
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    };
+    let stdout = receive_pipe(stdout, std::time::Duration::from_millis(100));
+    let stderr = receive_pipe(stderr, std::time::Duration::from_millis(100));
+    Ok(Output {
+        status,
+        stdout,
+        stderr,
+    })
+}
+
+fn spawn_pipe_reader<R>(stream: Option<R>) -> Option<Receiver<Vec<u8>>>
+where
+    R: std::io::Read + Send + 'static,
+{
+    let stream = stream?;
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut stream = stream;
+        let mut bytes = Vec::new();
+        let mut buffer = [0_u8; 8192];
+        loop {
+            let count = match std::io::Read::read(&mut stream, &mut buffer) {
+                Ok(0) | Err(_) => break,
+                Ok(count) => count,
+            };
+            let remaining = MAX_CAPTURE_BYTES.saturating_sub(bytes.len());
+            if remaining > 0 {
+                bytes.extend_from_slice(&buffer[..count.min(remaining)]);
+            }
+        }
+        let _ = tx.send(bytes);
+    });
+    Some(rx)
+}
+
+fn receive_pipe(stream: Option<Receiver<Vec<u8>>>, timeout: std::time::Duration) -> Vec<u8> {
+    stream
+        .and_then(|rx| rx.recv_timeout(timeout).ok())
+        .unwrap_or_default()
+}
+
+fn limit_text(mut text: String) -> String {
+    if text.len() > MAX_CAPTURE_BYTES {
+        let mut end = MAX_CAPTURE_BYTES;
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        text.truncate(end);
+    }
+    text
+}
+
+fn read_bounded_text(path: &std::path::Path) -> Result<String> {
+    let mut file = std::fs::File::open(path)?;
+    let mut bytes = Vec::with_capacity(MAX_CAPTURE_BYTES);
+    let mut limited = std::io::Read::take(&mut file, (MAX_CAPTURE_BYTES as u64) + 1);
+    std::io::Read::read_to_end(&mut limited, &mut bytes)?;
+    bytes.truncate(MAX_CAPTURE_BYTES);
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
 // ============================================================
@@ -337,12 +456,13 @@ impl OnDemandCollector for GoDisassCollector {
         ctx: &CollectCtx<'_>,
         _live: Option<&dyn LiveDebugger>,
     ) -> Result<DisasmOutput> {
-        let output = Command::new("go")
-            .args(["tool", "objdump", "-s", ctx.symbol, ctx.target])
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .output()
-            .context("invoking `go tool objdump`")?;
+        let output = run_command_with_timeout(
+            Command::new("go")
+                .args(["tool", "objdump", "-s", ctx.symbol, ctx.target])
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped()),
+            "invoking `go tool objdump`",
+        )?;
         if !output.status.success() {
             bail!(
                 "go tool objdump failed: {}",
@@ -482,6 +602,22 @@ test`main:
         let command = format!("disassemble --name {}", lldb_arg("danger`process launch`"));
         assert!(command.contains("\"danger\\`process launch\\`\""));
         assert!(!command.contains("danger`process launch`"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn debugger_pipe_capture_is_bounded() {
+        let mut command = Command::new("sh");
+        command
+            .args([
+                "-c",
+                "head -c 16777216 /dev/zero; head -c 16777216 /dev/zero >&2",
+            ])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let output = run_command_with_timeout(&mut command, "oversized debugger output").unwrap();
+        assert_eq!(output.stdout.len(), MAX_CAPTURE_BYTES);
+        assert_eq!(output.stderr.len(), MAX_CAPTURE_BYTES);
     }
 
     #[test]
