@@ -12,7 +12,7 @@ use rusqlite::Connection;
 use super::TargetClass;
 
 /// Bump this on every schema-breaking change. No migrations.
-pub const SCHEMA_VERSION: i64 = 2;
+pub const SCHEMA_VERSION: i64 = 3;
 
 /// Shared meta tables — always created regardless of track or target class.
 pub const CORE_DDL: &str = "
@@ -149,6 +149,8 @@ CREATE TABLE IF NOT EXISTS disassembly (
     layer_id        INTEGER REFERENCES layers(id)
 );
 CREATE INDEX IF NOT EXISTS idx_disasm_sym ON disassembly(symbol_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_disasm_identity
+    ON disassembly(session_id, symbol_id, source, COALESCE(tier, ''));
 
 CREATE TABLE IF NOT EXISTS source_snapshots (
     id              INTEGER PRIMARY KEY,
@@ -377,8 +379,246 @@ pub fn apply(conn: &Connection, class: TargetClass) -> Result<()> {
             conn.execute_batch(CPU_DDL)?;
         }
     }
+    conn.execute_batch(OWNERSHIP_TRIGGERS)?;
+    match class {
+        TargetClass::Gpu => conn.execute_batch(GPU_OWNERSHIP_TRIGGERS)?,
+        TargetClass::NativeCpu
+        | TargetClass::ManagedDotnet
+        | TargetClass::Jvm
+        | TargetClass::Python
+        | TargetClass::JsNode
+        | TargetClass::Ruby
+        | TargetClass::Php => conn.execute_batch(CPU_OWNERSHIP_TRIGGERS)?,
+    }
+    match class {
+        TargetClass::ManagedDotnet | TargetClass::Jvm => {
+            conn.execute_batch(MANAGED_OWNERSHIP_TRIGGERS)?
+        }
+        TargetClass::Python => conn.execute_batch(PYTHON_OWNERSHIP_TRIGGERS)?,
+        TargetClass::JsNode => conn.execute_batch(NODE_OWNERSHIP_TRIGGERS)?,
+        _ => {}
+    }
     Ok(())
 }
+
+/// SQLite's single-column foreign keys do not prove that a child link and
+/// its parent belong to the same session. These triggers add that missing
+/// invariant for every cross-track link while keeping the public insert
+/// shape stable for collectors.
+pub const OWNERSHIP_TRIGGERS: &str = r#"
+CREATE TRIGGER IF NOT EXISTS disassembly_symbol_same_session
+BEFORE INSERT ON disassembly WHEN NEW.symbol_id IS NOT NULL AND NOT EXISTS
+ (SELECT 1 FROM symbols WHERE id=NEW.symbol_id AND session_id=NEW.session_id)
+BEGIN SELECT RAISE(ABORT, 'disassembly symbol belongs to another session'); END;
+CREATE TRIGGER IF NOT EXISTS disassembly_layer_same_session
+BEFORE INSERT ON disassembly WHEN NEW.layer_id IS NOT NULL AND NOT EXISTS
+ (SELECT 1 FROM layers WHERE id=NEW.layer_id AND session_id=NEW.session_id)
+BEGIN SELECT RAISE(ABORT, 'disassembly layer belongs to another session'); END;
+CREATE TRIGGER IF NOT EXISTS disassembly_symbol_update_same_session
+BEFORE UPDATE OF session_id, symbol_id ON disassembly
+WHEN NEW.symbol_id IS NOT NULL AND NOT EXISTS
+ (SELECT 1 FROM symbols WHERE id=NEW.symbol_id AND session_id=NEW.session_id)
+BEGIN SELECT RAISE(ABORT, 'disassembly symbol belongs to another session'); END;
+CREATE TRIGGER IF NOT EXISTS disassembly_layer_update_same_session
+BEFORE UPDATE OF session_id, layer_id ON disassembly
+WHEN NEW.layer_id IS NOT NULL AND NOT EXISTS
+ (SELECT 1 FROM layers WHERE id=NEW.layer_id AND session_id=NEW.session_id)
+BEGIN SELECT RAISE(ABORT, 'disassembly layer belongs to another session'); END;
+CREATE TRIGGER IF NOT EXISTS source_symbol_same_session
+BEFORE INSERT ON source_snapshots WHEN NEW.symbol_id IS NOT NULL AND NOT EXISTS
+ (SELECT 1 FROM symbols WHERE id=NEW.symbol_id AND session_id=NEW.session_id)
+BEGIN SELECT RAISE(ABORT, 'source symbol belongs to another session'); END;
+CREATE TRIGGER IF NOT EXISTS source_symbol_update_same_session
+BEFORE UPDATE OF session_id, symbol_id ON source_snapshots
+WHEN NEW.symbol_id IS NOT NULL AND NOT EXISTS
+ (SELECT 1 FROM symbols WHERE id=NEW.symbol_id AND session_id=NEW.session_id)
+BEGIN SELECT RAISE(ABORT, 'source symbol belongs to another session'); END;
+CREATE TRIGGER IF NOT EXISTS alloc_site_symbol_same_session
+BEFORE INSERT ON alloc_sites WHEN NEW.symbol_id IS NOT NULL AND NOT EXISTS
+ (SELECT 1 FROM symbols WHERE id=NEW.symbol_id AND session_id=NEW.session_id)
+BEGIN SELECT RAISE(ABORT, 'allocation symbol belongs to another session'); END;
+CREATE TRIGGER IF NOT EXISTS alloc_site_symbol_update_same_session
+BEFORE UPDATE OF session_id, symbol_id ON alloc_sites
+WHEN NEW.symbol_id IS NOT NULL AND NOT EXISTS
+ (SELECT 1 FROM symbols WHERE id=NEW.symbol_id AND session_id=NEW.session_id)
+BEGIN SELECT RAISE(ABORT, 'allocation symbol belongs to another session'); END;
+CREATE TRIGGER IF NOT EXISTS alloc_site_layer_same_session
+BEFORE INSERT ON alloc_sites WHEN NEW.layer_id IS NOT NULL AND NOT EXISTS
+ (SELECT 1 FROM layers WHERE id=NEW.layer_id AND session_id=NEW.session_id)
+BEGIN SELECT RAISE(ABORT, 'allocation layer belongs to another session'); END;
+CREATE TRIGGER IF NOT EXISTS alloc_site_layer_update_same_session
+BEFORE UPDATE OF session_id, layer_id ON alloc_sites
+WHEN NEW.layer_id IS NOT NULL AND NOT EXISTS
+ (SELECT 1 FROM layers WHERE id=NEW.layer_id AND session_id=NEW.session_id)
+BEGIN SELECT RAISE(ABORT, 'allocation layer belongs to another session'); END;
+CREATE TRIGGER IF NOT EXISTS watch_hit_same_session
+BEFORE INSERT ON watch_evals WHEN NEW.hit_id IS NOT NULL AND NOT EXISTS
+ (SELECT 1 FROM breakpoint_hits WHERE id=NEW.hit_id AND session_id=NEW.session_id)
+BEGIN SELECT RAISE(ABORT, 'watch hit belongs to another session'); END;
+CREATE TRIGGER IF NOT EXISTS watch_hit_update_same_session
+BEFORE UPDATE OF session_id, hit_id ON watch_evals
+WHEN NEW.hit_id IS NOT NULL AND NOT EXISTS
+ (SELECT 1 FROM breakpoint_hits WHERE id=NEW.hit_id AND session_id=NEW.session_id)
+BEGIN SELECT RAISE(ABORT, 'watch hit belongs to another session'); END;
+CREATE TRIGGER IF NOT EXISTS regions_layer_same_session
+BEFORE INSERT ON regions WHEN NEW.layer_id IS NOT NULL AND NOT EXISTS
+ (SELECT 1 FROM layers WHERE id=NEW.layer_id AND session_id=NEW.session_id)
+BEGIN SELECT RAISE(ABORT, 'region layer belongs to another session'); END;
+CREATE TRIGGER IF NOT EXISTS regions_layer_update_same_session
+BEFORE UPDATE OF session_id, layer_id ON regions
+WHEN NEW.layer_id IS NOT NULL AND NOT EXISTS
+ (SELECT 1 FROM layers WHERE id=NEW.layer_id AND session_id=NEW.session_id)
+BEGIN SELECT RAISE(ABORT, 'region layer belongs to another session'); END;
+CREATE TRIGGER IF NOT EXISTS allocations_layer_same_session
+BEFORE INSERT ON allocations WHEN NEW.layer_id IS NOT NULL AND NOT EXISTS
+ (SELECT 1 FROM layers WHERE id=NEW.layer_id AND session_id=NEW.session_id)
+BEGIN SELECT RAISE(ABORT, 'allocation layer belongs to another session'); END;
+CREATE TRIGGER IF NOT EXISTS allocations_layer_update_same_session
+BEFORE UPDATE OF session_id, layer_id ON allocations
+WHEN NEW.layer_id IS NOT NULL AND NOT EXISTS
+ (SELECT 1 FROM layers WHERE id=NEW.layer_id AND session_id=NEW.session_id)
+BEGIN SELECT RAISE(ABORT, 'allocation layer belongs to another session'); END;
+"#;
+
+pub const GPU_OWNERSHIP_TRIGGERS: &str = r#"
+CREATE TRIGGER IF NOT EXISTS op_map_same_session
+BEFORE INSERT ON op_kernel_map WHEN NOT EXISTS
+ (SELECT 1 FROM ops WHERE id=NEW.op_id AND session_id=NEW.session_id)
+BEGIN SELECT RAISE(ABORT, 'operator link belongs to another session'); END;
+CREATE TRIGGER IF NOT EXISTS op_map_update_same_session
+BEFORE UPDATE OF session_id, op_id ON op_kernel_map WHEN NOT EXISTS
+ (SELECT 1 FROM ops WHERE id=NEW.op_id AND session_id=NEW.session_id)
+BEGIN SELECT RAISE(ABORT, 'operator link belongs to another session'); END;
+CREATE TRIGGER IF NOT EXISTS launches_layer_same_session
+BEFORE INSERT ON launches WHEN NEW.layer_id IS NOT NULL AND NOT EXISTS
+ (SELECT 1 FROM layers WHERE id=NEW.layer_id AND session_id=NEW.session_id)
+BEGIN SELECT RAISE(ABORT, 'launch layer belongs to another session'); END;
+CREATE TRIGGER IF NOT EXISTS launches_layer_update_same_session
+BEFORE UPDATE OF session_id, layer_id ON launches
+WHEN NEW.layer_id IS NOT NULL AND NOT EXISTS
+ (SELECT 1 FROM layers WHERE id=NEW.layer_id AND session_id=NEW.session_id)
+BEGIN SELECT RAISE(ABORT, 'launch layer belongs to another session'); END;
+CREATE TRIGGER IF NOT EXISTS metrics_layer_same_session
+BEFORE INSERT ON metrics WHEN NEW.layer_id IS NOT NULL AND NOT EXISTS
+ (SELECT 1 FROM layers WHERE id=NEW.layer_id AND session_id=NEW.session_id)
+BEGIN SELECT RAISE(ABORT, 'metric layer belongs to another session'); END;
+CREATE TRIGGER IF NOT EXISTS metrics_layer_update_same_session
+BEFORE UPDATE OF session_id, layer_id ON metrics
+WHEN NEW.layer_id IS NOT NULL AND NOT EXISTS
+ (SELECT 1 FROM layers WHERE id=NEW.layer_id AND session_id=NEW.session_id)
+BEGIN SELECT RAISE(ABORT, 'metric layer belongs to another session'); END;
+CREATE TRIGGER IF NOT EXISTS transfers_layer_same_session
+BEFORE INSERT ON transfers WHEN NEW.layer_id IS NOT NULL AND NOT EXISTS
+ (SELECT 1 FROM layers WHERE id=NEW.layer_id AND session_id=NEW.session_id)
+BEGIN SELECT RAISE(ABORT, 'transfer layer belongs to another session'); END;
+CREATE TRIGGER IF NOT EXISTS transfers_layer_update_same_session
+BEFORE UPDATE OF session_id, layer_id ON transfers
+WHEN NEW.layer_id IS NOT NULL AND NOT EXISTS
+ (SELECT 1 FROM layers WHERE id=NEW.layer_id AND session_id=NEW.session_id)
+BEGIN SELECT RAISE(ABORT, 'transfer layer belongs to another session'); END;
+CREATE TRIGGER IF NOT EXISTS ops_layer_same_session
+BEFORE INSERT ON ops WHEN NEW.layer_id IS NOT NULL AND NOT EXISTS
+ (SELECT 1 FROM layers WHERE id=NEW.layer_id AND session_id=NEW.session_id)
+BEGIN SELECT RAISE(ABORT, 'operator layer belongs to another session'); END;
+CREATE TRIGGER IF NOT EXISTS ops_layer_update_same_session
+BEFORE UPDATE OF session_id, layer_id ON ops
+WHEN NEW.layer_id IS NOT NULL AND NOT EXISTS
+ (SELECT 1 FROM layers WHERE id=NEW.layer_id AND session_id=NEW.session_id)
+BEGIN SELECT RAISE(ABORT, 'operator layer belongs to another session'); END;
+"#;
+
+pub const CPU_OWNERSHIP_TRIGGERS: &str = r#"
+CREATE TRIGGER IF NOT EXISTS samples_layer_same_session
+BEFORE INSERT ON samples WHEN NEW.layer_id IS NOT NULL AND NOT EXISTS
+ (SELECT 1 FROM layers WHERE id=NEW.layer_id AND session_id=NEW.session_id)
+BEGIN SELECT RAISE(ABORT, 'sample layer belongs to another session'); END;
+CREATE TRIGGER IF NOT EXISTS samples_symbol_same_session
+BEFORE INSERT ON samples WHEN NEW.symbol_id IS NOT NULL AND NOT EXISTS
+ (SELECT 1 FROM symbols WHERE id=NEW.symbol_id AND session_id=NEW.session_id)
+BEGIN SELECT RAISE(ABORT, 'sample symbol belongs to another session'); END;
+CREATE TRIGGER IF NOT EXISTS samples_layer_update_same_session
+BEFORE UPDATE OF session_id, layer_id ON samples
+WHEN NEW.layer_id IS NOT NULL AND NOT EXISTS
+ (SELECT 1 FROM layers WHERE id=NEW.layer_id AND session_id=NEW.session_id)
+BEGIN SELECT RAISE(ABORT, 'sample layer belongs to another session'); END;
+CREATE TRIGGER IF NOT EXISTS samples_symbol_update_same_session
+BEFORE UPDATE OF session_id, symbol_id ON samples
+WHEN NEW.symbol_id IS NOT NULL AND NOT EXISTS
+ (SELECT 1 FROM symbols WHERE id=NEW.symbol_id AND session_id=NEW.session_id)
+BEGIN SELECT RAISE(ABORT, 'sample symbol belongs to another session'); END;
+CREATE TRIGGER IF NOT EXISTS counters_layer_same_session
+BEFORE INSERT ON counters WHEN NEW.layer_id IS NOT NULL AND NOT EXISTS
+ (SELECT 1 FROM layers WHERE id=NEW.layer_id AND session_id=NEW.session_id)
+BEGIN SELECT RAISE(ABORT, 'counter layer belongs to another session'); END;
+CREATE TRIGGER IF NOT EXISTS counters_symbol_same_session
+BEFORE INSERT ON counters WHEN NEW.symbol_id IS NOT NULL AND NOT EXISTS
+ (SELECT 1 FROM symbols WHERE id=NEW.symbol_id AND session_id=NEW.session_id)
+BEGIN SELECT RAISE(ABORT, 'counter symbol belongs to another session'); END;
+CREATE TRIGGER IF NOT EXISTS counters_layer_update_same_session
+BEFORE UPDATE OF session_id, layer_id ON counters
+WHEN NEW.layer_id IS NOT NULL AND NOT EXISTS
+ (SELECT 1 FROM layers WHERE id=NEW.layer_id AND session_id=NEW.session_id)
+BEGIN SELECT RAISE(ABORT, 'counter layer belongs to another session'); END;
+CREATE TRIGGER IF NOT EXISTS counters_symbol_update_same_session
+BEFORE UPDATE OF session_id, symbol_id ON counters
+WHEN NEW.symbol_id IS NOT NULL AND NOT EXISTS
+ (SELECT 1 FROM symbols WHERE id=NEW.symbol_id AND session_id=NEW.session_id)
+BEGIN SELECT RAISE(ABORT, 'counter symbol belongs to another session'); END;
+"#;
+
+pub const MANAGED_OWNERSHIP_TRIGGERS: &str = r#"
+CREATE TRIGGER IF NOT EXISTS gc_events_layer_same_session
+BEFORE INSERT ON gc_events WHEN NEW.layer_id IS NOT NULL AND NOT EXISTS
+ (SELECT 1 FROM layers WHERE id=NEW.layer_id AND session_id=NEW.session_id)
+BEGIN SELECT RAISE(ABORT, 'GC layer belongs to another session'); END;
+CREATE TRIGGER IF NOT EXISTS gc_events_layer_update_same_session
+BEFORE UPDATE OF session_id, layer_id ON gc_events
+WHEN NEW.layer_id IS NOT NULL AND NOT EXISTS
+ (SELECT 1 FROM layers WHERE id=NEW.layer_id AND session_id=NEW.session_id)
+BEGIN SELECT RAISE(ABORT, 'GC layer belongs to another session'); END;
+CREATE TRIGGER IF NOT EXISTS jit_events_symbol_same_session
+BEFORE INSERT ON jit_events WHEN NEW.symbol_id IS NOT NULL AND NOT EXISTS
+ (SELECT 1 FROM symbols WHERE id=NEW.symbol_id AND session_id=NEW.session_id)
+BEGIN SELECT RAISE(ABORT, 'JIT symbol belongs to another session'); END;
+CREATE TRIGGER IF NOT EXISTS jit_events_layer_same_session
+BEFORE INSERT ON jit_events WHEN NEW.layer_id IS NOT NULL AND NOT EXISTS
+ (SELECT 1 FROM layers WHERE id=NEW.layer_id AND session_id=NEW.session_id)
+BEGIN SELECT RAISE(ABORT, 'JIT layer belongs to another session'); END;
+CREATE TRIGGER IF NOT EXISTS jit_events_symbol_update_same_session
+BEFORE UPDATE OF session_id, symbol_id ON jit_events
+WHEN NEW.symbol_id IS NOT NULL AND NOT EXISTS
+ (SELECT 1 FROM symbols WHERE id=NEW.symbol_id AND session_id=NEW.session_id)
+BEGIN SELECT RAISE(ABORT, 'JIT symbol belongs to another session'); END;
+CREATE TRIGGER IF NOT EXISTS jit_events_layer_update_same_session
+BEFORE UPDATE OF session_id, layer_id ON jit_events
+WHEN NEW.layer_id IS NOT NULL AND NOT EXISTS
+ (SELECT 1 FROM layers WHERE id=NEW.layer_id AND session_id=NEW.session_id)
+BEGIN SELECT RAISE(ABORT, 'JIT layer belongs to another session'); END;
+"#;
+
+pub const PYTHON_OWNERSHIP_TRIGGERS: &str = r#"
+CREATE TRIGGER IF NOT EXISTS gil_events_layer_same_session
+BEFORE INSERT ON gil_events WHEN NEW.layer_id IS NOT NULL AND NOT EXISTS
+ (SELECT 1 FROM layers WHERE id=NEW.layer_id AND session_id=NEW.session_id)
+BEGIN SELECT RAISE(ABORT, 'GIL layer belongs to another session'); END;
+CREATE TRIGGER IF NOT EXISTS gil_events_layer_update_same_session
+BEFORE UPDATE OF session_id, layer_id ON gil_events
+WHEN NEW.layer_id IS NOT NULL AND NOT EXISTS
+ (SELECT 1 FROM layers WHERE id=NEW.layer_id AND session_id=NEW.session_id)
+BEGIN SELECT RAISE(ABORT, 'GIL layer belongs to another session'); END;
+"#;
+
+pub const NODE_OWNERSHIP_TRIGGERS: &str = r#"
+CREATE TRIGGER IF NOT EXISTS event_loop_lags_layer_same_session
+BEFORE INSERT ON event_loop_lags WHEN NEW.layer_id IS NOT NULL AND NOT EXISTS
+ (SELECT 1 FROM layers WHERE id=NEW.layer_id AND session_id=NEW.session_id)
+BEGIN SELECT RAISE(ABORT, 'event-loop layer belongs to another session'); END;
+CREATE TRIGGER IF NOT EXISTS event_loop_lags_layer_update_same_session
+BEFORE UPDATE OF session_id, layer_id ON event_loop_lags
+WHEN NEW.layer_id IS NOT NULL AND NOT EXISTS
+ (SELECT 1 FROM layers WHERE id=NEW.layer_id AND session_id=NEW.session_id)
+BEGIN SELECT RAISE(ABORT, 'event-loop layer belongs to another session'); END;
+"#;
 
 #[cfg(test)]
 mod tests {
@@ -444,5 +684,19 @@ mod tests {
             "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='samples'",
             [], |r| r.get(0)).unwrap();
         assert_eq!(samples, 0, "samples table should not exist for GPU class");
+    }
+
+    #[test]
+    fn allocation_layer_links_must_stay_in_the_same_session() {
+        let c = in_mem();
+        apply(&c, TargetClass::NativeCpu).unwrap();
+        c.execute("INSERT INTO sessions (id, kind, target, target_class, started_at, label) VALUES ('a', 'debug', 't', 'native-cpu', 'now', 'a')", []).unwrap();
+        c.execute("INSERT INTO sessions (id, kind, target, target_class, started_at, label) VALUES ('b', 'debug', 't', 'native-cpu', 'now', 'b')", []).unwrap();
+        c.execute("INSERT INTO layers (session_id, source) VALUES ('b', 'other')", []).unwrap();
+        let layer_id = c.last_insert_rowid();
+        assert!(c.execute(
+            "INSERT INTO alloc_sites (session_id, bytes_total, layer_id, collected_at) VALUES ('a', 1, ?1, 'now')",
+            [layer_id],
+        ).is_err());
     }
 }

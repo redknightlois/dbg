@@ -103,19 +103,8 @@ pub trait OnDemandCollector: Send + Sync {
 /// `symbol_id` joins are always valid.
 fn upsert_symbol(db: &SessionDb, sym: &CanonicalSymbol) -> Result<i64> {
     let session_id = current_session_id(db)?;
-    // Try to find an existing row.
-    let existing: Option<i64> = db.conn()
-        .query_row(
-            "SELECT id FROM symbols WHERE session_id=?1 AND lang=?2 AND fqn=?3",
-            params![session_id, sym.lang, sym.fqn],
-            |r| r.get(0),
-        )
-        .optional()?;
-    if let Some(id) = existing {
-        return Ok(id);
-    }
     db.conn().execute(
-        "INSERT INTO symbols (session_id, lang, fqn, file, line, demangled, raw, is_synthetic)
+        "INSERT OR IGNORE INTO symbols (session_id, lang, fqn, file, line, demangled, raw, is_synthetic)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
         params![
             session_id,
@@ -128,7 +117,11 @@ fn upsert_symbol(db: &SessionDb, sym: &CanonicalSymbol) -> Result<i64> {
             sym.is_synthetic as i64,
         ],
     )?;
-    Ok(db.conn().last_insert_rowid())
+    Ok(db.conn().query_row(
+        "SELECT id FROM symbols WHERE session_id=?1 AND lang=?2 AND fqn=?3",
+        params![session_id, sym.lang, sym.fqn],
+        |r| r.get(0),
+    )?)
 }
 
 fn current_session_id(db: &SessionDb) -> Result<String> {
@@ -145,6 +138,25 @@ fn current_session_id(db: &SessionDb) -> Result<String> {
 ///
 /// Returns the `disassembly.id` of the stored row.
 pub fn persist_disasm(
+    db: &SessionDb,
+    ctx: &CollectCtx<'_>,
+    output: &DisasmOutput,
+) -> Result<i64> {
+    db.conn().execute_batch("BEGIN IMMEDIATE")?;
+    let result = persist_disasm_inner(db, ctx, output);
+    match result {
+        Ok(id) => {
+            db.conn().execute_batch("COMMIT")?;
+            Ok(id)
+        }
+        Err(error) => {
+            let _ = db.conn().execute_batch("ROLLBACK");
+            Err(error)
+        }
+    }
+}
+
+fn persist_disasm_inner(
     db: &SessionDb,
     ctx: &CollectCtx<'_>,
     output: &DisasmOutput,

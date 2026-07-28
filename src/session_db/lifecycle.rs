@@ -69,6 +69,11 @@ impl SessionDb {
             }
             None => Connection::open_in_memory()?,
         };
+        conn.execute_batch("PRAGMA foreign_keys=ON;")?;
+        let foreign_keys: i64 = conn.query_row("PRAGMA foreign_keys", [], |r| r.get(0))?;
+        if foreign_keys != 1 {
+            bail!("SQLite foreign-key enforcement could not be enabled");
+        }
         conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")
             .ok(); // WAL unsupported in-memory — non-fatal.
         schema::apply(&conn, opts.target_class)?;
@@ -146,6 +151,12 @@ impl SessionDb {
         }
         let conn = Connection::open_with_flags(path, flags)
             .with_context(|| format!("opening session DB {}", path.display()))?;
+        conn.execute_batch("PRAGMA foreign_keys=ON;")
+            .with_context(|| format!("enabling SQLite foreign keys for {}", path.display()))?;
+        let foreign_keys: i64 = conn.query_row("PRAGMA foreign_keys", [], |r| r.get(0))?;
+        if foreign_keys != 1 {
+            bail!("SQLite foreign-key enforcement is disabled for {}", path.display());
+        }
 
         let found: i64 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
@@ -166,6 +177,18 @@ impl SessionDb {
             );
         }
 
+        validate_required_schema(&conn, path)?;
+        let owner_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM sessions", [], |r| r.get(0))
+            .with_context(|| format!("counting session owners in {}", path.display()))?;
+        if owner_count != 1 {
+            bail!(
+                "session DB {} must contain exactly one session owner row, found {}",
+                path.display(),
+                owner_count
+            );
+        }
+
         // A well-formed DB has exactly one session row (the owning session).
         let (session_id, label, kind_s, class_s, target): (String, String, String, String, String) =
             conn.query_row(
@@ -183,6 +206,7 @@ impl SessionDb {
         let target_class: TargetClass = class_s
             .parse()
             .with_context(|| format!("parsing target_class {class_s}"))?;
+        validate_class_schema(&conn, path, target_class)?;
 
         Ok(SessionDb {
             conn,
@@ -288,6 +312,92 @@ impl SessionDb {
     pub fn target_class(&self) -> TargetClass { self.target_class }
     pub fn target(&self) -> &str { &self.target }
     pub fn db_path(&self) -> Option<&Path> { self.db_path.as_deref() }
+}
+
+fn validate_required_schema(conn: &Connection, path: &Path) -> Result<()> {
+    let required: &[(&str, &[&str])] = &[
+        ("sessions", &["id", "kind", "target", "target_class", "target_hash", "started_at", "ended_at", "label", "created_by"]),
+        ("layers", &["id", "session_id", "source", "file", "collected_at", "command_used", "collection_secs", "target_hash"]),
+        ("symbols", &["id", "session_id", "lang", "fqn", "file", "line", "demangled", "raw", "is_synthetic"]),
+        ("meta", &["session_id", "key", "value"]),
+        ("failures", &["session_id", "phase", "error"]),
+        ("regions", &["id", "session_id", "name", "start_us", "duration_us", "thread", "layer_id"]),
+        ("allocations", &["id", "session_id", "op", "address", "bytes", "start_us", "heap", "thread", "stack_json", "layer_id"]),
+        ("commands", &["seq", "session_id", "input", "output_head", "output_file", "output_bytes", "ts", "canonical_op"]),
+        ("breakpoint_hits", &["id", "session_id", "location_key", "hit_seq", "thread", "ts", "locals_json", "stack_json"]),
+        ("watch_evals", &["id", "session_id", "hit_id", "expr", "value", "type_name", "ts"]),
+        ("disassembly", &["id", "session_id", "symbol_id", "source", "tier", "code_bytes", "asm_text", "asm_lines_json", "collected_at", "trigger", "layer_id"]),
+        ("source_snapshots", &["id", "session_id", "symbol_id", "file", "line_start", "line_end", "text", "content_hash", "collected_at"]),
+        ("alloc_sites", &["id", "session_id", "symbol_id", "bytes_total", "count", "largest_bytes", "collected_at", "layer_id"]),
+        ("insn_hits", &["id", "session_id", "target", "hit_count", "sample_basis", "sample_period", "window_us", "backend", "collected_at", "detail_json"]),
+        ("insn_hit_details", &["id", "insn_hit_id", "ts_us", "stack_json", "regs_json"]),
+    ];
+    for (table, columns) in required {
+        validate_table_columns(conn, table, columns, path)?;
+    }
+    Ok(())
+}
+
+fn validate_class_schema(conn: &Connection, path: &Path, class: TargetClass) -> Result<()> {
+    let required: &[(&str, &[&str])] = match class {
+        TargetClass::Gpu => &[
+            ("launches", &["id", "session_id", "kernel_name", "duration_us", "grid_x", "grid_y", "grid_z", "block_x", "block_y", "block_z", "stream_id", "start_us", "correlation_id", "layer_id"]),
+            ("metrics", &["session_id", "kernel_name", "occupancy_pct", "compute_throughput_pct", "memory_throughput_pct", "registers_per_thread", "shared_mem_static_bytes", "shared_mem_dynamic_bytes", "l2_hit_rate_pct", "achieved_bandwidth_gb_s", "peak_bandwidth_gb_s", "boundedness", "layer_id"]),
+            ("transfers", &["id", "session_id", "kind", "bytes", "duration_us", "start_us", "stream_id", "layer_id"]),
+            ("ops", &["id", "session_id", "name", "module_path", "cpu_time_us", "gpu_time_us", "input_shapes", "layer_id"]),
+            ("op_kernel_map", &["session_id", "op_id", "kernel_name"]),
+        ],
+        TargetClass::ManagedDotnet | TargetClass::Jvm => &[
+            ("samples", &["id", "session_id", "symbol_id", "thread", "start_us", "duration_us", "cpu_ns", "weight", "stack_json", "layer_id"]),
+            ("counters", &["id", "session_id", "name", "symbol_id", "value", "unit", "layer_id"]),
+            ("gc_events", &["id", "session_id", "kind", "pause_us", "start_us", "heap_before_bytes", "heap_after_bytes", "reason", "layer_id"]),
+            ("jit_events", &["id", "session_id", "symbol_id", "compile_us", "code_bytes", "tier", "start_us", "layer_id"]),
+        ],
+        TargetClass::Python => &[
+            ("samples", &["id", "session_id", "symbol_id", "thread", "start_us", "duration_us", "cpu_ns", "weight", "stack_json", "layer_id"]),
+            ("counters", &["id", "session_id", "name", "symbol_id", "value", "unit", "layer_id"]),
+            ("gil_events", &["id", "session_id", "kind", "thread", "start_us", "duration_us", "layer_id"]),
+        ],
+        TargetClass::JsNode => &[
+            ("samples", &["id", "session_id", "symbol_id", "thread", "start_us", "duration_us", "cpu_ns", "weight", "stack_json", "layer_id"]),
+            ("counters", &["id", "session_id", "name", "symbol_id", "value", "unit", "layer_id"]),
+            ("event_loop_lags", &["id", "session_id", "lag_us", "start_us", "phase", "layer_id"]),
+        ],
+        TargetClass::NativeCpu | TargetClass::Ruby | TargetClass::Php => &[
+            ("samples", &["id", "session_id", "symbol_id", "thread", "start_us", "duration_us", "cpu_ns", "weight", "stack_json", "layer_id"]),
+            ("counters", &["id", "session_id", "name", "symbol_id", "value", "unit", "layer_id"]),
+        ],
+    };
+    for (table, columns) in required {
+        validate_table_columns(conn, table, columns, path)?;
+    }
+    Ok(())
+}
+
+fn validate_table_columns(
+    conn: &Connection,
+    table: &str,
+    required: &[&str],
+    path: &Path,
+) -> Result<()> {
+    let mut stmt = conn
+        .prepare(&format!("PRAGMA table_info({table})"))
+        .with_context(|| format!("checking required table {table} in {}", path.display()))?;
+    let actual: std::collections::HashSet<String> = stmt
+        .query_map([], |r| r.get::<_, String>(1))?
+        .collect::<rusqlite::Result<_>>()?;
+    if actual.is_empty() {
+        bail!("session DB {} is missing required table {table}", path.display());
+    }
+    for column in required {
+        if !actual.contains(*column) {
+            bail!(
+                "session DB {} has malformed table {table}: missing column {column}",
+                path.display()
+            );
+        }
+    }
+    Ok(())
 }
 
 /// `<cwd>/.dbg/sessions/` — where saved session DBs live.
@@ -495,6 +605,64 @@ mod tests {
         assert_eq!(opened.session_id(), src.session_id());
         assert_eq!(opened.label(), src.label());
         assert_eq!(opened.target_class(), TargetClass::NativeCpu);
+    }
+
+    #[test]
+    fn foreign_keys_are_enabled_for_created_and_opened_sessions() {
+        let tmp = TempDir::new().unwrap();
+        let db = SessionDb::create(opts(tmp.path(), "/bin/ls")).unwrap();
+        let fk: i64 = db
+            .conn
+            .query_row("PRAGMA foreign_keys", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(fk, 1);
+        assert!(db
+            .conn
+            .execute(
+                "INSERT INTO layers (session_id, source) VALUES ('missing', 'bad')",
+                [],
+            )
+            .is_err());
+
+        let path = tmp.path().join("foreign-keys.db");
+        db.save_to(&path).unwrap();
+        let opened = SessionDb::open(&path).unwrap();
+        let fk: i64 = opened
+            .conn
+            .query_row("PRAGMA foreign_keys", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(fk, 1);
+        assert!(opened
+            .conn
+            .execute(
+                "INSERT INTO layers (session_id, source) VALUES ('missing', 'bad')",
+                [],
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn open_requires_exactly_one_owner_row_and_required_tables() {
+        let tmp = TempDir::new().unwrap();
+        let source = SessionDb::create(opts(tmp.path(), "/bin/ls")).unwrap();
+        let path = tmp.path().join("malformed.db");
+        source.save_to(&path).unwrap();
+        let err = {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch("PRAGMA foreign_keys=OFF;").unwrap();
+            conn.execute("DELETE FROM sessions", []).unwrap();
+            SessionDb::open(&path).unwrap_err().to_string()
+        };
+        assert!(err.contains("exactly one session owner row"), "{err}");
+
+        let source = SessionDb::create(opts(tmp.path(), "/bin/ls")).unwrap();
+        source.save_to(&path).unwrap();
+        let err = {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute("DROP TABLE samples", []).unwrap();
+            SessionDb::open(&path).unwrap_err().to_string()
+        };
+        assert!(err.contains("missing required table samples"), "{err}");
     }
 
     #[test]

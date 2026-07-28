@@ -36,7 +36,7 @@ impl OnDemandCollector for LldbDisassembleCollector {
         ctx: &CollectCtx<'_>,
         live: Option<&dyn LiveDebugger>,
     ) -> Result<DisasmOutput> {
-        let cmd = format!("disassemble --name {}", ctx.symbol);
+        let cmd = format!("disassemble --name {}", lldb_arg(ctx.symbol));
         let raw = match live {
             Some(l) => l.send(&cmd)?,
             None => run_oneshot_lldb(ctx.target, &cmd)?,
@@ -63,7 +63,7 @@ fn run_oneshot_lldb(target: &str, disasm_cmd: &str) -> Result<String> {
             "--batch",
             "--no-use-colors",
             "-o",
-            &format!("target create \"{}\"", target.replace('"', "\\\"")),
+            &format!("target create {}", lldb_arg(target)),
             "-o",
             disasm_cmd,
             "-o",
@@ -81,6 +81,27 @@ fn run_oneshot_lldb(target: &str, disasm_cmd: &str) -> Result<String> {
         );
     }
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
+}
+
+/// LLDB treats backticks in command arguments as expression evaluation.
+/// Escape every command-language metacharacter before putting a native
+/// symbol into a command string. The symbol remains data.
+fn lldb_arg(value: &str) -> String {
+    let mut out = String::with_capacity(value.len() + 2);
+    out.push('"');
+    for ch in value.chars() {
+        match ch {
+            '\\' | '"' | '`' => {
+                out.push('\\');
+                out.push(ch);
+            }
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            _ => out.push(ch),
+        }
+    }
+    out.push('"');
+    out
 }
 
 /// Very rough upper bound on code size: span between first and last
@@ -454,6 +475,13 @@ test`main:
     fn count_bytes_none_on_empty() {
         assert_eq!(count_instruction_bytes(""), None);
         assert_eq!(count_instruction_bytes("no addrs here"), None);
+    }
+
+    #[test]
+    fn lldb_symbol_backticks_are_escaped_as_data() {
+        let command = format!("disassemble --name {}", lldb_arg("danger`process launch`"));
+        assert!(command.contains("\"danger\\`process launch\\`\""));
+        assert!(!command.contains("danger`process launch`"));
     }
 
     #[test]
