@@ -125,11 +125,11 @@ fn upsert_symbol(db: &SessionDb, sym: &CanonicalSymbol) -> Result<i64> {
 }
 
 fn current_session_id(db: &SessionDb) -> Result<String> {
-    Ok(db.conn().query_row(
-        "SELECT id FROM sessions LIMIT 1",
-        [],
-        |r| r.get::<_, String>(0),
-    )?)
+    Ok(db
+        .conn()
+        .query_row("SELECT id FROM sessions LIMIT 1", [], |r| {
+            r.get::<_, String>(0)
+        })?)
 }
 
 /// Write a `DisasmOutput` into the `disassembly` table, keyed to the
@@ -137,11 +137,7 @@ fn current_session_id(db: &SessionDb) -> Result<String> {
 /// row's id when a match is found and refresh is off.
 ///
 /// Returns the `disassembly.id` of the stored row.
-pub fn persist_disasm(
-    db: &SessionDb,
-    ctx: &CollectCtx<'_>,
-    output: &DisasmOutput,
-) -> Result<i64> {
+pub fn persist_disasm(db: &SessionDb, ctx: &CollectCtx<'_>, output: &DisasmOutput) -> Result<i64> {
     db.conn().execute_batch("BEGIN IMMEDIATE")?;
     let result = persist_disasm_inner(db, ctx, output);
     match result {
@@ -178,7 +174,8 @@ fn persist_disasm_inner(
     let session_id = current_session_id(db)?;
 
     if !ctx.refresh {
-        let existing: Option<i64> = db.conn()
+        let existing: Option<i64> = db
+            .conn()
             .query_row(
                 "SELECT id FROM disassembly
                  WHERE session_id=?1 AND symbol_id=?2 AND source=?3
@@ -279,11 +276,15 @@ mod tests {
         let id = persist_disasm(&db, &ctx(&tmp, "main", false), &out).unwrap();
         assert!(id > 0);
 
-        let count: i64 = db.conn()
-            .query_row("SELECT COUNT(*) FROM symbols", [], |r| r.get(0)).unwrap();
+        let count: i64 = db
+            .conn()
+            .query_row("SELECT COUNT(*) FROM symbols", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(count, 1);
-        let dcount: i64 = db.conn()
-            .query_row("SELECT COUNT(*) FROM disassembly", [], |r| r.get(0)).unwrap();
+        let dcount: i64 = db
+            .conn()
+            .query_row("SELECT COUNT(*) FROM disassembly", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(dcount, 1);
     }
 
@@ -302,8 +303,10 @@ mod tests {
         let b = persist_disasm(&db, &ctx(&tmp, "main", false), &out).unwrap();
         assert_eq!(a, b, "second call should return cached id");
 
-        let count: i64 = db.conn()
-            .query_row("SELECT COUNT(*) FROM disassembly", [], |r| r.get(0)).unwrap();
+        let count: i64 = db
+            .conn()
+            .query_row("SELECT COUNT(*) FROM disassembly", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(count, 1);
     }
 
@@ -328,10 +331,13 @@ mod tests {
         let _ = persist_disasm(&db, &ctx(&tmp, "main", false), &v1).unwrap();
         let _ = persist_disasm(&db, &ctx(&tmp, "main", true), &v2).unwrap();
 
-        let count: i64 = db.conn()
-            .query_row("SELECT COUNT(*) FROM disassembly", [], |r| r.get(0)).unwrap();
+        let count: i64 = db
+            .conn()
+            .query_row("SELECT COUNT(*) FROM disassembly", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(count, 1);
-        let text: String = db.conn()
+        let text: String = db
+            .conn()
             .query_row("SELECT asm_text FROM disassembly", [], |r| r.get(0))
             .unwrap();
         assert_eq!(text, "new asm");
@@ -366,8 +372,10 @@ mod tests {
         persist_disasm(&db, &c, &t0).unwrap();
         persist_disasm(&db, &c, &t1).unwrap();
 
-        let count: i64 = db.conn()
-            .query_row("SELECT COUNT(*) FROM disassembly", [], |r| r.get(0)).unwrap();
+        let count: i64 = db
+            .conn()
+            .query_row("SELECT COUNT(*) FROM disassembly", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(count, 2, "tier0 and tier1 are distinct rows");
     }
 

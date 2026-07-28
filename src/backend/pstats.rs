@@ -22,7 +22,10 @@ impl Backend for PstatsBackend {
         // 2. Python script → profile it with cProfile, save to temp, open pstats
         let path = std::path::Path::new(target);
 
-        if path.extension().is_some_and(|e| e == "prof" || e == "pstats") {
+        if path
+            .extension()
+            .is_some_and(|e| e == "prof" || e == "pstats")
+        {
             // Existing profile
             Ok(SpawnConfig {
                 bin: "python3".into(),
@@ -37,26 +40,21 @@ impl Backend for PstatsBackend {
             let escaped_target = shell_escape(target);
             let mut profile_cmd = format!(
                 "python3 -m cProfile -o {} {}",
-                shell_escape(&prof_str), escaped_target
+                shell_escape(&prof_str),
+                escaped_target
             );
             for a in args {
                 profile_cmd.push(' ');
                 profile_cmd.push_str(&shell_escape(a));
             }
 
-            let exec_repl = format!(
-                "exec python3 -m pstats {}",
-                shell_escape(&prof_str)
-            );
+            let exec_repl = format!("exec python3 -m pstats {}", shell_escape(&prof_str));
 
             Ok(SpawnConfig {
                 bin: "bash".into(),
                 args: vec!["--norc".into(), "--noprofile".into()],
                 env: vec![("PS1".into(), "% ".into())],
-                init_commands: vec![
-                    profile_cmd,
-                    exec_repl,
-                ],
+                init_commands: vec![profile_cmd, exec_repl],
             })
         }
     }
@@ -114,7 +112,10 @@ impl Backend for PstatsBackend {
     }
 
     fn adapters(&self) -> Vec<(&'static str, &'static str)> {
-        vec![("pyprofile.md", include_str!("../../skills/adapters/pyprofile.md"))]
+        vec![(
+            "pyprofile.md",
+            include_str!("../../skills/adapters/pyprofile.md"),
+        )]
     }
 }
 
@@ -178,7 +179,9 @@ mod tests {
 
     #[test]
     fn spawn_config_python_script_with_args() {
-        let cfg = PstatsBackend.spawn_config("app.py", &["--port".into(), "8080".into()]).unwrap();
+        let cfg = PstatsBackend
+            .spawn_config("app.py", &["--port".into(), "8080".into()])
+            .unwrap();
         let cmd = &cfg.init_commands[0];
         assert!(cmd.contains("app.py"));
         assert!(cmd.contains("--port"));

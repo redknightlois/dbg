@@ -26,7 +26,15 @@ impl Backend for NodeProtoBackend {
     }
 
     fn types(&self) -> &'static [&'static str] {
-        &["node-proto", "node", "nodejs", "js", "javascript", "ts", "typescript"]
+        &[
+            "node-proto",
+            "node",
+            "nodejs",
+            "js",
+            "javascript",
+            "ts",
+            "typescript",
+        ]
     }
 
     fn spawn_config(&self, target: &str, _args: &[String]) -> anyhow::Result<SpawnConfig> {
@@ -90,7 +98,10 @@ impl Backend for NodeProtoBackend {
     }
 
     fn adapters(&self) -> Vec<(&'static str, &'static str)> {
-        vec![("javascript.md", include_str!("../../skills/adapters/javascript.md"))]
+        vec![(
+            "javascript.md",
+            include_str!("../../skills/adapters/javascript.md"),
+        )]
     }
 
     fn canonical_ops(&self) -> Option<&dyn CanonicalOps> {

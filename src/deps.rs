@@ -51,17 +51,18 @@ pub fn check_dep(dep: Dependency) -> DepStatus {
             ..
         } => {
             for name in *alternatives {
-                let found_path = which::which(name)
-                    .map(|p| p.display().to_string())
-                    .or_else(|_| {
-                        for dir in extra_tool_dirs() {
-                            let path = dir.join(name);
-                            if path.is_file() {
-                                return Ok(path.display().to_string());
+                let found_path =
+                    which::which(name)
+                        .map(|p| p.display().to_string())
+                        .or_else(|_| {
+                            for dir in extra_tool_dirs() {
+                                let path = dir.join(name);
+                                if path.is_file() {
+                                    return Ok(path.display().to_string());
+                                }
                             }
-                        }
-                        Err(())
-                    });
+                            Err(())
+                        });
                 if let Ok(path) = found_path {
                     // Binary exists on disk. If a version_cmd is
                     // provided, run it to verify the toolchain
@@ -78,7 +79,9 @@ pub fn check_dep(dep: Dependency) -> DepStatus {
                             return DepStatus {
                                 name: dep.name,
                                 ok: false,
-                                detail: format!("{path} (found but broken — `{probe_bin}` failed to run)"),
+                                detail: format!(
+                                    "{path} (found but broken — `{probe_bin}` failed to run)"
+                                ),
                                 install: dep.install,
                                 warning: None,
                             };

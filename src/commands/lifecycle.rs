@@ -90,9 +90,9 @@ pub fn try_dispatch(input: &str) -> Option<super::Dispatched> {
                         ));
                     }
                     _ if t.starts_with("--") => {
-                        return Some(super::Dispatched::Immediate(
-                            format!("unknown flag `{t}` — supported: --label"),
-                        ));
+                        return Some(super::Dispatched::Immediate(format!(
+                            "unknown flag `{t}` — supported: --label"
+                        )));
                     }
                     _ if label.is_none() => label = Some(t.to_string()),
                     _ => {}
@@ -113,18 +113,23 @@ pub fn try_dispatch(input: &str) -> Option<super::Dispatched> {
                 0 => {
                     return Some(super::Dispatched::Immediate(
                         "usage:\n  dbg diff <other>          (active vs other)\n  \
-                         dbg diff <a> <b>          (two saved sessions)".into(),
+                         dbg diff <a> <b>          (two saved sessions)"
+                            .into(),
                     ));
                 }
-                1 => Lifecycle::Diff { a: None, b: toks[0].to_string() },
+                1 => Lifecycle::Diff {
+                    a: None,
+                    b: toks[0].to_string(),
+                },
                 2 => Lifecycle::Diff {
                     a: Some(toks[0].to_string()),
                     b: toks[1].to_string(),
                 },
                 _ => {
-                    return Some(super::Dispatched::Immediate(
-                        format!("dbg diff takes at most two arguments, got {}", toks.len()),
-                    ));
+                    return Some(super::Dispatched::Immediate(format!(
+                        "dbg diff takes at most two arguments, got {}",
+                        toks.len()
+                    )));
                 }
             }
         }
@@ -153,9 +158,11 @@ fn parse_prune_args(rest: &str) -> Result<(Duration, PrunePolicy)> {
         match toks[i] {
             "--all" => policy = PrunePolicy::All,
             "--older-than" => {
-                let v = toks.get(i + 1).ok_or_else(|| anyhow::anyhow!("--older-than needs a value"))?;
-                older_than = parse_duration(v)
-                    .ok_or_else(|| anyhow::anyhow!("invalid duration `{v}`"))?;
+                let v = toks
+                    .get(i + 1)
+                    .ok_or_else(|| anyhow::anyhow!("--older-than needs a value"))?;
+                older_than =
+                    parse_duration(v).ok_or_else(|| anyhow::anyhow!("invalid duration `{v}`"))?;
                 i += 1;
             }
             other => bail!("unknown prune argument `{other}`"),
@@ -257,10 +264,12 @@ fn cmd_sessions(ctx: &LifeCtx<'_>, group_only: bool) -> String {
         // falling through would silently drop the filter and list
         // every saved DB, which is indistinguishable from plain
         // `dbg sessions` and misleads the caller.
-        return "no active session — cannot filter by group (run `dbg sessions` for the full list)".into();
+        return "no active session — cannot filter by group (run `dbg sessions` for the full list)"
+            .into();
     }
     let group_key = if group_only {
-        ctx.active.and_then(|db| db.meta("session_group_key").ok().flatten())
+        ctx.active
+            .and_then(|db| db.meta("session_group_key").ok().flatten())
     } else {
         None
     };
@@ -458,10 +467,7 @@ fn cmd_save(ctx: &LifeCtx<'_>, label: Option<&str>) -> String {
     // Stamp created_by=user on the persisted DB too so a later
     // `prune` won't reap it.
     if let Ok(conn) = rusqlite::Connection::open(&path) {
-        let _ = conn.execute(
-            "UPDATE sessions SET created_by='user'",
-            [],
-        );
+        let _ = conn.execute("UPDATE sessions SET created_by='user'", []);
     }
     format!("saved `{lbl}` to {}", path.display())
 }
@@ -553,7 +559,7 @@ fn diff_two_dbs(ctx: &LifeCtx<'_>, a_db: &SessionDb, a_label: &str, b_label: &st
     // compare" and forced manual %×total_ms math.
     let a_is_profile = a_db.kind() == SessionKind::Profile;
     if a_is_profile {
-    let b_db = match SessionDb::open_read_only(&b_path) {
+        let b_db = match SessionDb::open_read_only(&b_path) {
             Ok(db) => db,
             Err(e) => return format!("[error opening {}: {e}]", b_path.display()),
         };
@@ -578,14 +584,18 @@ fn profile_diff(a_db: &SessionDb, b_db: &SessionDb, a_label: &str, b_label: &str
     use std::collections::HashMap;
     let a = match (load_profile(a_db), load_profile(b_db)) {
         (Some(a), Some(b)) => (a, b),
-        (None, _) => return format!(
-            "session `{a_label}` has no persisted profile source \
+        (None, _) => {
+            return format!(
+                "session `{a_label}` has no persisted profile source \
              (collected before replay support landed; re-collect to enable diff)"
-        ),
-        (_, None) => return format!(
-            "session `{b_label}` has no persisted profile source \
+            );
+        }
+        (_, None) => {
+            return format!(
+                "session `{b_label}` has no persisted profile source \
              (collected before replay support landed; re-collect to enable diff)"
-        ),
+            );
+        }
     };
     let (a, b) = a;
     let total_a = a.total_ms();
@@ -633,8 +643,12 @@ fn profile_diff(a_db: &SessionDb, b_db: &SessionDb, a_label: &str, b_label: &str
         out.push_str(&format!(
             "{:<58}  {:>9.1} {:>9.1} {:>+9.1}   {:>9.1} {:>9.1} {:>+9.1}\n",
             truncate(name, 58),
-            ia, ib, dinc,
-            ea, eb, dexc,
+            ia,
+            ib,
+            dinc,
+            ea,
+            eb,
+            dexc,
         ));
     }
     if rows.len() > 40 {
@@ -698,10 +712,8 @@ fn diff_hits(a_db: &SessionDb, b_path: &Path, a_label: &str, b_label: &str) -> S
         FROM combined
         ORDER BY ABS(hits_a - hits_b) DESC, lang, fqn";
 
-    let rows: Result<Vec<(String, String, i64, i64)>, rusqlite::Error> = a_db
-        .conn()
-        .prepare(sql)
-        .and_then(|mut s| {
+    let rows: Result<Vec<(String, String, i64, i64)>, rusqlite::Error> =
+        a_db.conn().prepare(sql).and_then(|mut s| {
             s.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
                 .and_then(|it| it.collect())
         });
@@ -725,7 +737,10 @@ fn diff_hits(a_db: &SessionDb, b_path: &Path, a_label: &str, b_label: &str) -> S
         ));
     }
     if rows.len() > 40 {
-        out.push_str(&format!("… {} more rows (use `dbg export` for the full set)\n", rows.len() - 40));
+        out.push_str(&format!(
+            "… {} more rows (use `dbg export` for the full set)\n",
+            rows.len() - 40
+        ));
     }
     out
 }
@@ -827,7 +842,10 @@ mod tests {
     fn save_rejects_path_escape_labels() {
         let tmp = TempDir::new().unwrap();
         let db = mk_db(&tmp, "active");
-        let ctx = LifeCtx { cwd: tmp.path(), active: Some(&db) };
+        let ctx = LifeCtx {
+            cwd: tmp.path(),
+            active: Some(&db),
+        };
         for label in ["../outside", "/tmp/outside", "a\\b"] {
             let out = cmd_save(&ctx, Some(label));
             assert!(out.contains("invalid session label"), "{label}: {out}");
@@ -846,11 +864,16 @@ mod tests {
             ("diff my-other", "diff"),
         ] {
             match try_dispatch(input).unwrap() {
-                super::super::Dispatched::Lifecycle(l) => assert_eq!(l.canonical_op(), expect_op, "{input}"),
-                other => panic!("unexpected variant for {input}: {:?}", match other {
-                    super::super::Dispatched::Immediate(s) => format!("Immediate({s:?})"),
-                    _ => "other".into(),
-                }),
+                super::super::Dispatched::Lifecycle(l) => {
+                    assert_eq!(l.canonical_op(), expect_op, "{input}")
+                }
+                other => panic!(
+                    "unexpected variant for {input}: {:?}",
+                    match other {
+                        super::super::Dispatched::Immediate(s) => format!("Immediate({s:?})"),
+                        _ => "other".into(),
+                    }
+                ),
             }
         }
     }
@@ -902,7 +925,10 @@ mod tests {
     #[test]
     fn sessions_reports_empty_when_no_sessions_dir() {
         let tmp = TempDir::new().unwrap();
-        let ctx = LifeCtx { cwd: tmp.path(), active: None };
+        let ctx = LifeCtx {
+            cwd: tmp.path(),
+            active: None,
+        };
         let out = cmd_sessions(&ctx, false);
         assert!(out.contains("no saved sessions"));
     }
@@ -918,7 +944,10 @@ mod tests {
         let p = sessions_dir(tmp.path()).join("first.db");
         db.save_to(&p).unwrap();
 
-        let ctx = LifeCtx { cwd: tmp.path(), active: None };
+        let ctx = LifeCtx {
+            cwd: tmp.path(),
+            active: None,
+        };
         let out = cmd_sessions(&ctx, false);
         assert!(out.contains("first"));
         assert!(out.contains("native-cpu"));
@@ -942,7 +971,10 @@ mod tests {
             .save_to(&sessions_dir(tmp.path()).join("newer.db"))
             .unwrap();
 
-        let ctx = LifeCtx { cwd: tmp.path(), active: None };
+        let ctx = LifeCtx {
+            cwd: tmp.path(),
+            active: None,
+        };
         let out = cmd_sessions(&ctx, false);
         let newer_pos = out.find("newer").expect("newer missing");
         let older_pos = out.find("older").expect("older missing");
@@ -964,7 +996,10 @@ mod tests {
         let db = mk_db(&tmp, "peer");
         db.save_to(&sessions_dir(tmp.path()).join("peer.db"))
             .unwrap();
-        let ctx = LifeCtx { cwd: tmp.path(), active: None };
+        let ctx = LifeCtx {
+            cwd: tmp.path(),
+            active: None,
+        };
         let out = cmd_sessions(&ctx, true);
         assert!(
             !out.contains("peer"),
@@ -984,7 +1019,10 @@ mod tests {
         // found nothing.
         let tmp = TempDir::new().unwrap();
         let db = mk_db(&tmp, "active");
-        let ctx = LifeCtx { cwd: tmp.path(), active: Some(&db) };
+        let ctx = LifeCtx {
+            cwd: tmp.path(),
+            active: Some(&db),
+        };
         let out = cmd_save(&ctx, None);
         assert!(out.contains("saved"), "{out}");
         let expected = sessions_dir(tmp.path()).join("active.db");
@@ -1003,7 +1041,10 @@ mod tests {
         // produces `.dbg/sessions/mylabel.db`.
         let tmp = TempDir::new().unwrap();
         let db = mk_db(&tmp, "active");
-        let ctx = LifeCtx { cwd: tmp.path(), active: Some(&db) };
+        let ctx = LifeCtx {
+            cwd: tmp.path(),
+            active: Some(&db),
+        };
         let out = cmd_save(&ctx, Some("mybug"));
         assert!(out.contains("saved `mybug`"), "{out}");
         let expected = sessions_dir(tmp.path()).join("mybug.db");
@@ -1013,7 +1054,10 @@ mod tests {
     #[test]
     fn save_without_active_session_errors() {
         let tmp = TempDir::new().unwrap();
-        let ctx = LifeCtx { cwd: tmp.path(), active: None };
+        let ctx = LifeCtx {
+            cwd: tmp.path(),
+            active: None,
+        };
         let out = cmd_save(&ctx, Some("anything"));
         assert!(out.contains("no active session"), "{out}");
     }
@@ -1025,23 +1069,33 @@ mod tests {
         // sessions", hiding the running session entirely.
         let tmp = TempDir::new().unwrap();
         let db = mk_db(&tmp, "live");
-        let ctx = LifeCtx { cwd: tmp.path(), active: Some(&db) };
+        let ctx = LifeCtx {
+            cwd: tmp.path(),
+            active: Some(&db),
+        };
         // Don't create .dbg/sessions/ — the synthesize-live branch
         // should still fire.
         assert!(!sessions_dir(tmp.path()).exists());
         let out = cmd_sessions(&ctx, false);
         assert!(out.contains("live"), "missing live entry:\n{out}");
-        assert!(out.contains("* = currently live session"), "missing * marker:\n{out}");
+        assert!(
+            out.contains("* = currently live session"),
+            "missing * marker:\n{out}"
+        );
     }
 
     #[test]
     fn prune_zero_age_removes_auto_sessions() {
         let tmp = TempDir::new().unwrap();
         let db = mk_db(&tmp, "auto1");
-        db.save_to(&sessions_dir(tmp.path()).join("auto1.db")).unwrap();
+        db.save_to(&sessions_dir(tmp.path()).join("auto1.db"))
+            .unwrap();
         std::thread::sleep(Duration::from_millis(10));
 
-        let ctx = LifeCtx { cwd: tmp.path(), active: None };
+        let ctx = LifeCtx {
+            cwd: tmp.path(),
+            active: None,
+        };
         let out = cmd_prune(&ctx, Duration::ZERO, PrunePolicy::AutoOnly);
         assert!(out.contains("deleted 1 session"));
         assert!(out.contains("auto1.db"));
@@ -1050,7 +1104,10 @@ mod tests {
     #[test]
     fn diff_reports_no_active_session() {
         let tmp = TempDir::new().unwrap();
-        let ctx = LifeCtx { cwd: tmp.path(), active: None };
+        let ctx = LifeCtx {
+            cwd: tmp.path(),
+            active: None,
+        };
         let out = cmd_diff(&ctx, None, "anything");
         assert!(out.contains("no active session"));
     }
@@ -1064,7 +1121,10 @@ mod tests {
             let conn = rusqlite::Connection::open(&other_path).unwrap();
             conn.execute("PRAGMA user_version = 9999", []).unwrap();
         }
-        let ctx = LifeCtx { cwd: tmp.path(), active: Some(&active) };
+        let ctx = LifeCtx {
+            cwd: tmp.path(),
+            active: Some(&active),
+        };
         let out = cmd_diff(&ctx, None, other_path.to_string_lossy().as_ref());
         assert!(out.contains("9999"));
         assert!(out.contains("re-collect"));
@@ -1078,7 +1138,10 @@ mod tests {
         let other_path = sessions_dir(tmp.path()).join("other.db");
         other.save_to(&other_path).unwrap();
 
-        let ctx = LifeCtx { cwd: tmp.path(), active: Some(&active) };
+        let ctx = LifeCtx {
+            cwd: tmp.path(),
+            active: Some(&active),
+        };
         let out = cmd_diff(&ctx, None, "other");
         assert!(
             out.contains("no symbols") || out.contains("diff cur"),
@@ -1094,35 +1157,50 @@ mod tests {
 
         // `a` has foo hit 3 times; `b` has bar hit 5 times; they
         // share nothing.
-        active.conn().execute(
-            "INSERT INTO symbols (session_id, lang, fqn, raw)
+        active
+            .conn()
+            .execute(
+                "INSERT INTO symbols (session_id, lang, fqn, raw)
              VALUES ((SELECT id FROM sessions LIMIT 1), 'cpp', 'foo', 'foo')",
-            [],
-        ).unwrap();
+                [],
+            )
+            .unwrap();
         for seq in 1..=3 {
-            active.conn().execute(
-                "INSERT INTO breakpoint_hits (session_id, location_key, hit_seq, ts)
+            active
+                .conn()
+                .execute(
+                    "INSERT INTO breakpoint_hits (session_id, location_key, hit_seq, ts)
                  VALUES ((SELECT id FROM sessions LIMIT 1), 'foo', ?1, datetime('now'))",
-                params![seq],
-            ).unwrap();
+                    params![seq],
+                )
+                .unwrap();
         }
-        other.conn().execute(
-            "INSERT INTO symbols (session_id, lang, fqn, raw)
+        other
+            .conn()
+            .execute(
+                "INSERT INTO symbols (session_id, lang, fqn, raw)
              VALUES ((SELECT id FROM sessions LIMIT 1), 'cpp', 'bar', 'bar')",
-            [],
-        ).unwrap();
+                [],
+            )
+            .unwrap();
         for seq in 1..=5 {
-            other.conn().execute(
-                "INSERT INTO breakpoint_hits (session_id, location_key, hit_seq, ts)
+            other
+                .conn()
+                .execute(
+                    "INSERT INTO breakpoint_hits (session_id, location_key, hit_seq, ts)
                  VALUES ((SELECT id FROM sessions LIMIT 1), 'bar', ?1, datetime('now'))",
-                params![seq],
-            ).unwrap();
+                    params![seq],
+                )
+                .unwrap();
         }
 
         let other_path = sessions_dir(tmp.path()).join("b.db");
         other.save_to(&other_path).unwrap();
 
-        let ctx = LifeCtx { cwd: tmp.path(), active: Some(&active) };
+        let ctx = LifeCtx {
+            cwd: tmp.path(),
+            active: Some(&active),
+        };
         let out = cmd_diff(&ctx, None, "b");
         assert!(out.contains("foo"), "{out}");
         assert!(out.contains("bar"), "{out}");
@@ -1144,7 +1222,8 @@ mod tests {
         })
         .unwrap();
         db.set_meta("profile_raw", speedscope).unwrap();
-        db.save_to(&sessions_dir(tmp.path()).join(format!("{label}.db"))).unwrap();
+        db.save_to(&sessions_dir(tmp.path()).join(format!("{label}.db")))
+            .unwrap();
         db
     }
 
@@ -1168,7 +1247,10 @@ mod tests {
         mk_profile_db(&tmp, "a", prof_a);
         mk_profile_db(&tmp, "b", prof_b);
 
-        let ctx = LifeCtx { cwd: tmp.path(), active: None };
+        let ctx = LifeCtx {
+            cwd: tmp.path(),
+            active: None,
+        };
         let out = cmd_diff(&ctx, Some("a"), "b");
 
         assert!(out.contains("slow"), "diff missing `slow`:\n{out}");
@@ -1209,7 +1291,10 @@ mod tests {
 
         mk_profile_db(&tmp, "b", prof_b);
 
-        let ctx = LifeCtx { cwd: tmp.path(), active: None };
+        let ctx = LifeCtx {
+            cwd: tmp.path(),
+            active: None,
+        };
         let out = cmd_diff(&ctx, Some("a"), "b");
         assert!(
             out.contains("re-collect") && out.contains("a"),

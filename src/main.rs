@@ -562,7 +562,11 @@ fn replay_eval(
     match commands::dispatch_no_backend(cmd) {
         Some(commands::Dispatched::Immediate(s)) => s,
         Some(commands::Dispatched::Query(q)) => {
-            if matches!(q, commands::crosstrack::Query::Disasm { .. } | commands::crosstrack::Query::AtHitDisasm) {
+            if matches!(
+                q,
+                commands::crosstrack::Query::Disasm { .. }
+                    | commands::crosstrack::Query::AtHitDisasm
+            ) {
                 return "replay is read-only: disassembly collection is unavailable; use cached disasm rows or run `dbg disasm` in a live session".into();
             }
             let ctx = commands::crosstrack::RunCtx {
@@ -574,11 +578,14 @@ fn replay_eval(
             commands::crosstrack::run(&q, db, &ctx)
         }
         Some(commands::Dispatched::Lifecycle(l)) => {
-            if matches!(l, commands::lifecycle::Lifecycle::Save { .. }
-                | commands::lifecycle::Lifecycle::Prune { .. }
-                | commands::lifecycle::Lifecycle::Replay { .. })
-            {
-                return "replay is read-only: save, prune, and nested replay are unavailable".into();
+            if matches!(
+                l,
+                commands::lifecycle::Lifecycle::Save { .. }
+                    | commands::lifecycle::Lifecycle::Prune { .. }
+                    | commands::lifecycle::Lifecycle::Replay { .. }
+            ) {
+                return "replay is read-only: save, prune, and nested replay are unavailable"
+                    .into();
             }
             let ctx = commands::lifecycle::LifeCtx {
                 cwd,
@@ -732,9 +739,7 @@ fn cmd_import(registry: &Registry, args: &[String]) -> Result<()> {
             })
             .collect();
         if sanitized.is_empty() || sanitized.chars().all(|c| c == '_') {
-            bail!(
-                "--label `{name}` sanitizes to empty/all-underscore (allowed: [A-Za-z0-9-_])"
-            );
+            bail!("--label `{name}` sanitizes to empty/all-underscore (allowed: [A-Za-z0-9-_])");
         }
         // SAFETY: cmd_import runs on the single client thread before
         // any daemon fork; matching the contract used by cmd_start.
@@ -1632,9 +1637,8 @@ mod tests {
             vec!["--args", "foo", "--attach-pid=1"],
             vec!["--args", "foo", "--attach-port=:9999"],
         ] {
-            let err = parse_start_flags(&s(&misordered)).expect_err(&format!(
-                "expected error for misordered `{misordered:?}`"
-            ));
+            let err = parse_start_flags(&s(&misordered))
+                .expect_err(&format!("expected error for misordered `{misordered:?}`"));
             let msg = format!("{err:#}");
             assert!(
                 msg.contains("appeared after `--args`"),
@@ -1653,7 +1657,10 @@ mod tests {
         // assumed to be for the debuggee, so `dbg start cargo run --release`
         // works without manual --args.
         let p = parse_start_flags(&s(&["positional", "--release", "--features", "x"])).unwrap();
-        assert_eq!(p.run_args, vec!["positional", "--release", "--features", "x"]);
+        assert_eq!(
+            p.run_args,
+            vec!["positional", "--release", "--features", "x"]
+        );
         assert!(p.breakpoints.is_empty());
         assert!(!p.do_run);
         assert!(p.attach_pid.is_none());

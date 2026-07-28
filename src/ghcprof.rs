@@ -93,10 +93,8 @@ pub fn convert(prof_path: &str, out_path: &str) -> anyhow::Result<()> {
         writeln!(out, "fn={}", fn_name)?;
 
         // Self cost: individual_time as fraction of total_ticks, individual_alloc as fraction of total_alloc
-        let self_ticks =
-            ((cc.individual_time / 100.0) * total_ticks as f64).round() as u64;
-        let self_bytes =
-            ((cc.individual_alloc / 100.0) * total_alloc as f64).round() as u64;
+        let self_ticks = ((cc.individual_time / 100.0) * total_ticks as f64).round() as u64;
+        let self_bytes = ((cc.individual_alloc / 100.0) * total_alloc as f64).round() as u64;
 
         writeln!(out, "1 {} {}", self_ticks, self_bytes)?;
 

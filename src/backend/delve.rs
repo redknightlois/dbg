@@ -108,7 +108,9 @@ impl Backend for DelveBackend {
 }
 
 impl CanonicalOps for DelveBackend {
-    fn tool_name(&self) -> &'static str { "delve" }
+    fn tool_name(&self) -> &'static str {
+        "delve"
+    }
 
     fn tool_version(&self) -> Option<String> {
         static V: OnceLock<Option<String>> = OnceLock::new();
@@ -132,7 +134,9 @@ impl CanonicalOps for DelveBackend {
     fn op_unbreak(&self, id: BreakId) -> anyhow::Result<String> {
         Ok(format!("clear {}", id.0))
     }
-    fn op_breaks(&self) -> anyhow::Result<String> { Ok("breakpoints".into()) }
+    fn op_breaks(&self) -> anyhow::Result<String> {
+        Ok("breakpoints".into())
+    }
 
     fn op_run(&self, _args: &[String]) -> anyhow::Result<String> {
         // Delve launches paused at the entry point. `continue` starts
@@ -142,10 +146,18 @@ impl CanonicalOps for DelveBackend {
         // achieves that explicitly.
         Ok("continue".into())
     }
-    fn op_continue(&self) -> anyhow::Result<String> { Ok("continue".into()) }
-    fn op_step(&self) -> anyhow::Result<String> { Ok("step".into()) }
-    fn op_next(&self) -> anyhow::Result<String> { Ok("next".into()) }
-    fn op_finish(&self) -> anyhow::Result<String> { Ok("stepout".into()) }
+    fn op_continue(&self) -> anyhow::Result<String> {
+        Ok("continue".into())
+    }
+    fn op_step(&self) -> anyhow::Result<String> {
+        Ok("step".into())
+    }
+    fn op_next(&self) -> anyhow::Result<String> {
+        Ok("next".into())
+    }
+    fn op_finish(&self) -> anyhow::Result<String> {
+        Ok("stepout".into())
+    }
 
     fn op_stack(&self, n: Option<u32>) -> anyhow::Result<String> {
         Ok(match n {
@@ -156,7 +168,9 @@ impl CanonicalOps for DelveBackend {
     fn op_frame(&self, n: u32) -> anyhow::Result<String> {
         Ok(format!("frame {n}"))
     }
-    fn op_locals(&self) -> anyhow::Result<String> { Ok("locals".into()) }
+    fn op_locals(&self) -> anyhow::Result<String> {
+        Ok("locals".into())
+    }
     fn op_print(&self, expr: &str) -> anyhow::Result<String> {
         Ok(format!("print {expr}"))
     }
@@ -252,7 +266,10 @@ mod tests {
 
     #[test]
     fn format_breakpoint() {
-        assert_eq!(DelveBackend.format_breakpoint("main.go:10"), "break main.go:10");
+        assert_eq!(
+            DelveBackend.format_breakpoint("main.go:10"),
+            "break main.go:10"
+        );
     }
 
     #[test]
@@ -306,7 +323,11 @@ mod tests {
     fn canonical_break_ops() {
         let ops: &dyn CanonicalOps = &DelveBackend;
         assert_eq!(
-            ops.op_break(&BreakLoc::FileLine { file: "main.go".into(), line: 10 }).unwrap(),
+            ops.op_break(&BreakLoc::FileLine {
+                file: "main.go".into(),
+                line: 10
+            })
+            .unwrap(),
             "break main.go:10"
         );
         assert_eq!(
@@ -314,7 +335,11 @@ mod tests {
             "break main.main"
         );
         assert_eq!(
-            ops.op_break(&BreakLoc::ModuleMethod { module: "pkg".into(), method: "Foo".into() }).unwrap(),
+            ops.op_break(&BreakLoc::ModuleMethod {
+                module: "pkg".into(),
+                method: "Foo".into()
+            })
+            .unwrap(),
             "break pkg.Foo"
         );
     }
@@ -371,7 +396,15 @@ mod tests {
         let out = "x = 42\nname = \"hello\"\ncfg = main.Config {Host: \"localhost\", Port: 8080}";
         let v = DelveBackend.parse_locals(out).expect("should parse");
         let obj = v.as_object().unwrap();
-        assert_eq!(obj.get("x").unwrap().get("value").unwrap().as_str().unwrap(), "42");
+        assert_eq!(
+            obj.get("x")
+                .unwrap()
+                .get("value")
+                .unwrap()
+                .as_str()
+                .unwrap(),
+            "42"
+        );
         assert!(obj.contains_key("name"));
         assert!(obj.contains_key("cfg"));
     }

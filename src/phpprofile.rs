@@ -121,10 +121,7 @@ impl ProfileIndex {
             // (e.g. "Ir Bc Bcm Bi Bim"). PHP/Xdebug profiles use longer names
             // like "Time_(10ns) Memory_(bytes)" and may also emit this line.
             if let Some(rest) = line.strip_prefix("events:") {
-                event_names = rest
-                    .split_whitespace()
-                    .map(str::to_string)
-                    .collect();
+                event_names = rest.split_whitespace().map(str::to_string).collect();
                 continue;
             }
 
@@ -138,16 +135,15 @@ impl ProfileIndex {
                     total_memory = m.parse().unwrap_or(0);
                 }
                 // Capture all columns for later display
-                event_totals = parts
-                    .iter()
-                    .filter_map(|s| s.parse::<u64>().ok())
-                    .collect();
+                event_totals = parts.iter().filter_map(|s| s.parse::<u64>().ok()).collect();
                 continue;
             }
 
             // fl=(id) [name] or fl=bare_name
             if let Some(rest) = line.strip_prefix("fl=") {
-                if let Some((id_str, name)) = parse_id_assignment(rest, &mut bare_name_ids, &mut next_bare_id) {
+                if let Some((id_str, name)) =
+                    parse_id_assignment(rest, &mut bare_name_ids, &mut next_bare_id)
+                {
                     current_fl = id_str;
                     if !name.is_empty() {
                         file_names.insert(id_str, name.to_string());
@@ -158,7 +154,9 @@ impl ProfileIndex {
 
             // fn=(id) [name] or fn=bare_name
             if let Some(rest) = line.strip_prefix("fn=") {
-                if let Some((id_str, name)) = parse_id_assignment(rest, &mut bare_name_ids, &mut next_bare_id) {
+                if let Some((id_str, name)) =
+                    parse_id_assignment(rest, &mut bare_name_ids, &mut next_bare_id)
+                {
                     current_fn = id_str;
                     if !name.is_empty() {
                         fn_names.insert(id_str, name.to_string());
@@ -173,7 +171,9 @@ impl ProfileIndex {
 
             // cfl=(id) [name] or cfl=bare_name
             if let Some(rest) = line.strip_prefix("cfl=") {
-                if let Some((id_str, name)) = parse_id_assignment(rest, &mut bare_name_ids, &mut next_bare_id) {
+                if let Some((id_str, name)) =
+                    parse_id_assignment(rest, &mut bare_name_ids, &mut next_bare_id)
+                {
                     _current_cfl = id_str;
                     if !name.is_empty() {
                         file_names.insert(id_str, name.to_string());
@@ -184,7 +184,9 @@ impl ProfileIndex {
 
             // cfn=(id) [name] or cfn=bare_name
             if let Some(rest) = line.strip_prefix("cfn=") {
-                if let Some((id_str, name)) = parse_id_assignment(rest, &mut bare_name_ids, &mut next_bare_id) {
+                if let Some((id_str, name)) =
+                    parse_id_assignment(rest, &mut bare_name_ids, &mut next_bare_id)
+                {
                     current_cfn = id_str;
                     if !name.is_empty() {
                         fn_names.insert(id_str, name.to_string());
@@ -206,23 +208,20 @@ impl ProfileIndex {
             // Native callgrind also uses `+N` (relative offset) and `*` prefixes;
             // we handle the absolute-address form that starts with a digit here.
             // Relative-offset lines (`+N ...`) are handled below.
-            let cost_parts_opt: Option<Vec<&str>> = if line
-                .chars()
-                .next()
-                .map_or(false, |c| c.is_ascii_digit())
-            {
-                let p: Vec<&str> = line.split_whitespace().collect();
-                if p.len() >= 2 { Some(p) } else { None }
-            } else if line.starts_with('+') || line.starts_with('*') {
-                // Relative-offset format: `+N time [extra...]` or `* line time [extra...]`
-                let p: Vec<&str> = line.split_whitespace().collect();
-                // For `+N` lines, col[0]="+N", col[1..] are counters.
-                // For `* line` lines, col[0]="*", col[1]=line, col[2..] are counters.
-                // In both cases we treat col[1] as time and col[2] as memory.
-                if p.len() >= 2 { Some(p) } else { None }
-            } else {
-                None
-            };
+            let cost_parts_opt: Option<Vec<&str>> =
+                if line.chars().next().map_or(false, |c| c.is_ascii_digit()) {
+                    let p: Vec<&str> = line.split_whitespace().collect();
+                    if p.len() >= 2 { Some(p) } else { None }
+                } else if line.starts_with('+') || line.starts_with('*') {
+                    // Relative-offset format: `+N time [extra...]` or `* line time [extra...]`
+                    let p: Vec<&str> = line.split_whitespace().collect();
+                    // For `+N` lines, col[0]="+N", col[1..] are counters.
+                    // For `* line` lines, col[0]="*", col[1]=line, col[2..] are counters.
+                    // In both cases we treat col[1] as time and col[2] as memory.
+                    if p.len() >= 2 { Some(p) } else { None }
+                } else {
+                    None
+                };
             if let Some(parts) = cost_parts_opt {
                 let (time_idx, mem_idx, extra_start): (usize, usize, usize) =
                     if line.starts_with('*') {
@@ -230,7 +229,10 @@ impl ProfileIndex {
                     } else {
                         (1, 2, 3) // N time memory extra...  or  +N time memory extra...
                     };
-                let time: u64 = parts.get(time_idx).and_then(|s| s.parse().ok()).unwrap_or(0);
+                let time: u64 = parts
+                    .get(time_idx)
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(0);
                 let memory: i64 = parts.get(mem_idx).and_then(|s| s.parse().ok()).unwrap_or(0);
                 // Extra counters (Bcm etc.)
                 let n_extra = event_names.len().saturating_sub(2);
@@ -267,7 +269,9 @@ impl ProfileIndex {
                     *fn_self_memory.entry(current_fn).or_insert(0) += memory;
                     // Accumulate extra counters
                     if !extra.is_empty() {
-                        let slot = fn_extra_self.entry(current_fn).or_insert_with(|| vec![0u64; n_extra]);
+                        let slot = fn_extra_self
+                            .entry(current_fn)
+                            .or_insert_with(|| vec![0u64; n_extra]);
                         for (i, v) in extra.iter().enumerate() {
                             if i < slot.len() {
                                 slot[i] += v;
@@ -315,7 +319,10 @@ impl ProfileIndex {
         let n_extra = event_names.len().saturating_sub(2);
 
         for id in all_fn_ids {
-            let name = fn_names.get(&id).cloned().unwrap_or_else(|| format!("fn#{}", id));
+            let name = fn_names
+                .get(&id)
+                .cloned()
+                .unwrap_or_else(|| format!("fn#{}", id));
             let file = fn_file
                 .get(&id)
                 .and_then(|fid| file_names.get(fid))
@@ -545,7 +552,10 @@ impl ProfileIndex {
             "Inclusive time: {}\n",
             Self::format_time(total_incl_time)
         ));
-        out.push_str(&format!("Self memory:    {}\n", Self::format_memory(total_self_mem)));
+        out.push_str(&format!(
+            "Self memory:    {}\n",
+            Self::format_memory(total_self_mem)
+        ));
         if self.total_time > 0 {
             out.push_str(&format!(
                 "Program total:  {}  {}\n",
@@ -560,10 +570,10 @@ impl ProfileIndex {
             for (i, name) in self.event_names.iter().enumerate() {
                 if let Some(&total) = self.event_totals.get(i) {
                     let label = match name.as_str() {
-                        "Ir"  => "Instr refs",
-                        "Bc"  => "Branch cond",
+                        "Ir" => "Instr refs",
+                        "Bc" => "Branch cond",
                         "Bcm" => "Branch mispred",
-                        "Bi"  => "Indirect br",
+                        "Bi" => "Indirect br",
                         "Bim" => "Indir br mispred",
                         other => other,
                     };
@@ -572,9 +582,11 @@ impl ProfileIndex {
             }
             // Compute misprediction rate when both Bc and Bcm are present
             let bcm_idx = self.event_names.iter().position(|n| n == "Bcm");
-            let bc_idx  = self.event_names.iter().position(|n| n == "Bc");
+            let bc_idx = self.event_names.iter().position(|n| n == "Bc");
             if let (Some(bcm_i), Some(bc_i)) = (bcm_idx, bc_idx) {
-                if let (Some(&bcm), Some(&bc)) = (self.event_totals.get(bcm_i), self.event_totals.get(bc_i)) {
+                if let (Some(&bcm), Some(&bc)) =
+                    (self.event_totals.get(bcm_i), self.event_totals.get(bc_i))
+                {
                     if bc > 0 {
                         let pct = bcm as f64 / bc as f64 * 100.0;
                         out.push_str(&format!("  {:<20} {:>13.1}%\n", "Branch mispredict%", pct));
@@ -617,8 +629,8 @@ impl ProfileIndex {
                             if v > 0 {
                                 let label = match name.as_str() {
                                     "Bcm" => "Branch mispred",
-                                    "Bc"  => "Branch cond",
-                                    "Bi"  => "Indirect br",
+                                    "Bc" => "Branch cond",
+                                    "Bi" => "Indirect br",
                                     "Bim" => "Indir br mispred",
                                     other => other,
                                 };
@@ -724,10 +736,8 @@ impl ProfileIndex {
         roots.sort_by(|a, b| b.inclusive_time.cmp(&a.inclusive_time));
         roots.truncate(n);
 
-        let fn_map: HashMap<&str, &PhpFunction> = filtered
-            .iter()
-            .map(|f| (f.name.as_str(), *f))
-            .collect();
+        let fn_map: HashMap<&str, &PhpFunction> =
+            filtered.iter().map(|f| (f.name.as_str(), *f)).collect();
 
         let mut out = String::new();
         let mut visited = std::collections::HashSet::new();
@@ -786,10 +796,8 @@ impl ProfileIndex {
     /// `hotpath` — the single most expensive call chain.
     pub fn cmd_hotpath(&self) -> String {
         let filtered: Vec<&PhpFunction> = self.filter("");
-        let fn_map: HashMap<&str, &PhpFunction> = filtered
-            .iter()
-            .map(|f| (f.name.as_str(), *f))
-            .collect();
+        let fn_map: HashMap<&str, &PhpFunction> =
+            filtered.iter().map(|f| (f.name.as_str(), *f)).collect();
 
         // Find the root with the most inclusive time (among filtered functions)
         let called_names: std::collections::HashSet<&str> = filtered
@@ -804,7 +812,10 @@ impl ProfileIndex {
             .or_else(|| {
                 // No uncalled root found (e.g. focus on mutually-recursive functions).
                 // Fall back to the function with the highest inclusive time.
-                filtered.iter().filter(|f| f.inclusive_time > 0).max_by_key(|f| f.inclusive_time)
+                filtered
+                    .iter()
+                    .filter(|f| f.inclusive_time > 0)
+                    .max_by_key(|f| f.inclusive_time)
             });
 
         let Some(root) = root else {
@@ -988,7 +999,11 @@ pub fn run_repl(cachegrind_path: &str, prompt: &str) -> io::Result<()> {
         let parts: Vec<&str> = rest.splitn(2, ' ').collect();
         let arg1 = parts.first().copied().unwrap_or("");
         let arg2 = parts.get(1).copied().unwrap_or("");
-        let pat = if arg2.is_empty() { arg1.to_string() } else { format!("{arg1} {arg2}") };
+        let pat = if arg2.is_empty() {
+            arg1.to_string()
+        } else {
+            format!("{arg1} {arg2}")
+        };
 
         let result = match cmd {
             "hotspots" => {
@@ -1137,14 +1152,22 @@ mod tests {
     #[test]
     fn parse_self_time() {
         let idx = ProfileIndex::parse(SAMPLE);
-        let multiply = idx.functions.iter().find(|f| f.name == "Matrix->multiply").unwrap();
+        let multiply = idx
+            .functions
+            .iter()
+            .find(|f| f.name == "Matrix->multiply")
+            .unwrap();
         assert_eq!(multiply.self_time, 175000);
     }
 
     #[test]
     fn parse_inclusive_time() {
         let idx = ProfileIndex::parse(SAMPLE);
-        let multiply = idx.functions.iter().find(|f| f.name == "Matrix->multiply").unwrap();
+        let multiply = idx
+            .functions
+            .iter()
+            .find(|f| f.name == "Matrix->multiply")
+            .unwrap();
         // self 175000 + constructor 141 + set 9500
         assert_eq!(multiply.inclusive_time, 175000 + 141 + 9500);
     }
@@ -1152,9 +1175,17 @@ mod tests {
     #[test]
     fn parse_calls() {
         let idx = ProfileIndex::parse(SAMPLE);
-        let multiply = idx.functions.iter().find(|f| f.name == "Matrix->multiply").unwrap();
+        let multiply = idx
+            .functions
+            .iter()
+            .find(|f| f.name == "Matrix->multiply")
+            .unwrap();
         assert_eq!(multiply.calls.len(), 2);
-        let set_call = multiply.calls.iter().find(|c| c.callee == "Matrix->set").unwrap();
+        let set_call = multiply
+            .calls
+            .iter()
+            .find(|c| c.callee == "Matrix->set")
+            .unwrap();
         assert_eq!(set_call.call_count, 900);
     }
 
@@ -1162,7 +1193,11 @@ mod tests {
     fn parse_main_calls_buildrandom() {
         let idx = ProfileIndex::parse(SAMPLE);
         let main = idx.functions.iter().find(|f| f.name == "main").unwrap();
-        let br_calls: Vec<&CallRecord> = main.calls.iter().filter(|c| c.callee == "buildRandom").collect();
+        let br_calls: Vec<&CallRecord> = main
+            .calls
+            .iter()
+            .filter(|c| c.callee == "buildRandom")
+            .collect();
         assert_eq!(br_calls.len(), 1);
         assert_eq!(br_calls[0].call_count, 2);
     }
@@ -1530,7 +1565,11 @@ calls=100 1
             // Each "→ name" line should be a Matrix function
             if let Some(name_part) = line.trim().strip_prefix("→ ") {
                 let name = name_part.split("  ").next().unwrap_or("");
-                assert!(name.contains("Matrix"), "unexpected function in focused hotpath: {}", name);
+                assert!(
+                    name.contains("Matrix"),
+                    "unexpected function in focused hotpath: {}",
+                    name
+                );
             }
         }
         assert!(!out.contains("buildRandom"));
@@ -1590,14 +1629,22 @@ calls=100 1
         #[test]
         fn parse_bare_name_self_time() {
             let idx = ProfileIndex::parse(SAMPLE);
-            let fib = idx.functions.iter().find(|f| f.name == "Object#fibonacci").unwrap();
+            let fib = idx
+                .functions
+                .iter()
+                .find(|f| f.name == "Object#fibonacci")
+                .unwrap();
             assert_eq!(fib.self_time, 16200);
         }
 
         #[test]
         fn parse_bare_name_calls() {
             let idx = ProfileIndex::parse(SAMPLE);
-            let fib = idx.functions.iter().find(|f| f.name == "Object#fibonacci").unwrap();
+            let fib = idx
+                .functions
+                .iter()
+                .find(|f| f.name == "Object#fibonacci")
+                .unwrap();
             assert_eq!(fib.calls.len(), 1);
             let self_call = &fib.calls[0];
             assert_eq!(self_call.callee, "Object#fibonacci");
@@ -1607,7 +1654,11 @@ calls=100 1
         #[test]
         fn parse_inclusive_time() {
             let idx = ProfileIndex::parse(SAMPLE);
-            let fib = idx.functions.iter().find(|f| f.name == "Object#fibonacci").unwrap();
+            let fib = idx
+                .functions
+                .iter()
+                .find(|f| f.name == "Object#fibonacci")
+                .unwrap();
             // self 16200 + recursive call 262400
             assert_eq!(fib.inclusive_time, 16200 + 262400);
         }
@@ -1678,7 +1729,12 @@ calls=100 1
             if out.contains("Object#fibonacci") {
                 let fib_count = out.matches("Object#fibonacci").count();
                 // Should appear at most twice (enter + recursive marker)
-                assert!(fib_count <= 2, "fibonacci appears {} times: {}", fib_count, out);
+                assert!(
+                    fib_count <= 2,
+                    "fibonacci appears {} times: {}",
+                    fib_count,
+                    out
+                );
             }
         }
 
@@ -1715,7 +1771,11 @@ calls=100 1
         #[test]
         fn parse_self_time() {
             let idx = ProfileIndex::parse(SAMPLE);
-            let mul = idx.functions.iter().find(|f| f.name == "matrix_multiply").unwrap();
+            let mul = idx
+                .functions
+                .iter()
+                .find(|f| f.name == "matrix_multiply")
+                .unwrap();
             assert_eq!(mul.self_time, 175000);
         }
 
@@ -1724,7 +1784,11 @@ calls=100 1
             let idx = ProfileIndex::parse(SAMPLE);
             // main calls build_random (cfn=(4) appears before fn=(4) is defined)
             let main = idx.functions.iter().find(|f| f.name == "main").unwrap();
-            let br = main.calls.iter().find(|c| c.callee == "build_random").unwrap();
+            let br = main
+                .calls
+                .iter()
+                .find(|c| c.callee == "build_random")
+                .unwrap();
             assert_eq!(br.call_count, 2);
         }
 
@@ -1732,7 +1796,11 @@ calls=100 1
         fn parse_back_ref_callee() {
             let idx = ProfileIndex::parse(SAMPLE);
             // matrix_multiply calls matrix_set (cfn=(2) after fn=(2) defined)
-            let mul = idx.functions.iter().find(|f| f.name == "matrix_multiply").unwrap();
+            let mul = idx
+                .functions
+                .iter()
+                .find(|f| f.name == "matrix_multiply")
+                .unwrap();
             let set = mul.calls.iter().find(|c| c.callee == "matrix_set").unwrap();
             assert_eq!(set.call_count, 900);
         }
@@ -1740,7 +1808,11 @@ calls=100 1
         #[test]
         fn parse_recursive_calls() {
             let idx = ProfileIndex::parse(SAMPLE);
-            let qsort = idx.functions.iter().find(|f| f.name == "qsort_compare").unwrap();
+            let qsort = idx
+                .functions
+                .iter()
+                .find(|f| f.name == "qsort_compare")
+                .unwrap();
             assert_eq!(qsort.calls.len(), 1);
             assert_eq!(qsort.calls[0].callee, "qsort_compare");
             assert_eq!(qsort.calls[0].call_count, 3100);

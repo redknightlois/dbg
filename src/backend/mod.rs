@@ -1,9 +1,9 @@
+pub mod callgrind;
 pub mod canonical;
 pub mod debugpy_proto;
 pub mod delve;
 pub mod delve_proto;
 pub mod dotnettrace;
-pub mod callgrind;
 pub mod ghci;
 pub mod ghcprof;
 pub mod import;
@@ -11,15 +11,15 @@ pub mod jdb;
 pub mod jitdasm;
 pub mod lldb;
 pub mod lldb_dap_proto;
-pub mod netcoredbg;
-pub mod netcoredbg_proto;
 pub mod massif;
 pub mod memcheck;
+pub mod netcoredbg;
+pub mod netcoredbg_proto;
 pub mod node_proto;
 pub mod nodeprof;
 pub mod ocamldebug;
-pub mod perf;
 pub mod pdb;
+pub mod perf;
 pub mod phpdbg;
 pub mod pprof;
 pub mod pstats;
@@ -29,7 +29,7 @@ pub mod xdebug;
 use std::collections::HashMap;
 
 // Re-export dependency types from shared crate for backwards compatibility
-pub use dbg_cli::deps::{Dependency, DependencyCheck, DepStatus};
+pub use dbg_cli::deps::{DepStatus, Dependency, DependencyCheck};
 
 pub use canonical::{BreakId, BreakLoc, CanonicalOps, CanonicalReq};
 
@@ -141,7 +141,11 @@ pub trait Backend: Send + Sync {
 
     /// Adapter spawn + launch configuration for DAP backends. Only
     /// invoked when `uses_dap()` returns true.
-    fn dap_launch(&self, _target: &str, _args: &[String]) -> anyhow::Result<crate::dap::DapLaunchConfig> {
+    fn dap_launch(
+        &self,
+        _target: &str,
+        _args: &[String],
+    ) -> anyhow::Result<crate::dap::DapLaunchConfig> {
         anyhow::bail!("dap_launch not implemented for this backend")
     }
 
@@ -175,7 +179,15 @@ pub fn shell_escape(s: &str) -> String {
         return "''".to_string();
     }
     // If the string is simple (no special chars), return as-is
-    if s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'/' || b == b'-' || b == b'_' || b == b'=' || b == b':') {
+    if s.bytes().all(|b| {
+        b.is_ascii_alphanumeric()
+            || b == b'.'
+            || b == b'/'
+            || b == b'-'
+            || b == b'_'
+            || b == b'='
+            || b == b':'
+    }) {
         return s.to_string();
     }
     // Wrap in single quotes, escaping existing single quotes as '\''
@@ -306,31 +318,63 @@ mod tests {
     fn registry_panics_on_duplicate_type_in_debug() {
         struct A;
         impl Backend for A {
-            fn name(&self) -> &'static str { "a" }
-            fn description(&self) -> &'static str { "" }
-            fn types(&self) -> &'static [&'static str] { &["shared"] }
+            fn name(&self) -> &'static str {
+                "a"
+            }
+            fn description(&self) -> &'static str {
+                ""
+            }
+            fn types(&self) -> &'static [&'static str] {
+                &["shared"]
+            }
             fn spawn_config(&self, _: &str, _: &[String]) -> anyhow::Result<SpawnConfig> {
                 anyhow::bail!("test")
             }
-            fn prompt_pattern(&self) -> &str { "" }
-            fn dependencies(&self) -> Vec<Dependency> { vec![] }
-            fn run_command(&self) -> &'static str { "" }
-            fn adapters(&self) -> Vec<(&'static str, &'static str)> { vec![] }
-            fn parse_help(&self, _: &str) -> String { String::new() }
+            fn prompt_pattern(&self) -> &str {
+                ""
+            }
+            fn dependencies(&self) -> Vec<Dependency> {
+                vec![]
+            }
+            fn run_command(&self) -> &'static str {
+                ""
+            }
+            fn adapters(&self) -> Vec<(&'static str, &'static str)> {
+                vec![]
+            }
+            fn parse_help(&self, _: &str) -> String {
+                String::new()
+            }
         }
         struct B;
         impl Backend for B {
-            fn name(&self) -> &'static str { "b" }
-            fn description(&self) -> &'static str { "" }
-            fn types(&self) -> &'static [&'static str] { &["shared"] }
+            fn name(&self) -> &'static str {
+                "b"
+            }
+            fn description(&self) -> &'static str {
+                ""
+            }
+            fn types(&self) -> &'static [&'static str] {
+                &["shared"]
+            }
             fn spawn_config(&self, _: &str, _: &[String]) -> anyhow::Result<SpawnConfig> {
                 anyhow::bail!("test")
             }
-            fn prompt_pattern(&self) -> &str { "" }
-            fn dependencies(&self) -> Vec<Dependency> { vec![] }
-            fn run_command(&self) -> &'static str { "" }
-            fn adapters(&self) -> Vec<(&'static str, &'static str)> { vec![] }
-            fn parse_help(&self, _: &str) -> String { String::new() }
+            fn prompt_pattern(&self) -> &str {
+                ""
+            }
+            fn dependencies(&self) -> Vec<Dependency> {
+                vec![]
+            }
+            fn run_command(&self) -> &'static str {
+                ""
+            }
+            fn adapters(&self) -> Vec<(&'static str, &'static str)> {
+                vec![]
+            }
+            fn parse_help(&self, _: &str) -> String {
+                String::new()
+            }
         }
         let mut r = Registry::new();
         r.register(Box::new(A));

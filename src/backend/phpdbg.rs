@@ -98,12 +98,18 @@ impl Backend for PhpdbgBackend {
         lines.join("\n")
     }
 
-    fn canonical_ops(&self) -> Option<&dyn CanonicalOps> { Some(self) }
+    fn canonical_ops(&self) -> Option<&dyn CanonicalOps> {
+        Some(self)
+    }
 }
 
 impl CanonicalOps for PhpdbgBackend {
-    fn tool_name(&self) -> &'static str { "phpdbg" }
-    fn auto_capture_locals(&self) -> bool { false }
+    fn tool_name(&self) -> &'static str {
+        "phpdbg"
+    }
+    fn auto_capture_locals(&self) -> bool {
+        false
+    }
 
     fn op_break(&self, loc: &BreakLoc) -> anyhow::Result<String> {
         Ok(match loc {
@@ -112,13 +118,27 @@ impl CanonicalOps for PhpdbgBackend {
             BreakLoc::ModuleMethod { module, method } => format!("break {module}::{method}"),
         })
     }
-    fn op_run(&self, _args: &[String]) -> anyhow::Result<String> { Ok("run".into()) }
-    fn op_continue(&self) -> anyhow::Result<String> { Ok("continue".into()) }
-    fn op_step(&self) -> anyhow::Result<String> { Ok("step".into()) }
-    fn op_next(&self) -> anyhow::Result<String> { Ok("next".into()) }
-    fn op_finish(&self) -> anyhow::Result<String> { Ok("finish".into()) }
-    fn op_stack(&self, _n: Option<u32>) -> anyhow::Result<String> { Ok("back".into()) }
-    fn op_frame(&self, n: u32) -> anyhow::Result<String> { Ok(format!("frame {n}")) }
+    fn op_run(&self, _args: &[String]) -> anyhow::Result<String> {
+        Ok("run".into())
+    }
+    fn op_continue(&self) -> anyhow::Result<String> {
+        Ok("continue".into())
+    }
+    fn op_step(&self) -> anyhow::Result<String> {
+        Ok("step".into())
+    }
+    fn op_next(&self) -> anyhow::Result<String> {
+        Ok("next".into())
+    }
+    fn op_finish(&self) -> anyhow::Result<String> {
+        Ok("finish".into())
+    }
+    fn op_stack(&self, _n: Option<u32>) -> anyhow::Result<String> {
+        Ok("back".into())
+    }
+    fn op_frame(&self, n: u32) -> anyhow::Result<String> {
+        Ok(format!("frame {n}"))
+    }
     fn op_locals(&self) -> anyhow::Result<String> {
         // phpdbg's `info vars` lists names only; the canonical way to
         // recover both names and values in one round-trip is
@@ -158,15 +178,15 @@ impl CanonicalOps for PhpdbgBackend {
         // with "command 'breakpoint' could not be found".
         Ok("info break".into())
     }
-    fn op_list(&self, _loc: Option<&str>) -> anyhow::Result<String> { Ok("list".into()) }
+    fn op_list(&self, _loc: Option<&str>) -> anyhow::Result<String> {
+        Ok("list".into())
+    }
 
     fn parse_hit(&self, output: &str) -> Option<HitEvent> {
         // phpdbg raw: `[Breakpoint #0 at /path/algos.php:19, hits: 1]`
         // or `[Break at /path/algos.php:19]`
         static RE: OnceLock<Regex> = OnceLock::new();
-        let re = RE.get_or_init(|| {
-            Regex::new(r"\[Break(?:point #\d+)? at (\S+):(\d+)").unwrap()
-        });
+        let re = RE.get_or_init(|| Regex::new(r"\[Break(?:point #\d+)? at (\S+):(\d+)").unwrap());
         for line in output.lines() {
             if let Some(c) = re.captures(line) {
                 let file = c[1].to_string();
@@ -193,9 +213,7 @@ impl CanonicalOps for PhpdbgBackend {
         //   }
         // Parse `["name"]=> type(value)` lines.
         static RE: OnceLock<Regex> = OnceLock::new();
-        let re = RE.get_or_init(|| {
-            Regex::new(r#"\["(\w+)"\]\s*=>\s*(.+)"#).unwrap()
-        });
+        let re = RE.get_or_init(|| Regex::new(r#"\["(\w+)"\]\s*=>\s*(.+)"#).unwrap());
         let mut obj = Map::new();
         for line in output.lines() {
             if let Some(c) = re.captures(line) {
@@ -212,7 +230,11 @@ impl CanonicalOps for PhpdbgBackend {
                 obj.insert(name, Value::Object(entry));
             }
         }
-        if obj.is_empty() { None } else { Some(Value::Object(obj)) }
+        if obj.is_empty() {
+            None
+        } else {
+            Some(Value::Object(obj))
+        }
     }
 }
 
@@ -222,8 +244,14 @@ mod tests {
 
     #[test]
     fn format_breakpoint() {
-        assert_eq!(PhpdbgBackend.format_breakpoint("test.php:10"), "break test.php:10");
-        assert_eq!(PhpdbgBackend.format_breakpoint("my_function"), "break my_function");
+        assert_eq!(
+            PhpdbgBackend.format_breakpoint("test.php:10"),
+            "break test.php:10"
+        );
+        assert_eq!(
+            PhpdbgBackend.format_breakpoint("my_function"),
+            "break my_function"
+        );
     }
 
     #[test]

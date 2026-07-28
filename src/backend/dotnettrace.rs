@@ -26,7 +26,9 @@ impl Backend for DotnetTraceBackend {
         let trace_bin = find_bin("dotnet-trace");
         let mut collect_cmd = format!(
             "{} collect --output {} -- {}",
-            shell_escape(&trace_bin), shell_escape(&trace_str), shell_escape(target)
+            shell_escape(&trace_bin),
+            shell_escape(&trace_str),
+            shell_escape(target)
         );
         for a in args {
             collect_cmd.push(' ');
@@ -38,10 +40,7 @@ impl Backend for DotnetTraceBackend {
             args: vec!["--norc".into(), "--noprofile".into()],
             env: vec![
                 ("PS1".into(), "$ ".into()),
-                (
-                    "DOTNET_ROOT".into(),
-                    find_dotnet_root().unwrap_or_default(),
-                ),
+                ("DOTNET_ROOT".into(), find_dotnet_root().unwrap_or_default()),
                 ("DOTNET_ROLL_FORWARD".into(), "LatestMajor".into()),
                 (
                     "PATH".into(),
@@ -56,7 +55,9 @@ impl Backend for DotnetTraceBackend {
                 collect_cmd,
                 format!(
                     "{} convert --format Speedscope {} -o {}",
-                    shell_escape(&trace_bin), shell_escape(&trace_str), shell_escape(&speedscope_str)
+                    shell_escape(&trace_bin),
+                    shell_escape(&trace_str),
+                    shell_escape(&speedscope_str)
                 ),
                 "echo '--- trace data ready ---'".into(),
             ],
@@ -115,7 +116,10 @@ impl Backend for DotnetTraceBackend {
     }
 
     fn adapters(&self) -> Vec<(&'static str, &'static str)> {
-        vec![("dotnet-trace.md", include_str!("../../skills/adapters/dotnet-trace.md"))]
+        vec![(
+            "dotnet-trace.md",
+            include_str!("../../skills/adapters/dotnet-trace.md"),
+        )]
     }
 }
 
@@ -150,9 +154,7 @@ mod tests {
 
     #[test]
     fn spawn_config_includes_collect_and_convert() {
-        let cfg = DotnetTraceBackend
-            .spawn_config("./myapp", &[])
-            .unwrap();
+        let cfg = DotnetTraceBackend.spawn_config("./myapp", &[]).unwrap();
         assert!(cfg.init_commands.len() >= 3);
         assert!(cfg.init_commands[0].contains("dotnet-trace collect"));
         assert!(cfg.init_commands[0].contains("./myapp"));
@@ -173,18 +175,14 @@ mod tests {
 
     #[test]
     fn spawn_config_escapes_spaces() {
-        let cfg = DotnetTraceBackend
-            .spawn_config("./my app", &[])
-            .unwrap();
+        let cfg = DotnetTraceBackend.spawn_config("./my app", &[]).unwrap();
         let cmd = &cfg.init_commands[0];
         assert!(cmd.contains("'./my app'"), "target not escaped: {cmd}");
     }
 
     #[test]
     fn spawn_config_sets_dotnet_env() {
-        let cfg = DotnetTraceBackend
-            .spawn_config("./myapp", &[])
-            .unwrap();
+        let cfg = DotnetTraceBackend.spawn_config("./myapp", &[]).unwrap();
         assert!(cfg.env.iter().any(|(k, _)| k == "DOTNET_ROLL_FORWARD"));
         assert!(cfg.env.iter().any(|(k, _)| k == "PATH"));
     }

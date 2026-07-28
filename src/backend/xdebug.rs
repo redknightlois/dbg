@@ -24,7 +24,9 @@ impl Backend for XdebugProfileBackend {
 
         let mut php_cmd = format!(
             "mkdir -p {} && php -d xdebug.mode=profile -d xdebug.output_dir={} -d xdebug.profiler_output_name=cachegrind.out {}",
-            shell_escape(&out_dir_str), shell_escape(&out_dir_str), shell_escape(target)
+            shell_escape(&out_dir_str),
+            shell_escape(&out_dir_str),
+            shell_escape(target)
         );
         for a in args {
             php_cmd.push(' ');
@@ -32,18 +34,17 @@ impl Backend for XdebugProfileBackend {
         }
 
         let dbg_bin = super::self_exe();
-        let exec_repl = format!("exec {} --phpprofile-repl {}", shell_escape(&dbg_bin), shell_escape(&out_file_str));
+        let exec_repl = format!(
+            "exec {} --phpprofile-repl {}",
+            shell_escape(&dbg_bin),
+            shell_escape(&out_file_str)
+        );
 
         Ok(SpawnConfig {
             bin: "bash".into(),
             args: vec!["--norc".into(), "--noprofile".into()],
-            env: vec![
-                ("PS1".into(), "php-profile> ".into()),
-            ],
-            init_commands: vec![
-                php_cmd,
-                exec_repl,
-            ],
+            env: vec![("PS1".into(), "php-profile> ".into())],
+            init_commands: vec![php_cmd, exec_repl],
         })
     }
 
@@ -86,9 +87,11 @@ impl Backend for XdebugProfileBackend {
     }
 
     fn adapters(&self) -> Vec<(&'static str, &'static str)> {
-        vec![("php-profile.md", include_str!("../../skills/adapters/php-profile.md"))]
+        vec![(
+            "php-profile.md",
+            include_str!("../../skills/adapters/php-profile.md"),
+        )]
     }
-
 }
 
 #[cfg(test)]
@@ -132,7 +135,10 @@ mod tests {
             .spawn_config("./my script.php", &[])
             .unwrap();
         let cmd = &cfg.init_commands[0];
-        assert!(cmd.contains("'./my script.php'"), "target not escaped: {cmd}");
+        assert!(
+            cmd.contains("'./my script.php'"),
+            "target not escaped: {cmd}"
+        );
     }
 
     #[test]
@@ -144,7 +150,10 @@ mod tests {
                 assert_eq!(*program, "php");
                 // Must actually check for xdebug, not just run php -m
                 let args_str = args.join(" ");
-                assert!(args_str.contains("xdebug"), "dep check doesn't verify xdebug: {args_str}");
+                assert!(
+                    args_str.contains("xdebug"),
+                    "dep check doesn't verify xdebug: {args_str}"
+                );
             }
             _ => panic!("xdebug dep should use Command check"),
         }

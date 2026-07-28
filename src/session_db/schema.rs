@@ -657,17 +657,32 @@ mod tests {
     fn core_tables_exist_after_apply() {
         let c = in_mem();
         apply(&c, TargetClass::NativeCpu).unwrap();
-        for t in ["sessions", "layers", "symbols", "meta", "failures",
-                  "regions", "allocations",
-                  "commands", "breakpoint_hits", "watch_evals",
-                  "disassembly", "source_snapshots", "alloc_sites",
-                  "insn_hits", "insn_hit_details",
-                  "samples", "counters"] {
-            let exists: i64 = c.query_row(
-                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
-                [t],
-                |r| r.get(0),
-            ).unwrap();
+        for t in [
+            "sessions",
+            "layers",
+            "symbols",
+            "meta",
+            "failures",
+            "regions",
+            "allocations",
+            "commands",
+            "breakpoint_hits",
+            "watch_evals",
+            "disassembly",
+            "source_snapshots",
+            "alloc_sites",
+            "insn_hits",
+            "insn_hit_details",
+            "samples",
+            "counters",
+        ] {
+            let exists: i64 = c
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
+                    [t],
+                    |r| r.get(0),
+                )
+                .unwrap();
             assert_eq!(exists, 1, "missing table: {t}");
         }
     }
@@ -676,13 +691,21 @@ mod tests {
     fn gpu_class_has_launches_but_not_samples() {
         let c = in_mem();
         apply(&c, TargetClass::Gpu).unwrap();
-        let launches: i64 = c.query_row(
-            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='launches'",
-            [], |r| r.get(0)).unwrap();
+        let launches: i64 = c
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='launches'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
         assert_eq!(launches, 1);
-        let samples: i64 = c.query_row(
-            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='samples'",
-            [], |r| r.get(0)).unwrap();
+        let samples: i64 = c
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='samples'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
         assert_eq!(samples, 0, "samples table should not exist for GPU class");
     }
 
@@ -692,7 +715,11 @@ mod tests {
         apply(&c, TargetClass::NativeCpu).unwrap();
         c.execute("INSERT INTO sessions (id, kind, target, target_class, started_at, label) VALUES ('a', 'debug', 't', 'native-cpu', 'now', 'a')", []).unwrap();
         c.execute("INSERT INTO sessions (id, kind, target, target_class, started_at, label) VALUES ('b', 'debug', 't', 'native-cpu', 'now', 'b')", []).unwrap();
-        c.execute("INSERT INTO layers (session_id, source) VALUES ('b', 'other')", []).unwrap();
+        c.execute(
+            "INSERT INTO layers (session_id, source) VALUES ('b', 'other')",
+            [],
+        )
+        .unwrap();
         let layer_id = c.last_insert_rowid();
         assert!(c.execute(
             "INSERT INTO alloc_sites (session_id, bytes_total, layer_id, collected_at) VALUES ('a', 1, ?1, 'now')",

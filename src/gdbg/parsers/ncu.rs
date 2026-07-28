@@ -66,7 +66,7 @@ pub fn import_ncu_csv(dest: &Connection, csv_path: &Path, layer_id: i64) -> Resu
              registers_per_thread, shared_mem_static_bytes, shared_mem_dynamic_bytes,
              l2_hit_rate_pct, achieved_bandwidth_gb_s, peak_bandwidth_gb_s,
              boundedness, layer_id)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)"
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
     )?;
 
     // Also insert per-launch data if available
@@ -74,7 +74,7 @@ pub fn import_ncu_csv(dest: &Connection, csv_path: &Path, layer_id: i64) -> Resu
         "INSERT INTO launches
             (kernel_name, duration_us, grid_x, grid_y, grid_z,
              block_x, block_y, block_z, stream_id, layer_id)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)"
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
     )?;
 
     for (name, m) in &kernel_metrics {
@@ -86,8 +86,12 @@ pub fn import_ncu_csv(dest: &Connection, csv_path: &Path, layer_id: i64) -> Resu
             .get("dram__throughput.avg.pct_of_peak_sustained_elapsed")
             .or_else(|| m.get("gpu__dram_throughput.avg.pct_of_peak_sustained_elapsed"));
         let registers = m.get("launch__registers_per_thread").map(|v| *v as i64);
-        let shmem_static = m.get("launch__shared_mem_per_block_static").map(|v| *v as i64);
-        let shmem_dynamic = m.get("launch__shared_mem_per_block_dynamic").map(|v| *v as i64);
+        let shmem_static = m
+            .get("launch__shared_mem_per_block_static")
+            .map(|v| *v as i64);
+        let shmem_dynamic = m
+            .get("launch__shared_mem_per_block_dynamic")
+            .map(|v| *v as i64);
         let l2_hit = m
             .get("lts__t_sector_hit_rate.pct")
             .or_else(|| m.get("l2__t_sector_hit_rate.pct"));
@@ -105,7 +109,7 @@ pub fn import_ncu_csv(dest: &Connection, csv_path: &Path, layer_id: i64) -> Resu
             shmem_dynamic,
             l2_hit,
             achieved_bw,
-            None::<f64>,  // peak_bandwidth — would need device spec
+            None::<f64>, // peak_bandwidth — would need device spec
             boundedness,
             layer_id,
         ])?;
@@ -128,8 +132,12 @@ pub fn import_ncu_csv(dest: &Connection, csv_path: &Path, layer_id: i64) -> Resu
             launch_stmt.execute(params![
                 name,
                 duration_ns / 1000.0,
-                *gx as u32, *gy as u32, *gz as u32,
-                *bx as u32, *by as u32, *bz as u32,
+                *gx as u32,
+                *gy as u32,
+                *gz as u32,
+                *bx as u32,
+                *by as u32,
+                *bz as u32,
                 sid,
                 layer_id,
             ])?;
@@ -186,17 +194,26 @@ mod tests {
 
     #[test]
     fn classify_memory_bound() {
-        assert_eq!(classify_boundedness(Some(30.0), Some(80.0)).as_deref(), Some("memory"));
+        assert_eq!(
+            classify_boundedness(Some(30.0), Some(80.0)).as_deref(),
+            Some("memory")
+        );
     }
 
     #[test]
     fn classify_compute_bound() {
-        assert_eq!(classify_boundedness(Some(85.0), Some(20.0)).as_deref(), Some("compute"));
+        assert_eq!(
+            classify_boundedness(Some(85.0), Some(20.0)).as_deref(),
+            Some("compute")
+        );
     }
 
     #[test]
     fn classify_latency_bound() {
-        assert_eq!(classify_boundedness(Some(5.0), Some(3.0)).as_deref(), Some("latency"));
+        assert_eq!(
+            classify_boundedness(Some(5.0), Some(3.0)).as_deref(),
+            Some("latency")
+        );
     }
 
     #[test]
@@ -208,24 +225,52 @@ mod tests {
 
         let mut tmp = tempfile::NamedTempFile::new().unwrap();
         use std::io::Write;
-        writeln!(tmp, r#""ID","Kernel Name","Metric Name","Metric Unit","Metric Value""#).unwrap();
-        writeln!(tmp, r#""1","my_kernel","gpu__time_duration.sum","nsecond","500000""#).unwrap();
-        writeln!(tmp, r#""1","my_kernel","sm__warps_active.avg.pct_of_peak_sustained_active","%","67.5""#).unwrap();
-        writeln!(tmp, r#""1","my_kernel","sm__throughput.avg.pct_of_peak_sustained_elapsed","%","31.2""#).unwrap();
-        writeln!(tmp, r#""1","my_kernel","dram__throughput.avg.pct_of_peak_sustained_elapsed","%","78.4""#).unwrap();
+        writeln!(
+            tmp,
+            r#""ID","Kernel Name","Metric Name","Metric Unit","Metric Value""#
+        )
+        .unwrap();
+        writeln!(
+            tmp,
+            r#""1","my_kernel","gpu__time_duration.sum","nsecond","500000""#
+        )
+        .unwrap();
+        writeln!(
+            tmp,
+            r#""1","my_kernel","sm__warps_active.avg.pct_of_peak_sustained_active","%","67.5""#
+        )
+        .unwrap();
+        writeln!(
+            tmp,
+            r#""1","my_kernel","sm__throughput.avg.pct_of_peak_sustained_elapsed","%","31.2""#
+        )
+        .unwrap();
+        writeln!(
+            tmp,
+            r#""1","my_kernel","dram__throughput.avg.pct_of_peak_sustained_elapsed","%","78.4""#
+        )
+        .unwrap();
 
         import_ncu_csv(&db.conn, tmp.path(), lid).unwrap();
 
-        let occ: f64 = db.conn.query_row(
-            "SELECT occupancy_pct FROM metrics WHERE kernel_name = 'my_kernel'",
-            [], |row| row.get(0),
-        ).unwrap();
+        let occ: f64 = db
+            .conn
+            .query_row(
+                "SELECT occupancy_pct FROM metrics WHERE kernel_name = 'my_kernel'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
         assert!((occ - 67.5).abs() < 0.1);
 
-        let bound: String = db.conn.query_row(
-            "SELECT boundedness FROM metrics WHERE kernel_name = 'my_kernel'",
-            [], |row| row.get(0),
-        ).unwrap();
+        let bound: String = db
+            .conn
+            .query_row(
+                "SELECT boundedness FROM metrics WHERE kernel_name = 'my_kernel'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
         assert_eq!(bound, "memory");
     }
 }

@@ -24,9 +24,9 @@ impl Backend for GhciBackend {
 
     fn spawn_config(&self, target: &str, args: &[String]) -> anyhow::Result<SpawnConfig> {
         let mut spawn_args = vec![
-            "-v0".into(),               // suppress GHC version/loading noise
+            "-v0".into(),                  // suppress GHC version/loading noise
             "-fbreak-on-exception".into(), // break on exceptions (useful for debugging)
-            "-ignore-dot-ghci".into(),  // don't load user .ghci (predictable behaviour)
+            "-ignore-dot-ghci".into(),     // don't load user .ghci (predictable behaviour)
             target.into(),
         ];
         spawn_args.extend(args.iter().cloned());
@@ -92,7 +92,9 @@ impl Backend for GhciBackend {
                 if tok.starts_with(':')
                     && tok.len() > 1
                     && tok.len() < 25
-                    && tok[1..].chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '!')
+                    && tok[1..]
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '!')
                 {
                     cmds.push(tok.to_string());
                 }
@@ -104,7 +106,10 @@ impl Backend for GhciBackend {
     }
 
     fn adapters(&self) -> Vec<(&'static str, &'static str)> {
-        vec![("haskell.md", include_str!("../../skills/adapters/haskell.md"))]
+        vec![(
+            "haskell.md",
+            include_str!("../../skills/adapters/haskell.md"),
+        )]
     }
 
     fn clean(&self, cmd: &str, output: &str) -> String {
@@ -154,12 +159,18 @@ impl Backend for GhciBackend {
         }
     }
 
-    fn canonical_ops(&self) -> Option<&dyn CanonicalOps> { Some(self) }
+    fn canonical_ops(&self) -> Option<&dyn CanonicalOps> {
+        Some(self)
+    }
 }
 
 impl CanonicalOps for GhciBackend {
-    fn tool_name(&self) -> &'static str { "ghci" }
-    fn auto_capture_locals(&self) -> bool { false }
+    fn tool_name(&self) -> &'static str {
+        "ghci"
+    }
+    fn auto_capture_locals(&self) -> bool {
+        false
+    }
 
     fn op_break(&self, loc: &BreakLoc) -> anyhow::Result<String> {
         Ok(match loc {
@@ -173,12 +184,23 @@ impl CanonicalOps for GhciBackend {
             BreakLoc::ModuleMethod { module, method } => format!(":break {module}.{method}"),
         })
     }
-    fn op_run(&self, _args: &[String]) -> anyhow::Result<String> { Ok(":trace main".into()) }
-    fn op_continue(&self) -> anyhow::Result<String> { Ok(":continue".into()) }
-    fn op_step(&self) -> anyhow::Result<String> { Ok(":step".into()) }
-    fn op_next(&self) -> anyhow::Result<String> { Ok(":steplocal".into()) }
+    fn op_run(&self, _args: &[String]) -> anyhow::Result<String> {
+        Ok(":trace main".into())
+    }
+    fn op_continue(&self) -> anyhow::Result<String> {
+        Ok(":continue".into())
+    }
+    fn op_step(&self) -> anyhow::Result<String> {
+        Ok(":step".into())
+    }
+    fn op_next(&self) -> anyhow::Result<String> {
+        Ok(":steplocal".into())
+    }
     fn op_finish(&self) -> anyhow::Result<String> {
-        Err(unsupported("ghci", "step-out (Haskell uses :back for time-travel)"))
+        Err(unsupported(
+            "ghci",
+            "step-out (Haskell uses :back for time-travel)",
+        ))
     }
     fn op_stack(&self, n: Option<u32>) -> anyhow::Result<String> {
         Ok(match n {
@@ -186,10 +208,18 @@ impl CanonicalOps for GhciBackend {
             None => ":history".into(),
         })
     }
-    fn op_frame(&self, _n: u32) -> anyhow::Result<String> { Ok(":back".into()) }
-    fn op_locals(&self) -> anyhow::Result<String> { Ok(":show bindings".into()) }
-    fn op_print(&self, expr: &str) -> anyhow::Result<String> { Ok(expr.to_string()) }
-    fn op_list(&self, _loc: Option<&str>) -> anyhow::Result<String> { Ok(":list".into()) }
+    fn op_frame(&self, _n: u32) -> anyhow::Result<String> {
+        Ok(":back".into())
+    }
+    fn op_locals(&self) -> anyhow::Result<String> {
+        Ok(":show bindings".into())
+    }
+    fn op_print(&self, expr: &str) -> anyhow::Result<String> {
+        Ok(expr.to_string())
+    }
+    fn op_list(&self, _loc: Option<&str>) -> anyhow::Result<String> {
+        Ok(":list".into())
+    }
 
     fn parse_hit(&self, output: &str) -> Option<HitEvent> {
         // GHC <9.6: `Stopped at Main.hs:5:3-39`
@@ -235,13 +265,19 @@ impl CanonicalOps for GhciBackend {
                     .unwrap_or("")
                     .trim()
                     .to_string();
-                if name.is_empty() || name.starts_with("it") { continue; }
+                if name.is_empty() || name.starts_with("it") {
+                    continue;
+                }
                 let mut entry = Map::new();
                 entry.insert("value".into(), Value::String(val.trim().to_string()));
                 obj.insert(name, Value::Object(entry));
             }
         }
-        if obj.is_empty() { None } else { Some(Value::Object(obj)) }
+        if obj.is_empty() {
+            None
+        } else {
+            Some(Value::Object(obj))
+        }
     }
 }
 
@@ -302,7 +338,11 @@ mod tests {
     #[test]
     fn spawn_config_flags() {
         let cfg = GhciBackend.spawn_config("Main.hs", &[]).unwrap();
-        assert!(cfg.bin.contains("ghci"), "bin should contain ghci: {}", cfg.bin);
+        assert!(
+            cfg.bin.contains("ghci"),
+            "bin should contain ghci: {}",
+            cfg.bin
+        );
         assert!(cfg.args.contains(&"-v0".to_string()));
         assert!(cfg.args.contains(&"-fbreak-on-exception".to_string()));
         assert!(cfg.args.contains(&"Main.hs".to_string()));

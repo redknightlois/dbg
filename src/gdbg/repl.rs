@@ -22,7 +22,9 @@ pub fn run(db: &mut GpuDb) -> Result<()> {
         }
 
         let line = line.trim();
-        if line.is_empty() { continue; }
+        if line.is_empty() {
+            continue;
+        }
 
         let parts: Vec<&str> = line.split_whitespace().collect();
         let cmd = parts[0];
@@ -97,7 +99,9 @@ fn cmd_help(args: &[&str]) {
         println!("    occupancy [N]           SM occupancy ranking");
         println!("    variance <kernel>       Launch-to-launch timing variance");
         println!("    outliers <kernel>       Slowest launches, timeline position, clustering");
-        println!("    source <kernel>         Op/file that launched this kernel (needs torch/proton)");
+        println!(
+            "    source <kernel>         Op/file that launched this kernel (needs torch/proton)"
+        );
         println!("    memory [N]              GPU allocations: peak, leaks, largest, churn");
         println!("    bandwidth [N] [pat]     Per-kernel achieved memory bandwidth (needs ncu)");
         println!("    critical-path [gap_us]  Longest same-stream kernel chain");

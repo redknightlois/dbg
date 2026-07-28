@@ -22,7 +22,8 @@ impl Backend for MassifBackend {
 
         let mut valgrind_cmd = format!(
             "valgrind --tool=massif --massif-out-file={} {}",
-            shell_escape(&out_str), shell_escape(target)
+            shell_escape(&out_str),
+            shell_escape(target)
         );
         for a in args {
             valgrind_cmd.push(' ');
@@ -32,14 +33,8 @@ impl Backend for MassifBackend {
         Ok(SpawnConfig {
             bin: "bash".into(),
             args: vec!["--norc".into(), "--noprofile".into()],
-            env: vec![
-                ("PS1".into(), "$ ".into()),
-                ("MASSIF_OUT".into(), out_str),
-            ],
-            init_commands: vec![
-                valgrind_cmd,
-                "echo '--- massif data ready ---'".into(),
-            ],
+            env: vec![("PS1".into(), "$ ".into()), ("MASSIF_OUT".into(), out_str)],
+            init_commands: vec![valgrind_cmd, "echo '--- massif data ready ---'".into()],
         })
     }
 
@@ -86,7 +81,9 @@ impl Backend for MassifBackend {
         let mut lines = Vec::new();
         for line in output.lines() {
             let trimmed = line.trim();
-            if trimmed.starts_with("==") && (trimmed.contains("Massif") || trimmed.contains("Copyright")) {
+            if trimmed.starts_with("==")
+                && (trimmed.contains("Massif") || trimmed.contains("Copyright"))
+            {
                 continue;
             }
             lines.push(line);
@@ -139,9 +136,7 @@ mod tests {
 
     #[test]
     fn spawn_config_escapes_spaces() {
-        let cfg = MassifBackend
-            .spawn_config("./my app", &[])
-            .unwrap();
+        let cfg = MassifBackend.spawn_config("./my app", &[]).unwrap();
         let cmd = &cfg.init_commands[0];
         assert!(cmd.contains("'./my app'"), "target not escaped: {cmd}");
     }

@@ -83,9 +83,7 @@ impl Backend for OcamlDebugBackend {
     fn parse_help(&self, raw: &str) -> String {
         // ocamldebug help is a flat "List of commands:" followed by space-separated words
         let mut cmds: Vec<String> = Vec::new();
-        let text = raw
-            .strip_prefix("List of commands:")
-            .unwrap_or(raw);
+        let text = raw.strip_prefix("List of commands:").unwrap_or(raw);
         for tok in text.split_whitespace() {
             if tok.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
                 && tok.len() > 1
@@ -103,7 +101,9 @@ impl Backend for OcamlDebugBackend {
         vec![("ocaml.md", include_str!("../../skills/adapters/ocaml.md"))]
     }
 
-    fn canonical_ops(&self) -> Option<&dyn CanonicalOps> { Some(self) }
+    fn canonical_ops(&self) -> Option<&dyn CanonicalOps> {
+        Some(self)
+    }
 
     fn clean(&self, cmd: &str, output: &str) -> String {
         let trimmed = cmd.trim();
@@ -157,8 +157,12 @@ fn module_from_path(path: &str) -> String {
 }
 
 impl CanonicalOps for OcamlDebugBackend {
-    fn tool_name(&self) -> &'static str { "ocamldebug" }
-    fn auto_capture_locals(&self) -> bool { false }
+    fn tool_name(&self) -> &'static str {
+        "ocamldebug"
+    }
+    fn auto_capture_locals(&self) -> bool {
+        false
+    }
 
     fn op_break(&self, loc: &BreakLoc) -> anyhow::Result<String> {
         Ok(match loc {
@@ -170,18 +174,30 @@ impl CanonicalOps for OcamlDebugBackend {
             BreakLoc::ModuleMethod { module, method: _ } => format!("break @ {module}"),
         })
     }
-    fn op_run(&self, _args: &[String]) -> anyhow::Result<String> { Ok("run".into()) }
-    fn op_continue(&self) -> anyhow::Result<String> { Ok("run".into()) }
-    fn op_step(&self) -> anyhow::Result<String> { Ok("step".into()) }
-    fn op_next(&self) -> anyhow::Result<String> { Ok("next".into()) }
-    fn op_finish(&self) -> anyhow::Result<String> { Ok("finish".into()) }
+    fn op_run(&self, _args: &[String]) -> anyhow::Result<String> {
+        Ok("run".into())
+    }
+    fn op_continue(&self) -> anyhow::Result<String> {
+        Ok("run".into())
+    }
+    fn op_step(&self) -> anyhow::Result<String> {
+        Ok("step".into())
+    }
+    fn op_next(&self) -> anyhow::Result<String> {
+        Ok("next".into())
+    }
+    fn op_finish(&self) -> anyhow::Result<String> {
+        Ok("finish".into())
+    }
     fn op_stack(&self, n: Option<u32>) -> anyhow::Result<String> {
         Ok(match n {
             Some(k) => format!("bt {k}"),
             None => "bt".into(),
         })
     }
-    fn op_frame(&self, n: u32) -> anyhow::Result<String> { Ok(format!("frame {n}")) }
+    fn op_frame(&self, n: u32) -> anyhow::Result<String> {
+        Ok(format!("frame {n}"))
+    }
     fn op_locals(&self) -> anyhow::Result<String> {
         // ocamldebug genuinely has no "enumerate local bindings" command:
         // `info` has no `locals`/`variables` subcommand, and `print` with
@@ -194,8 +210,12 @@ impl CanonicalOps for OcamlDebugBackend {
         // that's how ocamldebug is designed to be driven.
         Ok("frame".into())
     }
-    fn op_print(&self, expr: &str) -> anyhow::Result<String> { Ok(format!("print {expr}")) }
-    fn op_list(&self, _loc: Option<&str>) -> anyhow::Result<String> { Ok("list".into()) }
+    fn op_print(&self, expr: &str) -> anyhow::Result<String> {
+        Ok(format!("print {expr}"))
+    }
+    fn op_list(&self, _loc: Option<&str>) -> anyhow::Result<String> {
+        Ok("list".into())
+    }
     fn op_breaks(&self) -> anyhow::Result<String> {
         // ocamldebug's breakpoint list lives under `info breakpoints`;
         // the default `breakpoint list` that the canonical trait emits
@@ -218,9 +238,7 @@ impl CanonicalOps for OcamlDebugBackend {
         let time_re = TIME_RE.get_or_init(|| {
             Regex::new(r"Time:\s*\d+\s*-\s*pc:\s*[\d:]+\s*-\s*module\s+(\S+)").unwrap()
         });
-        let src_re = SRC_RE.get_or_init(|| {
-            Regex::new(r"^\s*(\d+)\s+").unwrap()
-        });
+        let src_re = SRC_RE.get_or_init(|| Regex::new(r"^\s*(\d+)\s+").unwrap());
 
         let mut module = None;
         let mut line_no = None;
@@ -270,14 +288,15 @@ impl CanonicalOps for OcamlDebugBackend {
                 // left is "name : type", extract just the name
                 let name = left.split(':').next().unwrap_or(left).trim();
                 if !name.is_empty() {
-                    obj.insert(
-                        name.to_string(),
-                        serde_json::json!({ "value": value }),
-                    );
+                    obj.insert(name.to_string(), serde_json::json!({ "value": value }));
                 }
             }
         }
-        if obj.is_empty() { None } else { Some(Value::Object(obj)) }
+        if obj.is_empty() {
+            None
+        } else {
+            Some(Value::Object(obj))
+        }
     }
 }
 
@@ -354,16 +373,15 @@ mod tests {
 
     #[test]
     fn clean_extracts_breakpoint_hit() {
-        let input = "Time: 19 - pc: 0:144156 - module Test\nBreakpoint: 1\n2   <|b|>if n = 0 then 1";
+        let input =
+            "Time: 19 - pc: 0:144156 - module Test\nBreakpoint: 1\n2   <|b|>if n = 0 then 1";
         let r = OcamlDebugBackend.clean("run", input);
         assert!(!r.contains("Breakpoint:"));
     }
 
     #[test]
     fn spawn_config_basic() {
-        let cfg = OcamlDebugBackend
-            .spawn_config("./my_program", &[])
-            .unwrap();
+        let cfg = OcamlDebugBackend.spawn_config("./my_program", &[]).unwrap();
         assert_eq!(cfg.bin, "ocamldebug");
         assert!(cfg.args.contains(&"./my_program".to_string()));
     }

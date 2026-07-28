@@ -60,7 +60,6 @@ impl BreakLoc {
         }
         BreakLoc::Fqn(spec.to_string())
     }
-
 }
 
 /// A breakpoint-id for `dbg unbreak`. Backends expose integer ids.
@@ -293,7 +292,10 @@ mod tests {
     fn parse_file_line() {
         assert_eq!(
             BreakLoc::parse("src/main.rs:42"),
-            BreakLoc::FileLine { file: "src/main.rs".into(), line: 42 }
+            BreakLoc::FileLine {
+                file: "src/main.rs".into(),
+                line: 42
+            }
         );
     }
 
@@ -326,10 +328,7 @@ mod tests {
 
     #[test]
     fn parse_empty_module_falls_through_to_filename() {
-        assert_eq!(
-            BreakLoc::parse("!foo"),
-            BreakLoc::Fqn("!foo".into())
-        );
+        assert_eq!(BreakLoc::parse("!foo"), BreakLoc::Fqn("!foo".into()));
     }
 
     #[test]

@@ -64,7 +64,11 @@ impl Canonicalizer for CxxCanonicalizer {
             fqn,
             file: None,
             line: None,
-            demangled: if used_demangler { Some(demangled_out) } else { None },
+            demangled: if used_demangler {
+                Some(demangled_out)
+            } else {
+                None
+            },
             raw: raw.to_string(),
             is_synthetic: synthetic,
         }
@@ -120,15 +124,19 @@ fn looks_synthetic(s: &str) -> bool {
     s.contains("{{closure}}")
         || s.contains("{closure#")
         || s.contains("<lambda")   // clang lambdas: "<lambda(...)>"
-        || s.contains("::$_")      // libc++ anonymous thunk prefix
+        || s.contains("::$_") // libc++ anonymous thunk prefix
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn cpp() -> CxxCanonicalizer { CxxCanonicalizer::new("cpp") }
-    fn rust() -> CxxCanonicalizer { CxxCanonicalizer::new("rust") }
+    fn cpp() -> CxxCanonicalizer {
+        CxxCanonicalizer::new("cpp")
+    }
+    fn rust() -> CxxCanonicalizer {
+        CxxCanonicalizer::new("rust")
+    }
 
     #[test]
     fn already_demangled_cpp_passes_through() {

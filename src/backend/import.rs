@@ -55,7 +55,11 @@ impl Backend for ImportBackend {
                 shell_escape(&convert_base.display().to_string()),
             )
         } else {
-            format!("cp {} {}", shell_escape(target), shell_escape(&speedscope_str))
+            format!(
+                "cp {} {}",
+                shell_escape(target),
+                shell_escape(&speedscope_str)
+            )
         };
 
         Ok(SpawnConfig {
@@ -97,7 +101,11 @@ impl Backend for ImportBackend {
     }
 
     fn profile_output(&self) -> Option<String> {
-        Some(session_tmp("imported.speedscope.json").display().to_string())
+        Some(
+            session_tmp("imported.speedscope.json")
+                .display()
+                .to_string(),
+        )
     }
 
     fn adapters(&self) -> Vec<(&'static str, &'static str)> {

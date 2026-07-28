@@ -143,8 +143,12 @@ impl Backend for NetCoreDbgBackend {
 }
 
 impl CanonicalOps for NetCoreDbgBackend {
-    fn tool_name(&self) -> &'static str { "netcoredbg" }
-    fn auto_capture_locals(&self) -> bool { false }
+    fn tool_name(&self) -> &'static str {
+        "netcoredbg"
+    }
+    fn auto_capture_locals(&self) -> bool {
+        false
+    }
 
     fn tool_version(&self) -> Option<String> {
         static V: OnceLock<Option<String>> = OnceLock::new();
@@ -175,16 +179,26 @@ impl CanonicalOps for NetCoreDbgBackend {
     fn op_unbreak(&self, id: BreakId) -> anyhow::Result<String> {
         Ok(format!("delete {}", id.0))
     }
-    fn op_breaks(&self) -> anyhow::Result<String> { Ok("info breakpoints".into()) }
+    fn op_breaks(&self) -> anyhow::Result<String> {
+        Ok("info breakpoints".into())
+    }
 
     fn op_run(&self, _args: &[String]) -> anyhow::Result<String> {
         // netcoredbg launches the target on startup; re-running is `run`.
         Ok("run".into())
     }
-    fn op_continue(&self) -> anyhow::Result<String> { Ok("continue".into()) }
-    fn op_step(&self) -> anyhow::Result<String> { Ok("step".into()) }
-    fn op_next(&self) -> anyhow::Result<String> { Ok("next".into()) }
-    fn op_finish(&self) -> anyhow::Result<String> { Ok("finish".into()) }
+    fn op_continue(&self) -> anyhow::Result<String> {
+        Ok("continue".into())
+    }
+    fn op_step(&self) -> anyhow::Result<String> {
+        Ok("step".into())
+    }
+    fn op_next(&self) -> anyhow::Result<String> {
+        Ok("next".into())
+    }
+    fn op_finish(&self) -> anyhow::Result<String> {
+        Ok("finish".into())
+    }
 
     fn op_stack(&self, n: Option<u32>) -> anyhow::Result<String> {
         Ok(match n {
@@ -201,12 +215,17 @@ impl CanonicalOps for NetCoreDbgBackend {
         // list method-local variables. Phase 2 should switch to MI
         // mode + `-stack-list-variables --all-values`. For now, agents
         // use `dbg print <varname>` for individual variables.
-        Err(unsupported("netcoredbg", "bulk locals in CLI mode (use `dbg print <var>` for individual variables)"))
+        Err(unsupported(
+            "netcoredbg",
+            "bulk locals in CLI mode (use `dbg print <var>` for individual variables)",
+        ))
     }
     fn op_print(&self, expr: &str) -> anyhow::Result<String> {
         Ok(format!("print {expr}"))
     }
-    fn op_threads(&self) -> anyhow::Result<String> { Ok("info threads".into()) }
+    fn op_threads(&self) -> anyhow::Result<String> {
+        Ok("info threads".into())
+    }
     fn op_thread(&self, n: u32) -> anyhow::Result<String> {
         Ok(format!("thread {n}"))
     }
@@ -272,9 +291,8 @@ impl CanonicalOps for NetCoreDbgBackend {
                 } else {
                     Some(file)
                 };
-                let line = line.or_else(|| {
-                    find_mi_field(frame_blob, "line").and_then(|s| s.parse().ok())
-                });
+                let line =
+                    line.or_else(|| find_mi_field(frame_blob, "line").and_then(|s| s.parse().ok()));
                 (func, file, line)
             }
             None => (None, None, None),
@@ -320,18 +338,13 @@ fn stop_regex_cleaned() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
         // `stopped: breakpoint 1 hit @ Ns.Class.Method() at /path/file.cs:42`
-        Regex::new(
-            r"^stopped:[^@]*@\s+(?P<frame>\S+?)\s+at\s+(?P<file>\S+):(?P<line>\d+)",
-        )
-        .unwrap()
+        Regex::new(r"^stopped:[^@]*@\s+(?P<frame>\S+?)\s+at\s+(?P<file>\S+):(?P<line>\d+)").unwrap()
     })
 }
 
 fn stop_regex_mi() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| {
-        Regex::new(r#"thread-id[:=]\s*["]?(?P<tid>\d+)"#).unwrap()
-    })
+    RE.get_or_init(|| Regex::new(r#"thread-id[:=]\s*["]?(?P<tid>\d+)"#).unwrap())
 }
 
 fn frame_regex_mi() -> &'static Regex {
@@ -418,7 +431,11 @@ mod tests {
     fn canonical_break_ops() {
         let ops: &dyn CanonicalOps = &NetCoreDbgBackend;
         assert_eq!(
-            ops.op_break(&BreakLoc::FileLine { file: "Program.cs".into(), line: 10 }).unwrap(),
+            ops.op_break(&BreakLoc::FileLine {
+                file: "Program.cs".into(),
+                line: 10
+            })
+            .unwrap(),
             "break Program.cs:10"
         );
         assert_eq!(
@@ -426,7 +443,11 @@ mod tests {
             "break Foo.Bar.Baz"
         );
         assert_eq!(
-            ops.op_break(&BreakLoc::ModuleMethod { module: "MyLib".into(), method: "Baz".into() }).unwrap(),
+            ops.op_break(&BreakLoc::ModuleMethod {
+                module: "MyLib".into(),
+                method: "Baz".into()
+            })
+            .unwrap(),
             "break MyLib!Baz"
         );
     }
@@ -463,7 +484,10 @@ mod tests {
         let hit = NetCoreDbgBackend.parse_hit(out).expect("should parse");
         assert_eq!(hit.file.as_deref(), Some("/app/Program.cs"));
         assert_eq!(hit.line, Some(22));
-        assert_eq!(hit.frame_symbol.as_deref(), Some("DbgExample.Algos.Fibonacci()"));
+        assert_eq!(
+            hit.frame_symbol.as_deref(),
+            Some("DbgExample.Algos.Fibonacci()")
+        );
     }
 
     #[test]
@@ -494,8 +518,24 @@ mod tests {
         let out = "x = 42\nname = \"hello\"\nempty = {}";
         let v = NetCoreDbgBackend.parse_locals(out).expect("should parse");
         let obj = v.as_object().unwrap();
-        assert_eq!(obj.get("x").unwrap().get("value").unwrap().as_str().unwrap(), "42");
-        assert_eq!(obj.get("name").unwrap().get("value").unwrap().as_str().unwrap(), "\"hello\"");
+        assert_eq!(
+            obj.get("x")
+                .unwrap()
+                .get("value")
+                .unwrap()
+                .as_str()
+                .unwrap(),
+            "42"
+        );
+        assert_eq!(
+            obj.get("name")
+                .unwrap()
+                .get("value")
+                .unwrap()
+                .as_str()
+                .unwrap(),
+            "\"hello\""
+        );
     }
 
     #[test]

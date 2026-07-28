@@ -86,7 +86,10 @@ impl Backend for MemcheckBackend {
     }
 
     fn adapters(&self) -> Vec<(&'static str, &'static str)> {
-        vec![("memcheck.md", include_str!("../../skills/adapters/memcheck.md"))]
+        vec![(
+            "memcheck.md",
+            include_str!("../../skills/adapters/memcheck.md"),
+        )]
     }
 }
 
@@ -166,10 +169,11 @@ mod tests {
 
     #[test]
     fn spawn_config_escapes_shell_metacharacters() {
-        let cfg = MemcheckBackend
-            .spawn_config("./app;rm -rf /", &[])
-            .unwrap();
+        let cfg = MemcheckBackend.spawn_config("./app;rm -rf /", &[]).unwrap();
         let cmd = &cfg.init_commands[0];
-        assert!(cmd.contains("'./app;rm -rf /'"), "metachar not escaped: {cmd}");
+        assert!(
+            cmd.contains("'./app;rm -rf /'"),
+            "metachar not escaped: {cmd}"
+        );
     }
 }

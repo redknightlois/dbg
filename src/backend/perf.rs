@@ -10,8 +10,12 @@ pub struct PerfBackend;
 fn is_perf_data_file(path: &std::path::Path) -> bool {
     use std::io::Read;
     let mut buf = [0u8; 8];
-    let Ok(mut f) = std::fs::File::open(path) else { return false };
-    if f.read_exact(&mut buf).is_err() { return false }
+    let Ok(mut f) = std::fs::File::open(path) else {
+        return false;
+    };
+    if f.read_exact(&mut buf).is_err() {
+        return false;
+    }
     &buf == b"PERFILE2"
 }
 
@@ -54,10 +58,7 @@ impl Backend for PerfBackend {
             })
         } else {
             // Record then emit script + report
-            let mut record_cmd = format!(
-                "perf record -g -- {}",
-                shell_escape(target)
-            );
+            let mut record_cmd = format!("perf record -g -- {}", shell_escape(target));
             for a in args {
                 record_cmd.push(' ');
                 record_cmd.push_str(&shell_escape(a));
@@ -194,12 +195,16 @@ mod tests {
             .unwrap();
         assert_eq!(cfg.bin, "bash");
         assert!(
-            cfg.init_commands.iter().any(|c| c.contains("perf report --stdio")),
-            "missing report: {:?}", cfg.init_commands
+            cfg.init_commands
+                .iter()
+                .any(|c| c.contains("perf report --stdio")),
+            "missing report: {:?}",
+            cfg.init_commands
         );
         assert!(
             cfg.init_commands.iter().any(|c| c.contains("perf script")),
-            "missing script step: {:?}", cfg.init_commands
+            "missing script step: {:?}",
+            cfg.init_commands
         );
         let _ = std::fs::remove_file(&tmp);
     }
@@ -212,11 +217,15 @@ mod tests {
         assert!(cfg.init_commands[0].contains("./myapp"));
         assert!(
             cfg.init_commands.iter().any(|c| c.contains("perf script")),
-            "missing script step: {:?}", cfg.init_commands
+            "missing script step: {:?}",
+            cfg.init_commands
         );
         assert!(
-            cfg.init_commands.iter().any(|c| c.contains("perf report --stdio")),
-            "missing report: {:?}", cfg.init_commands
+            cfg.init_commands
+                .iter()
+                .any(|c| c.contains("perf report --stdio")),
+            "missing report: {:?}",
+            cfg.init_commands
         );
     }
 
@@ -252,9 +261,7 @@ mod tests {
 
     #[test]
     fn spawn_config_escapes_target_with_spaces() {
-        let cfg = PerfBackend
-            .spawn_config("./my app", &[])
-            .unwrap();
+        let cfg = PerfBackend.spawn_config("./my app", &[]).unwrap();
         let cmd = &cfg.init_commands[0];
         assert!(cmd.contains("'./my app'"), "target not escaped: {cmd}");
     }
@@ -309,7 +316,9 @@ mod tests {
             .spawn_config(data_path.to_str().unwrap(), &[])
             .unwrap();
         assert!(
-            cfg.init_commands.iter().any(|c| c.contains("perf report --stdio -i")),
+            cfg.init_commands
+                .iter()
+                .any(|c| c.contains("perf report --stdio -i")),
             "PERFILE2-magic file should take the report path: {:?}",
             cfg.init_commands,
         );

@@ -34,10 +34,13 @@ pub fn import_nsys_rep(dest: &Connection, nsys_path: &Path, layer_id: i64) -> Re
 
 /// Import GPU kernel launches. Returns true if kernel data was found.
 fn import_kernels(dest: &Connection, src: &Connection, layer_id: i64) -> Result<bool> {
-    let table = match find_table(src, &[
-        "CUPTI_ACTIVITY_KIND_KERNEL",
-        "CUPTI_ACTIVITY_KIND_CONCURRENT_KERNEL",
-    ]) {
+    let table = match find_table(
+        src,
+        &[
+            "CUPTI_ACTIVITY_KIND_KERNEL",
+            "CUPTI_ACTIVITY_KIND_CONCURRENT_KERNEL",
+        ],
+    ) {
         Ok(t) => t,
         Err(_) => return Ok(false),
     };
@@ -77,22 +80,22 @@ fn import_kernels(dest: &Connection, src: &Connection, layer_id: i64) -> Result<
             (kernel_name, duration_us, grid_x, grid_y, grid_z,
              block_x, block_y, block_z, stream_id, start_us,
              correlation_id, layer_id)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)"
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
     )?;
 
     let rows = read.query_map([], |row| {
         Ok((
             row.get::<_, String>(0)?,
-            row.get::<_, i64>(1)?,   // start ns
-            row.get::<_, i64>(2)?,   // end ns
-            row.get::<_, u32>(3)?,   // grid_x
+            row.get::<_, i64>(1)?, // start ns
+            row.get::<_, i64>(2)?, // end ns
+            row.get::<_, u32>(3)?, // grid_x
             row.get::<_, u32>(4)?,
             row.get::<_, u32>(5)?,
-            row.get::<_, u32>(6)?,   // block_x
+            row.get::<_, u32>(6)?, // block_x
             row.get::<_, u32>(7)?,
             row.get::<_, u32>(8)?,
-            row.get::<_, u32>(9)?,   // stream_id
-            row.get::<_, i64>(10)?,  // correlation_id
+            row.get::<_, u32>(9)?,  // stream_id
+            row.get::<_, i64>(10)?, // correlation_id
         ))
     })?;
 
@@ -101,9 +104,18 @@ fn import_kernels(dest: &Connection, src: &Connection, layer_id: i64) -> Result<
         let duration_us = (end_ns - start_ns) as f64 / 1000.0;
         let start_us = start_ns as f64 / 1000.0;
         write.execute(params![
-            name, duration_us,
-            gx, gy, gz, bx, by, bz,
-            sid, start_us, cid, layer_id
+            name,
+            duration_us,
+            gx,
+            gy,
+            gz,
+            bx,
+            by,
+            bz,
+            sid,
+            start_us,
+            cid,
+            layer_id
         ])?;
     }
 
@@ -126,16 +138,16 @@ fn import_transfers(dest: &Connection, src: &Connection, layer_id: i64) -> Resul
 
     let mut write = dest.prepare(
         "INSERT INTO transfers (kind, bytes, duration_us, start_us, stream_id, layer_id)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)"
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
     )?;
 
     let rows = read.query_map([], |row| {
         Ok((
             row.get::<_, i32>(0)?,
-            row.get::<_, i64>(1)?,  // start ns
-            row.get::<_, i64>(2)?,  // end ns
-            row.get::<_, i64>(3)?,  // bytes
-            row.get::<_, u32>(4)?,  // stream_id
+            row.get::<_, i64>(1)?, // start ns
+            row.get::<_, i64>(2)?, // end ns
+            row.get::<_, i64>(3)?, // bytes
+            row.get::<_, u32>(4)?, // stream_id
         ))
     })?;
 
@@ -191,16 +203,16 @@ fn import_allocations(dest: &Connection, src: &Connection, layer_id: i64) -> Res
 
     let mut write = dest.prepare(
         "INSERT INTO allocations (op, address, bytes, start_us, stream_id, layer_id)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)"
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
     )?;
 
     let rows = read.query_map([], |row| {
         Ok((
-            row.get::<_, i64>(0)?,           // start_ns
-            row.get::<_, i32>(1)?,           // oper type
-            row.get::<_, i64>(2)?,           // address
-            row.get::<_, i64>(3)?,           // bytes
-            row.get::<_, Option<u32>>(4)?,   // streamId
+            row.get::<_, i64>(0)?,         // start_ns
+            row.get::<_, i32>(1)?,         // oper type
+            row.get::<_, i64>(2)?,         // address
+            row.get::<_, i64>(3)?,         // bytes
+            row.get::<_, Option<u32>>(4)?, // streamId
         ))
     })?;
 
@@ -244,7 +256,7 @@ fn import_nvtx_regions(dest: &Connection, src: &Connection, layer_id: i64) -> Re
 
     let mut write = dest.prepare(
         "INSERT INTO regions (name, start_us, duration_us, layer_id)
-         VALUES (?1, ?2, ?3, ?4)"
+         VALUES (?1, ?2, ?3, ?4)",
     )?;
 
     let rows = read.query_map([], |row| {
@@ -297,7 +309,7 @@ fn import_runtime_api(dest: &Connection, src: &Connection, layer_id: i64) -> Res
     let mut write = dest.prepare(
         "INSERT INTO launches
             (kernel_name, duration_us, start_us, correlation_id, layer_id)
-         VALUES (?1, ?2, ?3, ?4, ?5)"
+         VALUES (?1, ?2, ?3, ?4, ?5)",
     )?;
 
     let rows = read.query_map([], |row| {
@@ -419,12 +431,12 @@ fn find_table(conn: &Connection, candidates: &[&str]) -> Result<String> {
 /// Used to gate `SELECT`s whose columns vary across nsys versions.
 fn has_column(conn: &Connection, table: &str, column: &str) -> bool {
     let sql = format!("PRAGMA table_info({table})");
-    let Ok(mut stmt) = conn.prepare(&sql) else { return false };
+    let Ok(mut stmt) = conn.prepare(&sql) else {
+        return false;
+    };
     let rows = stmt.query_map([], |row| row.get::<_, String>(1));
     match rows {
-        Ok(rows) => rows
-            .flatten()
-            .any(|name| name.eq_ignore_ascii_case(column)),
+        Ok(rows) => rows.flatten().any(|name| name.eq_ignore_ascii_case(column)),
         Err(_) => false,
     }
 }
@@ -439,8 +451,8 @@ fn is_column_integer(conn: &Connection, table: &str, column: &str) -> bool {
     };
     let rows = stmt.query_map([], |row| {
         Ok((
-            row.get::<_, String>(1)?,  // name
-            row.get::<_, String>(2)?,  // type
+            row.get::<_, String>(1)?, // name
+            row.get::<_, String>(2)?, // type
         ))
     });
     match rows {
@@ -486,7 +498,11 @@ mod tests {
             INSERT INTO CUDA_GPU_MEMORY_USAGE_EVENTS VALUES (100, 0, 1, 4096);",
         )
         .unwrap();
-        assert!(!has_column(&src, "CUDA_GPU_MEMORY_USAGE_EVENTS", "streamId"));
+        assert!(!has_column(
+            &src,
+            "CUDA_GPU_MEMORY_USAGE_EVENTS",
+            "streamId"
+        ));
 
         // Synthesize the exact SELECT import_allocations builds and
         // confirm sqlite accepts it against the legacy schema.
@@ -500,9 +516,7 @@ mod tests {
              FROM CUDA_GPU_MEMORY_USAGE_EVENTS ORDER BY start"
         );
         let mut stmt = src.prepare(&sql).expect("SELECT must compile");
-        let got: Option<u32> = stmt
-            .query_row([], |r| r.get::<_, Option<u32>>(4))
-            .unwrap();
+        let got: Option<u32> = stmt.query_row([], |r| r.get::<_, Option<u32>>(4)).unwrap();
         assert!(got.is_none(), "stream_id must be NULL on 2023 schema");
     }
 
@@ -539,7 +553,8 @@ mod tests {
     #[test]
     fn has_column_detects_presence_and_absence() {
         let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch("CREATE TABLE t (a INTEGER, b TEXT)").unwrap();
+        conn.execute_batch("CREATE TABLE t (a INTEGER, b TEXT)")
+            .unwrap();
         assert!(has_column(&conn, "t", "a"));
         assert!(has_column(&conn, "t", "B")); // case-insensitive
         assert!(!has_column(&conn, "t", "c"));

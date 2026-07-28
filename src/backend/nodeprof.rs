@@ -33,10 +33,7 @@ impl Backend for NodeProfBackend {
                 bin: "bash".into(),
                 args: vec!["--norc".into(), "--noprofile".into()],
                 env: vec![("PS1".into(), "% ".into())],
-                init_commands: vec![
-                    copy_cmd,
-                    "echo '--- profile data ready ---'".into(),
-                ],
+                init_commands: vec![copy_cmd, "echo '--- profile data ready ---'".into()],
             });
         }
 
@@ -123,7 +120,10 @@ impl Backend for NodeProfBackend {
     }
 
     fn adapters(&self) -> Vec<(&'static str, &'static str)> {
-        vec![("js-profile.md", include_str!("../../skills/adapters/js-profile.md"))]
+        vec![(
+            "js-profile.md",
+            include_str!("../../skills/adapters/js-profile.md"),
+        )]
     }
 }
 

@@ -72,7 +72,8 @@ impl Backend for JdbBackend {
         let mut saw_exit = false;
         for line in output.lines() {
             let trimmed = line.trim();
-            if trimmed.starts_with("Set breakpoint") || trimmed.starts_with("Deferring breakpoint") {
+            if trimmed.starts_with("Set breakpoint") || trimmed.starts_with("Deferring breakpoint")
+            {
                 saw_deferred_bp = true;
                 continue;
             }
@@ -84,7 +85,9 @@ impl Backend for JdbBackend {
             {
                 saw_exit = true;
             }
-            if trimmed.contains("thread") && (trimmed.contains("started") || trimmed.contains("died")) {
+            if trimmed.contains("thread")
+                && (trimmed.contains("started") || trimmed.contains("died"))
+            {
                 continue;
             }
             lines.push(line);
@@ -112,12 +115,18 @@ impl Backend for JdbBackend {
         vec![("java.md", include_str!("../../skills/adapters/java.md"))]
     }
 
-    fn canonical_ops(&self) -> Option<&dyn CanonicalOps> { Some(self) }
+    fn canonical_ops(&self) -> Option<&dyn CanonicalOps> {
+        Some(self)
+    }
 }
 
 impl CanonicalOps for JdbBackend {
-    fn tool_name(&self) -> &'static str { "jdb" }
-    fn auto_capture_locals(&self) -> bool { false }
+    fn tool_name(&self) -> &'static str {
+        "jdb"
+    }
+    fn auto_capture_locals(&self) -> bool {
+        false
+    }
 
     fn op_break(&self, loc: &BreakLoc) -> anyhow::Result<String> {
         Ok(match loc {
@@ -134,18 +143,42 @@ impl CanonicalOps for JdbBackend {
             BreakLoc::ModuleMethod { module, method } => format!("stop at {module}.{method}"),
         })
     }
-    fn op_run(&self, _args: &[String]) -> anyhow::Result<String> { Ok("run".into()) }
-    fn op_continue(&self) -> anyhow::Result<String> { Ok("cont".into()) }
-    fn op_step(&self) -> anyhow::Result<String> { Ok("step".into()) }
-    fn op_next(&self) -> anyhow::Result<String> { Ok("next".into()) }
-    fn op_finish(&self) -> anyhow::Result<String> { Ok("step up".into()) }
-    fn op_stack(&self, _n: Option<u32>) -> anyhow::Result<String> { Ok("where".into()) }
-    fn op_frame(&self, n: u32) -> anyhow::Result<String> { Ok(format!("up {n}")) }
-    fn op_locals(&self) -> anyhow::Result<String> { Ok("locals".into()) }
-    fn op_print(&self, expr: &str) -> anyhow::Result<String> { Ok(format!("print {expr}")) }
-    fn op_threads(&self) -> anyhow::Result<String> { Ok("threads".into()) }
-    fn op_thread(&self, n: u32) -> anyhow::Result<String> { Ok(format!("thread {n}")) }
-    fn op_list(&self, _loc: Option<&str>) -> anyhow::Result<String> { Ok("list".into()) }
+    fn op_run(&self, _args: &[String]) -> anyhow::Result<String> {
+        Ok("run".into())
+    }
+    fn op_continue(&self) -> anyhow::Result<String> {
+        Ok("cont".into())
+    }
+    fn op_step(&self) -> anyhow::Result<String> {
+        Ok("step".into())
+    }
+    fn op_next(&self) -> anyhow::Result<String> {
+        Ok("next".into())
+    }
+    fn op_finish(&self) -> anyhow::Result<String> {
+        Ok("step up".into())
+    }
+    fn op_stack(&self, _n: Option<u32>) -> anyhow::Result<String> {
+        Ok("where".into())
+    }
+    fn op_frame(&self, n: u32) -> anyhow::Result<String> {
+        Ok(format!("up {n}"))
+    }
+    fn op_locals(&self) -> anyhow::Result<String> {
+        Ok("locals".into())
+    }
+    fn op_print(&self, expr: &str) -> anyhow::Result<String> {
+        Ok(format!("print {expr}"))
+    }
+    fn op_threads(&self) -> anyhow::Result<String> {
+        Ok("threads".into())
+    }
+    fn op_thread(&self, n: u32) -> anyhow::Result<String> {
+        Ok(format!("thread {n}"))
+    }
+    fn op_list(&self, _loc: Option<&str>) -> anyhow::Result<String> {
+        Ok("list".into())
+    }
     fn op_breaks(&self) -> anyhow::Result<String> {
         // jdb has no dedicated "breakpoint list" verb; the default
         // `breakpoint` sent by the canonical trait yields
@@ -195,10 +228,16 @@ impl CanonicalOps for JdbBackend {
                     // `dbg hits Broken.java:35` matches via
                     // `stem_line_key` → `Broken:35`.
                     let class_part = symbol.rsplit_once('.').map(|x| x.0).unwrap_or(&symbol);
-                    let outer_class = class_part.rsplit_once('$').map(|x| x.0).unwrap_or(class_part);
+                    let outer_class = class_part
+                        .rsplit_once('$')
+                        .map(|x| x.0)
+                        .unwrap_or(class_part);
                     // Further strip package prefix so `com.foo.Broken` →
                     // `Broken` for the key.
-                    let short = outer_class.rsplit_once('.').map(|x| x.1).unwrap_or(outer_class);
+                    let short = outer_class
+                        .rsplit_once('.')
+                        .map(|x| x.1)
+                        .unwrap_or(outer_class);
                     return Some(HitEvent {
                         location_key: format!("{short}:{line_no}"),
                         thread: Some(thread),
@@ -220,13 +259,19 @@ impl CanonicalOps for JdbBackend {
             let line = line.trim();
             if let Some((name, val)) = line.split_once(" = ") {
                 let name = name.trim().to_string();
-                if name.is_empty() || name.contains(' ') { continue; }
+                if name.is_empty() || name.contains(' ') {
+                    continue;
+                }
                 let mut entry = Map::new();
                 entry.insert("value".into(), Value::String(val.trim().to_string()));
                 obj.insert(name, Value::Object(entry));
             }
         }
-        if obj.is_empty() { None } else { Some(Value::Object(obj)) }
+        if obj.is_empty() {
+            None
+        } else {
+            Some(Value::Object(obj))
+        }
     }
 }
 
@@ -260,8 +305,7 @@ It will be set after the class is loaded.\n\
 The application exited";
         let r = JdbBackend.clean("run", input);
         assert!(
-            r.to_lowercase().contains("javac -g")
-                || r.to_lowercase().contains("debug info"),
+            r.to_lowercase().contains("javac -g") || r.to_lowercase().contains("debug info"),
             "expected -g hint when bp didn't fire before exit, got: {}",
             r
         );
@@ -294,7 +338,10 @@ The application exited";
     fn parse_hit_breakpoint_banner() {
         let raw = "> \nBreakpoint hit: \"thread=main\", Algos.fibonacci(), line=17 bci=13\n17                long next = a + b;\n\nmain[1] ";
         let hit = JdbBackend.parse_hit(raw);
-        assert!(hit.is_some(), "parse_hit should match jdb breakpoint banner");
+        assert!(
+            hit.is_some(),
+            "parse_hit should match jdb breakpoint banner"
+        );
         let hit = hit.unwrap();
         assert_eq!(hit.thread.as_deref(), Some("main"));
         assert_eq!(hit.frame_symbol.as_deref(), Some("Algos.fibonacci"));
@@ -306,8 +353,11 @@ The application exited";
         // Line breakpoints in methods with parameters used to return
         // None — the regex required empty `()`. This is the exact
         // banner the jdb docs show for such a break.
-        let raw = "Breakpoint hit: \"thread=main\", Broken.merge(int[], int, int), line=35 bci=12\n";
-        let hit = JdbBackend.parse_hit(raw).expect("should match parameterized method");
+        let raw =
+            "Breakpoint hit: \"thread=main\", Broken.merge(int[], int, int), line=35 bci=12\n";
+        let hit = JdbBackend
+            .parse_hit(raw)
+            .expect("should match parameterized method");
         assert_eq!(hit.line, Some(35));
         assert_eq!(hit.location_key, "Broken:35");
         assert_eq!(hit.frame_symbol.as_deref(), Some("Broken.merge"));
@@ -326,7 +376,17 @@ The application exited";
     fn parse_locals_simple() {
         let output = "a = 0\nb = 1\nnext = 1\ni = 0";
         let v = JdbBackend.parse_locals(output).expect("should parse");
-        assert_eq!(v.as_object().unwrap().get("a").unwrap().get("value").unwrap().as_str().unwrap(), "0");
+        assert_eq!(
+            v.as_object()
+                .unwrap()
+                .get("a")
+                .unwrap()
+                .get("value")
+                .unwrap()
+                .as_str()
+                .unwrap(),
+            "0"
+        );
     }
 
     #[test]

@@ -219,7 +219,9 @@ pub(crate) fn filter_pdb_where(raw: &str) -> String {
 }
 
 impl CanonicalOps for PdbBackend {
-    fn tool_name(&self) -> &'static str { "pdb" }
+    fn tool_name(&self) -> &'static str {
+        "pdb"
+    }
 
     fn postprocess_output(&self, canonical_op: &str, out: &str) -> String {
         match canonical_op {
@@ -271,7 +273,9 @@ impl CanonicalOps for PdbBackend {
         Ok(format!("clear {}", id.0))
     }
 
-    fn op_breaks(&self) -> anyhow::Result<String> { Ok("break".into()) }
+    fn op_breaks(&self) -> anyhow::Result<String> {
+        Ok("break".into())
+    }
 
     fn op_run(&self, _args: &[String]) -> anyhow::Result<String> {
         // pdb launches the script on daemon start and pauses at the
@@ -279,10 +283,18 @@ impl CanonicalOps for PdbBackend {
         // — the expected behaviour for the `--run` flag.
         Ok("continue".into())
     }
-    fn op_continue(&self) -> anyhow::Result<String> { Ok("continue".into()) }
-    fn op_step(&self) -> anyhow::Result<String> { Ok("step".into()) }
-    fn op_next(&self) -> anyhow::Result<String> { Ok("next".into()) }
-    fn op_finish(&self) -> anyhow::Result<String> { Ok("return".into()) }
+    fn op_continue(&self) -> anyhow::Result<String> {
+        Ok("continue".into())
+    }
+    fn op_step(&self) -> anyhow::Result<String> {
+        Ok("step".into())
+    }
+    fn op_next(&self) -> anyhow::Result<String> {
+        Ok("next".into())
+    }
+    fn op_finish(&self) -> anyhow::Result<String> {
+        Ok("return".into())
+    }
 
     fn op_stack(&self, _n: Option<u32>) -> anyhow::Result<String> {
         // pdb `where` has no count arg — full stack always.
@@ -411,9 +423,7 @@ impl CanonicalOps for PdbBackend {
 
 fn stop_regex() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| {
-        Regex::new(r"^>\s+(\S+?)\((\d+)\)([A-Za-z_<][A-Za-z0-9_<>]*)").unwrap()
-    })
+    RE.get_or_init(|| Regex::new(r"^>\s+(\S+?)\((\d+)\)([A-Za-z_<][A-Za-z0-9_<>]*)").unwrap())
 }
 
 /// Split on commas at bracket-depth zero, respecting `'`/`"` quotes.
@@ -489,7 +499,10 @@ mod tests {
 
     #[test]
     fn format_breakpoint() {
-        assert_eq!(PdbBackend::new().format_breakpoint("test.py:10"), "break test.py:10");
+        assert_eq!(
+            PdbBackend::new().format_breakpoint("test.py:10"),
+            "break test.py:10"
+        );
     }
 
     #[test]
@@ -536,8 +549,7 @@ mod tests {
         // Other ops ship their own formatting (locals, print, …) and
         // must not be touched even if an `exec(...)` line coincidentally
         // appears in them (e.g. a printed local whose repr contains it).
-        let weird_locals_dump =
-            "{'code': '-> exec(cmd, globals, locals)', 'n': 3}";
+        let weird_locals_dump = "{'code': '-> exec(cmd, globals, locals)', 'n': 3}";
         let got = PdbBackend::new().postprocess_output("locals", weird_locals_dump);
         assert_eq!(got, weird_locals_dump);
     }
@@ -558,11 +570,7 @@ mod tests {
     #[test]
     fn advance_decorator_line() {
         let tmp = tempfile::NamedTempFile::new().unwrap();
-        std::fs::write(
-            tmp.path(),
-            "@cache\ndef foo():\n    return 1\n",
-        )
-        .unwrap();
+        std::fs::write(tmp.path(), "@cache\ndef foo():\n    return 1\n").unwrap();
         let p = tmp.path().to_str().unwrap();
         assert_eq!(advance_to_body_line(p, 1), Some(3));
     }
@@ -570,11 +578,7 @@ mod tests {
     #[test]
     fn advance_noop_on_body_line() {
         let tmp = tempfile::NamedTempFile::new().unwrap();
-        std::fs::write(
-            tmp.path(),
-            "def foo():\n    return 1\n",
-        )
-        .unwrap();
+        std::fs::write(tmp.path(), "def foo():\n    return 1\n").unwrap();
         // Already a body line — no advance.
         let p = tmp.path().to_str().unwrap();
         assert_eq!(advance_to_body_line(p, 2), None);
@@ -625,7 +629,11 @@ mod tests {
     fn canonical_break_ops() {
         let ops: &dyn CanonicalOps = &PdbBackend::new();
         assert_eq!(
-            ops.op_break(&BreakLoc::FileLine { file: "app.py".into(), line: 10 }).unwrap(),
+            ops.op_break(&BreakLoc::FileLine {
+                file: "app.py".into(),
+                line: 10
+            })
+            .unwrap(),
             "break app.py:10"
         );
         assert_eq!(
@@ -633,7 +641,11 @@ mod tests {
             "break main"
         );
         assert_eq!(
-            ops.op_break(&BreakLoc::ModuleMethod { module: "app".into(), method: "main".into() }).unwrap(),
+            ops.op_break(&BreakLoc::ModuleMethod {
+                module: "app".into(),
+                method: "main".into()
+            })
+            .unwrap(),
             "break app:main"
         );
     }
@@ -681,7 +693,11 @@ mod tests {
 
     #[test]
     fn parse_hit_none_without_marker() {
-        assert!(PdbBackend::new().parse_hit("some output without marker").is_none());
+        assert!(
+            PdbBackend::new()
+                .parse_hit("some output without marker")
+                .is_none()
+        );
     }
 
     #[test]
@@ -689,7 +705,10 @@ mod tests {
         // pdb stops at the very first line of the module (line 1) before any
         // breakpoint fires. That synthetic stop must be skipped.
         let out = "> /app/main.py(1)<module>()\n-> \"\"\"Algorithms.\"\"\"\n(Pdb) ";
-        assert!(PdbBackend::new().parse_hit(out).is_none(), "should skip <module> stop at line 1");
+        assert!(
+            PdbBackend::new().parse_hit(out).is_none(),
+            "should skip <module> stop at line 1"
+        );
     }
 
     #[test]
@@ -697,13 +716,31 @@ mod tests {
         let out = "{'x': 42, 'name': 'hello', 'items': [1, 2, 3]}";
         let v = PdbBackend::new().parse_locals(out).expect("should parse");
         let obj = v.as_object().unwrap();
-        assert_eq!(obj.get("x").unwrap().get("value").unwrap().as_str().unwrap(), "42");
         assert_eq!(
-            obj.get("name").unwrap().get("value").unwrap().as_str().unwrap(),
+            obj.get("x")
+                .unwrap()
+                .get("value")
+                .unwrap()
+                .as_str()
+                .unwrap(),
+            "42"
+        );
+        assert_eq!(
+            obj.get("name")
+                .unwrap()
+                .get("value")
+                .unwrap()
+                .as_str()
+                .unwrap(),
             "'hello'"
         );
         assert_eq!(
-            obj.get("items").unwrap().get("value").unwrap().as_str().unwrap(),
+            obj.get("items")
+                .unwrap()
+                .get("value")
+                .unwrap()
+                .as_str()
+                .unwrap(),
             "[1, 2, 3]"
         );
     }
@@ -714,10 +751,23 @@ mod tests {
         let v = PdbBackend::new().parse_locals(out).expect("should parse");
         let obj = v.as_object().unwrap();
         assert_eq!(
-            obj.get("cfg").unwrap().get("value").unwrap().as_str().unwrap(),
+            obj.get("cfg")
+                .unwrap()
+                .get("value")
+                .unwrap()
+                .as_str()
+                .unwrap(),
             "{'host': 'localhost', 'port': 8080}"
         );
-        assert_eq!(obj.get("ready").unwrap().get("value").unwrap().as_str().unwrap(), "True");
+        assert_eq!(
+            obj.get("ready")
+                .unwrap()
+                .get("value")
+                .unwrap()
+                .as_str()
+                .unwrap(),
+            "True"
+        );
     }
 
     #[test]
@@ -726,10 +776,23 @@ mod tests {
         let v = PdbBackend::new().parse_locals(out).expect("should parse");
         let obj = v.as_object().unwrap();
         assert_eq!(
-            obj.get("greeting").unwrap().get("value").unwrap().as_str().unwrap(),
+            obj.get("greeting")
+                .unwrap()
+                .get("value")
+                .unwrap()
+                .as_str()
+                .unwrap(),
             "'hello, world'"
         );
-        assert_eq!(obj.get("n").unwrap().get("value").unwrap().as_str().unwrap(), "3");
+        assert_eq!(
+            obj.get("n")
+                .unwrap()
+                .get("value")
+                .unwrap()
+                .as_str()
+                .unwrap(),
+            "3"
+        );
     }
 
     #[test]
@@ -779,10 +842,7 @@ mod tests {
     fn parse_locals_all_dunders_returns_none() {
         let out = "{'__name__': '__main__', '__doc__': None, '__builtins__': <module 'builtins'>}";
         let v = PdbBackend::new().parse_locals(out);
-        assert!(
-            v.is_none(),
-            "all-dunder dict should yield None, got: {v:?}"
-        );
+        assert!(v.is_none(), "all-dunder dict should yield None, got: {v:?}");
     }
 
     // ----------------------------------------------------------------

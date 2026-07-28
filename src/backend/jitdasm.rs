@@ -126,9 +126,7 @@ impl Backend for JitDasmBackend {
         // lands in the capture file and the REPL happily loads the
         // host runtime's JIT noise instead. Catch the misuse up front.
         let lower = target.to_ascii_lowercase();
-        if !(lower.ends_with(".csproj")
-            || lower.ends_with(".fsproj")
-            || lower.ends_with(".vbproj"))
+        if !(lower.ends_with(".csproj") || lower.ends_with(".fsproj") || lower.ends_with(".vbproj"))
         {
             anyhow::bail!(
                 "jitdasm needs a project file (.csproj/.fsproj/.vbproj), got `{target}` — \
@@ -279,11 +277,15 @@ impl Backend for JitDasmBackend {
     }
 
     fn parse_help(&self, _raw: &str) -> String {
-        "jitdasm: methods, disasm <pattern>, search <instr>, stats, hotspots [N], simd, help".to_string()
+        "jitdasm: methods, disasm <pattern>, search <instr>, stats, hotspots [N], simd, help"
+            .to_string()
     }
 
     fn adapters(&self) -> Vec<(&'static str, &'static str)> {
-        vec![("jitdasm.md", include_str!("../../skills/adapters/jitdasm.md"))]
+        vec![(
+            "jitdasm.md",
+            include_str!("../../skills/adapters/jitdasm.md"),
+        )]
     }
 }
 
@@ -294,7 +296,10 @@ mod tests {
     #[test]
     fn spawn_config_with_pattern() {
         let cfg = JitDasmBackend
-            .spawn_config("bench/tq-quick/tq-quick.csproj", &["SimdOps:DotProduct".into()])
+            .spawn_config(
+                "bench/tq-quick/tq-quick.csproj",
+                &["SimdOps:DotProduct".into()],
+            )
             .unwrap();
         assert_eq!(cfg.bin, "bash");
         assert!(cfg.init_commands[0].contains("mkdir"));
@@ -305,9 +310,7 @@ mod tests {
 
     #[test]
     fn spawn_config_default_captures_all() {
-        let cfg = JitDasmBackend
-            .spawn_config("myapp.csproj", &[])
-            .unwrap();
+        let cfg = JitDasmBackend.spawn_config("myapp.csproj", &[]).unwrap();
         assert!(cfg.init_commands[2].contains("DOTNET_JitDisasm='*'"));
     }
 
@@ -398,10 +401,7 @@ mod tests {
 
     #[test]
     fn qualify_pattern_leaves_already_qualified() {
-        assert_eq!(
-            qualify_pattern("Foo.Bar:Baz", "Foo.csproj"),
-            "Foo.Bar:Baz"
-        );
+        assert_eq!(qualify_pattern("Foo.Bar:Baz", "Foo.csproj"), "Foo.Bar:Baz");
     }
 
     #[test]
@@ -440,7 +440,10 @@ mod tests {
             exec_cmd.contains("--jitdasm-pattern"),
             "missing --jitdasm-pattern:\n{exec_cmd}"
         );
-        assert!(exec_cmd.contains(":SumFast"), "missing :SumFast:\n{exec_cmd}");
+        assert!(
+            exec_cmd.contains(":SumFast"),
+            "missing :SumFast:\n{exec_cmd}"
+        );
     }
 
     #[test]
@@ -564,7 +567,10 @@ mod tests {
             .spawn_config("app.csproj", &["$(touch /tmp/pwned);'".into()])
             .unwrap();
         let run = &cfg.init_commands[2];
-        assert!(run.contains("DOTNET_JitDisasm='app.$(touch /tmp/pwned);'\\''"), "{run}");
+        assert!(
+            run.contains("DOTNET_JitDisasm='app.$(touch /tmp/pwned);'\\''"),
+            "{run}"
+        );
         assert!(!run.contains("DOTNET_JitDisasm='app.$(touch /tmp/pwned);' &&"));
     }
 }

@@ -61,8 +61,9 @@ fn parse(raw: &str) -> Parsed {
     }
     // `<method 'write' of 'BufferedWriter' objects>` → `BufferedWriter.write`
     static METHOD_OF: OnceLock<Regex> = OnceLock::new();
-    let re_method_of = METHOD_OF
-        .get_or_init(|| Regex::new(r"^<method '(?P<m>[^']+)' of '(?P<t>[^']+)' objects>$").unwrap());
+    let re_method_of = METHOD_OF.get_or_init(|| {
+        Regex::new(r"^<method '(?P<m>[^']+)' of '(?P<t>[^']+)' objects>$").unwrap()
+    });
     if let Some(c) = re_method_of.captures(raw) {
         return Parsed {
             fqn: format!("{}.{}", &c["t"], &c["m"]),
@@ -88,13 +89,19 @@ fn parse(raw: &str) -> Parsed {
             format!("{module}.{func}")
         };
         let synthetic = is_synthetic_func(&func);
-        return Parsed { fqn, file: Some(file), line: Some(line), synthetic };
+        return Parsed {
+            fqn,
+            file: Some(file),
+            line: Some(line),
+            synthetic,
+        };
     }
 
     // py-spy form: `my_func (app.py)` / `my_func (app.py:42)`
     static PYSPY: OnceLock<Regex> = OnceLock::new();
     let re_pyspy = PYSPY.get_or_init(|| {
-        Regex::new(r"^(?P<func>[A-Za-z_<][\w<>]*)\s+\((?P<file>[^:)]+)(?::(?P<line>\d+))?\)$").unwrap()
+        Regex::new(r"^(?P<func>[A-Za-z_<][\w<>]*)\s+\((?P<file>[^:)]+)(?::(?P<line>\d+))?\)$")
+            .unwrap()
     });
     if let Some(c) = re_pyspy.captures(raw) {
         let func = c["func"].to_string();
@@ -107,7 +114,12 @@ fn parse(raw: &str) -> Parsed {
             format!("{module}.{func}")
         };
         let synthetic = is_synthetic_func(&func);
-        return Parsed { fqn, file: Some(file), line, synthetic };
+        return Parsed {
+            fqn,
+            file: Some(file),
+            line,
+            synthetic,
+        };
     }
 
     // Bare dotted or bare function name.
@@ -131,14 +143,19 @@ fn module_from_file(file: &str) -> String {
 }
 
 fn is_synthetic_func(f: &str) -> bool {
-    matches!(f, "<lambda>" | "<listcomp>" | "<dictcomp>" | "<setcomp>" | "<genexpr>" | "<module>")
+    matches!(
+        f,
+        "<lambda>" | "<listcomp>" | "<dictcomp>" | "<setcomp>" | "<genexpr>" | "<module>"
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn py() -> PythonCanonicalizer { PythonCanonicalizer }
+    fn py() -> PythonCanonicalizer {
+        PythonCanonicalizer
+    }
 
     #[test]
     fn pstats_form_parsed() {
