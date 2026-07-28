@@ -22,6 +22,7 @@
 //!     so breakpoint hits and frame locals get captured into the
 //!     SessionDb uniformly across backends.
 
+use anyhow::{Result, bail};
 use serde_json::Value;
 
 /// Where to stop. `dbg break` parses one of these out of the user's
@@ -35,6 +36,32 @@ pub enum BreakLoc {
 }
 
 impl BreakLoc {
+    pub fn parse_checked(spec: &str) -> Result<Self> {
+        let spec = spec.trim();
+        if spec.is_empty() || spec.chars().any(|c| c.is_control()) {
+            bail!("breakpoint location must be non-empty and contain no control characters");
+        }
+        let loc = Self::parse(spec);
+        match &loc {
+            BreakLoc::FileLine { file, line } if file.trim().is_empty() || *line == 0 => {
+                bail!("breakpoint file and line must be valid (line must be greater than zero)");
+            }
+            BreakLoc::ModuleMethod { module, method }
+                if module.trim().is_empty() || method.trim().is_empty() =>
+            {
+                bail!("breakpoint module and method must be non-empty");
+            }
+            BreakLoc::Fqn(name) if name.trim().is_empty() => {
+                bail!("breakpoint symbol must be non-empty");
+            }
+            BreakLoc::Fqn(_) if spec.contains('!') => {
+                bail!("breakpoint module and method must be non-empty");
+            }
+            _ => {}
+        }
+        Ok(loc)
+    }
+
     /// Parse the `<loc>` argument to `dbg break`. Precedence:
     /// 1. `module!method` (explicit)
     /// 2. `file:line` (line is all digits)

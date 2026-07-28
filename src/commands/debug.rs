@@ -125,17 +125,27 @@ fn dispatch_break(ops: &dyn CanonicalOps, rest: &str) -> Dispatched {
             "usage: dbg break <file:line | symbol | module!method> [if <cond>] [log <msg>]".into(),
         );
     }
+    if rest.trim_start().starts_with("if ") || rest.trim_start().starts_with("log ") {
+        return invalid_breakpoint();
+    }
     // Peel ` log <template>` first (templates can contain ` if ` text),
     // then an optional ` if <expr>`. The remainder is the location.
-    let (head, log_msg) = match rest.find(" log ") {
-        Some(i) => (&rest[..i], &rest[i + 5..]),
+    let (head, log_msg) = match find_keyword_outside_quotes(rest, " log ") {
+        Some(i) if !rest[i + 5..].trim().is_empty() => (&rest[..i], &rest[i + 5..]),
+        Some(_) => return invalid_breakpoint(),
+        None if rest.trim_end().ends_with(" log") => return invalid_breakpoint(),
         None => (rest, ""),
     };
-    let (loc_str, cond) = match head.find(" if ") {
-        Some(i) => (&head[..i], &head[i + 4..]),
+    let (loc_str, cond) = match find_keyword_outside_quotes(head, " if ") {
+        Some(i) if !head[i + 4..].trim().is_empty() => (&head[..i], &head[i + 4..]),
+        Some(_) => return invalid_breakpoint(),
+        None if head.trim_end().ends_with(" if") => return invalid_breakpoint(),
         None => (head, ""),
     };
-    let loc = BreakLoc::parse(loc_str.trim());
+    let loc = match BreakLoc::parse_checked(loc_str) {
+        Ok(loc) => loc,
+        Err(e) => return Dispatched::Immediate(format!("[error: {e}]")),
+    };
     let cond_trim = cond.trim();
     let log_trim = log_msg.trim();
     let result = if !log_trim.is_empty() {
@@ -173,10 +183,44 @@ fn dispatch_break(ops: &dyn CanonicalOps, rest: &str) -> Dispatched {
     }
 }
 
+fn invalid_breakpoint() -> Dispatched {
+    Dispatched::Immediate(
+        "invalid breakpoint expression: location, condition, and log message must be non-empty"
+            .into(),
+    )
+}
+
+fn find_keyword_outside_quotes(input: &str, keyword: &str) -> Option<usize> {
+    let bytes = input.as_bytes();
+    let needle = keyword.as_bytes();
+    let mut quote = None;
+    let mut escaped = false;
+    for i in 0..=bytes.len().saturating_sub(needle.len()) {
+        let ch = bytes[i] as char;
+        if escaped {
+            escaped = false;
+        } else if ch == '\\' && quote.is_some() {
+            escaped = true;
+        } else if ch == '\'' || ch == '"' {
+            quote = if quote == Some(ch) {
+                None
+            } else if quote.is_none() {
+                Some(ch)
+            } else {
+                quote
+            };
+        }
+        if quote.is_none() && bytes.get(i..i + needle.len()) == Some(needle) {
+            return Some(i);
+        }
+    }
+    None
+}
+
 fn dispatch_unbreak(ops: &dyn CanonicalOps, rest: &str) -> Dispatched {
     let id = match rest.parse::<u32>() {
-        Ok(n) => BreakId(n),
-        Err(_) => {
+        Ok(n) if n > 0 => BreakId(n),
+        Ok(_) | Err(_) => {
             return Dispatched::Immediate(
                 "usage: dbg unbreak <id>  (id comes from `dbg breaks`)".into(),
             );
@@ -437,6 +481,32 @@ mod tests {
         assert_eq!(op, "break");
         assert_eq!(cmd, "breakpoint set --file src/foo.rs --line 42");
         assert!(dec);
+    }
+
+    #[test]
+    fn malformed_breakpoint_suffixes_are_rejected() {
+        for input in ["break app.go:10 if", "break app.go:10 log", "break  if x"] {
+            match dispatch_to(input, &lldb()) {
+                Dispatched::Immediate(message) => assert!(message.contains("invalid breakpoint")),
+                other => panic!("malformed breakpoint was accepted: {}", describe(&other)),
+            }
+        }
+    }
+
+    #[test]
+    fn quoted_condition_text_is_not_treated_as_a_log_suffix() {
+        use crate::backend::delve_proto::DelveProtoBackend;
+        let d = dispatch_to(
+            r#"break app.go:10 if message == " log " "#,
+            &DelveProtoBackend,
+        );
+        match structured_of(d) {
+            Some(CanonicalReq::Break { cond, log, .. }) => {
+                assert_eq!(cond.as_deref(), Some(r#"message == " log ""#.trim()));
+                assert!(log.is_none());
+            }
+            other => panic!("expected structured breakpoint, got {other:?}"),
+        }
     }
 
     #[test]

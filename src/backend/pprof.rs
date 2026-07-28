@@ -39,22 +39,10 @@ impl Backend for PprofBackend {
     }
 
     fn spawn_config(&self, target: &str, args: &[String]) -> anyhow::Result<SpawnConfig> {
-        // Accept three invocation shapes:
-        //   dbg start pprof cpu.prof                 → [cpu.prof]
-        //   dbg start pprof ./mybin cpu.prof         → [./mybin, cpu.prof]
-        //   dbg start pprof "./mybin cpu.prof"       → [./mybin, cpu.prof]  (legacy)
-        //
-        // The space-joined legacy form is what the CLI used to force
-        // because `spawn_config` ignored `args`; real users and the
-        // adapter doc both expect two separate positional arguments.
-        let mut positional: Vec<String> = Vec::new();
-        let split: Vec<&str> = target.splitn(2, ' ').collect();
-        if split.len() == 2 {
-            positional.push(split[0].into());
-            positional.push(split[1].into());
-        } else {
-            positional.push(target.into());
-        }
+        // `target` is one CLI argument. Never split it on whitespace: a
+        // profile path can contain spaces. Additional pprof positionals are
+        // passed through as separate `args` by the CLI.
+        let mut positional: Vec<String> = vec![target.into()];
         positional.extend(args.iter().cloned());
 
         // pprof only ingests profile files — source files and ELF
@@ -98,7 +86,7 @@ impl Backend for PprofBackend {
         // and silently falls back to an interactive session, yielding
         // a near-empty traces file.
         let shell_cmd = format!(
-            "go tool pprof -traces {} > {} 2>/dev/null; exec go tool pprof {}",
+            "go tool pprof -traces {} > {} 2>/dev/null && exec go tool pprof {}",
             quoted_positional,
             shell_escape(&traces_str),
             quoted_positional,
@@ -187,12 +175,24 @@ mod tests {
 
     #[test]
     fn spawn_config_binary_and_profile() {
-        let cfg = PprofBackend.spawn_config("./mybin cpu.prof", &[]).unwrap();
+        let cfg = PprofBackend
+            .spawn_config("./mybin", &["cpu.prof".into()])
+            .unwrap();
         let script = shell_script(&cfg);
         assert!(
             script.contains("./mybin") && script.contains("cpu.prof"),
             "{script}"
         );
+    }
+
+    #[test]
+    fn spawn_config_preserves_spaces_in_profile_path() {
+        let cfg = PprofBackend
+            .spawn_config("profile with spaces.prof", &[])
+            .unwrap();
+        let script = shell_script(&cfg);
+        assert!(script.contains("'profile with spaces.prof'"), "{script}");
+        assert!(!script.contains("'profile' 'with spaces.prof'"), "{script}");
     }
 
     #[test]

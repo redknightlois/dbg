@@ -131,12 +131,10 @@ impl CanonicalOps for JdbBackend {
     fn op_break(&self, loc: &BreakLoc) -> anyhow::Result<String> {
         Ok(match loc {
             BreakLoc::FileLine { file, line } => {
-                // jdb expects `stop at <ClassName>:<line>`, not a file path.
-                // Strip the directory and `.java` extension to get the class name.
-                let class = std::path::Path::new(file)
-                    .file_stem()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or(file);
+                // Preserve package qualifiers. jdb resolves `a.b.Main:10`
+                // differently from an unqualified `Main:10` when classes
+                // with the same simple name are loaded.
+                let class = jdb_class_name(file);
                 format!("stop at {class}:{line}")
             }
             BreakLoc::Fqn(name) => format!("stop at {name}"),
@@ -232,14 +230,8 @@ impl CanonicalOps for JdbBackend {
                         .rsplit_once('$')
                         .map(|x| x.0)
                         .unwrap_or(class_part);
-                    // Further strip package prefix so `com.foo.Broken` →
-                    // `Broken` for the key.
-                    let short = outer_class
-                        .rsplit_once('.')
-                        .map(|x| x.1)
-                        .unwrap_or(outer_class);
                     return Some(HitEvent {
-                        location_key: format!("{short}:{line_no}"),
+                        location_key: format!("{outer_class}:{line_no}"),
                         thread: Some(thread),
                         frame_symbol: Some(symbol),
                         file: None,
@@ -273,6 +265,31 @@ impl CanonicalOps for JdbBackend {
             Some(Value::Object(obj))
         }
     }
+}
+
+fn jdb_class_name(file: &str) -> String {
+    let stem = file
+        .strip_suffix(".java")
+        .or_else(|| file.strip_suffix(".kt"))
+        .unwrap_or(file)
+        .replace('\\', "/");
+    let relative = [
+        "src/main/java/",
+        "src/test/java/",
+        "src/",
+        "java/",
+        "kotlin/",
+    ]
+    .iter()
+    .find_map(|root| stem.find(root).map(|i| &stem[i + root.len()..]));
+    let class = relative.unwrap_or_else(|| {
+        if stem.starts_with('/') {
+            stem.rsplit('/').next().unwrap_or(&stem)
+        } else {
+            &stem
+        }
+    });
+    class.replace('/', ".")
 }
 
 #[cfg(test)]
@@ -369,7 +386,20 @@ The application exited";
         let hit = JdbBackend.parse_hit(raw).expect("nested class");
         assert_eq!(hit.line, Some(42));
         // Outer class, package stripped, $Inner stripped.
-        assert_eq!(hit.location_key, "Outer:42");
+        assert_eq!(hit.location_key, "com.x.Outer:42");
+    }
+
+    #[test]
+    fn file_breakpoint_keeps_java_package_qualifier() {
+        assert_eq!(
+            JdbBackend
+                .op_break(&BreakLoc::FileLine {
+                    file: "src/com/example/Main.java".into(),
+                    line: 12,
+                })
+                .unwrap(),
+            "stop at com.example.Main:12"
+        );
     }
 
     #[test]

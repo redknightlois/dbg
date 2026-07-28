@@ -174,11 +174,10 @@ impl CanonicalOps for GhciBackend {
 
     fn op_break(&self, loc: &BreakLoc) -> anyhow::Result<String> {
         Ok(match loc {
-            BreakLoc::FileLine { file: _, line } => {
-                // `:break <line>` sets a breakpoint in the most recently
-                // loaded module. We can't reliably infer the Haskell module
-                // name from the filename (algos.hs → Main, not Algos).
-                format!(":break {line}")
+            BreakLoc::FileLine { file, line } => {
+                // Keep the source component. GHCi accepts `file line` and
+                // needs it when more than one module is loaded.
+                format!(":break {file} {line}")
             }
             BreakLoc::Fqn(name) => format!(":break {name}"),
             BreakLoc::ModuleMethod { module, method } => format!(":break {module}.{method}"),

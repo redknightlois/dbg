@@ -178,6 +178,11 @@ impl CanonicalOps for PhpdbgBackend {
         // with "command 'breakpoint' could not be found".
         Ok("info break".into())
     }
+    fn op_unbreak(&self, id: super::BreakId) -> anyhow::Result<String> {
+        // `clear` removes every breakpoint. `break del N` is phpdbg's
+        // indexed deletion command and preserves the rest of the set.
+        Ok(format!("break del {}", id.0))
+    }
     fn op_list(&self, _loc: Option<&str>) -> anyhow::Result<String> {
         Ok("list".into())
     }
@@ -241,6 +246,7 @@ impl CanonicalOps for PhpdbgBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backend::canonical::BreakId;
 
     #[test]
     fn format_breakpoint() {
@@ -252,6 +258,11 @@ mod tests {
             PhpdbgBackend.format_breakpoint("my_function"),
             "break my_function"
         );
+    }
+
+    #[test]
+    fn unbreak_deletes_only_the_requested_phpdbg_breakpoint() {
+        assert_eq!(PhpdbgBackend.op_unbreak(BreakId(3)).unwrap(), "break del 3");
     }
 
     #[test]
