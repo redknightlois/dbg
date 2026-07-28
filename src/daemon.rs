@@ -5,11 +5,11 @@ use std::io::{Read, Write};
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use dbg_cli::session_db::{self, CreateOptions, SessionDb, SessionKind, TargetClass};
 use rusqlite::params;
 
@@ -22,6 +22,9 @@ use crate::pty::{DebuggerIo, DebuggerProcess};
 use dbg_cli::session_db::LiveDebugger;
 
 const CMD_TIMEOUT: Duration = Duration::from_secs(60);
+const MAX_IPC_CONNECTIONS: usize = 32;
+const MAX_IPC_REQUEST_BYTES: u64 = 64 * 1024;
+const IPC_IDLE_TIMEOUT: Duration = Duration::from_secs(5);
 
 fn cleanup_and_exit(keep_session_tmp: bool) -> ! {
     let me = session_slug();
@@ -34,11 +37,7 @@ fn cleanup_and_exit(keep_session_tmp: bool) -> ! {
     // Clear the "latest" pointer only if it still names us — another
     // daemon may have become the newest since we started, and we
     // mustn't blow away its pointer.
-    if let Ok(contents) = std::fs::read_to_string(latest_pointer_path()) {
-        if contents.trim() == me {
-            let _ = std::fs::remove_file(latest_pointer_path());
-        }
-    }
+    clear_latest_pointer_if_owner(&me);
     let session_dir = session_tmp_dir();
     if keep_session_tmp {
         eprintln!(
@@ -151,23 +150,59 @@ pub fn latest_pointer_path() -> PathBuf {
     runtime_dir().join(format!("dbg-{}.latest", cwd_base_slug()))
 }
 
+fn latest_pointer_lock_path() -> PathBuf {
+    runtime_dir().join(format!("dbg-{}.latest.lock", cwd_base_slug()))
+}
+
+fn with_latest_pointer_lock<T>(f: impl FnOnce() -> T) -> T {
+    let path = latest_pointer_lock_path();
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .open(path)
+        .expect("cannot open latest-session pointer lock");
+    let lock = nix::fcntl::Flock::lock(file, nix::fcntl::FlockArg::LockExclusive)
+        .expect("cannot lock latest-session pointer");
+    let result = f();
+    drop(lock);
+    result
+}
+
 /// Update the pointer to name `slug` as the newest daemon for this cwd.
 pub fn write_latest_pointer(slug: &str) {
-    let _ = std::fs::write(latest_pointer_path(), slug);
+    with_latest_pointer_lock(|| {
+        let path = latest_pointer_path();
+        let tmp = path.with_extension(format!("latest.{}", std::process::id()));
+        if std::fs::write(&tmp, format!("{slug}\n")).is_ok() {
+            let _ = std::fs::rename(tmp, path);
+        }
+    });
+}
+
+fn clear_latest_pointer_if_owner(slug: &str) {
+    with_latest_pointer_lock(|| {
+        let path = latest_pointer_path();
+        if std::fs::read_to_string(&path)
+            .ok()
+            .is_some_and(|contents| contents.trim() == slug)
+        {
+            let _ = std::fs::remove_file(path);
+        }
+    });
 }
 
 /// Read the pointer. Returns `None` if missing, empty, or pointing at
 /// a daemon that is no longer alive.
 fn read_live_pointer() -> Option<String> {
-    let raw = std::fs::read_to_string(latest_pointer_path()).ok()?;
-    let slug = raw.trim();
-    if slug.is_empty() {
-        return None;
-    }
-    if !is_slug_live(slug) {
-        return None;
-    }
-    Some(slug.to_string())
+    with_latest_pointer_lock(|| {
+        let raw = std::fs::read_to_string(latest_pointer_path()).ok()?;
+        let slug = raw.trim();
+        if slug.is_empty() || !is_slug_live(slug) {
+            return None;
+        }
+        Some(slug.to_string())
+    })
 }
 
 /// Slug the current process should act on. Priority:
@@ -213,13 +248,13 @@ pub fn is_slug_live(slug: &str) -> bool {
     let Ok(pid_str) = std::fs::read_to_string(pid_path_for(slug)) else {
         return false;
     };
-    let Ok(pid) = pid_str.trim().parse::<i32>() else {
+    let Some(pid) = pid_str.lines().next().and_then(|s| s.trim().parse::<i32>().ok()) else {
         return false;
     };
     if nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None).is_err() {
         return false;
     }
-    proc_comm_is_dbg(pid)
+    daemon_identity_matches(&pid_str, pid) && proc_comm_is_dbg(pid)
 }
 
 /// Pick a slug for a new daemon. With `DBG_SESSION` set we honor the
@@ -585,17 +620,17 @@ pub fn run_daemon(
     // use the Debug Adapter Protocol over TCP. All paths produce a
     // `Box<dyn DebuggerIo>`. Protocol backends have no post-spawn
     // init commands — their handshake happens inside the transport.
-    let (proc, init_commands): (Box<dyn DebuggerIo>, Vec<String>) = if backend.uses_inspector() {
+    let (proc, init_commands, fail_fast_init): (Box<dyn DebuggerIo>, Vec<String>, bool) = if backend.uses_inspector() {
         let t = crate::inspector::InspectorTransport::spawn(target, args)
             .context("failed to spawn inspector transport")?;
-        (Box::new(t), Vec::new())
+        (Box::new(t), Vec::new(), false)
     } else if backend.uses_dap() {
         let cfg = match attach {
             Some(spec) => backend.dap_attach(spec)?,
             None => backend.dap_launch(target, args)?,
         };
         let t = crate::dap::DapTransport::spawn(cfg).context("failed to spawn DAP transport")?;
-        (Box::new(t), Vec::new())
+        (Box::new(t), Vec::new(), false)
     } else {
         let config = backend.spawn_config(target, args)?;
         let p = DebuggerProcess::spawn(
@@ -605,7 +640,8 @@ pub fn run_daemon(
             backend.prompt_pattern(),
         )
         .context("failed to spawn debugger")?;
-        (Box::new(p), config.init_commands)
+        let fail_fast = config.bin == "bash" || config.bin.ends_with("/bash");
+        (Box::new(p), config.init_commands, fail_fast)
     };
 
     // Publish the jitdasm capture path so on-demand collectors (which
@@ -647,7 +683,7 @@ pub fn run_daemon(
     // written and socket bound up-front, connections queue into the
     // listener backlog and are served as soon as the accept loop
     // below picks them up — which happens right after init finishes.
-    std::fs::write(&pid_path(), std::process::id().to_string())?;
+    std::fs::write(&pid_path(), daemon_pid_record(std::process::id() as i32))?;
     let _ = std::fs::remove_file(&socket_path());
     let listener = UnixListener::bind(&socket_path()).context("failed to bind socket")?;
     // Point the cwd's "latest" pointer at ourselves so env-less clients
@@ -657,6 +693,7 @@ pub fn run_daemon(
     write_latest_pointer(&session_slug());
 
     let shutdown_requested = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let active_connections = std::sync::Arc::new(AtomicUsize::new(0));
     let shutdown_flag = shutdown_requested.clone();
     let wake_path = socket_path();
     let signal_pid = child_pid.load(Ordering::Relaxed);
@@ -675,8 +712,29 @@ pub fn run_daemon(
     // takes minutes to finish, so the backend's `init_timeout()`
     // overrides the default CMD_TIMEOUT here.
     let init_deadline = backend.init_timeout();
+    // Shell-backed profilers must stop at the first failed preparation
+    // command. `send_and_wait` only waits for the prompt, so it does not
+    // report a shell command's exit status. Append a private status marker
+    // and inspect it after every command. This also covers interactive bash
+    // contexts where `set -e` can be suppressed or changed by a command.
     for cmd in &init_commands {
-        proc.send_and_wait(cmd, init_deadline)?;
+        let is_exec = cmd.trim_start().starts_with("exec ");
+        let response = if fail_fast_init && !is_exec {
+            proc.send_and_wait(
+                &format!(
+                    "{cmd}; printf '\\n__DBG_INIT_STATUS__%s\\n' \"$?\""
+                ),
+                init_deadline,
+            )?
+        } else {
+            proc.send_and_wait(cmd, init_deadline)?
+        };
+        if fail_fast_init && !is_exec {
+            let status = parse_init_status(&response);
+            if status != Some(0) {
+                bail!("init command failed (exit status {status:?}): {cmd}");
+            }
+        }
     }
 
     // Cache help output now while the debugger is idle and responsive.
@@ -766,6 +824,19 @@ pub fn run_daemon(
                 Err(_) => continue,
             };
 
+            let previous = active_connections.fetch_update(
+                Ordering::AcqRel,
+                Ordering::Acquire,
+                |n| (n < MAX_IPC_CONNECTIONS).then_some(n + 1),
+            );
+            if previous.is_err() {
+                // Refuse excess clients without allocating a handler
+                // thread. The client can retry after an active request
+                // completes.
+                drop(stream);
+                continue;
+            }
+
             if shutdown_requested.load(Ordering::Acquire) {
                 let (_, keep_session_tmp) = handle_quit(backend, &session, &child_pid);
                 cleanup_and_exit(keep_session_tmp);
@@ -775,13 +846,28 @@ pub fn run_daemon(
             let cached_help = &cached_help;
             let child_pid = &child_pid;
             let log_handle = &log_handle;
+            let active_connections = active_connections.clone();
 
             scope.spawn(move || {
+                struct ConnectionGuard(std::sync::Arc<AtomicUsize>);
+                impl Drop for ConnectionGuard {
+                    fn drop(&mut self) {
+                        self.0.fetch_sub(1, Ordering::AcqRel);
+                    }
+                }
+                let _connection_guard = ConnectionGuard(active_connections);
                 let mut stream = stream;
-                // Accepted sockets inherit non-blocking from the listener; reset to blocking
-                let _ = stream.set_nonblocking(false);
-                let mut data = String::new();
-                let _ = stream.read_to_string(&mut data);
+                let _ = stream.set_read_timeout(Some(IPC_IDLE_TIMEOUT));
+                let _ = stream.set_write_timeout(Some(IPC_IDLE_TIMEOUT));
+                let (read_result, bytes) = read_ipc_request(&mut stream);
+                if read_result.is_err() || bytes.len() > MAX_IPC_REQUEST_BYTES as usize {
+                    let _ = stream.write_all(b"[error: IPC request exceeds size or idle limit]");
+                    return;
+                }
+                let Ok(data) = String::from_utf8(bytes) else {
+                    let _ = stream.write_all(b"[error: IPC request is not valid UTF-8]");
+                    return;
+                };
                 let cmd = data.trim().to_string();
 
                 if cmd.is_empty() {
@@ -818,6 +904,68 @@ pub fn run_daemon(
     });
 
     cleanup_and_exit(false);
+}
+
+fn read_ipc_request(
+    stream: &mut std::os::unix::net::UnixStream,
+) -> (std::io::Result<()>, Vec<u8>) {
+    read_ipc_request_with_timeout(stream, IPC_IDLE_TIMEOUT)
+}
+
+fn parse_init_status(response: &str) -> Option<i32> {
+    response
+        .lines()
+        .rev()
+        .find_map(|line| line.strip_prefix("__DBG_INIT_STATUS__"))
+        .and_then(|value| value.trim().parse::<i32>().ok())
+}
+
+fn read_ipc_request_with_timeout(
+    stream: &mut std::os::unix::net::UnixStream,
+    idle_timeout: Duration,
+) -> (std::io::Result<()>, Vec<u8>) {
+    let deadline = Instant::now() + idle_timeout;
+    let _ = stream.set_read_timeout(Some(idle_timeout));
+    let mut bytes = Vec::new();
+    let mut chunk = [0u8; 8192];
+    let result = loop {
+        if Instant::now() >= deadline {
+            break Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "IPC request exceeded idle limit",
+            ));
+        }
+        match stream.read(&mut chunk) {
+            Ok(0) => break Ok(()),
+            Ok(n) => {
+                bytes.extend_from_slice(&chunk[..n]);
+                if bytes.len() > MAX_IPC_REQUEST_BYTES as usize {
+                    break Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "IPC request is too large",
+                    ));
+                }
+                // Successful reads must not refresh the deadline. A
+                // slow-drip client must not retain a handler forever.
+                if Instant::now() >= deadline {
+                    break Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "IPC request exceeded idle limit",
+                    ));
+                }
+            }
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) && Instant::now() < deadline =>
+            {
+                continue;
+            }
+            Err(e) => break Err(e),
+        }
+    };
+    (result, bytes)
 }
 
 /// Lock the session mutex, recovering from poisoning so the daemon
@@ -2337,35 +2485,70 @@ fn foreign_daemon_hint() -> String {
     }
 }
 
-/// Check if a daemon is running.
-/// Read the current cwd's daemon PID file. Returns `None` when no
-/// daemon is registered for this slug — does NOT verify the process
-/// is alive (callers that need liveness should also check `is_running`
-/// or `is_slug_live`). Public so client-side commands like `dbg
-/// finalize` can locate the daemon's child process tree even before
-/// the accept loop is serving requests.
-pub fn current_daemon_pid() -> Option<i32> {
-    let s = std::fs::read_to_string(pid_path()).ok()?;
-    s.trim().parse().ok()
+/// Return a process identity that remains stable while a PID is alive.
+/// The kernel start time is the important part: a recycled PID has a
+/// different value even when the replacement executable has the same name.
+fn process_identity(pid: i32) -> Option<String> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let after_comm = stat.rsplit_once(") ")?.1;
+    let fields: Vec<&str> = after_comm.split_whitespace().collect();
+    let start_time = fields.get(19)?; // field 22, after pid + comm
+    let exe = std::fs::read_link(format!("/proc/{pid}/exe"))
+        .ok()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    Some(format!("{start_time}\n{exe}"))
 }
 
-/// List the direct child PIDs of `pid` via `/proc/<pid>/task/<pid>/children`.
+fn daemon_pid_record(pid: i32) -> String {
+    match process_identity(pid) {
+        Some(identity) => format!("{pid}\n{identity}\n"),
+        None => format!("{pid}\n"),
+    }
+}
+
+fn recorded_process_identity(pid_file: &str) -> Option<String> {
+    let mut lines = pid_file.lines();
+    let _pid = lines.next()?;
+    let start = lines.next()?.trim();
+    let exe = lines.next().unwrap_or("").trim();
+    if start.is_empty() {
+        None
+    } else {
+        Some(format!("{start}\n{exe}"))
+    }
+}
+
+fn daemon_identity_matches(pid_file: &str, pid: i32) -> bool {
+    match recorded_process_identity(pid_file) {
+        Some(recorded) => process_identity(pid).is_some_and(|current| current == recorded),
+        // PID-only markers are accepted only for this process. They are
+        // legacy test/runtime files and must never authorize signalling a
+        // different process after PID reuse.
+        None => pid == std::process::id() as i32,
+    }
+}
+
+/// List the direct child PIDs of `pid` via `/proc/<pid>/task/*/children`.
 /// Linux-only — returns an empty vec on other platforms or when the
 /// procfs entry is missing. Used by `dbg finalize` to walk from the
 /// daemon down to the profile collector (daemon → bash → collector).
 fn proc_children(pid: i32) -> Vec<i32> {
-    proc_children_from_reader(pid, |path| std::fs::read_to_string(path))
-}
-
-fn proc_children_from_reader<F>(pid: i32, read_to_string: F) -> Vec<i32>
-where
-    F: FnOnce(&str) -> std::io::Result<String>,
-{
-    let path = format!("/proc/{pid}/task/{pid}/children");
-    let Ok(content) = read_to_string(&path) else {
+    let task_dir = format!("/proc/{pid}/task");
+    let Ok(tasks) = std::fs::read_dir(&task_dir) else {
         return Vec::new();
     };
-    parse_proc_children(&content)
+    let mut children = Vec::new();
+    for task in tasks.flatten() {
+        let path = task.path().join("children");
+        let Ok(content) = std::fs::read_to_string(path) else {
+            continue;
+        };
+        children.extend(parse_proc_children(&content));
+    }
+    children.sort_unstable();
+    children.dedup();
+    children
 }
 
 fn parse_proc_children(content: &str) -> Vec<i32> {
@@ -2375,6 +2558,188 @@ fn parse_proc_children(content: &str) -> Vec<i32> {
         .collect()
 }
 
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+struct IdentitySafePidFd {
+    pid: i32,
+    identity: String,
+    fd: std::os::fd::OwnedFd,
+}
+
+/// Open a handle to one process instance and verify the instance after the
+/// open. If the PID changes after this function returns, the pidfd still
+/// refers to the original process and cannot address the replacement.
+#[cfg(target_os = "linux")]
+fn open_identity_safe_pidfd(pid: i32, expected_identity: &str) -> Result<IdentitySafePidFd> {
+    use std::os::fd::{FromRawFd, OwnedFd};
+
+    if expected_identity.is_empty() {
+        bail!("process {pid} has no verified start identity")
+    }
+
+    // SAFETY: this is the Linux pidfd_open(2) syscall. On kernels without
+    // pidfd support it returns an error; never fall back to kill(pid, ...).
+    let raw_fd = unsafe { nix::libc::syscall(nix::libc::SYS_pidfd_open, pid, 0) } as i32;
+    if raw_fd < 0 {
+        return Err(std::io::Error::last_os_error())
+            .with_context(|| format!("cannot obtain identity-safe handle for PID {pid}"));
+    }
+    // SAFETY: a successful pidfd_open returns a new owned file descriptor.
+    let fd = unsafe { OwnedFd::from_raw_fd(raw_fd) };
+    let Some(identity) = process_identity(pid) else {
+        bail!("cannot verify start identity for PID {pid} after opening its pidfd")
+    };
+    if identity != expected_identity {
+        bail!(
+            "PID {pid} changed process instance while opening its pidfd; refusing to signal it"
+        )
+    }
+    Ok(IdentitySafePidFd {
+        pid,
+        identity,
+        fd,
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn open_current_identity_safe_pidfd(pid: i32) -> Result<IdentitySafePidFd> {
+    let expected = process_identity(pid)
+        .ok_or_else(|| anyhow::anyhow!("cannot obtain start identity for PID {pid}"))?;
+    open_identity_safe_pidfd(pid, &expected)
+}
+
+#[cfg(target_os = "linux")]
+fn pidfd_send_sigint(handle: &IdentitySafePidFd) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+
+    // SAFETY: pidfd_send_signal addresses the process instance bound to the
+    // fd, never a later occupant of handle.pid.
+    let rc = unsafe {
+        nix::libc::syscall(
+            nix::libc::SYS_pidfd_send_signal,
+            handle.fd.as_raw_fd(),
+            nix::libc::SIGINT,
+            std::ptr::null::<nix::libc::siginfo_t>(),
+            0,
+        )
+    };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn process_parent_pid(pid: i32) -> Option<i32> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let after_comm = stat.rsplit_once(") ")?.1;
+    let fields: Vec<&str> = after_comm.split_whitespace().collect();
+    fields.get(1)?.parse().ok() // field 4: state, then parent PID
+}
+
+#[cfg(target_os = "linux")]
+fn process_is_child_of(pid: i32, parent: i32) -> bool {
+    let Some(actual_parent) = process_parent_pid(pid) else {
+        return false;
+    };
+    if actual_parent == parent {
+        return true;
+    }
+    // A child forked by a non-leader thread has that thread's TID as its
+    // parent in /proc. It is still a child of the daemon process here.
+    std::fs::read_dir(format!("/proc/{parent}/task"))
+        .ok()
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| entry.ok()?.file_name().to_str()?.parse::<i32>().ok())
+        .any(|tid| tid == actual_parent)
+}
+
+#[cfg(target_os = "linux")]
+fn open_verified_child(parent: &IdentitySafePidFd, pid: i32) -> Result<IdentitySafePidFd> {
+    let child = open_current_identity_safe_pidfd(pid)
+        .with_context(|| format!("cannot bind child PID {pid} to an identity-safe handle"))?;
+    // Check the process-tree boundary while both instance-bound handles are
+    // held. A replacement or a reparented process is not a descendant.
+    if !process_is_child_of(pid, parent.pid)
+        || process_identity(parent.pid).as_deref() != Some(parent.identity.as_str())
+    {
+        anyhow::bail!(
+            "PID {pid} is no longer a verified child of process instance {}",
+            parent.pid
+        );
+    }
+    Ok(child)
+}
+
+#[cfg(target_os = "linux")]
+fn open_verified_children_from_pids(
+    parent: &IdentitySafePidFd,
+    pids: Vec<i32>,
+) -> Result<(Vec<IdentitySafePidFd>, bool)> {
+    let had_children = !pids.is_empty();
+    let children = pids
+        .into_iter()
+        .map(|pid| open_verified_child(parent, pid))
+        .collect::<Result<Vec<_>>>()?;
+    Ok((children, had_children))
+}
+
+#[cfg(target_os = "linux")]
+fn open_verified_children(
+    parent: &IdentitySafePidFd,
+) -> Result<(Vec<IdentitySafePidFd>, bool)> {
+    open_verified_children_from_pids(parent, proc_children(parent.pid))
+}
+
+#[cfg(target_os = "linux")]
+fn append_verified_descendants(
+    root: IdentitySafePidFd,
+    output: &mut Vec<IdentitySafePidFd>,
+) -> Result<()> {
+    let (children, _) = open_verified_children(&root)?;
+    output.push(root);
+    for child in children {
+        append_verified_descendants(child, output)?;
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn collector_identity_safe_targets(daemon: &IdentitySafePidFd) -> Result<Vec<IdentitySafePidFd>> {
+    let (direct, had_direct) = open_verified_children(daemon)?;
+    if !had_direct {
+        anyhow::bail!(
+            "daemon {} has no child processes — has the collector already exited? Try `dbg status` to see the current state.",
+            daemon.pid
+        );
+    }
+    // The normal tree is daemon → shell → collector. Preserve the old
+    // direct-child fallback for backends that do not use a shell, but only
+    // with handles verified as this daemon's children.
+    let mut collectors = Vec::new();
+    let mut had_grandchildren = false;
+    for child in &direct {
+        let (grandchildren, had) = open_verified_children(child)?;
+        had_grandchildren |= had;
+        collectors.extend(grandchildren);
+    }
+    if !had_grandchildren {
+        collectors = direct;
+    }
+
+    let mut targets = Vec::new();
+    for collector in collectors {
+        append_verified_descendants(collector, &mut targets)?;
+    }
+    if targets.is_empty() {
+        anyhow::bail!("finalize: collector tree has no identity-safe signal targets");
+    }
+    Ok(targets)
+}
+
+#[cfg(test)]
 fn collector_signal_targets<F>(daemon_pid: i32, mut children_of: F) -> Result<Vec<i32>>
 where
     F: FnMut(i32) -> Vec<i32>,
@@ -2400,6 +2765,7 @@ where
     Ok(targets)
 }
 
+#[derive(Debug)]
 pub struct FinalizeReport {
     pub signalled: Vec<i32>,
     pub failed: Vec<i32>,
@@ -2408,44 +2774,61 @@ pub struct FinalizeReport {
 /// Signal the profile/sample collector process tree for the active daemon so
 /// blocking collectors can flush their trace and let daemon init complete.
 pub fn finalize_collector() -> Result<FinalizeReport> {
-    use nix::sys::signal::{Signal, kill};
-    use nix::unistd::{Pid, getpgid};
+    #[cfg(not(target_os = "linux"))]
+    {
+        // There is no portable process-instance-bound signal primitive here.
+        // A bare PID or process-group fallback would make stale runtime data
+        // dangerous, so unsupported platforms fail closed.
+        anyhow::bail!(
+            "finalize: identity-safe process handles are unavailable on this platform"
+        );
+    }
 
-    let daemon_pid = current_daemon_pid().ok_or_else(|| {
-        anyhow::anyhow!(
-            "no daemon registered for this cwd — `dbg start` must be running. \
-             If `dbg start` is mid-init the pid file should exist; check \
-             $XDG_RUNTIME_DIR/dbg-$UID/ for stale state."
-        )
-    })?;
+    #[cfg(target_os = "linux")]
+    {
+        let pid_file = std::fs::read_to_string(pid_path())
+            .context("cannot read daemon identity marker")?;
+        // Parse PID and identity from one marker snapshot. Reading the path
+        // twice could combine an old identity with a replacement marker's PID.
+        let daemon_pid = pid_file
+            .lines()
+            .next()
+            .and_then(|line| line.trim().parse::<i32>().ok())
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "no daemon registered for this cwd — `dbg start` must be running. \
+                     If `dbg start` is mid-init the pid file should exist; check \
+                     $XDG_RUNTIME_DIR/dbg-$UID/ for stale state."
+                )
+            })?;
+        let daemon_identity = recorded_process_identity(&pid_file).ok_or_else(|| {
+            anyhow::anyhow!(
+                "finalize: daemon identity marker has no verified process start identity; refusing to signal PID {daemon_pid}"
+            )
+        })?;
 
-    let targets = collector_signal_targets(daemon_pid, proc_children)?;
+        // Open the daemon handle before inspecting descendants. This binds
+        // the operation to this daemon instance if its PID is recycled.
+        let daemon = open_identity_safe_pidfd(daemon_pid, &daemon_identity)?;
+        let targets = collector_identity_safe_targets(&daemon)?;
 
-    let mut signalled = Vec::new();
-    let mut failed = Vec::new();
-    for pid in &targets {
-        // Send to the process group, not the bare PID: collectors that
-        // fork helper processes (perf record's session manager, etc.)
-        // need every member to see the signal for a clean shutdown.
-        let pgid = getpgid(Some(Pid::from_raw(*pid)))
-            .map(|p| p.as_raw())
-            .unwrap_or(*pid);
-        match kill(Pid::from_raw(-pgid), Signal::SIGINT) {
-            Ok(()) => signalled.push(*pid),
-            // EPERM is rare here (same-uid) but include the bare PID as
-            // a fallback so we still try the direct kill.
-            Err(_) => match kill(Pid::from_raw(*pid), Signal::SIGINT) {
-                Ok(()) => signalled.push(*pid),
-                Err(_) => failed.push(*pid),
-            },
+        let mut signalled = Vec::new();
+        let mut failed = Vec::new();
+        for target in &targets {
+            match pidfd_send_sigint(target) {
+                Ok(()) => signalled.push(target.pid),
+                Err(_) => failed.push(target.pid),
+            }
         }
-    }
 
-    if signalled.is_empty() {
-        anyhow::bail!("finalize: failed to signal any collector ({failed:?})");
-    }
+        if signalled.is_empty() {
+            anyhow::bail!(
+                "finalize: failed to signal any identity-safe collector ({failed:?})"
+            );
+        }
 
-    Ok(FinalizeReport { signalled, failed })
+        return Ok(FinalizeReport { signalled, failed });
+    }
 }
 
 pub fn is_running() -> bool {
@@ -2459,7 +2842,7 @@ pub fn is_running() -> bool {
     let Ok(pid_str) = std::fs::read_to_string(&pid_path()) else {
         return false;
     };
-    let Ok(pid) = pid_str.trim().parse::<i32>() else {
+    let Some(pid) = pid_str.lines().next().and_then(|s| s.trim().parse::<i32>().ok()) else {
         return false;
     };
     let alive = nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None).is_ok();
@@ -2478,7 +2861,7 @@ pub fn is_running() -> bool {
     // proof the daemon is gone — only that something removed the
     // path. Diagnosing that case (alive daemon, dead socket path)
     // is `connect_with_retry`'s job, not ours.
-    proc_comm_is_dbg(pid)
+    daemon_identity_matches(&pid_str, pid) && proc_comm_is_dbg(pid)
 }
 
 fn proc_comm_is_dbg(pid: i32) -> bool {
@@ -2509,8 +2892,9 @@ fn proc_comm_is_dbg(pid: i32) -> bool {
 /// should not pin this runtime slot forever.
 pub fn clean_stale_runtime_files() {
     if let Ok(pid_str) = std::fs::read_to_string(&pid_path()) {
-        if let Ok(pid) = pid_str.trim().parse::<i32>() {
+        if let Some(pid) = pid_str.lines().next().and_then(|s| s.trim().parse::<i32>().ok()) {
             if nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None).is_ok()
+                && daemon_identity_matches(&pid_str, pid)
                 && proc_comm_is_dbg(pid)
             {
                 return;
@@ -2562,6 +2946,9 @@ pub fn kill_daemon() -> Result<String> {
     if is_slug_live(&slug) {
         let pid = std::fs::read_to_string(pid_path_for(&slug))
             .unwrap_or_default()
+            .lines()
+            .next()
+            .unwrap_or("")
             .trim()
             .to_string();
         return Ok(format!(
@@ -2643,6 +3030,32 @@ mod tests {
             bind < init_loop,
             "socket bind must precede init_commands loop"
         );
+    }
+
+    #[test]
+    fn ipc_slow_drip_has_an_absolute_deadline() {
+        use std::os::unix::net::UnixStream;
+
+        let (mut writer, mut reader) = UnixStream::pair().unwrap();
+        let producer = std::thread::spawn(move || {
+            writer.write_all(b"x").unwrap();
+            std::thread::sleep(Duration::from_millis(40));
+            let _ = writer.write_all(b"y");
+        });
+
+        let started = Instant::now();
+        let (result, bytes) = read_ipc_request_with_timeout(&mut reader, Duration::from_millis(10));
+        assert!(result.is_err(), "slow-drip request must be rejected");
+        assert_eq!(bytes, b"x");
+        assert!(started.elapsed() < Duration::from_millis(100));
+        producer.join().unwrap();
+    }
+
+    #[test]
+    fn init_command_status_marker_surfaces_nonzero_exit() {
+        assert_eq!(parse_init_status("output\n__DBG_INIT_STATUS__0\n"), Some(0));
+        assert_eq!(parse_init_status("output\n__DBG_INIT_STATUS__7\n"), Some(7));
+        assert_eq!(parse_init_status("output without marker"), None);
     }
 
     // These tests mutate process-global env vars (XDG_RUNTIME_DIR +
@@ -3079,6 +3492,159 @@ mod tests {
             err.contains("has no child processes"),
             "unexpected error: {err}"
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn finalize_signals_a_live_collector_with_an_identity_safe_handle() {
+        use std::process::Command;
+
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = TempDir::new().unwrap();
+        unsafe {
+            std::env::set_var("XDG_RUNTIME_DIR", tmp.path());
+            std::env::set_var("DBG_SESSION", "finalize-live");
+        }
+        let mut collector = Command::new("sleep").arg("30").spawn().unwrap();
+        let collector_pid = collector.id() as i32;
+        std::fs::write(pid_path(), daemon_pid_record(std::process::id() as i32)).unwrap();
+
+        let report = finalize_collector().expect("live collector must be signalled");
+        assert!(report.signalled.contains(&collector_pid));
+        let status = collector.wait().unwrap();
+        assert!(!status.success(), "SIGINT must stop the collector");
+
+        let _ = std::fs::remove_file(pid_path());
+        unsafe {
+            std::env::remove_var("DBG_SESSION");
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn finalize_does_not_signal_an_unrelated_process_in_the_collector_group() {
+        use std::process::Command;
+
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = TempDir::new().unwrap();
+        unsafe {
+            std::env::set_var("XDG_RUNTIME_DIR", tmp.path());
+            std::env::set_var("DBG_SESSION", "finalize-group");
+        }
+
+        let mut collector = Command::new("sleep").arg("30").spawn().unwrap();
+        let collector_pid = collector.id() as i32;
+        // Both children inherit this test process's process group. The orphan
+        // below is reparented to init, so it is not a collector-tree
+        // descendant even though a negative-PGID kill would reach it.
+        let orphan_pid_file = tmp.path().join("orphan.pid");
+        let command = format!("sleep 30 & echo $! > {}; exit 0", orphan_pid_file.display());
+        let mut helper = Command::new("sh").arg("-c").arg(command).spawn().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !orphan_pid_file.exists() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let orphan_pid: i32 = std::fs::read_to_string(&orphan_pid_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        helper.wait().unwrap();
+
+        std::fs::write(pid_path(), daemon_pid_record(std::process::id() as i32)).unwrap();
+        let report = finalize_collector().expect("collector must be signalled");
+        assert!(report.signalled.contains(&collector_pid));
+        assert!(
+            nix::sys::signal::kill(nix::unistd::Pid::from_raw(orphan_pid), None).is_ok(),
+            "an unrelated same-group orphan must survive finalize"
+        );
+
+        let _ = collector.wait();
+        let _ = nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(orphan_pid),
+            nix::sys::signal::Signal::SIGKILL,
+        );
+        let _ = std::fs::remove_file(pid_path());
+        unsafe {
+            std::env::remove_var("DBG_SESSION");
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn finalize_rejects_a_replaced_daemon_identity() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = TempDir::new().unwrap();
+        unsafe {
+            std::env::set_var("XDG_RUNTIME_DIR", tmp.path());
+            std::env::set_var("DBG_SESSION", "finalize-daemon-replaced");
+        }
+        std::fs::write(
+            pid_path(),
+            format!("{}\nnot-the-current-instance\n", std::process::id()),
+        )
+        .unwrap();
+
+        let error = finalize_collector().unwrap_err().to_string();
+        assert!(
+            error.contains("changed process instance")
+                || error.contains("refusing to signal"),
+            "unexpected replacement error: {error}"
+        );
+
+        let _ = std::fs::remove_file(pid_path());
+        unsafe {
+            std::env::remove_var("DBG_SESSION");
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn identity_safe_handle_rejects_a_replaced_descendant_identity() {
+        let pid = std::process::id() as i32;
+        let current = process_identity(pid).unwrap();
+        let replacement = format!("{current}\nreplacement-executable");
+        assert!(
+            open_identity_safe_pidfd(pid, &replacement).is_err(),
+            "a PID with a different start identity must not be signalled"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn descendant_handle_failure_aborts_capture_before_any_signal() {
+        use std::process::Command;
+
+        let parent = open_current_identity_safe_pidfd(std::process::id() as i32).unwrap();
+        let mut child = Command::new("sleep").arg("30").spawn().unwrap();
+        let child_pid = child.id() as i32;
+
+        let error = open_verified_children_from_pids(&parent, vec![child_pid, i32::MAX])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("identity-safe handle"),
+            "unexpected handle failure: {error}"
+        );
+        assert!(
+            nix::sys::signal::kill(nix::unistd::Pid::from_raw(child_pid), None).is_ok(),
+            "capture failure must happen before a verified sibling is signalled"
+        );
+
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn finalize_fails_closed_when_identity_safe_handle_cannot_be_verified() {
+        let pid = std::process::id() as i32;
+        assert!(
+            open_identity_safe_pidfd(pid, "").is_err(),
+            "missing identity must never fall back to a bare PID signal"
+        );
+        let src = include_str!("daemon.rs");
+        assert!(src.contains("SYS_pidfd_send_signal"));
     }
 
     #[test]
