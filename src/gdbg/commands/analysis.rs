@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::Path;
 
 use super::{
     GpuDb, compute_gpu_gaps, detect_warmup_count, find_hottest_window, fmt_bytes, fmt_us,
@@ -2095,19 +2095,24 @@ pub fn cmd_regressions(db: &GpuDb, args: &[&str]) {
     let pct_thresh: f64 = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(5.0);
     let abs_thresh_us: f64 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(10.0);
 
-    let other_path = if name.ends_with(".gpu.db") || name.contains('/') {
-        PathBuf::from(name)
+    let other = if name.ends_with(".gpu.db") || name.contains('/') {
+        match GpuDb::open(Path::new(name)) {
+            Ok(saved) => saved,
+            Err(error) => {
+                println!("cannot load '{name}': {error}");
+                return;
+            }
+        }
     } else {
-        GpuDb::session_dir().join(format!("{name}.gpu.db"))
+        match GpuDb::load(name) {
+            Ok(saved) => saved,
+            Err(error) => {
+                println!("cannot load '{name}': {error}");
+                return;
+            }
+        }
     };
-    if !other_path.exists() {
-        println!(
-            "cannot load '{name}': no such session at {}",
-            other_path.display()
-        );
-        return;
-    }
-    if let Err(e) = db.attach(other_path.to_str().unwrap_or(""), "other") {
+    if let Err(e) = db.attach_db(&other, "other") {
         println!("cannot load '{name}': {e}");
         return;
     }
@@ -2117,7 +2122,8 @@ pub fn cmd_regressions(db: &GpuDb, args: &[&str]) {
         (SELECT id FROM other.layers WHERE source = 'nsys' ORDER BY id LIMIT 1),
         (SELECT id FROM other.layers WHERE source = 'torch' ORDER BY id LIMIT 1),
         (SELECT id FROM other.layers WHERE source = 'proton' ORDER BY id LIMIT 1), -1)";
-    let sql = format!("SELECT COALESCE(c.kernel_name, o.kernel_name),
+    let sql = format!(
+        "SELECT COALESCE(c.kernel_name, o.kernel_name),
                       COALESCE(o.total, 0), COALESCE(c.total, 0),
                       COALESCE(o.cnt,   0), COALESCE(c.cnt,   0)
                FROM
@@ -2126,7 +2132,8 @@ pub fn cmd_regressions(db: &GpuDb, args: &[&str]) {
                FULL OUTER JOIN
                  (SELECT kernel_name, SUM(duration_us) AS total, COUNT(*) AS cnt
                   FROM other.launches WHERE {other_tl} GROUP BY kernel_name) o
-               ON c.kernel_name = o.kernel_name");
+               ON c.kernel_name = o.kernel_name"
+    );
     let all: Vec<_> = db.query_vec(&sql, [], |row| {
         Ok((
             row.get::<_, String>(0)?,

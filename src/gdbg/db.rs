@@ -1,4 +1,6 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, ToSql, params};
@@ -20,6 +22,10 @@ pub const GDBG_SCHEMA_VERSION: i64 = 2;
 pub struct GpuDb {
     pub conn: Connection,
     pub _path: PathBuf,
+    /// Keep the descriptor used to open the database alive. SQLite opens
+    /// `/proc/self/fd/N`, so a pathname or ancestor swap cannot redirect it.
+    database_file: std::fs::File,
+    attached_files: Mutex<HashMap<String, std::fs::File>>,
     /// Active focus filter (kernel name substring).
     pub focus: Option<String>,
     /// Active ignore filter (kernel name substring).
@@ -70,14 +76,17 @@ impl GpuDb {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let conn =
-            Connection::open(path).with_context(|| format!("cannot create {}", path.display()))?;
+        let opened = open_sqlite_path(path, true)
+            .with_context(|| format!("cannot create {}", path.display()))?;
+        let conn = opened.conn;
         conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")?;
         init_schema(&conn)?;
         conn.execute(&format!("PRAGMA user_version = {GDBG_SCHEMA_VERSION}"), [])?;
         Ok(Self {
             conn,
             _path: path.to_path_buf(),
+            database_file: opened.file,
+            attached_files: Mutex::new(HashMap::new()),
             focus: None,
             ignore: None,
             region_filter: None,
@@ -92,11 +101,16 @@ impl GpuDb {
     /// directory are the durable artifact; re-run `gdbg <target>`
     /// to rebuild the index.
     pub fn open(path: &Path) -> Result<Self> {
-        if !path.exists() {
-            bail!("session not found: {}", path.display());
-        }
-        let conn =
-            Connection::open(path).with_context(|| format!("cannot open {}", path.display()))?;
+        // open_sqlite_path walks and opens the parent from a descriptor, then
+        // opens the final component with O_NOFOLLOW. Do not perform a public
+        // pathname check first: that would create a check/use race.
+        let opened = open_sqlite_path(path, false)
+            .with_context(|| format!("cannot open {}", path.display()))?;
+        Self::from_opened(path.to_path_buf(), opened)
+    }
+
+    fn from_opened(path: PathBuf, opened: OpenedSqlite) -> Result<Self> {
+        let conn = opened.conn;
         let found: i64 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap_or(0);
@@ -111,7 +125,9 @@ impl GpuDb {
         }
         Ok(Self {
             conn,
-            _path: path.to_path_buf(),
+            _path: path,
+            database_file: opened.file,
+            attached_files: Mutex::new(HashMap::new()),
             focus: None,
             ignore: None,
             region_filter: None,
@@ -127,30 +143,93 @@ impl GpuDb {
     /// Save this session by copying the DB to `.dbg/gpu/<name>.gpu.db`.
     pub fn save(&self, name: &str) -> Result<PathBuf> {
         validate_saved_session_name(name)?;
-        let dir = Self::session_dir();
-        let dbg_dir = dir
+        let public_dir = Self::session_dir();
+        reject_path_symlinks(&public_dir, "GPU session directory")?;
+        let dbg_dir = public_dir
             .parent()
             .ok_or_else(|| anyhow::anyhow!("GPU session directory has no parent"))?;
         reject_symlink(dbg_dir, "GPU state directory")?;
-        std::fs::create_dir_all(&dir)?;
-        reject_symlink(&dir, "GPU session directory")?;
+        std::fs::create_dir_all(&public_dir)?;
+        let (dir, dir_guard) = open_gpu_session_dir(&public_dir)?;
         let dest = dir.join(format!("{name}.gpu.db"));
+        let public_dest = public_dir.join(format!("{name}.gpu.db"));
         reject_symlink(&dest, "GPU session destination")?;
-        // Use SQLite backup API for safe copy of a live DB
-        let mut dest_conn = Connection::open(&dest)?;
+        // Use a new sibling and atomic rename. The destination is never
+        // reopened through a pathname which was checked earlier.
+        let tmp = dir.join(format!(
+            ".{}.tmp-{}-{}",
+            name,
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        #[cfg(unix)]
+        let guard = open_file_at_dir(
+            &dir_guard,
+            Path::new(tmp.file_name().expect("temporary database has a file name")),
+            true,
+            true,
+            true,
+        )?;
+        #[cfg(not(unix))]
+        let guard = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&tmp)?;
+        let mut dest_conn = open_sqlite_from_file(&guard, true)?;
         let backup = rusqlite::backup::Backup::new(&self.conn, &mut dest_conn)?;
         backup.run_to_completion(100, std::time::Duration::from_millis(10), None)?;
-        Ok(dest)
+        drop(backup);
+        drop(dest_conn);
+        drop(guard);
+        std::fs::rename(&tmp, &dest)?;
+        Ok(public_dest)
     }
 
     /// Load a saved session by name or path.
     pub fn load(name_or_path: &str) -> Result<Self> {
-        let path = if name_or_path.ends_with(".gpu.db") || name_or_path.contains('/') {
-            PathBuf::from(name_or_path)
-        } else {
-            Self::session_dir().join(format!("{name_or_path}.gpu.db"))
-        };
-        Self::open(&path)
+        if !name_or_path.contains('/') {
+            let name = name_or_path.strip_suffix(".gpu.db").unwrap_or(name_or_path);
+            return Self::load_saved_from_dir(&Self::session_dir(), name);
+        }
+        Self::open(Path::new(name_or_path))
+    }
+
+    fn load_saved_from_dir(public_dir: &Path, name: &str) -> Result<Self> {
+        validate_saved_session_name(name)?;
+        let (scan_dir, dir_guard) = open_gpu_session_dir(public_dir)?;
+        Self::load_saved_from_open_dir(public_dir, &scan_dir, &dir_guard, name)
+    }
+
+    #[cfg(unix)]
+    fn load_saved_from_open_dir(
+        public_dir: &Path,
+        _scan_dir: &Path,
+        dir_guard: &std::fs::File,
+        name: &str,
+    ) -> Result<Self> {
+        validate_saved_session_name(name)?;
+        let file_name = format!("{name}.gpu.db");
+        let file = open_file_at_dir(dir_guard, Path::new(&file_name), false, false, false)?;
+        let conn = open_sqlite_from_file(&file, false)?;
+        let public_path = public_dir.join(file_name);
+        Self::from_opened(public_path, OpenedSqlite { conn, file })
+    }
+
+    #[cfg(not(unix))]
+    fn load_saved_from_open_dir(
+        public_dir: &Path,
+        scan_dir: &Path,
+        _dir_guard: &std::fs::File,
+        name: &str,
+    ) -> Result<Self> {
+        validate_saved_session_name(name)?;
+        let mut db = Self::open(&scan_dir.join(format!("{name}.gpu.db")))?;
+        db._path = public_dir.join(format!("{name}.gpu.db"));
+        Ok(db)
     }
 
     /// Run one import and its layer creation as one SQLite transaction.
@@ -189,14 +268,38 @@ impl GpuDb {
         if !dir.exists() {
             return Ok(Vec::new());
         }
+        let (scan_dir, dir_guard) = open_gpu_session_dir(&dir)?;
+        Self::list_saved_from_open_dir(&scan_dir, &dir_guard)
+    }
+
+    fn list_saved_from_open_dir(
+        scan_dir: &Path,
+        dir_guard: &std::fs::File,
+    ) -> Result<Vec<SavedSession>> {
         let mut sessions = Vec::new();
-        for entry in std::fs::read_dir(&dir)? {
+        for entry in std::fs::read_dir(&scan_dir)? {
             let entry = entry?;
             let path = entry.path();
+            if std::fs::symlink_metadata(&path)
+                .is_ok_and(|metadata| metadata.file_type().is_symlink())
+            {
+                continue;
+            }
             if path.extension().is_some_and(|e| e == "db")
                 && path.to_str().is_some_and(|s| s.contains(".gpu."))
             {
-                if let Ok(db) = Self::open(&path) {
+                #[cfg(unix)]
+                let opened = {
+                    let file_name = entry.file_name();
+                    open_file_at_dir(&dir_guard, Path::new(&file_name), false, false, false)
+                        .and_then(|file| {
+                            let conn = open_sqlite_from_file(&file, false)?;
+                            Self::from_opened(path.clone(), OpenedSqlite { conn, file })
+                        })
+                };
+                #[cfg(not(unix))]
+                let opened = Self::open(&path);
+                if let Ok(db) = opened {
                     let name = path
                         .file_stem()
                         .unwrap_or_default()
@@ -619,18 +722,228 @@ impl GpuDb {
     // -----------------------------------------------------------------------
 
     pub fn attach(&self, path: &str, alias: &str) -> Result<()> {
-        self.conn.execute_batch(&format!(
-            "ATTACH DATABASE '{}' AS {alias}",
-            path.replace('\'', "''")
-        ))?;
-        Ok(())
+        validate_sql_identifier(alias)?;
+        let path = Path::new(path);
+        let file = open_existing_file(path)?;
+        self.attach_file(file, alias)
+    }
+
+    /// Attach an already-open database. The duplicated descriptor remains
+    /// owned by this connection until SQLite has completed `DETACH`.
+    pub fn attach_db(&self, other: &Self, alias: &str) -> Result<()> {
+        validate_sql_identifier(alias)?;
+        self.attach_file(other.database_file.try_clone()?, alias)
+    }
+
+    fn attach_file(&self, file: std::fs::File, alias: &str) -> Result<()> {
+        validate_sql_identifier(alias)?;
+        #[cfg(unix)]
+        {
+            let attach_path = sqlite_fd_path(&file);
+            self.conn.execute_batch(&format!(
+                "ATTACH DATABASE '{}' AS {alias}",
+                attach_path.to_string_lossy().replace('\'', "''")
+            ))?;
+            self.attached_files
+                .lock()
+                .unwrap()
+                .insert(alias.to_string(), file);
+            Ok(())
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (file, alias);
+            bail!("descriptor-backed SQLite attachments are unsupported on this platform")
+        }
     }
 
     pub fn detach(&self, alias: &str) -> Result<()> {
+        validate_sql_identifier(alias)?;
         self.conn
             .execute_batch(&format!("DETACH DATABASE {alias}"))?;
+        // SQLite is done with the file only after DETACH succeeds.
+        self.attached_files.lock().unwrap().remove(alias);
         Ok(())
     }
+}
+
+struct OpenedSqlite {
+    conn: Connection,
+    file: std::fs::File,
+}
+
+fn open_sqlite_path(path: &Path, writable: bool) -> Result<OpenedSqlite> {
+    #[cfg(unix)]
+    {
+        let file = open_file(path, writable, writable)?;
+        let conn = open_sqlite_from_file(&file, writable)?;
+        return Ok(OpenedSqlite { conn, file });
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (path, writable);
+        bail!("descriptor-backed SQLite access is unsupported on this platform")
+    }
+}
+
+fn open_sqlite_from_file(file: &std::fs::File, writable: bool) -> Result<Connection> {
+    #[cfg(unix)]
+    {
+        let fd_path = sqlite_fd_path(file);
+        let flags = if writable {
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
+        } else {
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+        };
+        return Connection::open_with_flags(fd_path, flags).map_err(Into::into);
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (file, writable);
+        bail!("descriptor-backed SQLite access is unsupported on this platform")
+    }
+}
+
+fn open_existing_file(path: &Path) -> Result<std::fs::File> {
+    open_file(path, false, false)
+}
+
+fn open_file(path: &Path, writable: bool, create: bool) -> Result<std::fs::File> {
+    #[cfg(unix)]
+    {
+        let parent = path.parent().unwrap_or_else(|| Path::new("."));
+        let name = path
+            .file_name()
+            .ok_or_else(|| anyhow::anyhow!("database path has no file name: {}", path.display()))?;
+        let dir = open_directory_anchored(parent)?;
+        return open_file_at_dir(&dir, Path::new(name), writable, create, false);
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (path, writable, create);
+        bail!("descriptor-relative file access is unsupported on this platform")
+    }
+}
+
+#[cfg(unix)]
+fn open_file_at_dir(
+    dir: &std::fs::File,
+    name: &Path,
+    writable: bool,
+    create: bool,
+    exclusive: bool,
+) -> Result<std::fs::File> {
+    use std::ffi::CString;
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::ffi::OsStrExt;
+
+    let name = CString::new(name.as_os_str().as_bytes())?;
+    let mut flags = if writable {
+        nix::libc::O_RDWR
+    } else {
+        nix::libc::O_RDONLY
+    };
+    flags |= nix::libc::O_NOFOLLOW | nix::libc::O_CLOEXEC;
+    if create {
+        flags |= nix::libc::O_CREAT;
+    }
+    if exclusive {
+        flags |= nix::libc::O_EXCL;
+    }
+    let fd = unsafe { nix::libc::openat(dir.as_raw_fd(), name.as_ptr(), flags, 0o600) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    Ok(unsafe { std::fs::File::from_raw_fd(fd) })
+}
+
+fn open_gpu_session_dir(path: &Path) -> Result<(PathBuf, std::fs::File)> {
+    #[cfg(unix)]
+    {
+        let guard = open_directory_anchored(path)?;
+        return Ok((sqlite_fd_path(&guard), guard));
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        bail!("descriptor-relative directory access is unsupported on this platform")
+    }
+}
+
+#[cfg(unix)]
+fn sqlite_fd_path(file: &std::fs::File) -> PathBuf {
+    use std::os::fd::AsRawFd;
+
+    #[cfg(target_os = "linux")]
+    const FD_DIR: &str = "/proc/self/fd";
+    #[cfg(not(target_os = "linux"))]
+    const FD_DIR: &str = "/dev/fd";
+
+    PathBuf::from(format!("{FD_DIR}/{}", file.as_raw_fd()))
+}
+
+/// Open a directory by walking each component from a stable descriptor.
+/// Checking the complete pathname first is not sufficient: an attacker can
+/// replace an ancestor with a symlink between that check and `open`. Every
+/// component is therefore opened with `openat`, `O_DIRECTORY`, and
+/// `O_NOFOLLOW` before the next component is resolved.
+#[cfg(unix)]
+fn open_directory_anchored(path: &Path) -> Result<std::fs::File> {
+    use std::ffi::CString;
+    use std::os::fd::{FromRawFd, OwnedFd};
+    use std::os::unix::ffi::OsStrExt;
+
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    let root = CString::new("/").expect("literal has no NUL");
+    #[cfg(target_os = "linux")]
+    let root_flags = nix::libc::O_PATH;
+    #[cfg(not(target_os = "linux"))]
+    let root_flags = nix::libc::O_RDONLY;
+    let root_fd = unsafe {
+        nix::libc::open(
+            root.as_ptr(),
+            root_flags | nix::libc::O_DIRECTORY | nix::libc::O_CLOEXEC,
+        )
+    };
+    if root_fd < 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    let mut current = unsafe { OwnedFd::from_raw_fd(root_fd) };
+    for component in absolute.components() {
+        let std::path::Component::Normal(name) = component else {
+            if matches!(component, std::path::Component::ParentDir) {
+                bail!(
+                    "refusing parent component in GPU session directory {}",
+                    path.display()
+                );
+            }
+            continue;
+        };
+        let name = CString::new(name.as_bytes())?;
+        #[cfg(target_os = "linux")]
+        let component_flags = nix::libc::O_PATH;
+        #[cfg(not(target_os = "linux"))]
+        let component_flags = nix::libc::O_RDONLY;
+        let fd = unsafe {
+            nix::libc::openat(
+                std::os::fd::AsRawFd::as_raw_fd(&current),
+                name.as_ptr(),
+                component_flags
+                    | nix::libc::O_DIRECTORY
+                    | nix::libc::O_NOFOLLOW
+                    | nix::libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        current = unsafe { OwnedFd::from_raw_fd(fd) };
+    }
+    Ok(std::fs::File::from(current))
 }
 
 // ---------------------------------------------------------------------------
@@ -761,11 +1074,38 @@ fn validate_saved_session_name(name: &str) -> Result<()> {
     Ok(())
 }
 
-fn reject_symlink(path: &Path, description: &str) -> Result<()> {
-    if std::fs::symlink_metadata(path)
-        .is_ok_and(|metadata| metadata.file_type().is_symlink())
+/// Validate a name interpolated into SQLite's identifier position.
+///
+/// SQLite does not provide a bind-parameter form for database aliases, so
+/// callers must use a deliberately narrow identifier grammar.
+fn validate_sql_identifier(identifier: &str) -> Result<()> {
+    let mut chars = identifier.chars();
+    let first = chars.next();
+    if first.is_none_or(|ch| !(ch == '_' || ch.is_ascii_alphabetic()))
+        || chars.any(|ch| !(ch == '_' || ch.is_ascii_alphanumeric()))
     {
+        bail!("invalid SQLite identifier `{identifier}`");
+    }
+    Ok(())
+}
+
+fn reject_symlink(path: &Path, description: &str) -> Result<()> {
+    if std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
         bail!("refusing {description} symlink: {}", path.display());
+    }
+    Ok(())
+}
+
+fn reject_path_symlinks(path: &Path, description: &str) -> Result<()> {
+    for ancestor in path.ancestors() {
+        if std::fs::symlink_metadata(ancestor)
+            .is_ok_and(|metadata| metadata.file_type().is_symlink())
+        {
+            bail!(
+                "refusing {description} path through symlink: {}",
+                ancestor.display()
+            );
+        }
     }
     Ok(())
 }
@@ -896,6 +1236,17 @@ mod tests {
         std::fs::write(&outside.join("real.db"), b"database").unwrap();
         std::os::unix::fs::symlink(outside.join("real.db"), &destination).unwrap();
         assert!(reject_symlink(&destination, "GPU session destination").is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn anchored_gpu_directory_rejects_a_symlinked_ancestor() {
+        let tmp = tempfile::tempdir().unwrap();
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(outside.join("gpu")).unwrap();
+        let link = tmp.path().join("link");
+        std::os::unix::fs::symlink(&outside, &link).unwrap();
+        assert!(open_gpu_session_dir(&link.join("gpu")).is_err());
     }
 
     /// Regression: when the nsys import failed (nsys 2023 schema
@@ -1050,5 +1401,129 @@ mod tests {
         // The backup path must pass the version gate cleanly.
         let loaded = GpuDb::open(&dest).unwrap();
         assert_eq!(loaded.meta("marker"), "present");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn named_load_keeps_database_descriptor_across_ancestor_swap() {
+        let tmp = tempfile::tempdir().unwrap();
+        let selected_dir = tmp.path().join("selected");
+        std::fs::create_dir(&selected_dir).unwrap();
+        let selected_path = selected_dir.join("comparison.gpu.db");
+        let selected = GpuDb::create(&selected_path).unwrap();
+        selected.set_meta("marker", "original").unwrap();
+        drop(selected);
+
+        // This is the named-session open step. Keep the directory descriptor
+        // alive while opening the file, then replace the public ancestor.
+        let (scan_dir, dir_guard) = open_gpu_session_dir(&selected_dir).unwrap();
+        let comparison =
+            GpuDb::load_saved_from_open_dir(&selected_dir, &scan_dir, &dir_guard, "comparison")
+                .unwrap();
+
+        let real_dir = tmp.path().join("selected-real");
+        std::fs::rename(&selected_dir, &real_dir).unwrap();
+        std::fs::create_dir(&selected_dir).unwrap();
+        let replacement_path = selected_dir.join("comparison.gpu.db");
+        let replacement = GpuDb::create(&replacement_path).unwrap();
+        replacement.set_meta("marker", "replacement").unwrap();
+        drop(replacement);
+
+        let current = GpuDb::create(&tmp.path().join("current.gpu.db")).unwrap();
+        current.attach_db(&comparison, "other").unwrap();
+        let marker: String = current
+            .conn
+            .query_row(
+                "SELECT value FROM other.meta WHERE key = 'marker'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(marker, "original");
+        current.detach("other").unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn named_list_reads_from_the_open_directory_after_ancestor_swap() {
+        let tmp = tempfile::tempdir().unwrap();
+        let selected_dir = tmp.path().join("selected");
+        std::fs::create_dir(&selected_dir).unwrap();
+        let selected_path = selected_dir.join("comparison.gpu.db");
+        let selected = GpuDb::create(&selected_path).unwrap();
+        selected.set_meta("device", "original-device").unwrap();
+        selected
+            .set_meta("created", "2026-01-01T00:00:00Z")
+            .unwrap();
+        drop(selected);
+
+        // list_saved opens the directory before it scans entries. The scan
+        // must continue to use that descriptor if the public ancestor moves.
+        let (scan_dir, dir_guard) = open_gpu_session_dir(&selected_dir).unwrap();
+        let real_dir = tmp.path().join("selected-real");
+        std::fs::rename(&selected_dir, &real_dir).unwrap();
+        std::fs::create_dir(&selected_dir).unwrap();
+        let replacement = GpuDb::create(&selected_dir.join("comparison.gpu.db")).unwrap();
+        replacement
+            .set_meta("device", "replacement-device")
+            .unwrap();
+        replacement
+            .set_meta("created", "2026-01-02T00:00:00Z")
+            .unwrap();
+        drop(replacement);
+
+        let sessions = GpuDb::list_saved_from_open_dir(&scan_dir, &dir_guard).unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].device, "original-device");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn named_diff_keeps_explicit_database_descriptor_across_ancestor_swap() {
+        let tmp = tempfile::tempdir().unwrap();
+        let selected_dir = tmp.path().join("selected");
+        std::fs::create_dir(&selected_dir).unwrap();
+        let selected_path = selected_dir.join("comparison.gpu.db");
+        let selected = GpuDb::create(&selected_path).unwrap();
+        selected.set_meta("marker", "original").unwrap();
+        drop(selected);
+
+        // gdbg diff validates and opens an explicit pathname before it
+        // attaches the comparison. The opened database, not the pathname,
+        // must remain the source of truth.
+        let comparison = GpuDb::open(&selected_path).unwrap();
+        let real_dir = tmp.path().join("selected-real");
+        std::fs::rename(&selected_dir, &real_dir).unwrap();
+        std::fs::create_dir(&selected_dir).unwrap();
+        let replacement = GpuDb::create(&selected_dir.join("comparison.gpu.db")).unwrap();
+        replacement.set_meta("marker", "replacement").unwrap();
+        drop(replacement);
+
+        let current = GpuDb::create(&tmp.path().join("current.gpu.db")).unwrap();
+        current.attach_db(&comparison, "other").unwrap();
+        let marker: String = current
+            .conn
+            .query_row(
+                "SELECT value FROM other.meta WHERE key = 'marker'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(marker, "original");
+        current.detach("other").unwrap();
+    }
+
+    #[test]
+    fn attach_and_detach_reject_sql_identifier_injection() {
+        let db = temp_db();
+        assert!(db.detach("other; DROP TABLE meta;--").is_err());
+        assert!(db.attach_db(&db, "other; DROP TABLE meta;--").is_err());
+        assert!(
+            db.conn
+                .query_row("SELECT COUNT(*) FROM meta", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .is_ok()
+        );
     }
 }
