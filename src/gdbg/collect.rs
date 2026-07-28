@@ -338,21 +338,14 @@ fn collect_nsys(
         bail!("nsys export did not produce {}", sqlite_path.display());
     }
 
-    let layer_id = db.add_layer(
+    let _layer_id = db.import_layer(
         "nsys",
         &trace_rep.display().to_string(),
         Some(&format!("nsys profile {target}")),
         Some(elapsed),
         target_hash,
+        |conn, layer_id| parsers::nsys::import_nsys_rep(conn, &sqlite_path, layer_id),
     )?;
-
-    // Roll back the empty layer on import failure, otherwise
-    // `has_layer("nsys")` returns true and the session summary
-    // falsely prints `Layers: nsys + ncu` with zero-everything data.
-    if let Err(e) = parsers::nsys::import_nsys_rep(&db.conn, &sqlite_path, layer_id) {
-        let _ = db.remove_layer(layer_id);
-        return Err(e);
-    }
 
     eprintln!(
         "  nsys done in {elapsed:.1}s ({} kernels, {} launches)",
@@ -399,7 +392,7 @@ fn collect_ncu(
     std::fs::write(&csv_path, &output.stdout)?;
     let elapsed = start.elapsed().as_secs_f64();
 
-    let layer_id = db.add_layer(
+    let _layer_id = db.import_layer(
         "ncu",
         &csv_path.display().to_string(),
         Some(&format!(
@@ -407,9 +400,8 @@ fn collect_ncu(
         )),
         Some(elapsed),
         target_hash,
+        |conn, layer_id| parsers::ncu::import_ncu_csv(conn, &csv_path, layer_id),
     )?;
-
-    parsers::ncu::import_ncu_csv(&db.conn, &csv_path, layer_id)?;
 
     eprintln!(
         "  ncu done in {elapsed:.1}s ({} kernels with metrics)",
@@ -442,14 +434,14 @@ fn collect_proton(
         bail!("proton did not produce {}", trace_json.display());
     }
     let elapsed = start.elapsed().as_secs_f64();
-    let layer_id = db.add_layer(
+    let _layer_id = db.import_layer(
         "proton",
         &trace_json.display().to_string(),
         Some(&format!("proton profile {target}")),
         Some(elapsed),
         target_hash,
+        |conn, layer_id| parsers::chrome_trace::import_chrome_trace(conn, &trace_json, layer_id),
     )?;
-    parsers::chrome_trace::import_chrome_trace(&db.conn, &trace_json, layer_id)?;
     eprintln!("  proton done in {elapsed:.1}s");
     Ok(())
 }
@@ -508,15 +500,14 @@ fn collect_torch(
         bail!("torch.profiler did not produce {}", trace_json.display());
     }
 
-    let layer_id = db.add_layer(
+    let _layer_id = db.import_layer(
         layer_name,
         &trace_json.display().to_string(),
         Some(&format!("torch.profiler on {target}")),
         Some(elapsed),
         target_hash,
+        |conn, layer_id| parsers::chrome_trace::import_chrome_trace(conn, &trace_json, layer_id),
     )?;
-
-    parsers::chrome_trace::import_chrome_trace(&db.conn, &trace_json, layer_id)?;
 
     eprintln!("  torch.profiler done in {elapsed:.1}s");
     Ok(())

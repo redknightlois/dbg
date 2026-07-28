@@ -126,9 +126,16 @@ impl GpuDb {
 
     /// Save this session by copying the DB to `.dbg/gpu/<name>.gpu.db`.
     pub fn save(&self, name: &str) -> Result<PathBuf> {
+        validate_saved_session_name(name)?;
         let dir = Self::session_dir();
+        let dbg_dir = dir
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("GPU session directory has no parent"))?;
+        reject_symlink(dbg_dir, "GPU state directory")?;
         std::fs::create_dir_all(&dir)?;
+        reject_symlink(&dir, "GPU session directory")?;
         let dest = dir.join(format!("{name}.gpu.db"));
+        reject_symlink(&dest, "GPU session destination")?;
         // Use SQLite backup API for safe copy of a live DB
         let mut dest_conn = Connection::open(&dest)?;
         let backup = rusqlite::backup::Backup::new(&self.conn, &mut dest_conn)?;
@@ -144,6 +151,36 @@ impl GpuDb {
             Self::session_dir().join(format!("{name_or_path}.gpu.db"))
         };
         Self::open(&path)
+    }
+
+    /// Run one import and its layer creation as one SQLite transaction.
+    /// Parsers can insert many child rows before discovering malformed input;
+    /// rollback must remove those rows and the layer together.
+    pub fn import_layer(
+        &self,
+        source: &str,
+        file: &str,
+        command: Option<&str>,
+        secs: Option<f64>,
+        target_hash: Option<&str>,
+        import: impl FnOnce(&Connection, i64) -> Result<()>,
+    ) -> Result<i64> {
+        self.conn.execute_batch("BEGIN IMMEDIATE")?;
+        let result = (|| {
+            let layer_id = self.add_layer(source, file, command, secs, target_hash)?;
+            import(&self.conn, layer_id)?;
+            Ok(layer_id)
+        })();
+        match result {
+            Ok(id) => {
+                self.conn.execute_batch("COMMIT")?;
+                Ok(id)
+            }
+            Err(error) => {
+                let _ = self.conn.execute_batch("ROLLBACK");
+                Err(error)
+            }
+        }
     }
 
     /// List all saved sessions.
@@ -711,6 +748,28 @@ fn init_schema(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+fn validate_saved_session_name(name: &str) -> Result<()> {
+    if name.is_empty()
+        || name == "."
+        || name == ".."
+        || !name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
+    {
+        bail!("invalid GPU saved-session name `{name}`; use only letters, digits, `-`, and `_`");
+    }
+    Ok(())
+}
+
+fn reject_symlink(path: &Path, description: &str) -> Result<()> {
+    if std::fs::symlink_metadata(path)
+        .is_ok_and(|metadata| metadata.file_type().is_symlink())
+    {
+        bail!("refusing {description} symlink: {}", path.display());
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Project root detection
 // ---------------------------------------------------------------------------
@@ -799,6 +858,44 @@ mod tests {
         assert!(db.has_layer("nsys"));
         assert!(!db.has_layer("ncu"));
         assert_eq!(db.layer_names(), vec!["nsys"]);
+    }
+
+    #[test]
+    fn import_layer_rolls_back_children_and_layer_together() {
+        let db = temp_db();
+        let result = db.import_layer("ncu", "metrics.csv", None, None, None, |conn, layer_id| {
+            conn.execute(
+                "INSERT INTO launches (kernel_name, duration_us, layer_id) VALUES ('bad', 1.0, ?1)",
+                params![layer_id],
+            )?;
+            bail!("malformed import")
+        });
+        assert!(result.is_err());
+        assert!(!db.has_layer("ncu"));
+        assert_eq!(db.total_launch_count(), 0);
+    }
+
+    #[test]
+    fn save_rejects_names_that_can_escape_gpu_directory() {
+        let db = temp_db();
+        for name in ["../outside", "a/b", "a\\b", "", ".", "..", "a space"] {
+            assert!(db.save(name).is_err(), "accepted unsafe name {name:?}");
+        }
+    }
+
+    #[test]
+    fn save_rejects_symlinked_gpu_directory_or_destination() {
+        let tmp = tempfile::tempdir().unwrap();
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        let link = tmp.path().join("gpu");
+        std::os::unix::fs::symlink(&outside, &link).unwrap();
+        assert!(reject_symlink(&link, "GPU session directory").is_err());
+
+        let destination = tmp.path().join("session.gpu.db");
+        std::fs::write(&outside.join("real.db"), b"database").unwrap();
+        std::os::unix::fs::symlink(outside.join("real.db"), &destination).unwrap();
+        assert!(reject_symlink(&destination, "GPU session destination").is_err());
     }
 
     /// Regression: when the nsys import failed (nsys 2023 schema
