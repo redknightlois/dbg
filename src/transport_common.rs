@@ -7,7 +7,7 @@
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 
 /// Minimal trait each transport's `State` struct exposes so the shared
 /// wait loop can tell whether a new stop arrived, whether the session
@@ -22,6 +22,12 @@ pub trait StopState {
     }
     fn stop_generation(&self) -> u64 {
         0
+    }
+    fn action_generation(&self) -> u64 {
+        0
+    }
+    fn pending_action_generation(&self) -> u64 {
+        self.action_generation()
     }
 }
 
@@ -47,7 +53,8 @@ where
         let mut guard = lock.lock().unwrap();
         // A stop which arrived after a previous timeout is still useful
         // to the next action. Consume it before issuing another resume.
-        if guard.has_pending_hit() {
+        if guard.has_pending_hit() && guard.pending_action_generation() >= guard.action_generation()
+        {
             return Ok(String::new());
         }
         guard.clear_pending();
@@ -58,7 +65,9 @@ where
     let (lock, cvar) = &**state;
     let mut guard = lock.lock().unwrap();
     while guard.alive()
-        && (!guard.has_pending_hit() || guard.stop_generation() <= baseline)
+        && (!guard.has_pending_hit()
+            || guard.stop_generation() <= baseline
+            || guard.pending_action_generation() < guard.action_generation())
         && !guard.terminated()
     {
         let remaining = deadline.saturating_duration_since(Instant::now());

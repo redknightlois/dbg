@@ -32,8 +32,8 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, anyhow, bail};
 use nix::unistd::Pid;
 use serde_json::{Value, json};
-use tungstenite::{Message, WebSocket};
 use tungstenite::stream::MaybeTlsStream;
+use tungstenite::{Message, WebSocket};
 
 use crate::backend::canonical::HitEvent;
 use crate::pty::{DebuggerIo, EventKind, LogHandle};
@@ -60,6 +60,7 @@ struct State {
     /// Populated when a new paused event arrives. Daemon drains via
     /// `pending_hit()` before the next command runs.
     pending_hit: Option<HitEvent>,
+    pending_action_generation: u64,
     /// scriptId → source URL. Tracks `Debugger.scriptParsed` so we can
     /// map breakpoint paths and format call frames in terms of files.
     script_urls: HashMap<String, String>,
@@ -87,6 +88,7 @@ impl State {
             paused: false,
             call_frames: Vec::new(),
             pending_hit: None,
+            pending_action_generation: 0,
             script_urls: HashMap::new(),
             script_sources: HashMap::new(),
             breakpoints: HashMap::new(),
@@ -111,6 +113,12 @@ impl crate::transport_common::StopState for State {
     }
     fn stop_generation(&self) -> u64 {
         self.stop_generation
+    }
+    fn action_generation(&self) -> u64 {
+        self.action_generation
+    }
+    fn pending_action_generation(&self) -> u64 {
+        self.pending_action_generation
     }
 }
 
@@ -207,7 +215,9 @@ impl InspectorTransport {
 
         let transport = Self {
             child_pid,
-            child: Mutex::new(Some(child_guard.0.take().expect("child guard is populated"))),
+            child: Mutex::new(Some(
+                child_guard.0.take().expect("child guard is populated"),
+            )),
             driver_tx,
             log,
             state,
@@ -264,16 +274,28 @@ impl InspectorTransport {
 
         // Resume / step family.
         if matches!(trimmed, "cont" | "c" | "continue") {
-            return self.exec(|s| s.call_blocking("Debugger.resume", json!({}), timeout), timeout);
+            return self.exec(
+                |s| s.call_blocking("Debugger.resume", json!({}), timeout),
+                timeout,
+            );
         }
         if matches!(trimmed, "step" | "s" | "stepi") {
-            return self.exec(|s| s.call_blocking("Debugger.stepInto", json!({}), timeout), timeout);
+            return self.exec(
+                |s| s.call_blocking("Debugger.stepInto", json!({}), timeout),
+                timeout,
+            );
         }
         if matches!(trimmed, "next" | "n") {
-            return self.exec(|s| s.call_blocking("Debugger.stepOver", json!({}), timeout), timeout);
+            return self.exec(
+                |s| s.call_blocking("Debugger.stepOver", json!({}), timeout),
+                timeout,
+            );
         }
         if matches!(trimmed, "out" | "finish") {
-            return self.exec(|s| s.call_blocking("Debugger.stepOut", json!({}), timeout), timeout);
+            return self.exec(
+                |s| s.call_blocking("Debugger.stepOut", json!({}), timeout),
+                timeout,
+            );
         }
         if trimmed == "catch" || trimmed == "catch off" {
             self.call_blocking(
@@ -310,7 +332,10 @@ impl InspectorTransport {
             // Inspector's pause doesn't emit `Debugger.paused` on its own
             // reply — the async notification arrives shortly after. Use
             // the same exec() helper so we wait for the stopped event.
-            return self.exec(|s| s.call_blocking("Debugger.pause", json!({}), timeout), timeout);
+            return self.exec(
+                |s| s.call_blocking("Debugger.pause", json!({}), timeout),
+                timeout,
+            );
         }
 
         // backtrace — from cached call_frames, no round trip.
@@ -393,14 +418,15 @@ impl InspectorTransport {
             let mut s = lock.lock().unwrap();
             s.action_generation = s.action_generation.wrapping_add(1);
         }
-        crate::transport_common::wait_for_stop(
-            &self.state,
-            || f(self).map(|_| ()),
-            timeout,
-        )
+        crate::transport_common::wait_for_stop(&self.state, || f(self).map(|_| ()), timeout)
     }
 
-    fn set_breakpoint(&self, bp: ParsedSb, cond: Option<&str>, timeout: Duration) -> Result<String> {
+    fn set_breakpoint(
+        &self,
+        bp: ParsedSb,
+        cond: Option<&str>,
+        timeout: Duration,
+    ) -> Result<String> {
         match bp {
             ParsedSb::FileLine { file, line } => {
                 // Inspector wants `url` or `urlRegex`. Node reports
@@ -427,7 +453,10 @@ impl InspectorTransport {
                 let key = format!("{file}:{line}");
                 {
                     let (lock, _) = &*self.state;
-                    lock.lock().unwrap().breakpoints.insert(key.clone(), bp_id.clone());
+                    lock.lock()
+                        .unwrap()
+                        .breakpoints
+                        .insert(key.clone(), bp_id.clone());
                 }
                 match cond {
                     Some(c) => Ok(format!("Breakpoint set at {key} if {c} (id={bp_id})")),
@@ -447,7 +476,10 @@ impl InspectorTransport {
                                 .and_then(|v| v.as_str())
                                 .unwrap_or("")
                                 .to_string(),
-                            f.get("url").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                            f.get("url")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                                .to_string(),
                         ),
                         None => (String::new(), String::new()),
                     }
@@ -463,11 +495,8 @@ impl InspectorTransport {
                 if let Some(c) = cond {
                     params.insert("condition".into(), Value::String(c.to_string()));
                 }
-                let resp = self.call_blocking(
-                    "Debugger.setBreakpoint",
-                    Value::Object(params),
-                    timeout,
-                )?;
+                let resp =
+                    self.call_blocking("Debugger.setBreakpoint", Value::Object(params), timeout)?;
                 let bp_id = resp
                     .get("breakpointId")
                     .and_then(|v| v.as_str())
@@ -476,12 +505,17 @@ impl InspectorTransport {
                 let key = format!("{url}:{line}");
                 {
                     let (lock, _) = &*self.state;
-                    lock.lock().unwrap().breakpoints.insert(key.clone(), bp_id.clone());
+                    lock.lock()
+                        .unwrap()
+                        .breakpoints
+                        .insert(key.clone(), bp_id.clone());
                 }
                 Ok(format!("Breakpoint set at {key} (id={bp_id})"))
             }
             ParsedSb::Name(_) => {
-                bail!("node-proto: function-name breakpoints unsupported — use `break file.js:line`");
+                bail!(
+                    "node-proto: function-name breakpoints unsupported — use `break file.js:line`"
+                );
             }
         }
     }
@@ -490,9 +524,11 @@ impl InspectorTransport {
         let call_frame_id = {
             let (lock, _) = &*self.state;
             let s = lock.lock().unwrap();
-            s.call_frames
-                .first()
-                .and_then(|f| f.get("callFrameId").and_then(|v| v.as_str()).map(String::from))
+            s.call_frames.first().and_then(|f| {
+                f.get("callFrameId")
+                    .and_then(|v| v.as_str())
+                    .map(String::from)
+            })
         };
         let (method, params) = match call_frame_id {
             Some(id) => (
@@ -507,7 +543,10 @@ impl InspectorTransport {
         let resp = self.call_blocking(method, params, timeout)?;
         let result = resp.get("result").unwrap_or(&Value::Null);
         if let Some(exc) = resp.get("exceptionDetails") {
-            return Ok(format!("[exception] {}", exc.get("text").and_then(|v| v.as_str()).unwrap_or("")));
+            return Ok(format!(
+                "[exception] {}",
+                exc.get("text").and_then(|v| v.as_str()).unwrap_or("")
+            ));
         }
         let rendered = match result.get("value") {
             Some(v) if !v.is_null() => match v {
@@ -620,10 +659,7 @@ impl InspectorTransport {
                     if out.contains_key(name) {
                         continue;
                     }
-                    out.insert(
-                        name.to_string(),
-                        json!({ "value": rendered }),
-                    );
+                    out.insert(name.to_string(), json!({ "value": rendered }));
                 }
             }
         }
@@ -642,7 +678,10 @@ impl InspectorTransport {
             None => {
                 let (lock, _) = &*self.state;
                 let s = lock.lock().unwrap();
-                let top = s.call_frames.first().ok_or_else(|| anyhow!("list: not paused"))?;
+                let top = s
+                    .call_frames
+                    .first()
+                    .ok_or_else(|| anyhow!("list: not paused"))?;
                 let location = top.get("location");
                 let sid = location
                     .and_then(|l| l.get("scriptId"))
@@ -699,7 +738,10 @@ impl InspectorTransport {
                 .unwrap_or("")
                 .to_string();
             let (lock, _) = &*self.state;
-            lock.lock().unwrap().script_sources.insert(script_id.clone(), src.clone());
+            lock.lock()
+                .unwrap()
+                .script_sources
+                .insert(script_id.clone(), src.clone());
             Ok(src)
         })?;
 
@@ -727,11 +769,25 @@ impl InspectorTransport {
         }
         let mut out = String::new();
         for (i, f) in s.call_frames.iter().enumerate() {
-            let func = f.get("functionName").and_then(|v| v.as_str()).filter(|x| !x.is_empty()).unwrap_or("(anonymous)");
+            let func = f
+                .get("functionName")
+                .and_then(|v| v.as_str())
+                .filter(|x| !x.is_empty())
+                .unwrap_or("(anonymous)");
             let loc = f.get("location");
-            let line = loc.and_then(|l| l.get("lineNumber")).and_then(|v| v.as_u64()).unwrap_or(0) + 1;
-            let script_id = loc.and_then(|l| l.get("scriptId")).and_then(|v| v.as_str()).unwrap_or("");
-            let url = s.script_urls.get(script_id).cloned()
+            let line = loc
+                .and_then(|l| l.get("lineNumber"))
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0)
+                + 1;
+            let script_id = loc
+                .and_then(|l| l.get("scriptId"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let url = s
+                .script_urls
+                .get(script_id)
+                .cloned()
                 .or_else(|| f.get("url").and_then(|v| v.as_str()).map(String::from))
                 .unwrap_or_default();
             out.push_str(&format!("#{i} {func} at {url}:{line}\n"));
@@ -752,7 +808,6 @@ impl InspectorTransport {
         out.trim_end().to_string()
     }
 }
-
 
 /// Render a `Runtime.RemoteObject` as a JSON-friendly value for the
 /// locals dump. Primitives come through with their real value;
@@ -906,7 +961,10 @@ impl Drop for InspectorTransport {
 /// any post-handshake stderr output).
 fn scrape_ws_url(stderr: ChildStderr, timeout: Duration) -> Result<String> {
     let fd = stderr.as_raw_fd();
-    nix::fcntl::fcntl(fd, nix::fcntl::FcntlArg::F_SETFL(nix::fcntl::OFlag::O_NONBLOCK))?;
+    nix::fcntl::fcntl(
+        fd,
+        nix::fcntl::FcntlArg::F_SETFL(nix::fcntl::OFlag::O_NONBLOCK),
+    )?;
     let mut reader = BufReader::new(stderr);
     let deadline = Instant::now() + timeout;
     let mut line = String::new();
@@ -1005,7 +1063,11 @@ fn driver_loop(
                     mark_dead(&state);
                     return;
                 }
-                Ok(DriverCmd::Call { method, params, resp }) => {
+                Ok(DriverCmd::Call {
+                    method,
+                    params,
+                    resp,
+                }) => {
                     let id = next_id;
                     next_id += 1;
                     let frame = json!({ "id": id, "method": method, "params": params });
@@ -1078,8 +1140,16 @@ fn dispatch_incoming(
 
     match method {
         "Debugger.scriptParsed" => {
-            let script_id = params.get("scriptId").and_then(|v| v.as_str()).unwrap_or("").to_string();
-            let url = params.get("url").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let script_id = params
+                .get("scriptId")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let url = params
+                .get("url")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
             if !script_id.is_empty() {
                 let (lock, _) = &**state;
                 lock.lock().unwrap().script_urls.insert(script_id, url);
@@ -1104,6 +1174,7 @@ fn dispatch_incoming(
             s.stop_generation = s.stop_generation.wrapping_add(1);
             s.call_frames = call_frames;
             s.pending_hit = Some(hit);
+            s.pending_action_generation = s.action_generation;
             cvar.notify_all();
         }
         "Debugger.resumed" => {
@@ -1143,7 +1214,11 @@ fn dispatch_incoming(
         "Runtime.executionContextCreated" => {
             // First context is the main realm; subsequent ones are
             // worker_threads, vm modules, etc. — ignore those.
-            if let Some(id) = params.get("context").and_then(|c| c.get("id")).and_then(|v| v.as_i64()) {
+            if let Some(id) = params
+                .get("context")
+                .and_then(|c| c.get("id"))
+                .and_then(|v| v.as_i64())
+            {
                 let (lock, _) = &**state;
                 let mut s = lock.lock().unwrap();
                 if s.main_context_id.is_none() {
@@ -1154,9 +1229,7 @@ fn dispatch_incoming(
         "Runtime.executionContextDestroyed" => {
             // Only tear down when the *main* context dies. A
             // worker_thread finishing should not kill the session.
-            let destroyed_id = params
-                .get("executionContextId")
-                .and_then(|v| v.as_i64());
+            let destroyed_id = params.get("executionContextId").and_then(|v| v.as_i64());
             let is_main = {
                 let (lock, _) = &**state;
                 let s = lock.lock().unwrap();
@@ -1181,7 +1254,10 @@ fn build_hit_event(frames: &[Value], state: &Arc<(Mutex<State>, Condvar)>) -> Hi
         .and_then(|f| f.get("location"))
         .map(|l| {
             (
-                l.get("scriptId").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                l.get("scriptId")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
                 l.get("lineNumber").and_then(|v| v.as_u64()).unwrap_or(0) as u32 + 1,
             )
         })
@@ -1192,10 +1268,7 @@ fn build_hit_event(frames: &[Value], state: &Arc<(Mutex<State>, Condvar)>) -> Hi
         s.script_urls.get(&script_id).cloned().unwrap_or_default()
     };
     // Pull file path from the url — strip `file://` if present.
-    let file = url
-        .strip_prefix("file://")
-        .unwrap_or(&url)
-        .to_string();
+    let file = url.strip_prefix("file://").unwrap_or(&url).to_string();
     HitEvent {
         location_key: if file.is_empty() {
             format!("scriptId={script_id}:{line_no}")
@@ -1270,7 +1343,10 @@ mod tests {
 
     #[test]
     fn parse_sb_line_only() {
-        assert!(matches!(parse_sb("sb(42)"), Some((ParsedSb::Line(42), None))));
+        assert!(matches!(
+            parse_sb("sb(42)"),
+            Some((ParsedSb::Line(42), None))
+        ));
     }
 
     #[test]

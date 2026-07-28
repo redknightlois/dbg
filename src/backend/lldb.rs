@@ -29,14 +29,13 @@ impl Backend for LldbBackend {
         let lldb_bin =
             std::env::var("LLDB_BIN").unwrap_or_else(|_| find_lldb().unwrap_or("lldb".into()));
 
-        let escaped_target = target.replace('\\', "\\\\").replace('"', "\\\"");
-        let mut init_commands = vec![format!("file \"{escaped_target}\"")];
+        let mut init_commands = vec![format!("file {}", lldb_command_arg(target))];
         if !args.is_empty() {
-            let escaped_args: Vec<String> = args.iter().map(|a| {
-                let e = a.replace('\\', "\\\\").replace('"', "\\\"");
-                format!("\"{e}\"")
-            }).collect();
-            init_commands.push(format!("settings set target.run-args {}", escaped_args.join(" ")));
+            let escaped_args: Vec<String> = args.iter().map(|a| lldb_command_arg(a)).collect();
+            init_commands.push(format!(
+                "settings set target.run-args {}",
+                escaped_args.join(" ")
+            ));
         }
 
         Ok(SpawnConfig {
@@ -170,20 +169,25 @@ impl CanonicalOps for LldbBackend {
         } else {
             let joined = args
                 .iter()
-                .map(|a| {
-                    let e = a.replace('\\', "\\\\").replace('"', "\\\"");
-                    format!("\"{e}\"")
-                })
+                .map(|a| lldb_command_arg(a))
                 .collect::<Vec<_>>()
                 .join(" ");
             Ok(format!("process launch -- {joined}"))
         }
     }
 
-    fn op_continue(&self) -> anyhow::Result<String> { Ok("process continue".into()) }
-    fn op_step(&self) -> anyhow::Result<String> { Ok("thread step-in".into()) }
-    fn op_next(&self) -> anyhow::Result<String> { Ok("thread step-over".into()) }
-    fn op_finish(&self) -> anyhow::Result<String> { Ok("thread step-out".into()) }
+    fn op_continue(&self) -> anyhow::Result<String> {
+        Ok("process continue".into())
+    }
+    fn op_step(&self) -> anyhow::Result<String> {
+        Ok("thread step-in".into())
+    }
+    fn op_next(&self) -> anyhow::Result<String> {
+        Ok("thread step-over".into())
+    }
+    fn op_finish(&self) -> anyhow::Result<String> {
+        Ok("thread step-out".into())
+    }
 
     fn op_stack(&self, n: Option<u32>) -> anyhow::Result<String> {
         Ok(match n {
@@ -194,14 +198,18 @@ impl CanonicalOps for LldbBackend {
     fn op_frame(&self, n: u32) -> anyhow::Result<String> {
         Ok(format!("frame select {n}"))
     }
-    fn op_locals(&self) -> anyhow::Result<String> { Ok("frame variable".into()) }
+    fn op_locals(&self) -> anyhow::Result<String> {
+        Ok("frame variable".into())
+    }
     fn op_print(&self, expr: &str) -> anyhow::Result<String> {
         Ok(format!("expression -- {expr}"))
     }
     fn op_watch(&self, expr: &str) -> anyhow::Result<String> {
         Ok(format!("watchpoint set variable {expr}"))
     }
-    fn op_threads(&self) -> anyhow::Result<String> { Ok("thread list".into()) }
+    fn op_threads(&self) -> anyhow::Result<String> {
+        Ok("thread list".into())
+    }
     fn op_thread(&self, n: u32) -> anyhow::Result<String> {
         Ok(format!("thread select {n}"))
     }
@@ -231,9 +239,9 @@ impl CanonicalOps for LldbBackend {
         let frame_re = frame_regex();
         let thread_re = thread_regex();
 
-        let thread = output.lines().find_map(|l| {
-            thread_re.captures(l).map(|c| c[1].to_string())
-        });
+        let thread = output
+            .lines()
+            .find_map(|l| thread_re.captures(l).map(|c| c[1].to_string()));
 
         let frame = output.lines().find_map(|l| frame_re.captures(l));
         let (symbol, file, line) = match frame.as_ref() {
@@ -328,6 +336,25 @@ impl CanonicalOps for LldbBackend {
     }
 }
 
+/// Quote one LLDB command argument. Newline must be encoded as data: a
+/// literal newline terminates the current LLDB command even inside quotes.
+fn lldb_command_arg(value: &str) -> String {
+    let mut out = String::from("\"");
+    for ch in value.chars() {
+        match ch {
+            '\\' | '"' | '`' => {
+                out.push('\\');
+                out.push(ch);
+            }
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            _ => out.push(ch),
+        }
+    }
+    out.push('"');
+    out
+}
+
 fn frame_regex() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
@@ -352,8 +379,7 @@ fn locals_regex() -> &'static Regex {
     // locals after step.
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
-        Regex::new(r"^\s*(?:\(([^)]+)\)\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.+)$")
-            .unwrap()
+        Regex::new(r"^\s*(?:\(([^)]+)\)\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.+)$").unwrap()
     })
 }
 
@@ -382,10 +408,7 @@ fn clean_bt(output: &str) -> String {
 
     for line in output.lines() {
         if let Some(caps) = frame_re.captures(line) {
-            cleaned.push(format!(
-                "  {}: {} at {}",
-                &caps[1], &caps[2], &caps[3]
-            ));
+            cleaned.push(format!("  {}: {} at {}", &caps[1], &caps[2], &caps[3]));
         } else if line.starts_with("* thread") || line.starts_with("  thread") {
             cleaned.push(line.to_string());
         } else if line.contains("stop reason") {
@@ -440,7 +463,8 @@ mod tests {
     #[test]
     fn clean_extracts_process_events() {
         let b = LldbBackend;
-        let input = "Process 1234 launched: '/bin/test'\nsome output\nProcess 1234 exited with status = 0";
+        let input =
+            "Process 1234 launched: '/bin/test'\nsome output\nProcess 1234 exited with status = 0";
         let r = b.clean("continue", input);
         assert_eq!(r, "some output");
     }
@@ -492,7 +516,8 @@ mod tests {
 
     #[test]
     fn parse_help_extracts_commands() {
-        let raw = "  breakpoint -- Set a breakpoint\n  continue   -- Continue execution\nSome other line";
+        let raw =
+            "  breakpoint -- Set a breakpoint\n  continue   -- Continue execution\nSome other line";
         let result = LldbBackend.parse_help(raw);
         assert!(result.contains("breakpoint"));
         assert!(result.contains("continue"));
@@ -506,7 +531,12 @@ mod tests {
     #[test]
     fn canonical_break_file_line() {
         let ops: &dyn CanonicalOps = &LldbBackend;
-        let s = ops.op_break(&BreakLoc::FileLine { file: "main.c".into(), line: 42 }).unwrap();
+        let s = ops
+            .op_break(&BreakLoc::FileLine {
+                file: "main.c".into(),
+                line: 42,
+            })
+            .unwrap();
         assert_eq!(s, "breakpoint set --file main.c --line 42");
     }
 
@@ -520,10 +550,12 @@ mod tests {
     #[test]
     fn canonical_break_module_method() {
         let ops: &dyn CanonicalOps = &LldbBackend;
-        let s = ops.op_break(&BreakLoc::ModuleMethod {
-            module: "libfoo.so".into(),
-            method: "bar".into(),
-        }).unwrap();
+        let s = ops
+            .op_break(&BreakLoc::ModuleMethod {
+                module: "libfoo.so".into(),
+                method: "bar".into(),
+            })
+            .unwrap();
         assert_eq!(s, "breakpoint set --shlib libfoo.so --name bar");
     }
 
@@ -541,6 +573,23 @@ mod tests {
         let ops: &dyn CanonicalOps = &LldbBackend;
         let s = ops.op_run(&["arg 1".into(), "arg\"2".into()]).unwrap();
         assert_eq!(s, "process launch -- \"arg 1\" \"arg\\\"2\"");
+    }
+
+    #[test]
+    fn lldb_newlines_stay_inside_one_argument() {
+        let args = vec!["safe\nprocess quit".to_string()];
+        let cfg = LldbBackend
+            .spawn_config("target\nprocess quit", &args)
+            .unwrap();
+        assert!(cfg.init_commands.iter().all(|command| {
+            !command
+                .lines()
+                .skip(1)
+                .any(|line| line.contains("process quit"))
+        }));
+        let run = (&LldbBackend as &dyn CanonicalOps).op_run(&args).unwrap();
+        assert!(!run.contains("\nsafe"));
+        assert!(run.contains("\\n"));
     }
 
     #[test]
@@ -598,9 +647,28 @@ mod tests {
         let output = "(int) x = 42\n(const char *) name = \"hello\"\n(std::vector<int>) v = size=3";
         let v = LldbBackend.parse_locals(output).expect("should parse");
         let obj = v.as_object().unwrap();
-        assert_eq!(obj.get("x").unwrap().get("type").unwrap().as_str().unwrap(), "int");
-        assert_eq!(obj.get("x").unwrap().get("value").unwrap().as_str().unwrap(), "42");
-        assert_eq!(obj.get("name").unwrap().get("type").unwrap().as_str().unwrap(), "const char *");
+        assert_eq!(
+            obj.get("x").unwrap().get("type").unwrap().as_str().unwrap(),
+            "int"
+        );
+        assert_eq!(
+            obj.get("x")
+                .unwrap()
+                .get("value")
+                .unwrap()
+                .as_str()
+                .unwrap(),
+            "42"
+        );
+        assert_eq!(
+            obj.get("name")
+                .unwrap()
+                .get("type")
+                .unwrap()
+                .as_str()
+                .unwrap(),
+            "const char *"
+        );
         assert!(obj.contains_key("v"));
     }
 
@@ -627,7 +695,9 @@ mod tests {
         // return a structured post-mortem value rather than None (which
         // would be silently dropped) or a raw error string passed through.
         let raw = "error: Command requires a process which is currently stopped.";
-        let v = LldbBackend.parse_locals(raw).expect("should return a value for the error case");
+        let v = LldbBackend
+            .parse_locals(raw)
+            .expect("should return a value for the error case");
         let obj = v.as_object().unwrap();
         // Must contain the sentinel key "[post-mortem]"
         assert!(

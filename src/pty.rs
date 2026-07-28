@@ -16,6 +16,82 @@ use regex::Regex;
 static ANSI_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\x1b\[[0-9;]*[A-Za-z]|\x1b\[K|\x1b\[2K").unwrap());
 
+/// Maximum number of debugger response bytes retained for one command.
+/// Reading continues after this limit so a debugger cannot block on a full
+/// PTY while the caller waits for the protocol prompt.
+pub const MAX_COMMAND_OUTPUT_BYTES: usize = 256 * 1024;
+const COMMAND_OUTPUT_HALF: usize = MAX_COMMAND_OUTPUT_BYTES / 2;
+
+/// Bounded response capture. Keep both ends of a large response: debugger
+/// stop records normally occur at the end, while the beginning still
+/// contains the command's useful context. The discarded middle is explicit
+/// in the returned text.
+struct BoundedOutput {
+    head: Vec<u8>,
+    tail: Vec<u8>,
+    total: usize,
+}
+
+impl BoundedOutput {
+    fn new() -> Self {
+        Self {
+            head: Vec::with_capacity(COMMAND_OUTPUT_HALF),
+            tail: Vec::with_capacity(COMMAND_OUTPUT_HALF),
+            total: 0,
+        }
+    }
+
+    fn push(&mut self, bytes: &[u8]) {
+        self.total = self.total.saturating_add(bytes.len());
+        let head_missing = COMMAND_OUTPUT_HALF.saturating_sub(self.head.len());
+        let head_bytes = head_missing.min(bytes.len());
+        self.head.extend_from_slice(&bytes[..head_bytes]);
+        self.push_tail(&bytes[head_bytes..]);
+    }
+
+    fn push_tail(&mut self, bytes: &[u8]) {
+        if bytes.is_empty() {
+            return;
+        }
+        if bytes.len() >= COMMAND_OUTPUT_HALF {
+            self.tail.clear();
+            self.tail
+                .extend_from_slice(&bytes[bytes.len() - COMMAND_OUTPUT_HALF..]);
+            return;
+        }
+        self.tail.extend_from_slice(bytes);
+        if self.tail.len() > COMMAND_OUTPUT_HALF {
+            let discard = self.tail.len() - COMMAND_OUTPUT_HALF;
+            self.tail.drain(..discard);
+        }
+    }
+
+    fn is_truncated(&self) -> bool {
+        self.total > self.head.len() + self.tail.len()
+    }
+
+    fn into_string(self) -> String {
+        if !self.is_truncated() {
+            let mut bytes = self.head;
+            bytes.extend_from_slice(&self.tail);
+            return String::from_utf8_lossy(&bytes).into_owned();
+        }
+        let marker = format!(
+            "\n[debugger output truncated: retained bytes from a {} byte response]\n",
+            self.total
+        );
+        let budget = MAX_COMMAND_OUTPUT_BYTES.saturating_sub(marker.len());
+        let head_len = self.head.len().min(budget / 2);
+        let tail_len = self.tail.len().min(budget - head_len);
+        let tail_start = self.tail.len() - tail_len;
+        let mut bytes = Vec::with_capacity(head_len + marker.len() + tail_len);
+        bytes.extend_from_slice(&self.head[..head_len]);
+        bytes.extend_from_slice(marker.as_bytes());
+        bytes.extend_from_slice(&self.tail[tail_start..]);
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+}
+
 /// An event emitted by the reader thread.
 ///
 /// The reader owns the PTY master read side and produces a stream of
@@ -387,13 +463,13 @@ impl DebuggerProcess {
     /// already ack-prompted the `cont`).
     pub fn drain_pending(&self) -> Option<String> {
         let rx = self.rx.lock().unwrap();
-        let mut accumulated: Vec<u8> = Vec::new();
+        let mut accumulated = BoundedOutput::new();
         let mut saw_data = false;
         loop {
             match rx.try_recv() {
                 Ok(PtyEvent::Data(bytes)) => {
                     saw_data = true;
-                    accumulated.extend(bytes);
+                    accumulated.push(&bytes);
                 }
                 Ok(PtyEvent::Prompt) => {}
                 Ok(PtyEvent::Exit) => break,
@@ -403,13 +479,13 @@ impl DebuggerProcess {
         if !saw_data {
             return None;
         }
-        Some(strip_ansi(&String::from_utf8_lossy(&accumulated)))
+        Some(strip_ansi(&accumulated.into_string()))
     }
 
     /// Wait for the initial prompt after spawn.
     pub fn wait_for_prompt(&self, timeout: Duration) -> Result<String> {
         let rx = self.rx.lock().unwrap();
-        let mut collected: Vec<u8> = Vec::new();
+        let mut collected = BoundedOutput::new();
         let deadline = Instant::now() + timeout;
         loop {
             let remaining = deadline.saturating_duration_since(Instant::now());
@@ -417,9 +493,9 @@ impl DebuggerProcess {
                 bail!("timeout waiting for initial prompt");
             }
             match rx.recv_timeout(remaining) {
-                Ok(PtyEvent::Data(bytes)) => collected.extend(bytes),
+                Ok(PtyEvent::Data(bytes)) => collected.push(&bytes),
                 Ok(PtyEvent::Prompt) => {
-                    return Ok(strip_ansi(&String::from_utf8_lossy(&collected)));
+                    return Ok(strip_ansi(&collected.into_string()));
                 }
                 Ok(PtyEvent::Exit) => bail!("debugger exited before producing prompt"),
                 Err(RecvTimeoutError::Timeout) => {
@@ -471,7 +547,7 @@ still available: `dbg hits <loc>`, `dbg stack`, `dbg locals`, `dbg cross <sym>`,
         }
 
         let rx = self.rx.lock().unwrap();
-        let mut collected: Vec<u8> = Vec::new();
+        let mut collected = BoundedOutput::new();
         let deadline = Instant::now() + timeout;
         loop {
             let remaining = deadline.saturating_duration_since(Instant::now());
@@ -479,7 +555,7 @@ still available: `dbg hits <loc>`, `dbg stack`, `dbg locals`, `dbg cross <sym>`,
                 bail!("timeout waiting for prompt");
             }
             match rx.recv_timeout(remaining) {
-                Ok(PtyEvent::Data(bytes)) => collected.extend(bytes),
+                Ok(PtyEvent::Data(bytes)) => collected.push(&bytes),
                 Ok(PtyEvent::Prompt) => break,
                 Ok(PtyEvent::Exit) => {
                     bail!("debugger exited while running `{cmd}`")
@@ -504,7 +580,7 @@ still available: `dbg hits <loc>`, `dbg stack`, `dbg locals`, `dbg cross <sym>`,
         // receiver for `drain_pending`. Output that arrived before the
         // prompt is already in `collected` and the daemon parses it for
         // stop banners even when this command is an inspection request.
-        let raw = String::from_utf8_lossy(&collected).to_string();
+        let raw = collected.into_string();
         let clean = strip_ansi(&raw);
         let no_prompts = self.prompt_re.replace_all(&clean, "");
 
@@ -615,6 +691,12 @@ fn reader_loop(
     // event when a prompt is detected, when it grows past 64KB, or on
     // exit.
     let mut pending: Vec<u8> = Vec::new();
+    // Keep a bounded copy separate from `pending`. The latter is flushed
+    // during very large responses; without this probe, a prompt split
+    // across two flushes could never match and the caller would wait until
+    // its timeout even though the debugger is ready.
+    const PROMPT_PROBE_BYTES: usize = 64 * 1024;
+    let mut prompt_probe: Vec<u8> = Vec::new();
 
     let flush_output = |pending: &mut Vec<u8>, tx: &Sender<PtyEvent>, log: &LogHandle| -> bool {
         if pending.is_empty() {
@@ -677,11 +759,17 @@ fn reader_loop(
         };
 
         pending.extend_from_slice(&buf[..n]);
+        prompt_probe.extend_from_slice(&buf[..n]);
+        if prompt_probe.len() > PROMPT_PROBE_BYTES {
+            let discard = prompt_probe.len() - PROMPT_PROBE_BYTES;
+            prompt_probe.drain(..discard);
+        }
 
-        // Prompt detection operates on the ANSI-stripped view of the
-        // entire pending buffer. Cheap enough since pending is capped.
-        let pending_str = String::from_utf8_lossy(&pending);
-        let cleaned = strip_ansi(&pending_str);
+        // Prompt detection operates on the bounded probe, not only on the
+        // bytes waiting to be emitted. This preserves a match when the
+        // prompt starts in a chunk that was already flushed.
+        let probe_str = String::from_utf8_lossy(&prompt_probe);
+        let cleaned = strip_ansi(&probe_str);
         if prompt_re.is_match(&cleaned) {
             if !flush_output(&mut pending, &tx, &log) {
                 return;
@@ -689,6 +777,7 @@ fn reader_loop(
             if !emit_marker(EventKind::Prompt, &tx, &log) {
                 return;
             }
+            prompt_probe.clear();
         } else if pending.len() > 64 * 1024 {
             // Safety valve: stream large outputs to the log without
             // waiting for a prompt. Agents tailing via `dbg events`
@@ -716,6 +805,119 @@ impl Drop for DebuggerProcess {
         if let Some(h) = self.reader.take() {
             // Best-effort: reader polls shutdown flag every 100ms.
             let _ = h.join();
+        }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::sync::{Arc, Barrier};
+    use std::thread;
+    use std::time::Instant;
+
+    fn large_output_process(ready: &std::path::Path, release: &std::path::Path) -> DebuggerProcess {
+        let script = r#"
+ready=$1
+release=$2
+printf 'dbg> '
+while IFS= read -r line; do
+    if [ "$line" = large ]; then
+        : > "$ready"
+        while [ ! -f "$release" ]; do
+            sleep 0.001
+        done
+        head -c 400000 /dev/zero | tr '\0' x
+        printf '\nSTOPPED\n'
+    else
+        printf 'ok\n'
+    fi
+    printf 'dbg> '
+done
+"#;
+        let process = DebuggerProcess::spawn(
+            "/bin/sh",
+            &[
+                "-c".to_string(),
+                script.to_string(),
+                "large-output-test".to_string(),
+                ready.display().to_string(),
+                release.display().to_string(),
+            ],
+            &[],
+            r"dbg> ",
+        )
+        .unwrap();
+        process.wait_for_prompt(Duration::from_secs(10)).unwrap();
+        process
+    }
+
+    #[test]
+    fn large_output_truncation() {
+        // The child-side markers prove that both producers reached their
+        // release gate. The Rust barrier makes both producer threads submit
+        // their commands before the controller inspects those markers and
+        // releases either stream. This is a real rendezvous, not a timing
+        // assumption about two threads starting close together.
+        let temp = tempfile::tempdir().unwrap();
+        let release = temp.path().join("release");
+        let ready = [temp.path().join("ready-0"), temp.path().join("ready-1")];
+        let processes = ready
+            .iter()
+            .map(|path| large_output_process(path, &release))
+            .collect::<Vec<_>>();
+        let barrier = Arc::new(Barrier::new(3));
+        let workers: Vec<_> = processes
+            .into_iter()
+            .enumerate()
+            .map(|(_, process)| {
+                let barrier = barrier.clone();
+                thread::spawn(move || {
+                    let write_result = process.write_master(b"large\n");
+                    barrier.wait();
+                    write_result.unwrap();
+                    let response = process.wait_for_prompt(Duration::from_secs(5)).unwrap();
+                    assert!(
+                        response.contains("[debugger output truncated:"),
+                        "missing truncation indication"
+                    );
+                    assert!(response.contains("STOPPED"), "stop marker was discarded");
+                    assert!(
+                        response.len() < MAX_COMMAND_OUTPUT_BYTES + 1024,
+                        "response exceeded hard capture bound: {}",
+                        response.len()
+                    );
+                    let follow_up = process
+                        .send_and_wait("small", Duration::from_secs(2))
+                        .unwrap();
+                    assert_eq!(follow_up, "ok");
+                })
+            })
+            .collect();
+
+        barrier.wait();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let both_ready = loop {
+            if ready.iter().all(|path| path.exists()) {
+                break true;
+            }
+            if Instant::now() >= deadline {
+                break false;
+            }
+            thread::sleep(Duration::from_millis(1));
+        };
+        if !both_ready {
+            // Release the children before joining so a failed readiness
+            // check cannot leave a worker blocked during test cleanup.
+            std::fs::write(&release, b"release").unwrap();
+            for worker in workers {
+                worker.join().unwrap();
+            }
+            panic!("both PTY producers must reach the release gate");
+        }
+        std::fs::write(&release, b"release").unwrap();
+        for worker in workers {
+            worker.join().unwrap();
         }
     }
 }
