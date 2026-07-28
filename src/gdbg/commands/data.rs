@@ -306,7 +306,14 @@ pub fn cmd_diff(db: &GpuDb, args: &[&str]) {
        LIMIT 15");
 
     let rows: Vec<(String, f64, f64)> =
-        db.query_vec(&sql, [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)));
+        match db.query_vec_result(&sql, [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?))) {
+            Ok(rows) => rows,
+            Err(error) => {
+                println!("diff query failed for '{name}': {error}");
+                let _ = db.detach("other");
+                return;
+            }
+        };
 
     println!("  Diff: current vs {name}\n");
     println!("  Kernel                            Before     After      Delta");

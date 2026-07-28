@@ -123,6 +123,7 @@ impl GpuDb {
                 expected = GDBG_SCHEMA_VERSION,
             );
         }
+        validate_schema_tables(&conn, &path)?;
         Ok(Self {
             conn,
             _path: path,
@@ -375,7 +376,6 @@ impl GpuDb {
     }
 
     /// Execute a query and collect all rows via a mapping function.
-    /// Returns an empty Vec on any error (safe for diagnostic/display code).
     pub fn query_vec<T>(
         &self,
         sql: &str,
@@ -389,6 +389,18 @@ impl GpuDb {
             return Vec::new();
         };
         rows.filter_map(|r| r.ok()).collect()
+    }
+
+    pub fn query_vec_result<T>(
+        &self,
+        sql: &str,
+        params: impl rusqlite::Params,
+        f: impl FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<T>,
+    ) -> Result<Vec<T>> {
+        let mut stmt = self.conn.prepare(sql)?;
+        let rows = stmt.query_map(params, f)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
     }
 
     /// Check if target hashes are consistent across all layers.
@@ -765,6 +777,40 @@ impl GpuDb {
         self.attached_files.lock().unwrap().remove(alias);
         Ok(())
     }
+}
+
+fn validate_schema_tables(conn: &Connection, path: &Path) -> Result<()> {
+    const REQUIRED: &[&str] = &[
+        "meta",
+        "layers",
+        "launches",
+        "metrics",
+        "transfers",
+        "ops",
+        "op_kernel_map",
+        "allocations",
+        "regions",
+        "failures",
+    ];
+    let mut missing = Vec::new();
+    for table in REQUIRED {
+        let present: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+            [table],
+            |row| row.get(0),
+        )?;
+        if present != 1 {
+            missing.push(*table);
+        }
+    }
+    if !missing.is_empty() {
+        bail!(
+            "gdbg session DB {} is missing required table(s): {}",
+            path.display(),
+            missing.join(", ")
+        );
+    }
+    Ok(())
 }
 
 struct OpenedSqlite {
@@ -1383,6 +1429,48 @@ mod tests {
         }
         let err = GpuDb::open(&path).unwrap_err().to_string();
         assert!(err.contains("schema_version=99"));
+    }
+
+    #[test]
+    fn gpudb_open_rejects_missing_required_tables() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("incomplete.gpu.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            init_schema(&conn).unwrap();
+            conn.execute("DROP TABLE metrics", []).unwrap();
+            conn.execute(&format!("PRAGMA user_version = {GDBG_SCHEMA_VERSION}"), [])
+                .unwrap();
+        }
+        let error = GpuDb::open(&path).unwrap_err().to_string();
+        assert!(
+            error.contains("missing required table(s): metrics"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn gdbg_comparison_database_validation_and_query_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("comparison.gpu.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            init_schema(&conn).unwrap();
+            conn.execute("DROP TABLE launches", []).unwrap();
+            conn.execute(&format!("PRAGMA user_version = {GDBG_SCHEMA_VERSION}"), [])
+                .unwrap();
+        }
+        let validation = GpuDb::open(&path).unwrap_err();
+        assert!(validation.to_string().contains("missing required table"));
+
+        let current = GpuDb::create(&dir.path().join("current.gpu.db")).unwrap();
+        assert!(
+            current
+                .query_vec_result("SELECT * FROM definitely_missing", [], |row| {
+                    row.get::<_, String>(0)
+                })
+                .is_err()
+        );
     }
 
     #[test]

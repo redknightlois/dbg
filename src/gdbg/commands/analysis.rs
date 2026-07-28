@@ -2134,7 +2134,7 @@ pub fn cmd_regressions(db: &GpuDb, args: &[&str]) {
                   FROM other.launches WHERE {other_tl} GROUP BY kernel_name) o
                ON c.kernel_name = o.kernel_name"
     );
-    let all: Vec<_> = db.query_vec(&sql, [], |row| {
+    let all: Vec<_> = match db.query_vec_result(&sql, [], |row| {
         Ok((
             row.get::<_, String>(0)?,
             row.get::<_, f64>(1)?,
@@ -2142,7 +2142,14 @@ pub fn cmd_regressions(db: &GpuDb, args: &[&str]) {
             row.get::<_, i64>(3)?,
             row.get::<_, i64>(4)?,
         ))
-    });
+    }) {
+        Ok(rows) => rows,
+        Err(error) => {
+            println!("regressions query failed for '{name}': {error}");
+            let _ = db.detach("other");
+            return;
+        }
+    };
 
     struct Change {
         name: String,
