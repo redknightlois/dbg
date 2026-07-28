@@ -469,7 +469,7 @@ fn cmd_replay(args: &[String]) -> Result<()> {
     // write-only — top/callers/callees would all bail because no live
     // backend is attached. With it, every profile REPL verb works
     // identically against a saved DB.
-    let mut profile = load_profile_from_db(&db);
+    let mut profile = load_profile_from_db(&db)?;
 
     let is_profile = matches!(db.kind(), dbg_cli::session_db::SessionKind::Profile);
     eprintln!("replay `{label}` (target={target}, class={target_class}) — read-only REPL");
@@ -528,15 +528,19 @@ fn cmd_replay(args: &[String]) -> Result<()> {
 }
 
 /// Rebuild a `ProfileData` from the source content stashed in the DB
-/// at session start. Returns `None` when the meta keys are missing
-/// (debug session, or profile session captured before persistence
-/// landed) or when parsing fails.
+/// at session start. Missing source is valid for old/debug sessions;
+/// malformed persisted source is corrupt evidence and is reported.
 pub(crate) fn load_profile_from_db(
     db: &dbg_cli::session_db::SessionDb,
-) -> Option<profile::ProfileData> {
-    let content = db.meta("profile_raw").ok().flatten()?;
-    let ext = db.meta("profile_raw_ext").ok().flatten();
-    profile::ProfileData::load_str(&content, ext.as_deref()).ok()
+) -> Result<Option<profile::ProfileData>> {
+    let Some(content) = db.meta("profile_raw")? else {
+        return Ok(None);
+    };
+    let ext = db.meta("profile_raw_ext")?;
+    Ok(Some(
+        profile::ProfileData::load_str(&content, ext.as_deref())
+            .context("parsing persisted profile source")?,
+    ))
 }
 
 fn replay_eval(
@@ -1419,7 +1423,9 @@ mod tests {
         .unwrap();
         db.set_meta("profile_raw", speedscope).unwrap();
 
-        let mut p = load_profile_from_db(&db).expect("rehydrate failed");
+        let mut p = load_profile_from_db(&db)
+            .expect("profile metadata read failed")
+            .expect("rehydrate failed");
         let top = p.handle_command("top 5");
         // Both frames should appear with non-zero inclusive %.
         assert!(top.contains("a"), "top output missing frame `a`:\n{top}");
@@ -1444,7 +1450,32 @@ mod tests {
             target_hash: None,
         })
         .unwrap();
-        assert!(load_profile_from_db(&db).is_none());
+        assert!(load_profile_from_db(&db).unwrap().is_none());
+    }
+
+    #[test]
+    fn replay_rejects_malformed_persisted_profile() {
+        use dbg_cli::session_db::{CreateOptions, SessionDb, SessionKind, TargetClass};
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db = SessionDb::create(CreateOptions {
+            kind: SessionKind::Profile,
+            target: "./app",
+            target_class: TargetClass::NativeCpu,
+            cwd: tmp.path(),
+            db_path: None,
+            label: Some("bad-profile".into()),
+            target_hash: None,
+        })
+        .unwrap();
+        db.set_meta("profile_raw", "not a profile").unwrap();
+        let error = match load_profile_from_db(&db) {
+            Ok(_) => panic!("malformed persisted profile unexpectedly parsed"),
+            Err(error) => error.to_string(),
+        };
+        assert!(
+            error.contains("parsing persisted profile source"),
+            "{error}"
+        );
     }
 
     #[test]

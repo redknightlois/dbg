@@ -597,30 +597,19 @@ pub fn is_profile_repl_verb(cmd: &str) -> bool {
 
 /// Read the profile source file at `src` and copy it into the session
 /// DB's meta table so a subsequent `dbg replay` can rebuild a
-/// `ProfileData` from it. Best-effort — failures are logged, never
-/// fatal: a profile session without persisted source is still useful
-/// live, it just can't be queried after replay. The format hint comes
+/// `ProfileData` from it. Errors are returned so the caller can record
+/// them in the same durable session. The format hint comes
 /// from the file extension so V8 cpuprofile vs speedscope JSON
 /// disambiguation matches what `ProfileData::load` would have used on
 /// the original path.
-fn persist_profile_source(db: &SessionDb, src: &Path) {
-    let content = match std::fs::read_to_string(src) {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!(
-                "[dbg] warning: profile replay disabled — could not read {} ({e})",
-                src.display()
-            );
-            return;
-        }
-    };
-    if let Err(e) = db.set_meta("profile_raw", &content) {
-        eprintln!("[dbg] warning: profile replay disabled — meta write failed ({e})");
-        return;
-    }
+fn persist_profile_source(db: &SessionDb, src: &Path) -> Result<()> {
+    let content = std::fs::read_to_string(src)
+        .with_context(|| format!("reading profile source {}", src.display()))?;
+    db.set_meta("profile_raw", &content)?;
     if let Some(ext) = src.extension().and_then(|e| e.to_str()) {
-        let _ = db.set_meta("profile_raw_ext", ext);
+        db.set_meta("profile_raw_ext", ext)?;
     }
+    Ok(())
 }
 
 /// Start the daemon: spawn the debugger, listen on socket.
@@ -760,21 +749,24 @@ pub fn run_daemon(
     let cached_help = proc
         .send_and_wait(backend.help_command(), CMD_TIMEOUT)
         .map(|raw| backend.parse_help(&raw))
-        .unwrap_or_default();
+        .context("failed to initialize debugger help")?;
 
     let profile_output_path = backend.profile_output();
-    let profile = profile_output_path
-        .as_ref()
-        .and_then(|path| ProfileData::load(Path::new(path)).ok());
+    let (profile, profile_error) = match profile_output_path.as_ref() {
+        Some(path) => match ProfileData::load(Path::new(path)) {
+            Ok(profile) => (Some(profile), None),
+            Err(error) => (None, Some(format!("{}: {error:#}", path))),
+        },
+        None => (None, None),
+    };
 
     // Build a per-run SessionDb alongside the debugger session. Create
-    // failure is non-fatal — we proceed without persistence rather than
-    // refusing to start the debugger.
+    // A live session must always have a durable owner and failure record.
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let target_class = backend_target_class(backend.name());
     let tmp_db = session_tmp("session.db");
     let _ = std::fs::remove_file(&tmp_db); // fresh DB on every start
-    let session_kind = if profile.is_some() {
+    let session_kind = if profile_output_path.is_some() {
         SessionKind::Profile
     } else {
         SessionKind::Debug
@@ -800,18 +792,18 @@ pub fn run_daemon(
             // a saved session. The raw file is on a tmp path that won't
             // survive the daemon — copy it into the SessionDb's meta
             // table now while we still know where it is.
-            if profile.is_some() {
-                if let Some(ref src) = profile_output_path {
-                    persist_profile_source(&db, Path::new(src));
+            if let Some(ref src) = profile_output_path {
+                if let Err(error) = persist_profile_source(&db, Path::new(src)) {
+                    db.add_failure("profile_source", &format!("{error:#}"))?;
                 }
+            }
+            if let Some(error) = profile_error {
+                db.add_failure("profile_parse", &error)?;
             }
             let final_path = session_save_path(&cwd, db.label());
             (Some(db), final_path)
         }
-        Err(e) => {
-            eprintln!("[dbg] warning: session DB unavailable ({e}); proceeding without capture");
-            (None, None)
-        }
+        Err(e) => bail!("session DB initialization failed: {e:#}"),
     };
 
     let session = Mutex::new(Session {
@@ -3212,6 +3204,44 @@ mod tests {
     use crate::dap::{DapLaunchConfig, DapTransport};
     use crate::pty::LogHandle;
     use tempfile::TempDir;
+
+    #[test]
+    fn import_profile_parse_init_errors_fail_closed() {
+        let tmp = TempDir::new().unwrap();
+        let source = tmp.path().join("profile.json");
+        std::fs::write(&source, "not valid profile data").unwrap();
+        let db = SessionDb::create(CreateOptions {
+            kind: SessionKind::Profile,
+            target: source.to_str().unwrap(),
+            target_class: TargetClass::NativeCpu,
+            cwd: tmp.path(),
+            db_path: None,
+            label: Some("profile-error".into()),
+            target_hash: Some("test".into()),
+        })
+        .unwrap();
+
+        let parse_error = match ProfileData::load(&source) {
+            Ok(_) => panic!("invalid profile input unexpectedly parsed"),
+            Err(error) => error.to_string(),
+        };
+        db.add_failure("profile_parse", &parse_error).unwrap();
+        persist_profile_source(&db, &source).unwrap();
+
+        let failure: String = db
+            .conn()
+            .query_row(
+                "SELECT error FROM failures WHERE phase = 'profile_parse'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!failure.is_empty());
+        assert_eq!(
+            db.meta("profile_raw").unwrap().as_deref(),
+            Some("not valid profile data")
+        );
+    }
 
     #[test]
     fn dap_adapter_child() {

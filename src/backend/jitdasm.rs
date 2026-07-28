@@ -177,10 +177,14 @@ impl Backend for JitDasmBackend {
 
         let dbg_bin = super::self_exe();
 
-        let mkdir_cmd = format!("mkdir -p {}", shell_escape(&out_dir_str));
+        let mkdir_cmd = format!(
+            "mkdir -p {} && rm -f {}",
+            shell_escape(&out_dir_str),
+            shell_escape(&out_file_str)
+        );
 
         let build_cmd = format!(
-            "echo 'Building...' && dotnet build {} -c Release --nologo -v q 2>&1 | tail -1",
+            "echo 'Building...' && dotnet build {} -c Release --nologo -v q 2>&1",
             shell_escape(&project)
         );
 
@@ -215,7 +219,10 @@ impl Backend for JitDasmBackend {
         let run_cmd = format!(
             "echo Disassembling: {pattern_arg} && {locate_dll} && \
              DOTNET_TieredCompilation=0 DOTNET_JitDisasm={pattern_arg} DOTNET_JitDiffableDasm=1 \
-             {timeout_prefix}dotnet exec \"$dll\"{extra} > {out_file} 2>&1",
+             {timeout_prefix}dotnet exec \"$dll\"{extra} > {out_file} 2>&1; \
+             status=$?; \
+             if ([ \"$status\" -eq 124 ] || [ \"$status\" -eq 143 ]) && [ -f {out_file} ]; then exit 0; fi; \
+             exit \"$status\"",
             pattern_arg = shell_escape(&pattern),
             out_file = shell_escape(&out_file_str),
         );
@@ -490,6 +497,25 @@ mod tests {
         JitDasmBackend
             .spawn_config("app.fsproj", &[])
             .expect("fsproj must be accepted");
+    }
+
+    #[test]
+    fn jitdasm_build_failure_cannot_be_masked_by_tail() {
+        let cfg = JitDasmBackend.spawn_config("app.csproj", &[]).unwrap();
+        let build = &cfg.init_commands[1];
+        assert!(build.contains("dotnet build"));
+        assert!(!build.contains("| tail"));
+        assert!(build.contains("&&"));
+    }
+
+    #[test]
+    fn jitdasm_capture_timeout_allows_repl_handoff() {
+        let cfg = JitDasmBackend
+            .spawn_config("app.csproj", &["--capture-duration".into(), "1s".into()])
+            .unwrap();
+        let capture = &cfg.init_commands[2];
+        assert!(capture.contains("-eq 124") || capture.contains("-eq 143"));
+        assert!(cfg.init_commands[3].starts_with("exec "));
     }
 
     #[test]
