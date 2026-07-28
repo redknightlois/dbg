@@ -94,7 +94,7 @@ impl Backend for PprofBackend {
         // and silently falls back to an interactive session, yielding
         // a near-empty traces file.
         let shell_cmd = format!(
-            "go tool pprof -traces {} > {} 2>/dev/null || true; exec go tool pprof {}",
+            "go tool pprof -traces {} > {} 2>/dev/null; exec go tool pprof {}",
             quoted_positional,
             shell_escape(&traces_str),
             quoted_positional,

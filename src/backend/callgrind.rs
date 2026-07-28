@@ -42,7 +42,7 @@ impl Backend for CallgrindBackend {
         if path.is_file() && is_existing_callgrind_profile(target) {
             let exec_repl = format!(
                 "exec {} --phpprofile-repl {} --profile-prompt 'callgrind> '",
-                dbg_bin,
+                shell_escape(&dbg_bin),
                 shell_escape(target),
             );
             return Ok(SpawnConfig {
@@ -58,7 +58,7 @@ impl Backend for CallgrindBackend {
 
         let mut valgrind_cmd = format!(
             "valgrind --tool=callgrind --callgrind-out-file={} {}",
-            out_str, shell_escape(target)
+            shell_escape(&out_str), shell_escape(target)
         );
         for a in args {
             valgrind_cmd.push(' ');
@@ -67,7 +67,7 @@ impl Backend for CallgrindBackend {
 
         let exec_repl = format!(
             "exec {} --phpprofile-repl {} --profile-prompt 'callgrind> '",
-            dbg_bin, out_str
+            shell_escape(&dbg_bin), shell_escape(&out_str)
         );
 
         Ok(SpawnConfig {

@@ -57,7 +57,7 @@ impl Backend for StackprofBackend {
         let dbg_bin = super::self_exe();
         let exec_repl = format!(
             "exec {} --phpprofile-repl {} --profile-prompt 'ruby-profile> '",
-            dbg_bin, cg_str
+            shell_escape(&dbg_bin), shell_escape(&cg_str)
         );
 
         Ok(SpawnConfig {

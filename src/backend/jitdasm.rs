@@ -179,7 +179,7 @@ impl Backend for JitDasmBackend {
 
         let dbg_bin = super::self_exe();
 
-        let mkdir_cmd = format!("mkdir -p {}", out_dir_str);
+        let mkdir_cmd = format!("mkdir -p {}", shell_escape(&out_dir_str));
 
         let build_cmd = format!(
             "echo 'Building...' && dotnet build {} -c Release --nologo -v q 2>&1 | tail -1",

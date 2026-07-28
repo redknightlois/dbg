@@ -26,7 +26,7 @@ impl Backend for DotnetTraceBackend {
         let trace_bin = find_bin("dotnet-trace");
         let mut collect_cmd = format!(
             "{} collect --output {} -- {}",
-            shell_escape(&trace_bin), trace_str, shell_escape(target)
+            shell_escape(&trace_bin), shell_escape(&trace_str), shell_escape(target)
         );
         for a in args {
             collect_cmd.push(' ');
@@ -56,7 +56,7 @@ impl Backend for DotnetTraceBackend {
                 collect_cmd,
                 format!(
                     "{} convert --format Speedscope {} -o {}",
-                    shell_escape(&trace_bin), trace_str, speedscope_str
+                    shell_escape(&trace_bin), shell_escape(&trace_str), shell_escape(&speedscope_str)
                 ),
                 "echo '--- trace data ready ---'".into(),
             ],

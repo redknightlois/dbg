@@ -45,7 +45,7 @@ impl Backend for PerfBackend {
                 env: vec![("PS1".into(), "perf> ".into())],
                 init_commands: vec![
                     format!(
-                        "perf script -F comm,tid,time,ip,sym,dso -i {} > {} 2>/dev/null || true",
+                        "perf script -F comm,tid,time,ip,sym,dso -i {} > {} 2>/dev/null",
                         shell_escape(target),
                         shell_escape(&script_str),
                     ),
@@ -70,7 +70,7 @@ impl Backend for PerfBackend {
                 init_commands: vec![
                     record_cmd,
                     format!(
-                        "perf script -F comm,tid,time,ip,sym,dso > {} 2>/dev/null || true",
+                        "perf script -F comm,tid,time,ip,sym,dso > {} 2>/dev/null",
                         shell_escape(&script_str),
                     ),
                     "perf report --stdio".into(),

@@ -481,7 +481,9 @@ still available: `dbg hits <loc>`, `dbg stack`, `dbg locals`, `dbg cross <sym>`,
             match rx.recv_timeout(remaining) {
                 Ok(PtyEvent::Data(bytes)) => collected.extend(bytes),
                 Ok(PtyEvent::Prompt) => break,
-                Ok(PtyEvent::Exit) => break,
+                Ok(PtyEvent::Exit) => {
+                    bail!("debugger exited while running `{cmd}`")
+                }
                 Err(RecvTimeoutError::Timeout) => bail!("timeout waiting for prompt"),
                 Err(RecvTimeoutError::Disconnected) => {
                     // Reader thread exited — child is gone. Return the

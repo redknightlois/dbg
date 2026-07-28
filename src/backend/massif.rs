@@ -22,7 +22,7 @@ impl Backend for MassifBackend {
 
         let mut valgrind_cmd = format!(
             "valgrind --tool=massif --massif-out-file={} {}",
-            out_str, shell_escape(target)
+            shell_escape(&out_str), shell_escape(target)
         );
         for a in args {
             valgrind_cmd.push(' ');
@@ -71,7 +71,7 @@ impl Backend for MassifBackend {
     }
 
     fn run_command(&self) -> &'static str {
-        "ms_print $MASSIF_OUT"
+        "ms_print \"$MASSIF_OUT\""
     }
 
     fn quit_command(&self) -> &'static str {
@@ -79,7 +79,7 @@ impl Backend for MassifBackend {
     }
 
     fn parse_help(&self, _raw: &str) -> String {
-        "massif: ms_print [--threshold=N] $MASSIF_OUT".to_string()
+        "massif: ms_print [--threshold=N] \"$MASSIF_OUT\"".to_string()
     }
 
     fn clean(&self, _cmd: &str, output: &str) -> String {
@@ -144,5 +144,11 @@ mod tests {
             .unwrap();
         let cmd = &cfg.init_commands[0];
         assert!(cmd.contains("'./my app'"), "target not escaped: {cmd}");
+    }
+
+    #[test]
+    fn session_output_path_is_quoted_in_commands() {
+        assert_eq!(MassifBackend.run_command(), "ms_print \"$MASSIF_OUT\"");
+        assert!(MassifBackend.parse_help("").contains("\"$MASSIF_OUT\""));
     }
 }

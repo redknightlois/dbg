@@ -24,7 +24,7 @@ impl Backend for XdebugProfileBackend {
 
         let mut php_cmd = format!(
             "mkdir -p {} && php -d xdebug.mode=profile -d xdebug.output_dir={} -d xdebug.profiler_output_name=cachegrind.out {}",
-            out_dir_str, out_dir_str, shell_escape(target)
+            shell_escape(&out_dir_str), shell_escape(&out_dir_str), shell_escape(target)
         );
         for a in args {
             php_cmd.push(' ');
@@ -32,7 +32,7 @@ impl Backend for XdebugProfileBackend {
         }
 
         let dbg_bin = super::self_exe();
-        let exec_repl = format!("exec {} --phpprofile-repl {}", dbg_bin, out_file_str);
+        let exec_repl = format!("exec {} --phpprofile-repl {}", shell_escape(&dbg_bin), shell_escape(&out_file_str));
 
         Ok(SpawnConfig {
             bin: "bash".into(),
