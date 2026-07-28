@@ -41,6 +41,84 @@ use serde_json::{Value, json};
 use crate::backend::canonical::HitEvent;
 use crate::pty::{DebuggerIo, EventKind, LogHandle};
 
+const MAX_DAP_FRAME_BYTES: usize = 8 * 1024 * 1024;
+const MAX_DAP_HEADER_BYTES: usize = 4096;
+const DAP_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
+
+struct SpawnedChildGuard(Option<Child>);
+
+impl Drop for SpawnedChildGuard {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.0.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ProcessIdentity {
+    start_time: u64,
+    exe_device: u64,
+    exe_inode: u64,
+}
+
+fn process_identity(pid: u32) -> Option<ProcessIdentity> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let fields = stat.rsplit_once(") ")?.1.split_whitespace().collect::<Vec<_>>();
+    let start_time = fields.get(19)?.parse().ok()?;
+    let metadata = std::fs::metadata(format!("/proc/{pid}/exe")).ok()?;
+    use std::os::unix::fs::MetadataExt;
+    Some(ProcessIdentity {
+        start_time,
+        exe_device: metadata.dev(),
+        exe_inode: metadata.ino(),
+    })
+}
+
+fn process_children(pid: u32) -> Vec<u32> {
+    std::fs::read_to_string(format!("/proc/{pid}/task/{pid}/children"))
+        .unwrap_or_default()
+        .split_whitespace()
+        .filter_map(|child| child.parse().ok())
+        .collect()
+}
+
+fn capture_owned_descendants(pid: u32) -> Vec<(u32, ProcessIdentity)> {
+    let mut tree = Vec::new();
+    let mut pending = process_children(pid);
+    while let Some(current) = pending.pop() {
+        if tree.iter().any(|(seen, _)| *seen == current) {
+            continue;
+        }
+        if let Some(current_identity) = process_identity(current) {
+            tree.push((current, current_identity));
+        }
+        pending.extend(process_children(current));
+    }
+    tree
+}
+
+fn kill_captured_processes(tree: Vec<(u32, ProcessIdentity)>) {
+    for (current, expected_identity) in tree.into_iter().rev() {
+        if process_identity(current) == Some(expected_identity) {
+            let _ = nix::sys::signal::kill(
+                Pid::from_raw(current as i32),
+                nix::sys::signal::Signal::SIGKILL,
+            );
+        }
+    }
+}
+
+fn kill_owned_process_tree(pid: u32, identity: ProcessIdentity) {
+    if process_identity(pid) != Some(identity) {
+        return;
+    }
+    let mut tree = capture_owned_descendants(pid);
+    tree.push((pid, identity));
+    kill_captured_processes(tree);
+}
+
 /// Launch-time configuration supplied by the backend. Everything the
 /// transport needs to spawn the adapter and drive the DAP handshake
 /// through to the first `stopped` event.
@@ -130,6 +208,12 @@ struct State {
     /// cleanly — netcoredbg leaks the dotnet host to systemd-user
     /// otherwise.
     launched_pid: Option<u32>,
+    launched_identity: Option<ProcessIdentity>,
+    /// Generation of the current execution request. Deferred stack
+    /// helpers carry this value so a late response from an earlier stop
+    /// cannot populate a later continue's state.
+    action_generation: u64,
+    stop_generation: u64,
 }
 
 impl State {
@@ -149,6 +233,9 @@ impl State {
             initialized: false,
             terminated: false,
             launched_pid: None,
+            launched_identity: None,
+            action_generation: 0,
+            stop_generation: 0,
         }
     }
 }
@@ -160,6 +247,9 @@ impl crate::transport_common::StopState for State {
     }
     fn has_pending_hit(&self) -> bool {
         self.pending_hit.is_some()
+    }
+    fn stop_generation(&self) -> u64 {
+        self.stop_generation
     }
     fn alive(&self) -> bool {
         self.alive
@@ -221,9 +311,11 @@ impl DapTransport {
             // stderr. Pipe both and let the scraper search either.
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        let mut child = cmd
-            .spawn()
-            .with_context(|| format!("failed to spawn {}", cfg.bin))?;
+        let mut child_guard = SpawnedChildGuard(Some(
+            cmd.spawn()
+                .with_context(|| format!("failed to spawn {}", cfg.bin))?,
+        ));
+        let child = child_guard.0.as_mut().expect("child guard is populated");
         let child_pid = Pid::from_raw(child.id() as i32);
         let stderr = child.stderr.take().context("missing adapter stderr")?;
         let stdout = child.stdout.take().context("missing adapter stdout")?;
@@ -292,7 +384,7 @@ impl DapTransport {
         let is_attach = cfg.launch_verb == "attach";
         let transport = Self {
             child_pid,
-            child: Mutex::new(Some(child)),
+            child: Mutex::new(Some(child_guard.0.take().expect("child guard is populated"))),
             driver_tx,
             log,
             state,
@@ -535,6 +627,11 @@ impl DapTransport {
     }
 
     fn exec<F: FnOnce(&Self) -> Result<Value>>(&self, f: F, timeout: Duration) -> Result<String> {
+        {
+            let (lock, _) = &*self.state;
+            let mut s = lock.lock().unwrap();
+            s.action_generation = s.action_generation.wrapping_add(1);
+        }
         crate::transport_common::wait_for_stop(&self.state, || f(self).map(|_| ()), timeout)
     }
 
@@ -738,6 +835,11 @@ impl DapTransport {
         // DAP `setFunctionBreakpoints` replaces the whole set per call,
         // same semantics as `setBreakpoints`. Accumulate in state so
         // adding a second fn bp doesn't remove the first.
+        let snapshot = {
+            let (lock, _) = &*self.state;
+            let s = lock.lock().unwrap();
+            (s.function_breakpoints.clone(), s.function_breakpoint_conditions.clone())
+        };
         let all: Vec<String> = {
             let (lock, _) = &*self.state;
             let mut s = lock.lock().unwrap();
@@ -766,11 +868,17 @@ impl DapTransport {
                 })
                 .collect()
         };
-        self.call_blocking(
+        if let Err(e) = self.call_blocking(
             "setFunctionBreakpoints",
             json!({ "breakpoints": fns }),
             timeout,
-        )?;
+        ) {
+            let (lock, _) = &*self.state;
+            let mut s = lock.lock().unwrap();
+            s.function_breakpoints = snapshot.0;
+            s.function_breakpoint_conditions = snapshot.1;
+            return Err(e);
+        }
         match cond {
             Some(c) => Ok(format!("Function breakpoint set: {name} if {c}")),
             None => Ok(format!("Function breakpoint set: {name}")),
@@ -784,6 +892,11 @@ impl DapTransport {
             condition,
             log_message,
         } = spec;
+        let snapshot = {
+            let (lock, _) = &*self.state;
+            let s = lock.lock().unwrap();
+            (s.breakpoints.clone(), s.breakpoint_conditions.clone(), s.breakpoint_log_messages.clone())
+        };
         // DAP requires the full set of breakpoints for a source each
         // call — it doesn't merge. Accumulate in state.breakpoints
         // and replay the full list per source on each add.
@@ -830,7 +943,7 @@ impl DapTransport {
                 })
                 .collect()
         };
-        let response = self.call_blocking(
+        let response = match self.call_blocking(
             "setBreakpoints",
             json!({
                 "source": { "path": resolved_path },
@@ -838,7 +951,17 @@ impl DapTransport {
                 "sourceModified": false,
             }),
             timeout,
-        )?;
+        ) {
+            Ok(response) => response,
+            Err(e) => {
+                let (lock, _) = &*self.state;
+                let mut s = lock.lock().unwrap();
+                s.breakpoints = snapshot.0;
+                s.breakpoint_conditions = snapshot.1;
+                s.breakpoint_log_messages = snapshot.2;
+                return Err(e);
+            }
+        };
         let requested_index = lines.iter().position(|candidate| candidate == line);
         let verified = response
             .get("breakpoints")
@@ -847,6 +970,11 @@ impl DapTransport {
             .and_then(|bp| bp.get("verified").and_then(Value::as_bool))
             .unwrap_or(false);
         if !verified {
+            let (lock, _) = &*self.state;
+            let mut s = lock.lock().unwrap();
+            s.breakpoints = snapshot.0;
+            s.breakpoint_conditions = snapshot.1;
+            s.breakpoint_log_messages = snapshot.2;
             bail!("breakpoint at {file}:{line} was not verified by the adapter")
         }
         match (condition, log_message) {
@@ -1112,6 +1240,15 @@ impl DapTransport {
             bail!("delete: no breakpoint id {id}; run `dbg breaks` to list ids");
         };
         let source_path = file.clone();
+        let snapshot = {
+            let (lock, _) = &*self.state;
+            let s = lock.lock().unwrap();
+            (
+                s.breakpoints.clone(),
+                s.breakpoint_conditions.clone(),
+                s.breakpoint_log_messages.clone(),
+            )
+        };
         let remaining: Vec<u32> = {
             let (lock, _) = &*self.state;
             let mut s = lock.lock().unwrap();
@@ -1147,7 +1284,7 @@ impl DapTransport {
                 })
                 .collect()
         };
-        self.call_blocking(
+        if let Err(error) = self.call_blocking(
             "setBreakpoints",
             json!({
                 "source": { "path": source_path },
@@ -1155,7 +1292,14 @@ impl DapTransport {
                 "sourceModified": false,
             }),
             timeout,
-        )?;
+        ) {
+            let (lock, _) = &*self.state;
+            let mut s = lock.lock().unwrap();
+            s.breakpoints = snapshot.0;
+            s.breakpoint_conditions = snapshot.1;
+            s.breakpoint_log_messages = snapshot.2;
+            return Err(error);
+        }
         Ok(format!("Breakpoint {id} cleared ({line})"))
     }
 }
@@ -1258,11 +1402,12 @@ impl DebuggerIo for DapTransport {
         //    follow through. Skip in attach mode — the user explicitly
         //    opted into not owning the lifecycle.
         if !self.is_attach {
-            if let Some(pid) = launched_pid {
-                let p = nix::unistd::Pid::from_raw(pid as i32);
-                if nix::sys::signal::kill(p, None).is_ok() {
-                    let _ = nix::sys::signal::kill(p, nix::sys::signal::Signal::SIGKILL);
-                }
+            let identity = {
+                let (lock, _) = &*self.state;
+                lock.lock().unwrap().launched_identity
+            };
+            if let (Some(pid), Some(identity)) = (launched_pid, identity) {
+                kill_owned_process_tree(pid, identity);
             }
         }
     }
@@ -1307,9 +1452,24 @@ impl Drop for DapTransport {
     fn drop(&mut self) {
         self.shutdown.store(true, Ordering::Relaxed);
         let _ = self.driver_tx.send(DriverCmd::Shutdown);
+        // Capture adapter descendants before killing the adapter. A launch
+        // can have started its debuggee while the handshake is still in
+        // progress, before the DAP `process` event has been dispatched.
+        let adapter_descendants = capture_owned_descendants(self.child_pid.as_raw() as u32);
         if let Some(mut child) = self.child.lock().unwrap().take() {
             let _ = child.kill();
             let _ = child.wait();
+        }
+        kill_captured_processes(adapter_descendants);
+        if !self.is_attach {
+            let launched = {
+                let (lock, _) = &*self.state;
+                let state = lock.lock().unwrap();
+                state.launched_pid.zip(state.launched_identity)
+            };
+            if let Some((pid, identity)) = launched {
+                kill_owned_process_tree(pid, identity);
+            }
         }
     }
 }
@@ -1508,7 +1668,7 @@ fn driver_loop(
 ) {
     // Inbound buffer holds bytes that arrived but didn't yet form a
     // complete Content-Length-framed message.
-    let mut inbox: Vec<u8> = Vec::with_capacity(16 * 1024);
+    let mut decoder = DapFrameDecoder::new();
     let mut next_seq: i64 = 1;
     let mut pending: HashMap<i64, (String, Sender<Result<Value, String>>)> = HashMap::new();
     loop {
@@ -1525,7 +1685,7 @@ fn driver_loop(
                     mark_dead(&state);
                     return;
                 }
-                Ok(n) => inbox.extend_from_slice(&buf[..n]),
+                Ok(n) => decoder.inbox.extend_from_slice(&buf[..n]),
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
                 Err(_) => {
                     drain_pending(&mut pending);
@@ -1537,8 +1697,8 @@ fn driver_loop(
 
         // Parse as many complete messages as are in the inbox.
         loop {
-            match take_frame(&mut inbox) {
-                Some(bytes) => {
+            match decoder.next_frame() {
+                Ok(Some(bytes)) => {
                     if let Ok(v) = serde_json::from_slice::<Value>(&bytes) {
                         dispatch_incoming(
                             v,
@@ -1550,7 +1710,8 @@ fn driver_loop(
                         );
                     }
                 }
-                None => break,
+                Ok(None) => break,
+                Err(_) => continue,
             }
         }
 
@@ -1611,23 +1772,114 @@ fn mark_dead(state: &Arc<(Mutex<State>, Condvar)>) {
     cvar.notify_all();
 }
 
-fn take_frame(inbox: &mut Vec<u8>) -> Option<Vec<u8>> {
-    // Find header/body boundary.
-    let hdr_end = inbox.windows(4).position(|w| w == b"\r\n\r\n")?;
-    let header_s = std::str::from_utf8(&inbox[..hdr_end]).ok()?;
-    let mut content_length = 0usize;
-    for line in header_s.split("\r\n") {
-        if let Some(rest) = line.strip_prefix("Content-Length:") {
-            content_length = rest.trim().parse().ok()?;
+struct DapFrameDecoder {
+    inbox: Vec<u8>,
+    /// An oversized frame has no safe, bounded body buffer. Once its
+    /// header is rejected, scan for the next header marker instead of
+    /// trusting its declared length, which could be `usize::MAX`.
+    resync_oversized: bool,
+}
+
+impl DapFrameDecoder {
+    fn new() -> Self {
+        Self {
+            inbox: Vec::with_capacity(16 * 1024),
+            resync_oversized: false,
         }
     }
-    let total = hdr_end + 4 + content_length;
-    if inbox.len() < total {
-        return None;
+
+    fn next_frame(&mut self) -> Result<Option<Vec<u8>>, &'static str> {
+        // Do not discard an attacker-controlled number of bytes. A hostile
+        // oversized length can be usize::MAX, and waiting for that declared
+        // boundary would consume every later valid frame. Resynchronize at
+        // the next plausible DAP header while retaining only a bounded
+        // suffix when the marker has not arrived yet.
+        if self.resync_oversized {
+            const CONTENT_LENGTH: &[u8] = b"Content-Length:";
+            if let Some(pos) = self
+                .inbox
+                .windows(CONTENT_LENGTH.len())
+                .position(|window| window == CONTENT_LENGTH)
+            {
+                self.inbox.drain(..pos);
+                self.resync_oversized = false;
+            } else {
+                let keep = CONTENT_LENGTH.len().saturating_sub(1);
+                let discard = self.inbox.len().saturating_sub(keep);
+                if discard > 0 {
+                    self.inbox.drain(..discard);
+                }
+                return Ok(None);
+            }
+        }
+
+        let Some(hdr_end) = self.inbox.windows(4).position(|w| w == b"\r\n\r\n") else {
+            if self.inbox.len() > MAX_DAP_HEADER_BYTES {
+                let keep = self
+                    .inbox
+                    .windows(b"Content-Length:".len())
+                    .rposition(|w| w == b"Content-Length:")
+                    .unwrap_or(self.inbox.len().saturating_sub(b"Content-Length:".len()));
+                self.inbox.drain(..keep);
+                return Err("DAP header exceeded maximum size");
+            }
+            return Ok(None);
+        };
+        if hdr_end > MAX_DAP_HEADER_BYTES {
+            self.inbox.drain(..hdr_end + 4);
+            return Err("DAP header exceeded maximum size");
+        }
+        let header_s = match std::str::from_utf8(&self.inbox[..hdr_end]) {
+            Ok(s) => s,
+            Err(_) => {
+                self.inbox.drain(..hdr_end + 4);
+                return Err("DAP header is not valid UTF-8");
+            }
+        };
+        let mut content_length = None;
+        for line in header_s.split("\r\n") {
+            if let Some(rest) = line.strip_prefix("Content-Length:") {
+                if content_length.is_some() {
+                    self.inbox.drain(..hdr_end + 4);
+                    return Err("duplicate DAP Content-Length header");
+                }
+                let parsed = match rest.trim().parse::<usize>() {
+                    Ok(length) => length,
+                    Err(_) => {
+                        self.inbox.drain(..hdr_end + 4);
+                        return Err("invalid DAP Content-Length");
+                    }
+                };
+                content_length = Some(parsed);
+            }
+        }
+        let Some(content_length) = content_length else {
+            self.inbox.drain(..hdr_end + 4);
+            return Err("missing DAP Content-Length header");
+        };
+        if content_length > MAX_DAP_FRAME_BYTES {
+            self.inbox.drain(..hdr_end + 4);
+            self.resync_oversized = true;
+            return Err("DAP frame exceeds maximum size");
+        }
+        let total = hdr_end + 4 + content_length;
+        if self.inbox.len() < total {
+            return Ok(None);
+        }
+        let body = self.inbox[hdr_end + 4..total].to_vec();
+        self.inbox.drain(..total);
+        Ok(Some(body))
     }
-    let body = inbox[hdr_end + 4..total].to_vec();
-    inbox.drain(..total);
-    Some(body)
+}
+
+fn take_frame(inbox: &mut Vec<u8>) -> Option<Vec<u8>> {
+    let mut decoder = DapFrameDecoder {
+        inbox: std::mem::take(inbox),
+        resync_oversized: false,
+    };
+    let frame = decoder.next_frame().ok().flatten();
+    *inbox = decoder.inbox;
+    frame
 }
 
 fn write_frame(stream: &mut TcpStream, frame: &Value) -> std::io::Result<()> {
@@ -1639,6 +1891,7 @@ fn write_frame(stream: &mut TcpStream, frame: &Value) -> std::io::Result<()> {
     to_write.extend_from_slice(header.as_bytes());
     to_write.extend_from_slice(bytes);
     let mut written = 0;
+    let deadline = Instant::now() + DAP_WRITE_TIMEOUT;
     while written < to_write.len() {
         match stream.write(&to_write[written..]) {
             Ok(0) => {
@@ -1649,6 +1902,12 @@ fn write_frame(stream: &mut TcpStream, frame: &Value) -> std::io::Result<()> {
             }
             Ok(n) => written += n,
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                if Instant::now() >= deadline {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "DAP write remained blocked past its deadline",
+                    ));
+                }
                 std::thread::sleep(Duration::from_millis(2));
             }
             Err(e) => return Err(e),
@@ -1695,12 +1954,26 @@ fn dispatch_incoming(
                 }
                 "stopped" => {
                     let thread_id = body.get("threadId").and_then(|v| v.as_i64());
-                    {
+                    let stop_generation = {
                         let (lock, _) = &**state;
                         let mut s = lock.lock().unwrap();
                         s.paused = true;
                         s.current_thread = thread_id;
-                    }
+                        s.stop_generation = s.stop_generation.wrapping_add(1);
+                        // Publish ownership of the stop before the
+                        // asynchronous stackTrace helper returns. A late
+                        // stop must remain available to the next action,
+                        // but its delayed helper must not create a hit for
+                        // a later continue.
+                        s.pending_hit = Some(HitEvent {
+                            location_key: thread_id
+                                .map(|id| format!("dap:thread:{id}"))
+                                .unwrap_or_else(|| "dap:thread:?".into()),
+                            thread: thread_id.map(|id| id.to_string()),
+                            ..HitEvent::default()
+                        });
+                        s.stop_generation
+                    };
                     if let Some(tid) = thread_id {
                         // Fire an out-of-band stackTrace request so the
                         // handler can build a structured HitEvent. We
@@ -1722,7 +1995,7 @@ fn dispatch_incoming(
                         let state2 = state.clone();
                         std::thread::spawn(move || {
                             if let Ok(Ok(body)) = rx.recv_timeout(Duration::from_secs(5)) {
-                                handle_stack_response(body, &state2);
+                                handle_stack_response(body, &state2, stop_generation);
                             }
                         });
                     }
@@ -1774,6 +2047,7 @@ fn dispatch_incoming(
                         let (lock, _) = &**state;
                         let mut s = lock.lock().unwrap();
                         s.launched_pid = Some(spid);
+                        s.launched_identity = process_identity(spid);
                     }
                 }
                 _ => {}
@@ -1783,7 +2057,11 @@ fn dispatch_incoming(
     }
 }
 
-fn handle_stack_response(body: Value, state: &Arc<(Mutex<State>, Condvar)>) {
+fn handle_stack_response(
+    body: Value,
+    state: &Arc<(Mutex<State>, Condvar)>,
+    stop_generation: u64,
+) {
     let frames = body
         .get("stackFrames")
         .and_then(|v| v.as_array())
@@ -1817,9 +2095,17 @@ fn handle_stack_response(body: Value, state: &Arc<(Mutex<State>, Condvar)>) {
     });
     let (lock, cvar) = &**state;
     let mut s = lock.lock().unwrap();
+    // A stack helper owns exactly the stop event which created it. If the
+    // daemon already consumed that stop, or another stop arrived, this
+    // delayed response must not create a hit for a later continue.
+    if s.stop_generation != stop_generation || s.pending_hit.is_none() {
+        return;
+    }
     s.call_frames = frames;
     s.top_frame = top;
-    s.pending_hit = hit;
+    if let Some(hit) = hit {
+        s.pending_hit = Some(hit);
+    }
     cvar.notify_all();
 }
 
@@ -1994,6 +2280,91 @@ mod tests {
     fn take_frame_returns_none_when_incomplete() {
         let mut inbox = b"Content-Length: 10\r\n\r\n{}".to_vec();
         assert!(take_frame(&mut inbox).is_none());
+    }
+
+    #[test]
+    fn framing_rejects_bad_headers_and_keeps_the_next_frame() {
+        let valid = b"Content-Length: 2\r\n\r\n{}";
+        for bad in [
+            b"Content-Length: nope\r\n\r\n".as_slice(),
+            b"Content-Length: 2\r\nX: \xff\r\n\r\n".as_slice(),
+        ] {
+            let mut decoder = DapFrameDecoder::new();
+            decoder.inbox.extend_from_slice(bad);
+            decoder.inbox.extend_from_slice(valid);
+            assert!(decoder.next_frame().is_err());
+            assert_eq!(decoder.next_frame().unwrap().as_deref(), Some(&b"{}"[..]));
+        }
+    }
+
+    #[test]
+    fn framing_discards_oversized_body_before_resynchronizing() {
+        let mut decoder = DapFrameDecoder::new();
+        let header = format!("Content-Length: {}\r\n\r\n", MAX_DAP_FRAME_BYTES + 1);
+        decoder.inbox.extend_from_slice(header.as_bytes());
+        decoder
+            .inbox
+            .extend(std::iter::repeat(b'x').take(MAX_DAP_FRAME_BYTES + 1));
+        decoder.inbox.extend_from_slice(b"Content-Length: 2\r\n\r\n{}");
+        assert!(decoder.next_frame().is_err());
+        assert_eq!(decoder.next_frame().unwrap().as_deref(), Some(&b"{}"[..]));
+    }
+
+    #[test]
+    fn framing_resynchronizes_after_an_oversized_length_without_waiting_for_it() {
+        let mut decoder = DapFrameDecoder::new();
+        decoder
+            .inbox
+            .extend_from_slice(b"Content-Length: 18446744073709551615\r\n\r\n");
+        decoder.inbox.extend_from_slice(b"Content-Length: 2\r\n\r\n{}");
+
+        assert!(decoder.next_frame().is_err());
+        assert_eq!(decoder.next_frame().unwrap().as_deref(), Some(&b"{}"[..]));
+    }
+
+    #[test]
+    fn oversized_resynchronization_keeps_memory_bounded_between_chunks() {
+        let mut decoder = DapFrameDecoder::new();
+        decoder
+            .inbox
+            .extend_from_slice(b"Content-Length: 999999999999999999\r\n\r\n");
+        assert!(decoder.next_frame().is_err());
+
+        decoder.inbox.extend(std::iter::repeat(b'x').take(1_000_000));
+        assert!(decoder.next_frame().unwrap().is_none());
+        assert!(decoder.inbox.len() < b"Content-Length:".len());
+
+        decoder.inbox.extend_from_slice(b"Content-Length: 2\r\n\r\n{}");
+        assert_eq!(decoder.next_frame().unwrap().as_deref(), Some(&b"{}"[..]));
+    }
+
+    #[test]
+    fn a_consumed_stop_cannot_be_recreated_by_a_late_stack_helper() {
+        let state = Arc::new((Mutex::new(State::new()), Condvar::new()));
+        {
+            let (lock, _) = &*state;
+            let mut guard = lock.lock().unwrap();
+            guard.stop_generation = 7;
+            guard.pending_hit = Some(HitEvent::default());
+        }
+        let body = json!({
+            "stackFrames": [{
+                "name": "old_stop",
+                "line": 10,
+                "source": { "path": "old.rs" }
+            }]
+        });
+        handle_stack_response(body.clone(), &state, 7);
+        {
+            let (lock, _) = &*state;
+            assert_eq!(lock.lock().unwrap().pending_hit.take().unwrap().file.as_deref(), Some("old.rs"));
+        }
+
+        // The daemon consumed the stop and began a later action. A delayed
+        // helper from the earlier stop must not repopulate pending state.
+        handle_stack_response(body, &state, 7);
+        let (lock, _) = &*state;
+        assert!(lock.lock().unwrap().pending_hit.is_none());
     }
 
     #[test]

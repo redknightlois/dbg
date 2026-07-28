@@ -38,6 +38,17 @@ use tungstenite::stream::MaybeTlsStream;
 use crate::backend::canonical::HitEvent;
 use crate::pty::{DebuggerIo, EventKind, LogHandle};
 
+struct SpawnedChildGuard(Option<Child>);
+
+impl Drop for SpawnedChildGuard {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.0.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
 /// Tracks conversation state on the inspector socket. Protected by a
 /// mutex + condvar so `send_and_wait` callers on the daemon side can
 /// block until the driver thread records a state transition.
@@ -66,6 +77,8 @@ struct State {
     /// own contexts during a healthy run, and we must not mark the
     /// whole session dead in that case.
     main_context_id: Option<i64>,
+    action_generation: u64,
+    stop_generation: u64,
 }
 
 impl State {
@@ -79,6 +92,8 @@ impl State {
             breakpoints: HashMap::new(),
             alive: true,
             main_context_id: None,
+            action_generation: 0,
+            stop_generation: 0,
         }
     }
 }
@@ -93,6 +108,9 @@ impl crate::transport_common::StopState for State {
     }
     fn alive(&self) -> bool {
         self.alive
+    }
+    fn stop_generation(&self) -> u64 {
+        self.stop_generation
     }
 }
 
@@ -137,7 +155,8 @@ impl InspectorTransport {
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        let mut child = cmd.spawn().context("failed to spawn node")?;
+        let mut child_guard = SpawnedChildGuard(Some(cmd.spawn().context("failed to spawn node")?));
+        let child = child_guard.0.as_mut().expect("child guard is populated");
         let child_pid = Pid::from_raw(child.id() as i32);
 
         let stderr = child.stderr.take().context("missing node stderr")?;
@@ -188,7 +207,7 @@ impl InspectorTransport {
 
         let transport = Self {
             child_pid,
-            child: Mutex::new(Some(child)),
+            child: Mutex::new(Some(child_guard.0.take().expect("child guard is populated"))),
             driver_tx,
             log,
             state,
@@ -369,6 +388,11 @@ impl InspectorTransport {
     /// any, lands in `state.pending_hit` for the daemon to drain via
     /// `pending_hit()`.
     fn exec<F: FnOnce(&Self) -> Result<Value>>(&self, f: F, timeout: Duration) -> Result<String> {
+        {
+            let (lock, _) = &*self.state;
+            let mut s = lock.lock().unwrap();
+            s.action_generation = s.action_generation.wrapping_add(1);
+        }
         crate::transport_common::wait_for_stop(
             &self.state,
             || f(self).map(|_| ()),
@@ -1077,6 +1101,7 @@ fn dispatch_incoming(
             let (lock, cvar) = &**state;
             let mut s = lock.lock().unwrap();
             s.paused = true;
+            s.stop_generation = s.stop_generation.wrapping_add(1);
             s.call_frames = call_frames;
             s.pending_hit = Some(hit);
             cvar.notify_all();
