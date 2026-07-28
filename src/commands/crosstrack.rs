@@ -13,7 +13,7 @@ use std::path::Path;
 use anyhow::Result;
 use dbg_cli::session_db::{
     CollectCtx, CollectTrigger, LiveDebugger, OnDemandCollector, SessionDb, TargetClass,
-    collectors::disasm::{JitDasmCollector, LldbDisassembleCollector},
+    collectors::disasm::{GoDisassCollector, JitDasmCollector, LldbDisassembleCollector},
     persist_disasm,
 };
 use rusqlite::{OptionalExtension, params};
@@ -838,14 +838,57 @@ fn cmd_disasm(db: &SessionDb, ctx: &RunCtx<'_>, symbol: Option<&str>, refresh: b
         },
     };
 
+    // Replay has no debugger transport. Read the row that belongs to this
+    // session instead of falling through to a shell-out collector. This also
+    // keeps a mixed database from leaking another session's disassembly.
+    if ctx.live.is_none() {
+        if refresh {
+            return "replay is read-only: disassembly refresh requires a live session".into();
+        }
+        let cached: Option<(String, String, Option<String>, Option<i64>)> = db
+            .conn()
+            .query_row(
+                "SELECT d.asm_text, d.source, d.tier, d.code_bytes
+                 FROM disassembly d
+                 JOIN symbols s ON s.id = d.symbol_id
+                 WHERE d.session_id = (SELECT id FROM sessions LIMIT 1)
+                   AND (s.fqn = ?1 OR s.raw = ?1 OR s.demangled = ?1)
+                 ORDER BY d.id DESC LIMIT 1",
+                params![sym],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .optional()
+            .ok()
+            .flatten();
+        return match cached {
+            Some((asm_text, source, tier, code_bytes)) => {
+                let mut header = format!("[via cached {source}] disasm {sym}");
+                if let Some(tier) = tier.as_deref() {
+                    header.push_str(&format!(" ({tier})"));
+                }
+                if let Some(bytes) = code_bytes {
+                    header.push_str(&format!(" — {bytes} bytes"));
+                }
+                format!("{header}\n{asm_text}")
+            }
+            None => "replay is read-only: no cached disassembly exists for that symbol".into(),
+        };
+    }
+
     let collector: Box<dyn OnDemandCollector> = match ctx.target_class {
         TargetClass::ManagedDotnet => Box::new(JitDasmCollector),
         TargetClass::NativeCpu => {
-            // Go vs C/Rust: prefer go-objdump when the target file
-            // claims to be a Go binary (cheap heuristic: extension
-            // unlikely, so rely on user explicitly passing `--tool=go`
-            // in future). Default lldb for now.
-            Box::new(LldbDisassembleCollector)
+            let backend = db
+                .conn()
+                .query_row("SELECT value FROM meta WHERE key='backend'", [], |r| {
+                    r.get::<_, String>(0)
+                })
+                .unwrap_or_default();
+            if backend.contains("delve") || backend.contains("go") {
+                Box::new(GoDisassCollector)
+            } else {
+                Box::new(LldbDisassembleCollector)
+            }
         }
         _ => {
             return format!(
@@ -869,7 +912,7 @@ fn cmd_disasm(db: &SessionDb, ctx: &RunCtx<'_>, symbol: Option<&str>, refresh: b
         Err(e) => return format!("[disasm {}: {e}]", collector.kind()),
     };
     if let Err(e) = persist_disasm(db, &collect_ctx, &output) {
-        eprintln!("[dbg] warning: disasm persist failed: {e}");
+        return format!("[disasm persistence failed: {e}]\n{}", output.asm_text);
     }
 
     let mut header = format!(
@@ -1441,6 +1484,44 @@ mod tests {
             !out.contains("source snapshots:0"),
             "source-snapshots line regressed to the unspaced form:\n{out}"
         );
+    }
+
+    #[test]
+    fn replay_disasm_reads_only_cached_session_rows() {
+        let tmp = TempDir::new().unwrap();
+        let (db, cwd) = db_and_ctx(&tmp);
+        db.conn()
+            .execute(
+                "INSERT INTO symbols (session_id, lang, fqn, raw)
+                 VALUES ((SELECT id FROM sessions LIMIT 1), 'cpp', 'foo', 'foo')",
+                [],
+            )
+            .unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO disassembly
+                    (session_id, symbol_id, source, asm_text, collected_at)
+                 VALUES ((SELECT id FROM sessions LIMIT 1),
+                         (SELECT id FROM symbols LIMIT 1), 'test', 'mov r0, r1', datetime('now'))",
+                [],
+            )
+            .unwrap();
+        let ctx = RunCtx {
+            target: "./app",
+            target_class: TargetClass::NativeCpu,
+            cwd: &cwd,
+            live: None,
+        };
+        let out = run(
+            &Query::Disasm {
+                symbol: Some("foo".into()),
+                refresh: false,
+            },
+            &db,
+            &ctx,
+        );
+        assert!(out.contains("via cached test"), "{out}");
+        assert!(out.contains("mov r0, r1"), "{out}");
     }
 
     // Regression for X1: the indexer may store a fully-qualified name

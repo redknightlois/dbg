@@ -162,6 +162,8 @@ pub trait Backend: Send + Sync {
 #[derive(Clone, Debug, Default)]
 pub struct AttachSpec {
     pub pid: Option<u32>,
+    /// An already-running DAP adapter endpoint, in `host:port` form.
+    pub port: Option<String>,
 }
 
 /// Path to the current dbg binary, for exec-ing into sub-REPLs.

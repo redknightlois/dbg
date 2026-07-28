@@ -83,6 +83,18 @@ where
         let r = cvar.wait_timeout(guard, remaining).unwrap();
         guard = r.0;
     }
+    let accepted = guard.has_pending_hit()
+        && guard.stop_generation() > baseline
+        && (guard.pending_is_unscoped()
+            || guard.pending_action_generation() >= guard.action_generation());
+    if !accepted {
+        if guard.terminated() {
+            bail!("debugger terminated before reporting a stopped event");
+        }
+        if !guard.alive() {
+            bail!("debugger connection closed before reporting a stopped event");
+        }
+    }
     Ok(String::new())
 }
 

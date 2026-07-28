@@ -31,6 +31,11 @@ fn should_wake_accept_after_release(previous: usize) -> bool {
 }
 
 fn cleanup_and_exit(keep_session_tmp: bool) -> ! {
+    cleanup_runtime_state(keep_session_tmp);
+    std::process::exit(0);
+}
+
+fn cleanup_runtime_state(keep_session_tmp: bool) {
     let me = session_slug();
     let _ = std::fs::remove_file(socket_path());
     let _ = std::fs::remove_file(pid_path());
@@ -43,7 +48,12 @@ fn cleanup_and_exit(keep_session_tmp: bool) -> ! {
     // mustn't blow away its pointer.
     clear_latest_pointer_if_owner(&me);
     cleanup_session_tmp(keep_session_tmp);
-    std::process::exit(0);
+}
+
+/// Remove state published before backend initialization completed.
+/// Called by the forked child when `run_daemon` returns an error.
+pub fn cleanup_after_startup_error() {
+    cleanup_runtime_state(false);
 }
 
 fn cleanup_session_tmp(keep_session_tmp: bool) {
@@ -533,8 +543,10 @@ impl LiveDebugger for ProcLive<'_> {
 /// for those, not driving any per-class domain tables.
 fn backend_target_class(name: &str) -> TargetClass {
     match name {
-        "pdb" => TargetClass::Python,
-        "netcoredbg" | "dotnet-trace" | "jitdasm" => TargetClass::ManagedDotnet,
+        "pdb" | "debugpy-proto" => TargetClass::Python,
+        "netcoredbg" | "netcoredbg-proto" | "dotnet-trace" | "jitdasm" => {
+            TargetClass::ManagedDotnet
+        }
         "jdb" => TargetClass::Jvm,
         "node-inspect" | "nodeprof" | "node-proto" => TargetClass::JsNode,
         "rdbg" | "stackprof" => TargetClass::Ruby,
@@ -603,7 +615,18 @@ pub fn is_profile_repl_verb(cmd: &str) -> bool {
 /// disambiguation matches what `ProfileData::load` would have used on
 /// the original path.
 fn persist_profile_source(db: &SessionDb, src: &Path) -> Result<()> {
-    let content = std::fs::read_to_string(src)
+    const MAX_PROFILE_SOURCE_BYTES: u64 = 256 * 1024 * 1024;
+    let metadata =
+        std::fs::metadata(src).with_context(|| format!("stat profile source {}", src.display()))?;
+    if metadata.len() > MAX_PROFILE_SOURCE_BYTES {
+        anyhow::bail!(
+            "profile source {} is too large ({} bytes; maximum is {} bytes)",
+            src.display(),
+            metadata.len(),
+            MAX_PROFILE_SOURCE_BYTES
+        );
+    }
+    let content = crate::profile::read_bounded_text(src, MAX_PROFILE_SOURCE_BYTES)
         .with_context(|| format!("reading profile source {}", src.display()))?;
     db.set_meta("profile_raw", &content)?;
     if let Some(ext) = src.extension().and_then(|e| e.to_str()) {
@@ -681,7 +704,8 @@ pub fn run_daemon(
     let log_handle = proc.log();
 
     // Wait for initial prompt
-    proc.wait_for_prompt(Duration::from_secs(120))
+    let startup_output = proc
+        .wait_for_prompt(Duration::from_secs(120))
         .context("debugger did not produce prompt")?;
 
     // Publish pid + socket BEFORE running init commands. Backends
@@ -787,6 +811,7 @@ pub fn run_daemon(
         target_hash: None,
     }) {
         Ok(db) => {
+            db.set_meta("backend", backend.name())?;
             // Profile sessions need their source content stashed in the
             // DB so `dbg replay` can rehydrate top/callers/callees from
             // a saved session. The raw file is on a tmp path that won't
@@ -820,6 +845,13 @@ pub fn run_daemon(
         cwd: cwd.clone(),
         target_class,
     });
+
+    // Consume a protocol entry stop (or a PTY stop banner) at startup. This
+    // makes the entry stop observable exactly once and prevents the first
+    // user execution command from treating it as its own result.
+    if let Ok(mut session_guard) = session.lock() {
+        capture_hit_if_stopped(&mut session_guard, backend, &startup_output);
+    }
 
     if shutdown_requested.load(Ordering::Acquire) {
         let (_, keep_session_tmp) =
@@ -3403,6 +3435,7 @@ mod tests {
             launch_verb: "launch".into(),
             launch_args: serde_json::json!({"request": "launch"}),
             preassigned_addr: None,
+            connect_addr: None,
             debuggee_pid: None,
         })
         .unwrap();
@@ -3836,6 +3869,34 @@ mod tests {
     }
 
     #[test]
+    fn startup_error_cleanup_removes_published_runtime_state() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = TempDir::new().unwrap();
+        unsafe {
+            std::env::set_var("XDG_RUNTIME_DIR", tmp.path());
+            std::env::set_var("DBG_SESSION", "failed-startup");
+        }
+
+        let slug = session_slug();
+        std::fs::write(socket_path(), "socket").unwrap();
+        std::fs::write(pid_path(), "123").unwrap();
+        write_latest_pointer(&slug);
+        let evidence = session_tmp("partial.data");
+        std::fs::write(&evidence, "partial").unwrap();
+
+        cleanup_after_startup_error();
+
+        assert!(!socket_path().exists());
+        assert!(!pid_path().exists());
+        assert!(!latest_pointer_path().exists());
+        assert!(!evidence.parent().unwrap().exists());
+        unsafe {
+            std::env::remove_var("DBG_SESSION");
+            std::env::remove_var("XDG_RUNTIME_DIR");
+        }
+    }
+
+    #[test]
     fn live_slugs_in_cwd_enumerates_peers() {
         let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let tmp = TempDir::new().unwrap();
@@ -4205,8 +4266,13 @@ mod tests {
         assert_eq!(backend_target_class("lldb"), TargetClass::NativeCpu);
         assert_eq!(backend_target_class("delve"), TargetClass::NativeCpu);
         assert_eq!(backend_target_class("pdb"), TargetClass::Python);
+        assert_eq!(backend_target_class("debugpy-proto"), TargetClass::Python);
         assert_eq!(
             backend_target_class("netcoredbg"),
+            TargetClass::ManagedDotnet
+        );
+        assert_eq!(
+            backend_target_class("netcoredbg-proto"),
             TargetClass::ManagedDotnet
         );
         assert_eq!(backend_target_class("jdb"), TargetClass::Jvm);

@@ -22,7 +22,7 @@ use std::collections::HashMap;
 use std::io::{BufRead, BufReader};
 use std::net::TcpStream;
 use std::os::fd::AsRawFd;
-use std::process::{Child, ChildStderr, Command, Stdio};
+use std::process::{Child, ChildStderr, ChildStdout, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::sync::{Arc, Condvar, Mutex};
@@ -34,6 +34,8 @@ use nix::unistd::Pid;
 use serde_json::{Value, json};
 use tungstenite::stream::MaybeTlsStream;
 use tungstenite::{Message, WebSocket};
+
+const MAX_INSPECTOR_PENDING_REQUESTS: usize = 4096;
 
 use crate::backend::canonical::HitEvent;
 use crate::pty::{DebuggerIo, EventKind, LogHandle};
@@ -170,7 +172,7 @@ impl InspectorTransport {
         let stderr = child.stderr.take().context("missing node stderr")?;
         // Claim stdout from the Child so it closes cleanly on Drop.
         // Not piped into the event log — see comment below.
-        let _stdout = child.stdout.take().context("missing node stdout")?;
+        let stdout = child.stdout.take().context("missing node stdout")?;
 
         // Scrape the ws URL from stderr. Node emits
         //   "Debugger listening on ws://127.0.0.1:PORT/UUID"
@@ -186,6 +188,7 @@ impl InspectorTransport {
         set_nonblocking(&mut ws)?;
 
         let log = LogHandle::new();
+        spawn_stdout_drain(stdout, log.clone());
         let state = Arc::new((Mutex::new(State::new()), Condvar::new()));
         let shutdown = Arc::new(AtomicBool::new(false));
         let (driver_tx, driver_rx) = mpsc::channel::<DriverCmd>();
@@ -427,6 +430,14 @@ impl InspectorTransport {
         cond: Option<&str>,
         timeout: Duration,
     ) -> Result<String> {
+        if let Some(condition) = cond {
+            if condition.trim().is_empty()
+                || condition.len() > 256 * 1024
+                || condition.chars().any(|c| c.is_control() && c != '\t')
+            {
+                bail!("invalid breakpoint condition");
+            }
+        }
         match bp {
             ParsedSb::FileLine { file, line } => {
                 // Inspector wants `url` or `urlRegex`. Node reports
@@ -864,8 +875,11 @@ impl DebuggerIo for InspectorTransport {
             {
                 let (lock, _) = &*self.state;
                 let s = lock.lock().unwrap();
-                if s.paused || !s.alive {
+                if s.paused {
                     return Ok(String::new());
+                }
+                if !s.alive {
+                    bail!("node terminated before the required entry stop");
                 }
             }
             if Instant::now() >= deadline {
@@ -992,7 +1006,25 @@ fn extract_ws_url(line: &str) -> Option<String> {
     let start = line.find("ws://")?;
     let tail = &line[start..];
     let end = tail.find(char::is_whitespace).unwrap_or(tail.len());
-    Some(tail[..end].to_string())
+    let url = &tail[..end];
+    let authority = url.strip_prefix("ws://")?.split('/').next()?;
+    let (host, port) = authority.rsplit_once(':')?;
+    if host.is_empty() || port.parse::<u16>().ok().filter(|p| *p != 0).is_none() {
+        return None;
+    }
+    Some(url.to_string())
+}
+
+fn spawn_stdout_drain(mut stdout: ChildStdout, log: LogHandle) {
+    std::thread::spawn(move || {
+        let mut buf = [0u8; 4096];
+        loop {
+            match std::io::Read::read(&mut stdout, &mut buf) {
+                Ok(0) | Err(_) => return,
+                Ok(n) => log.push(EventKind::Stdout, buf[..n].to_vec()),
+            }
+        }
+    });
 }
 
 fn set_nonblocking(ws: &mut WebSocket<MaybeTlsStream<TcpStream>>) -> Result<()> {
@@ -1068,6 +1100,10 @@ fn driver_loop(
                     params,
                     resp,
                 }) => {
+                    if pending.len() >= MAX_INSPECTOR_PENDING_REQUESTS {
+                        let _ = resp.send(Err("Inspector request queue is full".into()));
+                        continue;
+                    }
                     let id = next_id;
                     next_id += 1;
                     let frame = json!({ "id": id, "method": method, "params": params });
@@ -1294,7 +1330,10 @@ fn parse_sb(cmd: &str) -> Option<(ParsedSb, Option<String>)> {
     // Optionally followed by ` if <expr>`.
     let rest = cmd.strip_prefix("sb(")?;
     let (inner, cond) = match rest.find(") if ") {
-        Some(i) => (&rest[..i], Some(rest[i + 5..].trim().to_string())),
+        Some(i) if !rest[i + 5..].trim().is_empty() => {
+            (&rest[..i], Some(rest[i + 5..].trim().to_string()))
+        }
+        Some(_) => return None,
         None => (rest.strip_suffix(')')?, None),
     };
     let inner = inner.trim();
@@ -1302,13 +1341,26 @@ fn parse_sb(cmd: &str) -> Option<(ParsedSb, Option<String>)> {
         return None;
     }
     let parsed = if let Some((a, b)) = inner.split_once(',') {
+        if b.contains(',') {
+            return None;
+        }
         let file = a.trim().trim_matches('\'').trim_matches('"').to_string();
         let line: u32 = b.trim().parse().ok()?;
+        if line == 0 || file.is_empty() {
+            return None;
+        }
         ParsedSb::FileLine { file, line }
     } else if let Ok(line) = inner.parse::<u32>() {
+        if line == 0 {
+            return None;
+        }
         ParsedSb::Line(line)
     } else {
-        let name = inner.trim_matches('\'').trim_matches('"').to_string();
+        let name = inner.trim_matches('\'').trim_matches('"').trim();
+        if name.is_empty() || name.chars().any(|c| c.is_control()) {
+            return None;
+        }
+        let name = name.to_string();
         ParsedSb::Name(name)
     };
     Some((parsed, cond))

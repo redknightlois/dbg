@@ -566,13 +566,6 @@ fn replay_eval(
     match commands::dispatch_no_backend(cmd) {
         Some(commands::Dispatched::Immediate(s)) => s,
         Some(commands::Dispatched::Query(q)) => {
-            if matches!(
-                q,
-                commands::crosstrack::Query::Disasm { .. }
-                    | commands::crosstrack::Query::AtHitDisasm
-            ) {
-                return "replay is read-only: disassembly collection is unavailable; use cached disasm rows or run `dbg disasm` in a live session".into();
-            }
             let ctx = commands::crosstrack::RunCtx {
                 target,
                 target_class,
@@ -847,7 +840,9 @@ fn autodetect_backend(target: &str) -> Option<&'static str> {
     } else if lower.ends_with(".php") {
         Some("phpdbg")
     } else if lower.ends_with(".csproj") {
-        Some("netcoredbg")
+        // The protocol backend is the headless path. The legacy PTY
+        // backend is not reliable for a non-interactive daemon.
+        Some("netcoredbg-proto")
     } else if lower.ends_with(".js") || lower.ends_with(".mjs") || lower.ends_with(".ts") {
         Some("node-proto")
     } else if lower.ends_with(".hs") {
@@ -867,6 +862,7 @@ struct ParsedStartFlags {
     run_args: Vec<String>,
     do_run: bool,
     attach_pid: Option<u32>,
+    attach_port: Option<String>,
 }
 
 /// Parse the trailing flag tail of `dbg start <type> <target> …`.
@@ -874,6 +870,7 @@ struct ParsedStartFlags {
 ///   - `--break SPEC` / `-b SPEC`: append to `breakpoints`.
 ///   - `--run` / `-r`: set `do_run`.
 ///   - `--attach-pid N` / `--attach-pid=N`: set `attach_pid`.
+///   - `--attach-port H:P` / `--attach-port=H:P`: connect to an existing DAP adapter.
 ///   - `--args …`: forward everything that follows to the debuggee.
 ///     Bails if a known dbg flag (`--break`, `--run`, `--attach-pid`,
 ///     `--attach-port`) appears after `--args` — that misroute used
@@ -884,14 +881,16 @@ fn parse_start_flags(args: &[String]) -> Result<ParsedStartFlags> {
     let mut run_args = Vec::new();
     let mut do_run = false;
     let mut attach_pid: Option<u32> = None;
+    let mut attach_port: Option<String> = None;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
             "--break" | "-b" => {
                 i += 1;
-                if i < args.len() {
-                    breakpoints.push(args[i].clone());
+                if i >= args.len() || args[i].trim().is_empty() {
+                    bail!("--break requires a breakpoint specification");
                 }
+                breakpoints.push(args[i].clone());
             }
             "--args" | "-a" => {
                 // Everything after `--args` belongs to the debuggee,
@@ -935,6 +934,13 @@ fn parse_start_flags(args: &[String]) -> Result<ParsedStartFlags> {
                     bail!("--attach-pid requires a PID");
                 }
             }
+            "--attach-port" => {
+                i += 1;
+                if i >= args.len() || args[i].trim().is_empty() {
+                    bail!("--attach-port requires HOST:PORT");
+                }
+                attach_port = Some(validate_attach_port(&args[i])?);
+            }
             other if other.starts_with("--attach-pid=") => {
                 let pid = other.trim_start_matches("--attach-pid=");
                 if pid.is_empty() {
@@ -944,6 +950,13 @@ fn parse_start_flags(args: &[String]) -> Result<ParsedStartFlags> {
                     pid.parse()
                         .with_context(|| format!("invalid --attach-pid `{pid}`"))?,
                 );
+            }
+            other if other.starts_with("--attach-port=") => {
+                let address = other.trim_start_matches("--attach-port=");
+                if address.trim().is_empty() {
+                    bail!("--attach-port requires HOST:PORT");
+                }
+                attach_port = Some(validate_attach_port(address)?);
             }
             other => {
                 // Bare positionals and unknown `--*` flags both go to
@@ -962,25 +975,41 @@ fn parse_start_flags(args: &[String]) -> Result<ParsedStartFlags> {
         run_args,
         do_run,
         attach_pid,
+        attach_port,
     })
+}
+
+fn validate_attach_port(address: &str) -> Result<String> {
+    let address = address.trim();
+    let (host, port) = address
+        .rsplit_once(':')
+        .ok_or_else(|| anyhow::anyhow!("invalid --attach-port `{address}`; expected HOST:PORT"))?;
+    if host.is_empty() || port.parse::<u16>().ok().filter(|p| *p != 0).is_none() {
+        bail!("invalid --attach-port `{address}`; expected HOST:PORT with a non-zero port");
+    }
+    Ok(address.to_string())
 }
 
 fn normalize_start_args(registry: &Registry, args: &[String]) -> Result<Vec<String>> {
     if args.is_empty() {
         bail!("usage: dbg start <type> <target> [--break spec] [--args ...] [--run]");
     }
-    if args
-        .first()
-        .is_some_and(|a| a == "--attach-pid" || a.starts_with("--attach-pid="))
-    {
+    if args.first().is_some_and(|a| {
+        a == "--attach-pid"
+            || a.starts_with("--attach-pid=")
+            || a == "--attach-port"
+            || a.starts_with("--attach-port=")
+    }) {
         bail!(
             "usage: dbg start <type> <target> --attach-pid <PID>\n       --attach-pid must come after <type> <target>; attach mode still needs an explicit DAP backend type and target hint"
         );
     }
-    if args
-        .get(1)
-        .is_some_and(|a| a == "--attach-pid" || a.starts_with("--attach-pid="))
-    {
+    if args.get(1).is_some_and(|a| {
+        a == "--attach-pid"
+            || a.starts_with("--attach-pid=")
+            || a == "--attach-port"
+            || a.starts_with("--attach-port=")
+    }) {
         bail!(
             "usage: dbg start <type> <target> --attach-pid <PID>\n       attach mode still needs a target hint before --attach-pid; use an absolute target/path hint when source paths matter"
         );
@@ -1120,12 +1149,23 @@ fn cmd_start(registry: &Registry, args: &[String]) -> Result<()> {
     let run_args = parsed.run_args;
     let do_run = parsed.do_run;
     let attach_pid = parsed.attach_pid;
-    if attach_pid.is_some() && !backend.uses_dap() {
+    let attach_port = parsed.attach_port;
+    if (attach_pid.is_some() || attach_port.is_some()) && !backend.uses_dap() {
         bail!(
-            "--attach-pid requires a DAP backend such as netcoredbg-proto, debugpy-proto, delve-proto, or lldb-dap-proto; `{backend_type}` is not DAP-based"
+            "--attach-pid/--attach-port requires a DAP backend such as netcoredbg-proto, debugpy-proto, delve-proto, or lldb-dap-proto; `{backend_type}` is not DAP-based"
         );
     }
-    let attach = attach_pid.map(|pid| backend::AttachSpec { pid: Some(pid) });
+    if attach_pid.is_some() && attach_port.is_some() {
+        bail!("--attach-pid and --attach-port are mutually exclusive");
+    }
+    let attach = if attach_pid.is_some() || attach_port.is_some() {
+        Some(backend::AttachSpec {
+            pid: attach_pid,
+            port: attach_port,
+        })
+    } else {
+        None
+    };
 
     // Resolve target. Attach mode doesn't need a local target file —
     // the debuggee is already running — so skip resolution and pass
@@ -1153,6 +1193,7 @@ fn cmd_start(registry: &Registry, args: &[String]) -> Result<()> {
             daemon::detach_stdio(&log_path);
             if let Err(e) = daemon::run_daemon(backend, &resolved, &run_args, attach.as_ref()) {
                 eprintln!("daemon error: {e:#}");
+                daemon::cleanup_after_startup_error();
                 std::process::exit(1);
             }
             std::process::exit(0);
@@ -1286,7 +1327,7 @@ mod tests {
         assert_eq!(autodetect_backend("App.java"), Some("jdb"));
         assert_eq!(autodetect_backend("script.rb"), Some("rdbg"));
         assert_eq!(autodetect_backend("site.php"), Some("phpdbg"));
-        assert_eq!(autodetect_backend("proj.csproj"), Some("netcoredbg"));
+        assert_eq!(autodetect_backend("proj.csproj"), Some("netcoredbg-proto"));
         assert_eq!(autodetect_backend("app.js"), Some("node-proto"));
         assert_eq!(autodetect_backend("app.ts"), Some("node-proto"));
         assert_eq!(autodetect_backend("foo.hs"), Some("ghci"));
@@ -1577,13 +1618,31 @@ mod tests {
     fn dap_attach_configs_remember_debuggee_pid() {
         use crate::backend::Backend;
 
-        let spec = backend::AttachSpec { pid: Some(4321) };
+        let spec = backend::AttachSpec {
+            pid: Some(4321),
+            port: None,
+        };
         let cfg = backend::netcoredbg_proto::NetCoreDbgProtoBackend
             .dap_attach(&spec)
             .unwrap();
         assert_eq!(cfg.launch_verb, "attach");
         assert_eq!(cfg.debuggee_pid, Some(4321));
         assert_eq!(cfg.launch_args["processId"], 4321);
+    }
+
+    #[test]
+    fn dap_attach_port_uses_existing_endpoint() {
+        use crate::backend::Backend;
+
+        let spec = backend::AttachSpec {
+            pid: None,
+            port: Some("127.0.0.1:4711".into()),
+        };
+        let cfg = backend::netcoredbg_proto::NetCoreDbgProtoBackend
+            .dap_attach(&spec)
+            .unwrap();
+        assert_eq!(cfg.connect_addr.as_deref(), Some("127.0.0.1:4711"));
+        assert!(cfg.debuggee_pid.is_none());
     }
 
     #[test]
@@ -1626,6 +1685,16 @@ mod tests {
 
         let p = parse_start_flags(&s(&["--attach-pid=999"])).unwrap();
         assert_eq!(p.attach_pid, Some(999));
+    }
+
+    #[test]
+    fn parse_start_flags_validates_attach_port() {
+        let p = parse_start_flags(&s(&["--attach-port", "127.0.0.1:4711"])).unwrap();
+        assert_eq!(p.attach_port.as_deref(), Some("127.0.0.1:4711"));
+        let p = parse_start_flags(&s(&["--attach-port=localhost:9000"])).unwrap();
+        assert_eq!(p.attach_port.as_deref(), Some("localhost:9000"));
+        assert!(parse_start_flags(&s(&["--attach-port", "127.0.0.1:0"])).is_err());
+        assert!(parse_start_flags(&s(&["--attach-port", "no-port"])).is_err());
     }
 
     #[test]

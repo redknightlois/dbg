@@ -113,11 +113,24 @@ impl Backend for DebugpyProtoBackend {
                 "justMyCode": false,
             }),
             preassigned_addr: None,
+            connect_addr: None,
             debuggee_pid: None,
         })
     }
 
     fn dap_attach(&self, spec: &super::AttachSpec) -> anyhow::Result<crate::dap::DapLaunchConfig> {
+        if let Some(addr) = &spec.port {
+            return Ok(crate::dap::DapLaunchConfig {
+                bin: "external-dap".into(),
+                args: vec![],
+                listen_marker: String::new(),
+                launch_verb: "attach".into(),
+                launch_args: json!({"request": "attach"}),
+                preassigned_addr: None,
+                connect_addr: Some(addr.clone()),
+                debuggee_pid: spec.pid,
+            });
+        }
         // debugpy attach requires a pid. `--log-stderr` still needed
         // for the listen-announce line.
         let pid = spec
@@ -134,6 +147,7 @@ impl Backend for DebugpyProtoBackend {
                 "justMyCode": false,
             }),
             preassigned_addr: None,
+            connect_addr: None,
             debuggee_pid: Some(pid),
         })
     }

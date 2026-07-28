@@ -125,11 +125,24 @@ impl Backend for DelveProtoBackend {
                 "showLog": false,
             }),
             preassigned_addr: None,
+            connect_addr: None,
             debuggee_pid: None,
         })
     }
 
     fn dap_attach(&self, spec: &super::AttachSpec) -> anyhow::Result<crate::dap::DapLaunchConfig> {
+        if let Some(addr) = &spec.port {
+            return Ok(crate::dap::DapLaunchConfig {
+                bin: "external-dap".into(),
+                args: vec![],
+                listen_marker: String::new(),
+                launch_verb: "attach".into(),
+                launch_args: json!({"request": "attach"}),
+                preassigned_addr: None,
+                connect_addr: Some(addr.clone()),
+                debuggee_pid: spec.pid,
+            });
+        }
         let pid = spec
             .pid
             .ok_or_else(|| anyhow::anyhow!("delve-proto attach needs --attach-pid"))?;
@@ -144,6 +157,7 @@ impl Backend for DelveProtoBackend {
                 "processId": pid,
             }),
             preassigned_addr: None,
+            connect_addr: None,
             debuggee_pid: Some(pid),
         })
     }
