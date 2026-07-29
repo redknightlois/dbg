@@ -206,23 +206,22 @@ impl Backend for JitDasmBackend {
         // emit one, so it reliably names the entry-point dll.
         // Capture dirname into a shell variable so paths with spaces
         // survive expansion inside the ls glob.
-        let locate_dll = format!(
-            "proj_dir=$(dirname {project_arg}); \
+        let run_cmd = format!(
+            "echo Disassembling: {pattern_arg}; \
+             proj_dir=$(dirname {project_arg}); \
              dll=$(ls -t \"$proj_dir\"/bin/Release/net*/*.runtimeconfig.json 2>/dev/null | \
              head -1 | sed 's/\\.runtimeconfig\\.json$/.dll/'); \
              if [ -z \"$dll\" ] || [ ! -f \"$dll\" ]; then \
                echo 'jitdasm: could not locate built dll under bin/Release/net*/; did build succeed?' >&2; \
-               exit 1; \
-             fi",
-            project_arg = shell_escape(&project),
-        );
-        let run_cmd = format!(
-            "echo Disassembling: {pattern_arg} && {locate_dll} && \
+               status=1; \
+             else \
              DOTNET_TieredCompilation=0 DOTNET_JitDisasm={pattern_arg} DOTNET_JitDiffableDasm=1 \
              {timeout_prefix}dotnet exec \"$dll\"{extra} > {out_file} 2>&1; \
              status=$?; \
-             if ([ \"$status\" -eq 124 ] || [ \"$status\" -eq 143 ]) && [ -f {out_file} ]; then exit 0; fi; \
-             exit \"$status\"",
+             fi; \
+             if ([ \"$status\" -eq 124 ] || [ \"$status\" -eq 143 ]) && [ -f {out_file} ]; then status=0; fi; \
+             bash -c 'exit \"$1\"' _ \"$status\"",
+            project_arg = shell_escape(&project),
             pattern_arg = shell_escape(&pattern),
             out_file = shell_escape(&out_file_str),
         );
@@ -516,6 +515,30 @@ mod tests {
         let capture = &cfg.init_commands[2];
         assert!(capture.contains("-eq 124") || capture.contains("-eq 143"));
         assert!(cfg.init_commands[3].starts_with("exec "));
+    }
+
+    #[test]
+    fn capture_status_keeps_shell_alive_for_daemon_marker() {
+        let cfg = JitDasmBackend.spawn_config("app.csproj", &[]).unwrap();
+        let run = &cfg.init_commands[2];
+        assert!(run.contains("bash -c 'exit \"$1\"'"));
+        assert!(!run.contains("exit \"$status\""));
+    }
+
+    #[test]
+    fn capture_status_preserves_the_exact_nonzero_code() {
+        let output = std::process::Command::new("bash")
+            .args([
+                "-c",
+                "status=42; bash -c 'exit \"$1\"' _ \"$status\"; printf '__DBG_INIT_STATUS__%s\n' \"$?\"",
+            ])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        assert_eq!(
+            String::from_utf8(output.stdout).unwrap(),
+            "__DBG_INIT_STATUS__42\n"
+        );
     }
 
     #[test]
