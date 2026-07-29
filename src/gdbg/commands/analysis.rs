@@ -24,7 +24,7 @@ pub fn cmd_bound(db: &GpuDb, args: &[&str]) {
                       m.compute_throughput_pct, m.memory_throughput_pct,
                       m.l2_hit_rate_pct, m.achieved_bandwidth_gb_s, m.peak_bandwidth_gb_s,
                       m.occupancy_pct
-               FROM metrics m WHERE m.kernel_name LIKE ?1 ESCAPE '\' AND {}",
+               FROM metrics m WHERE m.kernel_name LIKE ?1 ESCAPE '\\' AND {}",
         db.metric_filter_for("m")
     );
     let rows: Vec<_> = db.query_vec(&sql, [like_param(pattern)], |row| {
@@ -100,11 +100,11 @@ pub fn cmd_roofline(db: &GpuDb, args: &[&str]) {
     let sql = format!(
         "SELECT kernel_name, boundedness, compute_throughput_pct,
                       memory_throughput_pct, occupancy_pct
-               FROM metrics m WHERE kernel_name LIKE ?1 ESCAPE '\' AND {}
+               FROM metrics m WHERE kernel_name LIKE ?1 ESCAPE '\\' AND {}
                ORDER BY kernel_name",
         db.metric_filter_for("m")
     );
-    let rows: Vec<_> = db.query_vec(&sql, [&pat], |row| {
+    let rows: Vec<_> = match db.query_vec_result(&sql, [&pat], |row| {
         Ok((
             row.get::<_, String>(0)?,
             row.get::<_, Option<String>>(1)?,
@@ -112,7 +112,13 @@ pub fn cmd_roofline(db: &GpuDb, args: &[&str]) {
             row.get::<_, Option<f64>>(3)?,
             row.get::<_, Option<f64>>(4)?,
         ))
-    });
+    }) {
+        Ok(rows) => rows,
+        Err(error) => {
+            println!("could not query roofline metrics: {error}");
+            return;
+        }
+    };
 
     println!("  Kernel                            Bound     Compute%  Memory%   Occupancy");
     println!("  ────────────────────────────────── ──────── ──────── ──────── ──────────");

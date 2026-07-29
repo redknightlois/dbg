@@ -151,6 +151,47 @@ fn ncu_csv_edge_cases() {
         bound, "memory",
         "65.2% mem vs 12.0% compute should be memory-bound"
     );
+
+    // The roofline command must be able to read nullable hardware metrics.
+    let pat = "%".to_string();
+    let rows: Vec<_> = db.query_vec(
+        "SELECT kernel_name, boundedness, compute_throughput_pct,
+                memory_throughput_pct, occupancy_pct
+         FROM metrics m WHERE kernel_name LIKE ?1 ESCAPE '\\' AND
+              (m.layer_id = ?2 OR m.layer_id IS NULL)",
+        rusqlite::params![pat, lid],
+        |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, Option<f64>>(2)?,
+                row.get::<_, Option<f64>>(3)?,
+                row.get::<_, Option<f64>>(4)?,
+            ))
+        },
+    );
+    assert_eq!(rows.len(), 2, "roofline query should return both kernels");
+
+    let sql = format!(
+        "SELECT kernel_name, boundedness, compute_throughput_pct,
+                memory_throughput_pct, occupancy_pct
+         FROM metrics m WHERE kernel_name LIKE ?1 ESCAPE '\\' AND {}",
+        db.metric_filter_for("m")
+    );
+    let command_rows: Vec<_> = db.query_vec(&sql, [&pat], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, Option<String>>(1)?,
+            row.get::<_, Option<f64>>(2)?,
+            row.get::<_, Option<f64>>(3)?,
+            row.get::<_, Option<f64>>(4)?,
+        ))
+    });
+    assert_eq!(
+        command_rows.len(),
+        2,
+        "the exact roofline command query should return both kernels"
+    );
 }
 
 #[test]
