@@ -92,7 +92,7 @@ impl Backend for MemcheckBackend {
     fn adapters(&self) -> Vec<(&'static str, &'static str)> {
         vec![(
             "memcheck.md",
-            include_str!("../../skills/adapters/memcheck.md"),
+            include_str!("../../skills/references/adapters/memcheck.md"),
         )]
     }
 }

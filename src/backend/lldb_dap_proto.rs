@@ -69,10 +69,22 @@ impl Backend for LldbDapProtoBackend {
         // Shares skill adapters with the PTY lldb backend — native
         // debugging vocabulary doesn't differ at the agent layer.
         vec![
-            ("rust.md", include_str!("../../skills/adapters/rust.md")),
-            ("c.md", include_str!("../../skills/adapters/c.md")),
-            ("cpp.md", include_str!("../../skills/adapters/cpp.md")),
-            ("zig.md", include_str!("../../skills/adapters/zig.md")),
+            (
+                "rust.md",
+                include_str!("../../skills/references/adapters/rust.md"),
+            ),
+            (
+                "c.md",
+                include_str!("../../skills/references/adapters/c.md"),
+            ),
+            (
+                "cpp.md",
+                include_str!("../../skills/references/adapters/cpp.md"),
+            ),
+            (
+                "zig.md",
+                include_str!("../../skills/references/adapters/zig.md"),
+            ),
         ]
     }
 

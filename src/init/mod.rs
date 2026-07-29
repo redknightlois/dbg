@@ -6,8 +6,22 @@ use crate::backend::Registry;
 
 const SKILL_MD: &str = include_str!("../../skills/SKILL.md");
 const VERSION: &str = env!("CARGO_PKG_VERSION");
+const SHARED_ADAPTERS: [(&str, &str); 3] = [
+    (
+        "_canonical-commands.md",
+        include_str!("../../skills/references/adapters/_canonical-commands.md"),
+    ),
+    (
+        "_taxonomy-debug.md",
+        include_str!("../../skills/references/adapters/_taxonomy-debug.md"),
+    ),
+    (
+        "gdbg.md",
+        include_str!("../../skills/references/adapters/gdbg.md"),
+    ),
+];
 
-/// Silently update any installed skills whose version doesn't match the binary.
+/// Silently repair installed skill bundles.
 pub fn auto_update(registry: &Registry) {
     let home = match std::env::var("HOME") {
         Ok(h) => h,
@@ -19,15 +33,13 @@ pub fn auto_update(registry: &Registry) {
         (".forge", "Forge"),
     ] {
         let skill_dir = skill_dir_for_home(&PathBuf::from(&home), config_dir);
-        let version_file = skill_dir.join(".version");
-        if !version_file.exists() {
+        if !skill_dir.join(".version").exists() {
             continue;
         }
-        let installed = std::fs::read_to_string(&version_file).unwrap_or_default();
-        if installed.trim() == VERSION {
+        let adapters = bundled_adapters(registry);
+        if skill_is_current(&skill_dir, &adapters) {
             continue;
         }
-        // Version mismatch — update silently
         let _ = init_agent(registry, config_dir, agent_name);
     }
 }
@@ -77,29 +89,20 @@ fn init_agent(registry: &Registry, config_dir: &str, agent_name: &str) -> Result
     let skill_dir = skill_dir_for_home(&PathBuf::from(&home), config_dir);
     let adapters_dir = skill_dir.join("references/adapters");
 
-    let adapters: Vec<(&str, &str)> = registry
-        .all_backends()
-        .iter()
-        .flat_map(|b| b.adapters())
-        .collect();
+    let adapters = bundled_adapters(registry);
 
     let version_file = skill_dir.join(".version");
 
     #[cfg(not(debug_assertions))]
-    if version_file.exists() {
-        if let Ok(existing) = std::fs::read_to_string(&version_file) {
-            if existing.trim() == VERSION {
-                eprintln!("dbg v{VERSION} skill already up to date");
-                match ensure_on_path()? {
-                    Some(path) => eprintln!("installed: {}", path.display()),
-                    None => eprintln!("dbg already on PATH"),
-                }
-                return Ok(());
-            }
+    if skill_is_current(&skill_dir, &adapters) {
+        eprintln!("dbg v{VERSION} skill already up to date");
+        match ensure_on_path()? {
+            Some(path) => eprintln!("installed: {}", path.display()),
+            None => eprintln!("dbg already on PATH"),
         }
+        return Ok(());
     }
 
-    // Remove stale .hash file from older versions
     let _ = std::fs::remove_file(skill_dir.join(".hash"));
 
     std::fs::create_dir_all(&adapters_dir).context("failed to create skill directory")?;
@@ -121,6 +124,24 @@ fn init_agent(registry: &Registry, config_dir: &str, agent_name: &str) -> Result
 
     eprintln!("done — restart {agent_name} to activate");
     Ok(())
+}
+
+fn bundled_adapters(registry: &Registry) -> Vec<(&'static str, &'static str)> {
+    registry
+        .all_backends()
+        .iter()
+        .flat_map(|backend| backend.adapters())
+        .chain(SHARED_ADAPTERS)
+        .collect()
+}
+
+fn skill_is_current(skill_dir: &std::path::Path, adapters: &[(&str, &str)]) -> bool {
+    std::fs::read_to_string(skill_dir.join(".version")).is_ok_and(|v| v.trim() == VERSION)
+        && std::fs::read_to_string(skill_dir.join("SKILL.md")).is_ok_and(|v| v == SKILL_MD)
+        && adapters.iter().all(|(filename, content)| {
+            std::fs::read_to_string(skill_dir.join("references/adapters").join(filename))
+                .is_ok_and(|v| v == *content)
+        })
 }
 
 /// Ensure dbg is on PATH by copying to ~/.local/bin/
@@ -201,5 +222,14 @@ mod tests {
             skill_dir_for_home(&home, ".forge"),
             PathBuf::from("/home/example/.forge/skills/dbg")
         );
+    }
+
+    #[test]
+    fn bundled_adapters_include_shared_references() {
+        let registry = Registry::new();
+        let adapters = bundled_adapters(&registry);
+        for name in ["_canonical-commands.md", "_taxonomy-debug.md", "gdbg.md"] {
+            assert!(adapters.iter().any(|(filename, _)| *filename == name));
+        }
     }
 }

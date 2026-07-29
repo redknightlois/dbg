@@ -113,7 +113,7 @@ impl Backend for CallgrindBackend {
     fn adapters(&self) -> Vec<(&'static str, &'static str)> {
         vec![(
             "callgrind.md",
-            include_str!("../../skills/adapters/callgrind.md"),
+            include_str!("../../skills/references/adapters/callgrind.md"),
         )]
     }
 }

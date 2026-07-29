@@ -109,7 +109,10 @@ impl Backend for ImportBackend {
     }
 
     fn adapters(&self) -> Vec<(&'static str, &'static str)> {
-        vec![("import.md", include_str!("../../skills/adapters/import.md"))]
+        vec![(
+            "import.md",
+            include_str!("../../skills/references/adapters/import.md"),
+        )]
     }
 }
 

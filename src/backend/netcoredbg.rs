@@ -96,7 +96,10 @@ impl Backend for NetCoreDbgBackend {
     }
 
     fn adapters(&self) -> Vec<(&'static str, &'static str)> {
-        vec![("dotnet.md", include_str!("../../skills/adapters/dotnet.md"))]
+        vec![(
+            "dotnet.md",
+            include_str!("../../skills/references/adapters/dotnet.md"),
+        )]
     }
 
     fn clean(&self, _cmd: &str, output: &str) -> String {

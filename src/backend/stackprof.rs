@@ -110,7 +110,7 @@ impl Backend for StackprofBackend {
     fn adapters(&self) -> Vec<(&'static str, &'static str)> {
         vec![(
             "ruby-profile.md",
-            include_str!("../../skills/adapters/ruby-profile.md"),
+            include_str!("../../skills/references/adapters/ruby-profile.md"),
         )]
     }
 }

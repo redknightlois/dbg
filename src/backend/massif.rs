@@ -96,7 +96,10 @@ impl Backend for MassifBackend {
     }
 
     fn adapters(&self) -> Vec<(&'static str, &'static str)> {
-        vec![("massif.md", include_str!("../../skills/adapters/massif.md"))]
+        vec![(
+            "massif.md",
+            include_str!("../../skills/references/adapters/massif.md"),
+        )]
     }
 }
 

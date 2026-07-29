@@ -122,7 +122,7 @@ impl Backend for NodeProfBackend {
     fn adapters(&self) -> Vec<(&'static str, &'static str)> {
         vec![(
             "js-profile.md",
-            include_str!("../../skills/adapters/js-profile.md"),
+            include_str!("../../skills/references/adapters/js-profile.md"),
         )]
     }
 }

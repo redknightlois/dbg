@@ -99,7 +99,10 @@ impl Backend for DelveBackend {
     }
 
     fn adapters(&self) -> Vec<(&'static str, &'static str)> {
-        vec![("go.md", include_str!("../../skills/adapters/go.md"))]
+        vec![(
+            "go.md",
+            include_str!("../../skills/references/adapters/go.md"),
+        )]
     }
 
     fn canonical_ops(&self) -> Option<&dyn CanonicalOps> {

@@ -98,7 +98,10 @@ impl Backend for OcamlDebugBackend {
     }
 
     fn adapters(&self) -> Vec<(&'static str, &'static str)> {
-        vec![("ocaml.md", include_str!("../../skills/adapters/ocaml.md"))]
+        vec![(
+            "ocaml.md",
+            include_str!("../../skills/references/adapters/ocaml.md"),
+        )]
     }
 
     fn canonical_ops(&self) -> Option<&dyn CanonicalOps> {

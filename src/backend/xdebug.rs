@@ -93,7 +93,7 @@ impl Backend for XdebugProfileBackend {
     fn adapters(&self) -> Vec<(&'static str, &'static str)> {
         vec![(
             "php-profile.md",
-            include_str!("../../skills/adapters/php-profile.md"),
+            include_str!("../../skills/references/adapters/php-profile.md"),
         )]
     }
 }

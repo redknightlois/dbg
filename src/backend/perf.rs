@@ -160,7 +160,10 @@ impl Backend for PerfBackend {
     }
 
     fn adapters(&self) -> Vec<(&'static str, &'static str)> {
-        vec![("perf.md", include_str!("../../skills/adapters/perf.md"))]
+        vec![(
+            "perf.md",
+            include_str!("../../skills/references/adapters/perf.md"),
+        )]
     }
 }
 

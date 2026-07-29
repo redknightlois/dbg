@@ -118,7 +118,7 @@ impl Backend for PstatsBackend {
     fn adapters(&self) -> Vec<(&'static str, &'static str)> {
         vec![(
             "pyprofile.md",
-            include_str!("../../skills/adapters/pyprofile.md"),
+            include_str!("../../skills/references/adapters/pyprofile.md"),
         )]
     }
 }

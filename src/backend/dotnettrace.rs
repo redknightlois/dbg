@@ -118,7 +118,7 @@ impl Backend for DotnetTraceBackend {
     fn adapters(&self) -> Vec<(&'static str, &'static str)> {
         vec![(
             "dotnet-trace.md",
-            include_str!("../../skills/adapters/dotnet-trace.md"),
+            include_str!("../../skills/references/adapters/dotnet-trace.md"),
         )]
     }
 }

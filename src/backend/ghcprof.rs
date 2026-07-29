@@ -133,7 +133,7 @@ impl Backend for GhcProfBackend {
     fn adapters(&self) -> Vec<(&'static str, &'static str)> {
         vec![(
             "haskell-profile.md",
-            include_str!("../../skills/adapters/haskell-profile.md"),
+            include_str!("../../skills/references/adapters/haskell-profile.md"),
         )]
     }
 }

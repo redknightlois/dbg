@@ -152,7 +152,7 @@ impl Backend for JitDasmBackend {
         // hang forever waiting for the child to produce EOF. When the
         // flag is set we wrap the child with `timeout --preserve-status`
         // so a graceful time-kill still looks like success. See
-        // skills/adapters/jitdasm.md "Long-running targets".
+        // skills/references/adapters/jitdasm.md "Long-running targets".
         let (capture_duration, rest_args) = extract_capture_duration(args);
 
         let raw_pattern = if rest_args.is_empty() {
@@ -290,7 +290,7 @@ impl Backend for JitDasmBackend {
     fn adapters(&self) -> Vec<(&'static str, &'static str)> {
         vec![(
             "jitdasm.md",
-            include_str!("../../skills/adapters/jitdasm.md"),
+            include_str!("../../skills/references/adapters/jitdasm.md"),
         )]
     }
 }

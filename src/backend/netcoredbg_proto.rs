@@ -85,7 +85,10 @@ impl Backend for NetCoreDbgProtoBackend {
     }
 
     fn adapters(&self) -> Vec<(&'static str, &'static str)> {
-        vec![("dotnet.md", include_str!("../../skills/adapters/dotnet.md"))]
+        vec![(
+            "dotnet.md",
+            include_str!("../../skills/references/adapters/dotnet.md"),
+        )]
     }
 
     fn canonical_ops(&self) -> Option<&dyn CanonicalOps> {

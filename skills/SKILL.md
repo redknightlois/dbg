@@ -3,7 +3,7 @@ name: dbg
 description: >
   Debug programs and profile performance through a persistent CLI session.
   Triggers on: "debug this", "set a breakpoint", "run under debugger",
-  "launch debugger", "debug <target>", "why is this crashing", "step through",
+  "launch debugger", "debug a target", "why is this crashing", "step through",
   "fix this bug", "find the bug", "track down this issue", "investigate this crash",
   "attach to pid", "post-mortem", "replay a session",
   "this is too slow", "make this faster", "profile this", "find the bottleneck",
@@ -13,124 +13,94 @@ description: >
   "SIMD", "bounds checks", "jitdasm", "diff two runs", "regression hunt",
   "GPU", "CUDA", "kernel", "training is slow", "optimize GPU", "roofline",
   "occupancy", "memory bound", "compute bound", "kernel fusion".
-  Also use when you would otherwise guess at runtime state — if you're about to
-  add print statements, re-read the same function a third time, speculate about
-  variable values, or rewrite code hoping the bug disappears, use dbg instead.
+  Also use when you would otherwise guess at runtime state, add print statements,
+  or rewrite code without runtime evidence.
 ---
 
 # dbg
 
-Persistent CLI for debugging, profiling, and JIT disassembly. One canonical command vocabulary across every supported backend. Every breakpoint hit is captured into a SessionDb so you can diff, trend, and cross-reference runs. Run `dbg` with no arguments to list backends and their readiness.
+Use `dbg` for runtime state, CPU profiling, memory diagnostics, and codegen. Use
+the separate `gdbg` binary for GPU timelines and hardware metrics.
 
-## Pick the right backend
+## Choose the tool
 
-Backend type is NOT always a language name — match the user's **goal**:
+Match the backend to the question, not only the language:
 
-| Goal | Backend type | NOT |
-|------|-------------|-----|
-| Debug .NET code | `dotnet` / `csharp` / `fsharp` | |
-| Profile .NET code | `dotnet-trace` | `dotnet` |
-| .NET JIT disassembly | `jitdasm` | `dotnet` |
-| Debug JS/TS/Node/Bun/Deno | `node` | |
-| Profile JS/TS/Node.js | `nodeprof` | `node` |
-| Profile C/C++/Rust | `callgrind` or `perf` | `lldb` |
-| Memory errors (C/C++/Rust) | `memcheck` | `lldb` |
-| Heap profiling (C/C++/Rust) | `massif` | `lldb` |
-| Debug Python | `python` | |
-| Profile Python | `pyprofile` / `pstats` | `python` |
-| Debug Go | `go` (delve) | |
-| Profile Go | `pprof` | |
-| Debug Java/Kotlin | `jdb` | |
-| Debug Haskell / OCaml / Ruby / PHP | `ghci` / `ocamldebug` / `rdbg` / `phpdbg` | |
-| Profile Haskell / Ruby / PHP | `ghc-profile` / `stackprof` / `xdebug-profile` | |
-| **GPU kernels / CUDA / PyTorch / Triton** | **`gdbg` (separate binary)** | `dbg` |
+| Goal | Tool or backend |
+|---|---|
+| Debug runtime state | `dbg` with the language backend |
+| Profile C, C++, or Rust | `callgrind` or `perf` |
+| Find native memory errors or heap growth | `memcheck` or `massif` |
+| Profile Python, Node, Go, or .NET | `pyprofile`, `nodeprof`, `pprof`, or `dotnet-trace` |
+| Inspect .NET JIT code | `jitdasm` |
+| Profile CUDA, PyTorch, Triton, JAX, or GPU kernels | `gdbg` |
 
-`dbg start` without a `<type>` auto-detects from the target's file extension. Pass `<type>` explicitly when you need a non-default (e.g. `callgrind` instead of `lldb` for the same C++ binary).
+Use `dbg start` auto-detection only for the default debugger. Pass the backend
+explicitly for profiling, memory analysis, or JIT inspection. Never run
+`dbg start gdbg`.
 
-## GPU profiling — when to use `gdbg` instead of `dbg`
+## Load references progressively
 
-If the target imports `torch`, `triton`, `tensorflow`, `jax`, `cupy`, `mxnet`, or uses `.cuda()` / `.to('cuda')`, or if the user asks about GPU kernels, kernel fusion, memory bandwidth, SM occupancy, roofline, or training throughput — use `gdbg`, not `dbg`.
+Load only the material needed for the current investigation:
 
-`gdbg` is a **separate binary** (installed alongside `dbg`). It is NOT a dbg backend — do not try `dbg start gdbg`. Load `adapters/gdbg.md` for its commands.
+| Need | Reference |
+|---|---|
+| Start a specific debugger or profiler | The matching file under `references/adapters/` |
+| Profile GPU code | `references/adapters/gdbg.md` |
+| Check exact canonical command support or translation | `references/adapters/_canonical-commands.md` |
+| Plan an ambiguous, intermittent, comparative, or CPU/GPU investigation | `references/adapters/_taxonomy-debug.md` |
 
-## Usage
+Do not load unrelated backend references. Backend files contain their own
+preconditions, target rules, and tool-specific limitations.
 
-```
+## Core workflow
+
+1. Load the selected backend reference and check its preconditions.
+2. Start from the source root so relative targets and breakpoints resolve.
+3. Collect the smallest runtime or profile evidence that tests the hypothesis.
+4. Compare hits or saved sessions instead of interpreting one sample alone.
+5. Interpret the native output for the user.
+6. Run `dbg kill` before finishing or switching targets.
+
+```text
 dbg start [<type>] <target> [--break <spec>] [--args ...] [--run]
-dbg start <dap-type> <target-hint> --attach-pid <PID>  # attach to a running process
-dbg start --attach-port <PORT>            # attach to a debug port
-dbg <command>                             # send command to running session
-dbg cancel                                # SIGINT the child without tearing down the session
-dbg replay <label>                        # open a persisted session read-only
-dbg help                                  # list commands the backend supports
-dbg help <command>                        # ask the backend what a command does
-dbg kill                                  # stop session (always do this when done)
+dbg <command>
+dbg help [<command>]
+dbg cancel
+dbg kill
 ```
 
-Multiple daemons can coexist in the same cwd; sessions are keyed by label. Attach mode needs an explicit DAP backend (for .NET use `netcoredbg-proto`) and `--attach-pid` must appear after `<type> <target-hint>`. Use the actual managed child PID, not a shell launcher PID. Relative targets and source breakpoints resolve from the `dbg start` working directory.
+Use canonical commands first. Use `dbg raw <native-command>` only when the
+canonical vocabulary cannot express the operation. Every breakpoint hit is
+captured with locals and a short stack for later `hits`, `hit-diff`,
+`hit-trend`, and `cross` queries.
 
-## Canonical command vocabulary
+## Sessions
 
-One vocabulary, every backend. The underlying tool is always named in the first line of output (`[via lldb 20.1.0]`). Full table in `adapters/_canonical-commands.md`. Short form:
+- Use `dbg sessions [--group]` to find captured sessions.
+- Use `dbg save [<label>]` before a comparison or prune.
+- Use `dbg diff <other>` to compare saved runtime or profile evidence.
+- Use `dbg replay <label>` for read-only post-mortem inspection.
+- Treat raw captures as durable; schema mismatches require recollection.
 
-- **Flow:** `run`, `continue`, `step`, `next`, `finish`, `pause`, `restart`
-- **Breakpoints:** `break <file:line|symbol|module!method>`, `unbreak <id>`, `breaks`, `watch <expr>`, `catch <exception>`, conditional via `break <loc> if <expr>`, logpoints via `break <loc> log <msg>`
-- **Inspection at a stop:** `stack [N]`, `frame <n>`, `locals`, `print <expr>`, `set <var>=<expr>`, `list [loc]`
-- **Concurrency:** `threads`, `thread <n>` (maps to goroutines on Go)
-- **Meta / escape:** `dbg tool` (prints active backend), `dbg raw <native-cmd>` (passthrough, no `[via]` header)
+Multiple daemons may coexist in one directory and are keyed by session label.
+Always run `dbg kill`; leaving the client does not stop the daemon.
 
-When the canonical vocabulary can't express something, use `dbg raw` — don't invent a new canonical command.
+## Report findings
 
-## Hit capture & cross-track queries (always on)
+- Use plain English.
+- Use STE100 wording when a condition, sequence, reference, or causal claim can
+  be ambiguous. Use short sentences and one term for one concept.
+- Keep command names and program symbols exact.
+- Separate observations, inferences, and untested hypotheses.
 
-Every hit is written to the SessionDb with locals and a short stack slice. Query across captures instead of re-stepping.
+## Constraints
 
-- `dbg hits <loc>` — every hit at `<loc>` with a 4-field locals summary
-- `dbg hit-diff <loc> <a> <b>` — field-by-field diff between hits
-- `dbg hit-trend <loc> <field>` — sparkline of a local across every hit
-- `dbg cross <sym>` — **headline**: hits + profile samples + JIT/GC events + disasm + source in one pane
-- `dbg disasm [<sym>]`, `dbg disasm-diff <a> <b>`, `dbg source <sym>`
-- `dbg at-hit disasm` — disasm the current frame at the current hit
-
-Discipline: **diff, don't just look.** One hit tells you nothing; two adjacent hits with one changed field tell a story. See `adapters/_taxonomy-debug.md` for question-driven workflows (Hotspots → Analysis → Timeline → Drill-down).
-
-## Session lifecycle
-
-- Every `dbg start` creates an auto-labeled session. On `dbg kill`, if it saw any hits/layers, it's backed up to `.dbg/sessions/<label>/`.
-- `dbg sessions [--group]` — list saved sessions (`--group` = same `(cwd, target)` only)
-- `dbg save [<label>]` — promote a session so `dbg prune` won't touch it
-- `dbg prune [--older-than 7d] [--all]` — clear old auto sessions
-- `dbg diff <other>` — full-outer-join on `(lang, fqn)`, ranked by hit-count delta. The regression-hunting primitive.
-- `dbg replay <label>` — open a persisted session read-only (post-mortem)
-
-No DB migrations: schema mismatches fail loudly and ask you to re-collect. The raw captures under `.dbg/sessions/<label>/raw/` are the durable artifact.
-
-## Preconditions & adapters
-
-Before `dbg start`, load the matching file under `skills/adapters/`. Each adapter lists its preconditions, native-specific notes, and any commands that only exist on that backend. Two files are required reading before any session:
-
-- `adapters/_canonical-commands.md` — the full canonical vocab + per-backend translation table
-- `adapters/_taxonomy-debug.md` — how to turn a question into the right 2-3 commands
-
-## Sandbox warning
-
-Requires process control (fork, ptrace, PTY, DAP sockets). Will fail inside sandboxes — use unsandboxed execution.
-
-## Invalid targets
-
-`dbg` instruments the process it launches directly. Anything that spawns its own child workload **will not work** because the child doesn't inherit instrumentation. Write a small standalone driver instead.
-
-Examples that **do NOT work**:
-- **BenchmarkDotNet** projects — isolated child process per benchmark
-- **Test runners with process isolation** (xunit `parallelizeAssembly`, NUnit process-level isolation)
-- **Docker-wrapped** executables
-- Any launcher that `fork+exec`s the real workload
-
-## Rules
-
-- Load the adapter first. Backend-specific knowledge lives there, not here.
-- Check preconditions from the adapter before starting.
-- **Always `dbg kill` when done** — the session daemon keeps the debuggee (and any capture subprocess) alive indefinitely otherwise. Exiting an interactive REPL (`exit`, `quit`, Ctrl-D) only ends your *view* of the session — the daemon keeps running. Before you move on to the next task, run `dbg kill`. Leaked daemons hold file locks, pin large capture files on disk, and will misattribute the next `dbg start` to the wrong target if the user forgets and restarts without a kill. Treat `dbg kill` as part of the task, not an optional cleanup.
-- Interpret output for the user — translate mangled names, summarize state, name the hypothesis each diff tests.
-- **Never prepend env vars to every `dbg` command.** The daemon inherits its environment from `dbg start`. If a tool needs env vars (e.g. `DOTNET_ROOT`), tell the user to add them to their shell profile once.
-- When preflight fails, read the error — it names the missing dependency. Don't retry blindly.
+- Run outside sandboxes because debugging needs process control, PTYs, and
+  local sockets.
+- Instrument the real workload directly. Process-isolating test runners,
+  Docker wrappers, and launchers that spawn the workload hide the child from
+  instrumentation; use a standalone driver.
+- Put environment configuration in the shell used for `dbg start`; the daemon
+  inherits that environment.
+- Stop on a preflight error and fix the named dependency.

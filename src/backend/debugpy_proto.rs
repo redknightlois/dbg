@@ -69,7 +69,10 @@ impl Backend for DebugpyProtoBackend {
     }
 
     fn adapters(&self) -> Vec<(&'static str, &'static str)> {
-        vec![("python.md", include_str!("../../skills/adapters/python.md"))]
+        vec![(
+            "python.md",
+            include_str!("../../skills/references/adapters/python.md"),
+        )]
     }
 
     fn canonical_ops(&self) -> Option<&dyn CanonicalOps> {

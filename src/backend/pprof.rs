@@ -147,7 +147,10 @@ impl Backend for PprofBackend {
     }
 
     fn adapters(&self) -> Vec<(&'static str, &'static str)> {
-        vec![("pprof.md", include_str!("../../skills/adapters/pprof.md"))]
+        vec![(
+            "pprof.md",
+            include_str!("../../skills/references/adapters/pprof.md"),
+        )]
     }
 }
 

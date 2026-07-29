@@ -75,7 +75,10 @@ impl Backend for PhpdbgBackend {
     }
 
     fn adapters(&self) -> Vec<(&'static str, &'static str)> {
-        vec![("php.md", include_str!("../../skills/adapters/php.md"))]
+        vec![(
+            "php.md",
+            include_str!("../../skills/references/adapters/php.md"),
+        )]
     }
 
     fn clean(&self, cmd: &str, output: &str) -> String {

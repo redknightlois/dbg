@@ -104,7 +104,7 @@ impl Backend for NodeProtoBackend {
     fn adapters(&self) -> Vec<(&'static str, &'static str)> {
         vec![(
             "javascript.md",
-            include_str!("../../skills/adapters/javascript.md"),
+            include_str!("../../skills/references/adapters/javascript.md"),
         )]
     }
 

@@ -85,10 +85,22 @@ impl Backend for LldbBackend {
 
     fn adapters(&self) -> Vec<(&'static str, &'static str)> {
         vec![
-            ("rust.md", include_str!("../../skills/adapters/rust.md")),
-            ("c.md", include_str!("../../skills/adapters/c.md")),
-            ("cpp.md", include_str!("../../skills/adapters/cpp.md")),
-            ("zig.md", include_str!("../../skills/adapters/zig.md")),
+            (
+                "rust.md",
+                include_str!("../../skills/references/adapters/rust.md"),
+            ),
+            (
+                "c.md",
+                include_str!("../../skills/references/adapters/c.md"),
+            ),
+            (
+                "cpp.md",
+                include_str!("../../skills/references/adapters/cpp.md"),
+            ),
+            (
+                "zig.md",
+                include_str!("../../skills/references/adapters/zig.md"),
+            ),
         ]
     }
 

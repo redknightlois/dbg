@@ -66,6 +66,13 @@ After collection, `gdbg` drops into an interactive REPL. Key commands:
 | `bound <kernel>` | Detailed boundedness diagnosis |
 | `occupancy [N]` | SM occupancy ranking |
 | `variance <kernel>` | Launch-to-launch timing variance |
+| `outliers <kernel>` | Slow launches with their timeline positions |
+| `launches <kernel> [N]` | Per-launch time, launch shape, stream, and gap |
+| `source <kernel>` | Source or operator that launched a kernel |
+| `memory [N]` | GPU allocation peaks, leaks, largest blocks, and churn |
+| `bandwidth [N] [pattern]` | Achieved memory bandwidth from NCU metrics |
+| `compare <a> <b>` | Side-by-side statistics for two kernels |
+| `regressions <session> [%] [us]` | Regressions above relative and absolute thresholds |
 | `warmup` | Detect warmup launches before steady state |
 | `small [N]` | Kernels where launch overhead > compute |
 | `fuse [N]` | Sequential kernels that could be fused |
@@ -74,6 +81,9 @@ After collection, `gdbg` drops into an interactive REPL. Key commands:
 | `compare-ops [N]` | CPU vs GPU time ratio per operator |
 | `breakdown <op>` | Which kernels an op expands into |
 | `idle-between <a> <b>` | GPU idle gap between two ops |
+| `hotspot <window_us>` | Hottest fixed-width interval |
+| `critical-path [gap_us]` | Longest serialized same-stream chain |
+| `stream-graph [width]` | Stream-aligned ASCII timeline |
 
 ### Timeline
 | Command | What it does |

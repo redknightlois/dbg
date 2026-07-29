@@ -92,7 +92,10 @@ impl Backend for RdbgBackend {
     }
 
     fn adapters(&self) -> Vec<(&'static str, &'static str)> {
-        vec![("ruby.md", include_str!("../../skills/adapters/ruby.md"))]
+        vec![(
+            "ruby.md",
+            include_str!("../../skills/references/adapters/ruby.md"),
+        )]
     }
 
     fn canonical_ops(&self) -> Option<&dyn CanonicalOps> {

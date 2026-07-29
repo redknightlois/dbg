@@ -112,7 +112,10 @@ impl Backend for JdbBackend {
     }
 
     fn adapters(&self) -> Vec<(&'static str, &'static str)> {
-        vec![("java.md", include_str!("../../skills/adapters/java.md"))]
+        vec![(
+            "java.md",
+            include_str!("../../skills/references/adapters/java.md"),
+        )]
     }
 
     fn canonical_ops(&self) -> Option<&dyn CanonicalOps> {

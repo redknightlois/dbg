@@ -160,7 +160,10 @@ impl Backend for PdbBackend {
     }
 
     fn adapters(&self) -> Vec<(&'static str, &'static str)> {
-        vec![("python.md", include_str!("../../skills/adapters/python.md"))]
+        vec![(
+            "python.md",
+            include_str!("../../skills/references/adapters/python.md"),
+        )]
     }
 
     fn clean(&self, cmd: &str, output: &str) -> String {
