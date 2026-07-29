@@ -1019,6 +1019,14 @@ fn native_help_topic_command(backend: &dyn Backend, topic: &str) -> Option<Strin
         .then(|| format!("{} {topic}", backend.help_command()))
 }
 
+fn jdb_run_needs_vm_prompt(backend: &dyn Backend, canonical_op: &str, output: &str) -> bool {
+    backend.name() == "jdb"
+        && canonical_op == "run"
+        && !output.contains("VM Started:")
+        && !output.contains("The application exited")
+        && !output.contains("The application has been disconnected")
+}
+
 fn read_ipc_request_with_timeout(
     stream: &mut std::os::unix::net::UnixStream,
     idle_timeout: Duration,
@@ -1244,6 +1252,18 @@ fn handle_command(
                     None => guard.proc.send_and_wait(&native_cmd, CMD_TIMEOUT),
                 },
                 None => guard.proc.send_and_wait(&native_cmd, CMD_TIMEOUT),
+            };
+            let send_result = match send_result {
+                Ok(mut raw) if jdb_run_needs_vm_prompt(backend, canonical_op, &raw) => {
+                    // JDB emits one transient prompt while it starts the VM.
+                    // Wait for the next prompt so the run command returns at
+                    // the breakpoint or exit boundary.
+                    guard.proc.wait_for_prompt(CMD_TIMEOUT).map(|late| {
+                        raw.push_str(&late);
+                        raw
+                    })
+                }
+                result => result,
             };
             match send_result {
                 Ok(raw) => {
@@ -3261,6 +3281,7 @@ pub fn wait_for_socket(timeout: Duration) -> bool {
 mod tests {
     use super::*;
     use crate::backend::delve_proto::DelveProtoBackend;
+    use crate::backend::jdb::JdbBackend;
     use crate::backend::node_proto::NodeProtoBackend;
     use crate::dap::{DapLaunchConfig, DapTransport};
     use crate::pty::LogHandle;
@@ -3588,6 +3609,22 @@ mod tests {
             native_help_topic_command(&NodeProtoBackend, "unknown-topic"),
             None
         );
+    }
+
+    #[test]
+    fn jdb_run_waits_past_the_transient_startup_prompt() {
+        let backend = JdbBackend;
+        assert!(jdb_run_needs_vm_prompt(
+            &backend,
+            "run",
+            "run Broken\nSet deferred uncaught java.lang.Throwable\n"
+        ));
+        assert!(!jdb_run_needs_vm_prompt(
+            &backend,
+            "run",
+            "VM Started:\nBreakpoint hit: Broken$Sku.equals"
+        ));
+        assert!(!jdb_run_needs_vm_prompt(&backend, "stack", "where\n"));
     }
 
     // These tests mutate process-global env vars (XDG_RUNTIME_DIR +
