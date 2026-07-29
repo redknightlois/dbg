@@ -557,6 +557,14 @@ fn backend_target_class(name: &str) -> TargetClass {
     }
 }
 
+fn backend_session_kind(backend: &dyn Backend) -> SessionKind {
+    if backend.is_profile_backend() {
+        SessionKind::Profile
+    } else {
+        SessionKind::Debug
+    }
+}
+
 /// Does this canonical operation cause an execution-state transition?
 /// Only these ops can produce a *new* breakpoint hit. Inspection ops
 /// (`stack`, `locals`, `print`, `breaks`) echo the current stop state
@@ -790,11 +798,7 @@ pub fn run_daemon(
     let target_class = backend_target_class(backend.name());
     let tmp_db = session_tmp("session.db");
     let _ = std::fs::remove_file(&tmp_db); // fresh DB on every start
-    let session_kind = if profile_output_path.is_some() {
-        SessionKind::Profile
-    } else {
-        SessionKind::Debug
-    };
+    let session_kind = backend_session_kind(backend);
     // Honour a user-chosen session label (e.g. `dbg import --label foo`).
     // The cmd_* layer sets DBG_LABEL before forking the daemon; we
     // pass it through to the session DB so `dbg sessions` and
@@ -4282,6 +4286,34 @@ mod tests {
         assert_eq!(backend_target_class("phpdbg"), TargetClass::Php);
         // Unknown backends fall through to native-cpu — informational only.
         assert_eq!(backend_target_class("perf"), TargetClass::NativeCpu);
+    }
+
+    #[test]
+    fn report_oriented_profilers_are_profile_sessions() {
+        let profilers: Vec<Box<dyn Backend>> = vec![
+            Box::new(crate::backend::callgrind::CallgrindBackend),
+            Box::new(crate::backend::pstats::PstatsBackend),
+            Box::new(crate::backend::massif::MassifBackend),
+            Box::new(crate::backend::memcheck::MemcheckBackend),
+            Box::new(crate::backend::ghcprof::GhcProfBackend),
+            Box::new(crate::backend::stackprof::StackprofBackend),
+            Box::new(crate::backend::xdebug::XdebugProfileBackend),
+        ];
+        for backend in profilers {
+            assert_eq!(
+                backend_session_kind(backend.as_ref()),
+                SessionKind::Profile,
+                "{} must create a profile-kind session",
+                backend.name()
+            );
+        }
+
+        let debugger = crate::backend::lldb::LldbBackend;
+        assert_eq!(
+            backend_session_kind(&debugger),
+            SessionKind::Debug,
+            "debuggers must retain debug-kind sessions"
+        );
     }
 
     #[test]

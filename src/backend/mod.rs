@@ -100,6 +100,17 @@ pub trait Backend: Send + Sync {
         None
     }
 
+    /// Whether this backend represents a profiling/analysis session.
+    ///
+    /// Most profilers expose a source that the generic `ProfileData` loader can
+    /// persist and replay, so that remains the default signal. Report-oriented
+    /// profilers such as callgrind, pstats, massif, and memcheck use their own
+    /// REPL/data format and override this independently. Session kind must not
+    /// be inferred solely from generic replay support.
+    fn is_profile_backend(&self) -> bool {
+        self.profile_output().is_some()
+    }
+
     /// Wall-clock deadline for each init command (see `SpawnConfig::init_commands`).
     /// Defaults to the daemon's `CMD_TIMEOUT` (60s). Profiling backends that
     /// wrap a slow child (cProfile, massif on a heavy program, …) override

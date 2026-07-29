@@ -79,6 +79,10 @@ impl Backend for PstatsBackend {
         "sort cumulative\nstats 20"
     }
 
+    fn is_profile_backend(&self) -> bool {
+        true
+    }
+
     /// cProfile runs the target script to completion before pstats
     /// opens. Real programs easily exceed the 60s default (scenario 15
     /// does ~200k regex compiles and takes minutes). Give init a 10-

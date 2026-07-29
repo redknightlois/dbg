@@ -98,6 +98,10 @@ impl Backend for CallgrindBackend {
         "stats"
     }
 
+    fn is_profile_backend(&self) -> bool {
+        true
+    }
+
     fn quit_command(&self) -> &'static str {
         "exit"
     }

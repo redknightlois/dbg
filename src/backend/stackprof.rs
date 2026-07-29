@@ -95,6 +95,10 @@ impl Backend for StackprofBackend {
         "hotspots"
     }
 
+    fn is_profile_backend(&self) -> bool {
+        true
+    }
+
     fn quit_command(&self) -> &'static str {
         "exit"
     }
