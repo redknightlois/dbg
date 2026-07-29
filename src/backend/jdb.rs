@@ -134,7 +134,7 @@ impl CanonicalOps for JdbBackend {
                 // Preserve package qualifiers. jdb resolves `a.b.Main:10`
                 // differently from an unqualified `Main:10` when classes
                 // with the same simple name are loaded.
-                let class = jdb_class_name(file);
+                let class = jdb_location_class(file, *line);
                 format!("stop at {class}:{line}")
             }
             BreakLoc::Fqn(name) => format!("stop at {name}"),
@@ -292,6 +292,165 @@ fn jdb_class_name(file: &str) -> String {
     class.replace('/', ".")
 }
 
+fn jdb_location_class(file: &str, line: u32) -> String {
+    let outer = jdb_class_name(file);
+    let path = std::path::Path::new(file);
+    let source_path = if path.is_file() {
+        path.to_path_buf()
+    } else if let Ok(cwd) = std::env::current_dir() {
+        cwd.join(path)
+    } else {
+        return outer;
+    };
+    let Ok(source) = std::fs::read_to_string(source_path) else {
+        return outer;
+    };
+
+    let source = sanitize_java_source(&source);
+    static CLASS_RE: OnceLock<Regex> = OnceLock::new();
+    let class_re = CLASS_RE.get_or_init(|| {
+        Regex::new(r"\b(?:class|interface|enum|record)\s+([A-Za-z_$][A-Za-z0-9_$]*)").unwrap()
+    });
+
+    let mut depth = 0usize;
+    let mut classes: Vec<(String, usize)> = Vec::new();
+    let mut pending = Vec::new();
+    for (index, text) in source.lines().enumerate() {
+        let source_line = index as u32 + 1;
+        let declarations: Vec<(usize, String)> = class_re
+            .captures_iter(text)
+            .filter_map(|capture| Some((capture.get(0)?.start(), capture[1].to_string())))
+            .collect();
+        let mut declaration_index = 0;
+
+        if source_line == line {
+            let nested: Vec<&str> = classes
+                .iter()
+                .skip(1)
+                .map(|(name, _)| name.as_str())
+                .collect();
+            if !nested.is_empty() {
+                return format!("{}${}", outer, nested.join("$"));
+            }
+        }
+
+        for (position, character) in text.char_indices() {
+            match character {
+                '{' => {
+                    if declaration_index < declarations.len()
+                        && declarations[declaration_index].0 < position
+                    {
+                        pending.push(declarations[declaration_index].1.clone());
+                        declaration_index += 1;
+                    }
+                    if let Some(name) = pending.pop() {
+                        classes.push((name, depth));
+                    }
+                    depth += 1;
+                }
+                '}' => {
+                    depth = depth.saturating_sub(1);
+                    while classes
+                        .last()
+                        .is_some_and(|(_, open_depth)| *open_depth >= depth)
+                    {
+                        classes.pop();
+                    }
+                }
+                _ => {}
+            }
+        }
+        pending.extend(
+            declarations
+                .into_iter()
+                .skip(declaration_index)
+                .map(|(_, name)| name),
+        );
+    }
+    outer
+}
+
+/// Replace comments and string contents with spaces before scanning braces.
+/// This keeps source positions while preventing text from changing scope.
+fn sanitize_java_source(source: &str) -> String {
+    let mut clean = String::with_capacity(source.len());
+    let bytes = source.as_bytes();
+    let mut index = 0;
+    let mut block_comment = false;
+    let mut quote = None;
+    let mut text_block = false;
+    while index < bytes.len() {
+        if block_comment {
+            if bytes[index..].starts_with(b"*/") {
+                clean.push(' ');
+                clean.push(' ');
+                index += 2;
+                block_comment = false;
+            } else {
+                clean.push(if bytes[index] == b'\n' { '\n' } else { ' ' });
+                index += 1;
+            }
+            continue;
+        }
+        if text_block {
+            if bytes[index..].starts_with(b"\"\"\"") {
+                clean.push_str("   ");
+                index += 3;
+                text_block = false;
+            } else {
+                clean.push(if bytes[index] == b'\n' { '\n' } else { ' ' });
+                index += 1;
+            }
+            continue;
+        }
+        if let Some(end_quote) = quote {
+            if bytes[index] == b'\\' && index + 1 < bytes.len() {
+                clean.push(' ');
+                clean.push(if bytes[index + 1] == b'\n' { '\n' } else { ' ' });
+                index += 2;
+            } else if bytes[index] as char == end_quote {
+                clean.push(' ');
+                index += 1;
+                quote = None;
+            } else {
+                clean.push(if bytes[index] == b'\n' { '\n' } else { ' ' });
+                index += 1;
+            }
+            continue;
+        }
+        if bytes[index..].starts_with(b"//") {
+            clean.push_str("  ");
+            index += 2;
+            while index < bytes.len() && bytes[index] != b'\n' {
+                clean.push(' ');
+                index += 1;
+            }
+            continue;
+        }
+        if bytes[index..].starts_with(b"/*") {
+            clean.push_str("  ");
+            index += 2;
+            block_comment = true;
+            continue;
+        }
+        if bytes[index..].starts_with(b"\"\"\"") {
+            clean.push_str("   ");
+            index += 3;
+            text_block = true;
+            continue;
+        }
+        if bytes[index] == b'"' || bytes[index] == b'\'' {
+            clean.push(' ');
+            quote = Some(bytes[index] as char);
+            index += 1;
+            continue;
+        }
+        clean.push(bytes[index] as char);
+        index += 1;
+    }
+    clean
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -399,6 +558,66 @@ The application exited";
                 })
                 .unwrap(),
             "stop at com.example.Main:12"
+        );
+    }
+
+    #[test]
+    fn file_breakpoint_targets_nested_class_at_source_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("Broken.java");
+        std::fs::write(
+            &source,
+            "public class Broken {\n    static class Sku {\n        boolean same() {\n            return true;\n        }\n    }\n}\n",
+        )
+        .unwrap();
+        assert_eq!(
+            JdbBackend
+                .op_break(&BreakLoc::FileLine {
+                    file: source.to_string_lossy().into_owned(),
+                    line: 4,
+                })
+                .unwrap(),
+            "stop at Broken$Sku:4"
+        );
+    }
+
+    #[test]
+    fn file_breakpoint_ignores_braces_in_comments_and_strings() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("Broken.java");
+        std::fs::write(
+            &source,
+            "class Broken {\n    static class Sku {\n        String text = \"}\"; // }\n        void run() {\n            return;\n        }\n    }\n}\n",
+        )
+        .unwrap();
+        assert_eq!(
+            JdbBackend
+                .op_break(&BreakLoc::FileLine {
+                    file: source.to_string_lossy().into_owned(),
+                    line: 5,
+                })
+                .unwrap(),
+            "stop at Broken$Sku:5"
+        );
+    }
+
+    #[test]
+    fn file_breakpoint_accepts_class_brace_on_next_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("Broken.java");
+        std::fs::write(
+            &source,
+            "class Broken\n{\n    static class Sku\n    {\n        void run() {}\n    }\n}\n",
+        )
+        .unwrap();
+        assert_eq!(
+            JdbBackend
+                .op_break(&BreakLoc::FileLine {
+                    file: source.to_string_lossy().into_owned(),
+                    line: 5,
+                })
+                .unwrap(),
+            "stop at Broken$Sku:5"
         );
     }
 
