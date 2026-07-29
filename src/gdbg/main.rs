@@ -2,6 +2,7 @@ mod check;
 mod collect;
 mod commands;
 mod db;
+mod kernel;
 mod parsers;
 mod repl;
 #[cfg(test)]

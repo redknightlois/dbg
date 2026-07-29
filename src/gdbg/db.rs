@@ -1,9 +1,11 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, ToSql, params};
+
+use crate::kernel::normalize_kernel_name;
 
 /// gdbg's schema version.
 ///
@@ -76,12 +78,13 @@ impl GpuDb {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let opened = open_sqlite_path(path, true)
+        let opened = open_sqlite_path(path, true, true)
             .with_context(|| format!("cannot create {}", path.display()))?;
         let conn = opened.conn;
         conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")?;
         init_schema(&conn)?;
         conn.execute(&format!("PRAGMA user_version = {GDBG_SCHEMA_VERSION}"), [])?;
+        normalize_kernel_names_in(&conn)?;
         Ok(Self {
             conn,
             _path: path.to_path_buf(),
@@ -104,13 +107,36 @@ impl GpuDb {
         // open_sqlite_path walks and opens the parent from a descriptor, then
         // opens the final component with O_NOFOLLOW. Do not perform a public
         // pathname check first: that would create a check/use race.
-        let opened = open_sqlite_path(path, false)
-            .with_context(|| format!("cannot open {}", path.display()))?;
+        let opened = match open_sqlite_path(path, true, false) {
+            Ok(opened) => opened,
+            Err(write_error) => open_sqlite_path(path, false, false).with_context(|| {
+                format!(
+                    "cannot open {} for read or write: {write_error}",
+                    path.display()
+                )
+            })?,
+        };
         Self::from_opened(path.to_path_buf(), opened)
     }
 
     fn from_opened(path: PathBuf, opened: OpenedSqlite) -> Result<Self> {
-        let conn = opened.conn;
+        let OpenedSqlite {
+            conn: source,
+            file,
+            writable,
+        } = opened;
+        let conn = if writable {
+            source
+        } else {
+            // A read-only source can still contain legacy profiler spellings.
+            // Copy it to memory so normalization keeps saved-session queries
+            // consistent without changing the source file permissions.
+            let mut copy = Connection::open_in_memory()?;
+            let backup = rusqlite::backup::Backup::new(&source, &mut copy)?;
+            backup.run_to_completion(100, std::time::Duration::from_millis(10), None)?;
+            drop(backup);
+            copy
+        };
         let found: i64 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap_or(0);
@@ -124,10 +150,12 @@ impl GpuDb {
             );
         }
         validate_schema_tables(&conn, &path)?;
+        normalize_kernel_names_transaction(&conn)
+            .with_context(|| format!("normalize kernel names in {}", path.display()))?;
         Ok(Self {
             conn,
             _path: path,
-            database_file: opened.file,
+            database_file: file,
             attached_files: Mutex::new(HashMap::new()),
             focus: None,
             ignore: None,
@@ -214,10 +242,30 @@ impl GpuDb {
     ) -> Result<Self> {
         validate_saved_session_name(name)?;
         let file_name = format!("{name}.gpu.db");
-        let file = open_file_at_dir(dir_guard, Path::new(&file_name), false, false, false)?;
-        let conn = open_sqlite_from_file(&file, false)?;
+        let (file, writable) =
+            match open_file_at_dir(dir_guard, Path::new(&file_name), true, false, false) {
+                Ok(file) => (file, true),
+                Err(write_error) => {
+                    let file =
+                        open_file_at_dir(dir_guard, Path::new(&file_name), false, false, false)
+                            .with_context(|| {
+                                format!(
+                                    "cannot open saved session for read or write: {write_error}"
+                                )
+                            })?;
+                    (file, false)
+                }
+            };
+        let conn = open_sqlite_from_file(&file, writable)?;
         let public_path = public_dir.join(file_name);
-        Self::from_opened(public_path, OpenedSqlite { conn, file })
+        Self::from_opened(
+            public_path,
+            OpenedSqlite {
+                conn,
+                file,
+                writable,
+            },
+        )
     }
 
     #[cfg(not(unix))]
@@ -292,10 +340,27 @@ impl GpuDb {
                 #[cfg(unix)]
                 let opened = {
                     let file_name = entry.file_name();
-                    open_file_at_dir(&dir_guard, Path::new(&file_name), false, false, false)
-                        .and_then(|file| {
-                            let conn = open_sqlite_from_file(&file, false)?;
-                            Self::from_opened(path.clone(), OpenedSqlite { conn, file })
+                    open_file_at_dir(&dir_guard, Path::new(&file_name), true, false, false)
+                        .map(|file| (file, true))
+                        .or_else(|write_error| {
+                            open_file_at_dir(&dir_guard, Path::new(&file_name), false, false, false)
+                                .map(|file| (file, false))
+                                .with_context(|| {
+                                    format!(
+                                        "cannot open saved session for read or write: {write_error}"
+                                    )
+                                })
+                        })
+                        .and_then(|(file, writable)| {
+                            let conn = open_sqlite_from_file(&file, writable)?;
+                            Self::from_opened(
+                                path.clone(),
+                                OpenedSqlite {
+                                    conn,
+                                    file,
+                                    writable,
+                                },
+                            )
                         })
                 };
                 #[cfg(not(unix))]
@@ -373,6 +438,14 @@ impl GpuDb {
         self.conn
             .execute("DELETE FROM layers WHERE id = ?1", params![layer_id])?;
         Ok(())
+    }
+
+    /// Normalize names in databases created by older gdbg versions.
+    ///
+    /// New imports already use the same key. This pass keeps saved sessions
+    /// compatible and makes every SQL equality join use the canonical key.
+    pub fn normalize_kernel_names(&self) -> Result<()> {
+        normalize_kernel_names_transaction(&self.conn)
     }
 
     /// Execute a query and collect all rows via a mapping function.
@@ -878,14 +951,19 @@ fn validate_schema_tables(conn: &Connection, path: &Path) -> Result<()> {
 struct OpenedSqlite {
     conn: Connection,
     file: std::fs::File,
+    writable: bool,
 }
 
-fn open_sqlite_path(path: &Path, writable: bool) -> Result<OpenedSqlite> {
+fn open_sqlite_path(path: &Path, writable: bool, create: bool) -> Result<OpenedSqlite> {
     #[cfg(unix)]
     {
-        let file = open_file(path, writable, writable)?;
+        let file = open_file(path, writable, create)?;
         let conn = open_sqlite_from_file(&file, writable)?;
-        return Ok(OpenedSqlite { conn, file });
+        return Ok(OpenedSqlite {
+            conn,
+            file,
+            writable,
+        });
     }
     #[cfg(not(unix))]
     {
@@ -1170,6 +1248,113 @@ fn init_schema(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+fn normalize_kernel_names_in(conn: &Connection) -> Result<()> {
+    let launch_rows: Vec<(i64, String)> = {
+        let mut stmt = conn.prepare("SELECT id, kernel_name FROM launches")?;
+        stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    for (id, raw) in launch_rows {
+        let name = normalize_kernel_name(&raw);
+        if name != raw {
+            conn.execute(
+                "UPDATE launches SET kernel_name = ?1 WHERE id = ?2",
+                params![name, id],
+            )?;
+        }
+    }
+
+    // Metrics have a primary key on (kernel_name, layer_id). If two old
+    // spellings become one key, merge non-null values before removing the
+    // duplicate. A saved database can contain complementary NCU rows.
+    let metric_rows: Vec<(String, Option<i64>)> = {
+        let mut stmt = conn.prepare("SELECT kernel_name, layer_id FROM metrics")?;
+        stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    for (raw, layer_id) in metric_rows {
+        let name = normalize_kernel_name(&raw);
+        if name == raw {
+            continue;
+        }
+        let duplicate = conn.query_row(
+            "SELECT COUNT(*) FROM metrics
+             WHERE kernel_name = ?1 AND layer_id IS ?2",
+            params![name, layer_id],
+            |row| row.get::<_, i64>(0),
+        )? > 0;
+        if duplicate {
+            conn.execute(
+                "UPDATE metrics AS existing SET
+                   occupancy_pct = COALESCE(existing.occupancy_pct, (SELECT incoming.occupancy_pct FROM metrics AS incoming WHERE incoming.kernel_name = ?1 AND incoming.layer_id IS ?2)),
+                   compute_throughput_pct = COALESCE(existing.compute_throughput_pct, (SELECT incoming.compute_throughput_pct FROM metrics AS incoming WHERE incoming.kernel_name = ?1 AND incoming.layer_id IS ?2)),
+                   memory_throughput_pct = COALESCE(existing.memory_throughput_pct, (SELECT incoming.memory_throughput_pct FROM metrics AS incoming WHERE incoming.kernel_name = ?1 AND incoming.layer_id IS ?2)),
+                   registers_per_thread = COALESCE(existing.registers_per_thread, (SELECT incoming.registers_per_thread FROM metrics AS incoming WHERE incoming.kernel_name = ?1 AND incoming.layer_id IS ?2)),
+                   shared_mem_static_bytes = COALESCE(existing.shared_mem_static_bytes, (SELECT incoming.shared_mem_static_bytes FROM metrics AS incoming WHERE incoming.kernel_name = ?1 AND incoming.layer_id IS ?2)),
+                   shared_mem_dynamic_bytes = COALESCE(existing.shared_mem_dynamic_bytes, (SELECT incoming.shared_mem_dynamic_bytes FROM metrics AS incoming WHERE incoming.kernel_name = ?1 AND incoming.layer_id IS ?2)),
+                   l2_hit_rate_pct = COALESCE(existing.l2_hit_rate_pct, (SELECT incoming.l2_hit_rate_pct FROM metrics AS incoming WHERE incoming.kernel_name = ?1 AND incoming.layer_id IS ?2)),
+                   achieved_bandwidth_gb_s = COALESCE(existing.achieved_bandwidth_gb_s, (SELECT incoming.achieved_bandwidth_gb_s FROM metrics AS incoming WHERE incoming.kernel_name = ?1 AND incoming.layer_id IS ?2)),
+                   peak_bandwidth_gb_s = COALESCE(existing.peak_bandwidth_gb_s, (SELECT incoming.peak_bandwidth_gb_s FROM metrics AS incoming WHERE incoming.kernel_name = ?1 AND incoming.layer_id IS ?2)),
+                   boundedness = COALESCE(existing.boundedness, (SELECT incoming.boundedness FROM metrics AS incoming WHERE incoming.kernel_name = ?1 AND incoming.layer_id IS ?2))
+                 WHERE existing.kernel_name = ?3 AND existing.layer_id IS ?4",
+                params![raw, layer_id, name, layer_id],
+            )?;
+            conn.execute(
+                "DELETE FROM metrics WHERE kernel_name = ?1 AND layer_id IS ?2",
+                params![raw, layer_id],
+            )?;
+        } else {
+            conn.execute(
+                "UPDATE metrics SET kernel_name = ?1
+                 WHERE kernel_name = ?2 AND layer_id IS ?3",
+                params![name, raw, layer_id],
+            )?;
+        }
+    }
+
+    let mappings: Vec<(Option<i64>, Option<String>, Option<i64>)> = {
+        let mut stmt = conn.prepare("SELECT op_id, kernel_name, launch_id FROM op_kernel_map")?;
+        stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+    };
+
+    // Normalize the complete key before the table changes. SQLite permits
+    // duplicate composite keys when any key value is NULL.
+    let mut unique_mappings = HashSet::new();
+    let mut normalized_mappings = Vec::with_capacity(mappings.len());
+    for (op_id, name, launch_id) in mappings {
+        let name = name.map(|name| normalize_kernel_name(&name));
+        let mapping = (op_id, name, launch_id);
+        if unique_mappings.insert(mapping.clone()) {
+            normalized_mappings.push(mapping);
+        }
+    }
+
+    conn.execute("DELETE FROM op_kernel_map", [])?;
+    for (op_id, name, launch_id) in normalized_mappings {
+        conn.execute(
+            "INSERT INTO op_kernel_map (op_id, kernel_name, launch_id)
+             VALUES (?1, ?2, ?3)",
+            params![op_id, name, launch_id],
+        )?;
+    }
+    Ok(())
+}
+
+fn normalize_kernel_names_transaction(conn: &Connection) -> Result<()> {
+    conn.execute_batch("BEGIN IMMEDIATE")?;
+    match normalize_kernel_names_in(conn) {
+        Ok(()) => {
+            conn.execute_batch("COMMIT")?;
+            Ok(())
+        }
+        Err(error) => {
+            let _ = conn.execute_batch("ROLLBACK");
+            Err(error)
+        }
+    }
+}
+
 fn validate_saved_session_name(name: &str) -> Result<()> {
     if name.is_empty()
         || name == "."
@@ -1289,6 +1474,32 @@ mod tests {
         assert_eq!(db.meta("target"), "train.py");
         assert_eq!(db.meta("device"), "A100");
         assert_eq!(db.meta("missing"), "");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_only_legacy_database_is_normalized_in_memory() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("legacy.gpu.db");
+        {
+            let db = GpuDb::create(&path).unwrap();
+            let layer = db.add_layer("nsys", "trace", None, None, None).unwrap();
+            db.conn
+                .execute(
+                    "INSERT INTO launches (kernel_name, duration_us, layer_id)
+                     VALUES ('void legacy::kernel(float)', 1.0, ?1)",
+                    params![layer],
+                )
+                .unwrap();
+        }
+
+        let opened = open_sqlite_path(&path, false, false).unwrap();
+        let db = GpuDb::from_opened(path, opened).unwrap();
+        let name: String = db
+            .conn
+            .query_row("SELECT kernel_name FROM launches", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(name, "legacy::kernel");
     }
 
     #[test]

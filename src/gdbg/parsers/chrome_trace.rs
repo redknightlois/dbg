@@ -5,6 +5,8 @@ use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, params};
 use serde::Deserialize;
 
+use crate::kernel::normalize_kernel_name;
+
 #[derive(Deserialize)]
 struct ChromeTrace {
     #[serde(rename = "traceEvents")]
@@ -182,8 +184,9 @@ fn import_kernel_events(dest: &Connection, events: &[TraceEvent], layer_id: i64)
                 .transpose()?,
         };
 
+        let name = normalize_kernel_name(&event.name);
         stmt.execute(params![
-            event.name,
+            name,
             dur,
             grid.map(|g| g.0),
             grid.map(|g| g.1),

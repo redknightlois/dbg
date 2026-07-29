@@ -3,6 +3,8 @@ use std::path::Path;
 use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, params};
 
+use crate::kernel::normalize_kernel_name;
+
 const MAX_IMPORT_BYTES: u64 = 1 * 1024 * 1024 * 1024;
 const MAX_NSYS_ROWS: usize = 1_000_000;
 const MAX_NSYS_ROWS_PLUS_ONE: usize = MAX_NSYS_ROWS + 1;
@@ -149,7 +151,8 @@ fn import_kernels(dest: &Connection, src: &Connection, layer_id: i64) -> Result<
         if row_count > MAX_NSYS_ROWS {
             bail!("NSYS kernel table exceeds the maximum of {MAX_NSYS_ROWS} rows");
         }
-        let (name, start_ns, end_ns, gx, gy, gz, bx, by, bz, sid, cid) = row?;
+        let (raw_name, start_ns, end_ns, gx, gy, gz, bx, by, bz, sid, cid) = row?;
+        let name = normalize_kernel_name(&raw_name);
         let duration_us = duration_us(start_ns, end_ns, "kernel")?;
         let start_us = start_ns as f64 / 1000.0;
         write.execute(params![

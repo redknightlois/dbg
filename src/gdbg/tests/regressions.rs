@@ -51,6 +51,120 @@ fn make_db(
     (db, dir)
 }
 
+#[test]
+fn kernel_identity_correlates_torch_nsys_and_ncu_spellings() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = GpuDb::create(&dir.path().join("identity.gpu.db")).unwrap();
+    let nsys = db.add_layer("nsys", "trace", None, None, None).unwrap();
+    let torch = db.add_layer("torch", "trace", None, None, None).unwrap();
+    let ncu = db.add_layer("ncu", "metrics", None, None, None).unwrap();
+
+    db.conn
+        .execute(
+            "INSERT INTO launches (kernel_name, duration_us, start_us, layer_id)
+             VALUES ('void fused::kernel(float)', 10.0, 1.0, ?1)",
+            params![nsys],
+        )
+        .unwrap();
+    db.conn
+        .execute(
+            "INSERT INTO launches (kernel_name, duration_us, start_us, layer_id)
+             VALUES ('fused::kernel', 9.0, 1.0, ?1)",
+            params![torch],
+        )
+        .unwrap();
+    db.conn
+        .execute(
+            "INSERT INTO metrics (kernel_name, occupancy_pct, layer_id)
+             VALUES ('fused::kernel(float)', 80.0, ?1)",
+            params![ncu],
+        )
+        .unwrap();
+
+    db.normalize_kernel_names().unwrap();
+
+    let names: Vec<String> = db.query_vec(
+        "SELECT DISTINCT kernel_name FROM launches ORDER BY kernel_name",
+        [],
+        |row| row.get(0),
+    );
+    assert_eq!(names, vec!["fused::kernel"]);
+    assert_eq!(db.kernels_with_metrics(), 1);
+    assert!(db.check_kernel_consistency().is_empty());
+}
+
+#[test]
+fn legacy_metric_normalization_merges_complementary_values() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = GpuDb::create(&dir.path().join("metric-merge.gpu.db")).unwrap();
+    let ncu = db.add_layer("ncu", "metrics", None, None, None).unwrap();
+
+    db.conn
+        .execute(
+            "INSERT INTO metrics (kernel_name, occupancy_pct, layer_id)
+             VALUES ('void fused::kernel(float)', 80.0, ?1)",
+            params![ncu],
+        )
+        .unwrap();
+    db.conn
+        .execute(
+            "INSERT INTO metrics (kernel_name, compute_throughput_pct, layer_id)
+             VALUES ('fused::kernel [12]', 65.0, ?1)",
+            params![ncu],
+        )
+        .unwrap();
+
+    db.normalize_kernel_names().unwrap();
+
+    let values: (String, Option<f64>, Option<f64>) = db
+        .conn
+        .query_row(
+            "SELECT kernel_name, occupancy_pct, compute_throughput_pct
+             FROM metrics WHERE layer_id = ?1",
+            params![ncu],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(values.0, "fused::kernel");
+    assert_eq!(values.1, Some(80.0));
+    assert_eq!(values.2, Some(65.0));
+}
+
+#[test]
+fn kernel_mapping_normalization_deduplicates_null_keys() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = GpuDb::create(&dir.path().join("mapping-merge.gpu.db")).unwrap();
+    let torch = db.add_layer("torch", "trace", None, None, None).unwrap();
+    db.conn
+        .execute(
+            "INSERT INTO ops (name, layer_id) VALUES ('fused op', ?1)",
+            params![torch],
+        )
+        .unwrap();
+    for name in [
+        "void fused::kernel(float)",
+        "fused::kernel",
+        "fused::kernel",
+    ] {
+        db.conn
+            .execute(
+                "INSERT INTO op_kernel_map (op_id, kernel_name, launch_id)
+                 VALUES (1, ?1, NULL)",
+                params![name],
+            )
+            .unwrap();
+    }
+
+    db.normalize_kernel_names().unwrap();
+
+    let mappings: Vec<(i64, String, Option<i64>)> = db.query_vec(
+        "SELECT op_id, kernel_name, launch_id FROM op_kernel_map",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    );
+    assert_eq!(mappings, vec![(1, "fused::kernel".to_string(), None)]);
+}
+
 // =======================================================================
 // Bug 4: import_wall_time must include transfer span
 // =======================================================================

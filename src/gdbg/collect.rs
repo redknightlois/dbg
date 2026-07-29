@@ -250,6 +250,7 @@ pub fn collect_all(db: &GpuDb, target: &str, args: &[String]) -> Result<()> {
     // layer launches.  If nsys is also present (phase 1), its kernel
     // durations are more complete.  This ensures top-ops, compare-ops, and
     // hotpath stay consistent with breakdown and kernels.
+    db.normalize_kernel_names()?;
     db.recompute_op_gpu_times();
 
     Ok(())

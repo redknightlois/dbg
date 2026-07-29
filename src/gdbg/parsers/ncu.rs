@@ -4,6 +4,8 @@ use std::{fs::File, io::Read, path::Path};
 use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, params};
 
+use crate::kernel::normalize_kernel_name;
+
 const MAX_IMPORT_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_NCU_ROWS: usize = 1_000_000;
 const MAX_KERNELS: usize = 100_000;
@@ -63,7 +65,7 @@ pub fn import_ncu_csv(dest: &Connection, csv_path: &Path, layer_id: i64) -> Resu
         let fields = parse_csv_line(line);
 
         let kernel = match fields.get(kernel_idx) {
-            Some(k) if !k.is_empty() => k.to_string(),
+            Some(k) if !k.is_empty() => normalize_kernel_name(k),
             _ => continue,
         };
         let metric_name = match fields.get(metric_name_idx) {
@@ -105,7 +107,8 @@ pub fn import_ncu_csv(dest: &Connection, csv_path: &Path, layer_id: i64) -> Resu
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
     )?;
 
-    for (name, m) in &kernel_metrics {
+    for (raw_name, m) in &kernel_metrics {
+        let name = normalize_kernel_name(raw_name);
         let occupancy = m.get("sm__warps_active.avg.pct_of_peak_sustained_active");
         let compute_tp = m
             .get("sm__throughput.avg.pct_of_peak_sustained_elapsed")
@@ -135,7 +138,7 @@ pub fn import_ncu_csv(dest: &Connection, csv_path: &Path, layer_id: i64) -> Resu
         let boundedness = classify_boundedness(compute_tp.copied(), memory_tp.copied());
 
         stmt.execute(params![
-            name,
+            &name,
             occupancy,
             compute_tp,
             memory_tp,
@@ -183,7 +186,7 @@ pub fn import_ncu_csv(dest: &Connection, csv_path: &Path, layer_id: i64) -> Resu
             let sid = m.get("launch__stream_id").map(|v| *v as i64);
 
             launch_stmt.execute(params![
-                name,
+                &name,
                 duration_ns / 1000.0,
                 gx,
                 gy,
