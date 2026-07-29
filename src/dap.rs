@@ -52,8 +52,10 @@ struct SpawnedChildGuard(Option<Child>);
 impl Drop for SpawnedChildGuard {
     fn drop(&mut self) {
         if let Some(mut child) = self.0.take() {
+            let descendants = capture_owned_descendants(child.id());
             let _ = child.kill();
             let _ = child.wait();
+            kill_captured_processes(descendants);
         }
     }
 }
@@ -469,6 +471,11 @@ impl DapTransport {
         // listen port just before bind() completes.
         let require_listener_owner =
             cfg.preassigned_addr.is_some() && cfg.bin.to_ascii_lowercase().contains("netcoredbg");
+        // Keep ownership of the adapter until the transport is fully
+        // constructed. `Child` does not kill a process when it is dropped,
+        // so an error while connecting or starting the driver would leak
+        // the adapter (and often its debuggee) without this guard.
+        let mut child_guard = SpawnedChildGuard(child);
         let stream = connect_with_retry_owned(
             &addr,
             Duration::from_secs(5),
@@ -495,7 +502,7 @@ impl DapTransport {
         let is_attach = cfg.launch_verb == "attach";
         let transport = Self {
             child_pid,
-            child: Mutex::new(child),
+            child: Mutex::new(child_guard.0.take()),
             driver_tx,
             log,
             state,
@@ -1703,10 +1710,12 @@ impl DebuggerIo for DapTransport {
         let deadline = Instant::now() + timeout;
         let (lock, cvar) = &*self.state;
         let mut guard = lock.lock().unwrap();
-        while guard.alive
-            && !guard.terminated
-            && (!guard.paused || (!self.is_attach && guard.pending_hit.is_none()))
-        {
+        // A stopped event is the startup boundary. Stack enrichment runs on
+        // a helper thread and may arrive after the event, so startup must not
+        // wait for that optional response. Waiting for pending_hit here can
+        // time out a healthy Delve session when the adapter sends entry and
+        // stackTrace frames in separate packets.
+        while guard.alive && !guard.terminated && !guard.paused {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
                 if self.is_attach {

@@ -430,14 +430,21 @@ fn resolve_ocaml(target: &str) -> Result<String> {
 }
 
 fn run_go_build(parent: &Path, args: &[&str]) -> Result<Output> {
+    let cache = go_build_cache(parent)?;
     Command::new("go")
         .args(args)
         .current_dir(parent)
         .env("GOTOOLCHAIN", "local")
         .env("GOVERSION", "")
-        .env("GOCACHE", parent.join(".dbg-go-build-cache"))
+        .env("GOCACHE", cache)
         .output()
         .context("go not found")
+}
+
+fn go_build_cache(parent: &Path) -> Result<std::path::PathBuf> {
+    Ok(std::fs::canonicalize(parent)
+        .with_context(|| format!("resolve Go build directory {}", parent.display()))?
+        .join(".dbg-go-build-cache"))
 }
 
 fn go_build_error(stderr: &[u8]) -> String {
@@ -630,6 +637,22 @@ mod tests {
             !out.contains("nested/nested"),
             "duplicated output path: {out}"
         );
+    }
+
+    #[test]
+    fn go_build_cache_is_absolute_for_relative_directory() {
+        let tmp = tempfile::tempdir_in(".").unwrap();
+        let relative = tmp
+            .path()
+            .strip_prefix(std::env::current_dir().unwrap())
+            .unwrap();
+        let cache = go_build_cache(relative).unwrap();
+        assert!(
+            cache.is_absolute(),
+            "GOCACHE must be absolute: {}",
+            cache.display()
+        );
+        assert!(cache.ends_with(".dbg-go-build-cache"));
     }
 
     #[test]

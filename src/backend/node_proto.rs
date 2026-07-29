@@ -91,6 +91,10 @@ impl Backend for NodeProtoBackend {
         "help"
     }
 
+    fn supports_help_command(&self) -> bool {
+        false
+    }
+
     fn parse_help(&self, _raw: &str) -> String {
         "node-proto: cont, step, next, out, backtrace, breakpoints, \
          sb(file, line), print <expr>, .exit"
@@ -213,5 +217,15 @@ impl CanonicalOps for NodeProtoBackend {
         // The inspector transport already emits a JSON object as the
         // `locals` response — just round-trip it.
         serde_json::from_str(output.trim()).ok()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn inspector_transport_rejects_native_help() {
+        assert!(!NodeProtoBackend.supports_help_command());
     }
 }

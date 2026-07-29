@@ -6,11 +6,47 @@
 //! (initialize / launch / configurationDone).
 
 use serde_json::{Value, json};
+use std::io::Read;
 
 use super::canonical::{BreakLoc, CanonicalOps};
 use super::{Backend, Dependency, DependencyCheck, SpawnConfig};
 
 pub struct DelveProtoBackend;
+
+fn is_compiled_binary(path: &std::path::Path) -> bool {
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return false;
+    };
+    let mut magic = [0_u8; 4];
+    let Ok(size) = file.read(&mut magic) else {
+        return false;
+    };
+    if size >= 2 && magic[..2] == *b"MZ" {
+        return true;
+    }
+    size == 4
+        && matches!(
+            magic,
+            [0x7f, b'E', b'L', b'F']
+                | [0xfe, 0xed, 0xfa, 0xce]
+                | [0xce, 0xfa, 0xed, 0xfe]
+                | [0xfe, 0xed, 0xfa, 0xcf]
+                | [0xcf, 0xfa, 0xed, 0xfe]
+                | [0xca, 0xfe, 0xba, 0xbe]
+                | [0xbe, 0xba, 0xfe, 0xca]
+        )
+}
+
+fn launch_mode(path: &std::path::Path) -> &'static str {
+    if path.is_dir()
+        || (path.extension().and_then(|extension| extension.to_str()) == Some("go")
+            && !is_compiled_binary(path))
+    {
+        "debug"
+    } else {
+        "exec"
+    }
+}
 
 impl Backend for DelveProtoBackend {
     fn name(&self) -> &'static str {
@@ -104,6 +140,11 @@ impl Backend for DelveProtoBackend {
         target: &str,
         args: &[String],
     ) -> anyhow::Result<crate::dap::DapLaunchConfig> {
+        let path = std::path::Path::new(target);
+        let mode = launch_mode(path);
+        let program = std::fs::canonicalize(target)
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|_| target.to_string());
         // `dlv dap -l 127.0.0.1:0` — lets the kernel pick a free port;
         // delve prints `DAP server listening at: 127.0.0.1:PORT` on
         // stderr. The transport scrapes that.
@@ -115,8 +156,8 @@ impl Backend for DelveProtoBackend {
             launch_args: json!({
                 // Delve launch config mirrors VSCode's go.debug settings.
                 "request": "launch",
-                "mode": "debug",
-                "program": target,
+                "mode": mode,
+                "program": program,
                 "args": args,
                 "cwd": std::env::current_dir()
                     .map(|p| p.display().to_string())
@@ -160,6 +201,35 @@ impl Backend for DelveProtoBackend {
             connect_addr: None,
             debuggee_pid: Some(pid),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::backend::Backend;
+
+    #[test]
+    fn source_launch_uses_debug_mode() {
+        let config = DelveProtoBackend.dap_launch("missing.go", &[]).unwrap();
+        assert_eq!(config.launch_args["mode"], "debug");
+    }
+
+    #[test]
+    fn binary_launch_uses_exec_mode() {
+        let config = DelveProtoBackend.dap_launch("missing-bin", &[]).unwrap();
+        assert_eq!(config.launch_args["mode"], "exec");
+    }
+
+    #[test]
+    fn go_named_binary_uses_exec_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let binary = dir.path().join("worker.go");
+        std::fs::write(&binary, b"\x7fELF").unwrap();
+        let config = DelveProtoBackend
+            .dap_launch(binary.to_str().unwrap(), &[])
+            .unwrap();
+        assert_eq!(config.launch_args["mode"], "exec");
     }
 }
 

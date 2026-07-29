@@ -89,6 +89,11 @@ pub trait Backend: Send + Sync {
         "help"
     }
 
+    /// Return true when the transport accepts a native help command.
+    fn supports_help_command(&self) -> bool {
+        !self.uses_inspector() && !self.uses_dap()
+    }
+
     /// Adapter markdown files for AI skill integration.
     fn adapters(&self) -> Vec<(&'static str, &'static str)>;
 

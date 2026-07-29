@@ -778,10 +778,15 @@ pub fn run_daemon(
     // Cache help output now while the debugger is idle and responsive.
     // Stored outside the session mutex so it can be served even when
     // the debugger is busy running a command.
-    let cached_help = proc
-        .send_and_wait(backend.help_command(), CMD_TIMEOUT)
-        .map(|raw| backend.parse_help(&raw))
-        .context("failed to initialize debugger help")?;
+    // Protocol transports expose their command surface through structured
+    // requests. They do not accept the native PTY help command, so use the
+    // backend's static description without sending an unsupported request.
+    // PTY transports keep the native help query and its parsed output.
+    let cached_help = cache_help(backend, || {
+        proc.send_and_wait(backend.help_command(), CMD_TIMEOUT)
+            .map(|raw| backend.parse_help(&raw))
+            .context("failed to initialize debugger help")
+    })?;
 
     let profile_output_path = backend.profile_output();
     let (profile, profile_error) = match profile_output_path.as_ref() {
@@ -997,6 +1002,23 @@ fn parse_init_status(response: &str) -> Option<i32> {
         .and_then(|value| value.trim().parse::<i32>().ok())
 }
 
+fn cache_help(
+    backend: &dyn Backend,
+    native_help: impl FnOnce() -> Result<String>,
+) -> Result<String> {
+    if !backend.supports_help_command() {
+        Ok(backend.parse_help(""))
+    } else {
+        native_help()
+    }
+}
+
+fn native_help_topic_command(backend: &dyn Backend, topic: &str) -> Option<String> {
+    backend
+        .supports_help_command()
+        .then(|| format!("{} {topic}", backend.help_command()))
+}
+
 fn read_ipc_request_with_timeout(
     stream: &mut std::os::unix::net::UnixStream,
     idle_timeout: Duration,
@@ -1162,14 +1184,16 @@ fn handle_command(
         if let Some(text) = dbg_verb_help(topic) {
             return text.to_string();
         }
-        let help_cmd = backend.help_command();
+        let Some(help_command) = native_help_topic_command(backend, topic) else {
+            return cached_help.to_string();
+        };
         let guard = match session.try_lock() {
             Ok(g) => g,
             Err(_) => return "[busy] debugger is running a command — try again".to_string(),
         };
         return guard
             .proc
-            .send_and_wait(&format!("{help_cmd} {topic}"), CMD_TIMEOUT)
+            .send_and_wait(&help_command, CMD_TIMEOUT)
             .unwrap_or_else(|e| format!("[error: {e}]"));
     }
 
@@ -3237,6 +3261,7 @@ pub fn wait_for_socket(timeout: Duration) -> bool {
 mod tests {
     use super::*;
     use crate::backend::delve_proto::DelveProtoBackend;
+    use crate::backend::node_proto::NodeProtoBackend;
     use crate::dap::{DapLaunchConfig, DapTransport};
     use crate::pty::LogHandle;
     use tempfile::TempDir;
@@ -3550,6 +3575,19 @@ mod tests {
         assert_eq!(parse_init_status("output\n__DBG_INIT_STATUS__0\n"), Some(0));
         assert_eq!(parse_init_status("output\n__DBG_INIT_STATUS__7\n"), Some(7));
         assert_eq!(parse_init_status("output without marker"), None);
+    }
+
+    #[test]
+    fn protocol_help_uses_static_surface_without_native_command() {
+        let help = cache_help(&NodeProtoBackend, || {
+            panic!("node-proto must not receive the native help command")
+        })
+        .unwrap();
+        assert!(help.contains("node-proto"));
+        assert_eq!(
+            native_help_topic_command(&NodeProtoBackend, "unknown-topic"),
+            None
+        );
     }
 
     // These tests mutate process-global env vars (XDG_RUNTIME_DIR +
