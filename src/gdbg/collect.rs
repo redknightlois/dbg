@@ -371,40 +371,42 @@ fn collect_ncu(
     let csv_path = session.join("ncu_metrics.csv");
     let start = Instant::now();
 
-    // Kernel names are data, not regex syntax. The same escaping used by
-    // `suggest` must be used for the actual ncu command, otherwise names
-    // such as `foo.bar` select unrelated kernels and make the imported ncu
-    // layer disagree with the displayed recommendation.
-    let regex = kernel_names
-        .iter()
-        .map(|name| crate::commands::escape_regex(name))
-        .collect::<Vec<_>>()
-        .join("|");
-
-    let mut cmd = Command::new("ncu");
-    cmd.args(["--set", "full", "--csv"]);
-    cmd.args(["--kernel-name", &format!("regex:{regex}")]);
-    if matches!(
-        kind,
-        TargetKind::Python | TargetKind::PythonTorch | TargetKind::PythonTriton
-    ) {
-        cmd.arg("python3").arg(target);
-    } else {
-        cmd.arg(target);
+    // nsys stores demangled signatures (for example
+    // `add_one(float *, int)`), while ncu matches `--kernel-name` against
+    // its shorter `function` basis by default (`add_one`). Explicitly select
+    // the demangled basis so the phase-1 names match phase 2. Run each top
+    // kernel separately and capture one representative launch: a combined
+    // regex plus a global launch limit can consume every slot on the first
+    // hot kernel, while omitting the limit can attempt to replay 100k+ tiny
+    // launches under `--set full`.
+    let mut combined_csv = Vec::new();
+    for kernel_name in kernel_names {
+        let mut cmd = ncu_command(target, args, kernel_name, kind);
+        let output = run_cmd(&mut cmd, &format!("ncu failed for kernel `{kernel_name}`"))?;
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        if !stdout.contains("\"Kernel Name\"")
+            || !stdout.contains("\"Metric Name\"")
+            || !stdout.contains("\"Metric Value\"")
+        {
+            bail!(
+                "ncu produced no metrics for kernel `{kernel_name}`:\n{}",
+                stdout.trim()
+            );
+        }
+        combined_csv.extend_from_slice(&output.stdout);
+        if !combined_csv.ends_with(b"\n") {
+            combined_csv.push(b'\n');
+        }
     }
-    for a in args {
-        cmd.arg(a);
-    }
-
-    let output = run_cmd(&mut cmd, "ncu failed")?;
-    std::fs::write(&csv_path, &output.stdout)?;
+    std::fs::write(&csv_path, &combined_csv)?;
     let elapsed = start.elapsed().as_secs_f64();
 
     let _layer_id = db.import_layer(
         "ncu",
         &csv_path.display().to_string(),
         Some(&format!(
-            "ncu --set full --kernel-name regex:{regex} {target}"
+            "ncu --set full --kernel-name-base demangled --launch-count 1 \
+             (one run per top kernel) {target}"
         )),
         Some(elapsed),
         target_hash,
@@ -416,6 +418,31 @@ fn collect_ncu(
         db.kernels_with_metrics()
     );
     Ok(())
+}
+
+fn ncu_command(target: &str, args: &[String], kernel_name: &str, kind: TargetKind) -> Command {
+    let regex = crate::commands::escape_regex(kernel_name);
+    let mut cmd = Command::new("ncu");
+    cmd.args(["--set", "full", "--csv"]);
+    // The importer keys off Nsight Compute's stable metric identifiers (for
+    // example `sm__throughput.avg.pct_of_peak_sustained_elapsed`).  CSV output
+    // uses localized/display labels such as `Compute (SM) Throughput` unless
+    // this is requested explicitly, which creates a metrics row containing
+    // only NULL values and makes the REPL report `[no ncu]`.
+    cmd.args(["--print-metric-name", "name"]);
+    cmd.args(["--kernel-name-base", "demangled"]);
+    cmd.args(["--kernel-name", &format!("regex:{regex}")]);
+    cmd.args(["--launch-count", "1"]);
+    if matches!(
+        kind,
+        TargetKind::Python | TargetKind::PythonTorch | TargetKind::PythonTriton
+    ) {
+        cmd.arg("python3").arg(target);
+    } else {
+        cmd.arg(target);
+    }
+    cmd.args(args);
+    cmd
 }
 
 /// Collect Triton's operator mapping with Proton. Triton targets must not
@@ -640,5 +667,59 @@ mod tests {
         assert_eq!(python_preflight_module(TargetKind::Python), None);
         assert_eq!(python_preflight_module(TargetKind::Binary), None);
         assert_eq!(python_preflight_module(TargetKind::CudaSource), None);
+    }
+
+    #[test]
+    fn ncu_command_matches_nsys_demangled_name_and_bounds_launches() {
+        let cmd = ncu_command(
+            "./app",
+            &["--size".into(), "42".into()],
+            "add_one(float *, int)",
+            TargetKind::Binary,
+        );
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            args.windows(2)
+                .any(|w| w == ["--kernel-name-base", "demangled"]),
+            "ncu must match the demangled names imported from nsys: {args:?}"
+        );
+        assert!(
+            args.windows(2)
+                .any(|w| w == ["--print-metric-name", "name"]),
+            "ncu must emit stable metric identifiers consumed by the parser: {args:?}"
+        );
+        assert!(
+            args.windows(2).any(|w| w == ["--launch-count", "1"]),
+            "each ncu subprocess must capture one representative launch: {args:?}"
+        );
+        assert!(
+            args.iter()
+                .any(|arg| arg == "regex:add_one\\(float \\*, int\\)"),
+            "kernel signatures must be regex-escaped: {args:?}"
+        );
+        assert!(args.ends_with(&["./app".into(), "--size".into(), "42".into()]));
+    }
+
+    #[test]
+    fn ncu_command_wraps_python_targets_after_profiler_flags() {
+        let cmd = ncu_command(
+            "train.py",
+            &["--steps".into(), "2".into()],
+            "kernel()",
+            TargetKind::PythonTorch,
+        );
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert!(args.ends_with(&[
+            "python3".into(),
+            "train.py".into(),
+            "--steps".into(),
+            "2".into(),
+        ]));
     }
 }

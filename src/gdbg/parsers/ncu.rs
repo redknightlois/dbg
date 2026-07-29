@@ -112,7 +112,12 @@ pub fn import_ncu_csv(dest: &Connection, csv_path: &Path, layer_id: i64) -> Resu
             .or_else(|| m.get("sm__pipe_tensor_cycles_active.avg.pct_of_peak_sustained_elapsed"));
         let memory_tp = m
             .get("dram__throughput.avg.pct_of_peak_sustained_elapsed")
-            .or_else(|| m.get("gpu__dram_throughput.avg.pct_of_peak_sustained_elapsed"));
+            .or_else(|| m.get("gpu__dram_throughput.avg.pct_of_peak_sustained_elapsed"))
+            // Newer architectures expose the Speed-of-Light "Memory
+            // Throughput" value under this aggregate GPU metric instead of a
+            // `dram__throughput` metric.  Nsight Compute 2025.x on Blackwell
+            // is one example.
+            .or_else(|| m.get("gpu__compute_memory_throughput.avg.pct_of_peak_sustained_elapsed"));
         let registers = m
             .get("launch__registers_per_thread")
             .and_then(|v| nonnegative_i64(*v));

@@ -99,7 +99,7 @@ fn ncu_csv_edge_cases() {
     // Second kernel with memory metric
     writeln!(
         tmp,
-        r#""2","other_kernel","dram__throughput.avg.pct_of_peak_sustained_elapsed","%","65.2""#
+        r#""2","other_kernel","gpu__compute_memory_throughput.avg.pct_of_peak_sustained_elapsed","%","65.2""#
     )
     .unwrap();
     writeln!(
