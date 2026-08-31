@@ -302,6 +302,14 @@ impl ProfileData {
                         }
                     }
                     "C" => {
+                        if !stack
+                            .last()
+                            .is_some_and(|(opened_idx, _)| *opened_idx == idx)
+                        {
+                            anyhow::bail!(
+                                "profile close event for frame {idx} does not match the open frame"
+                            );
+                        }
                         if let Some((opened_idx, opened_at)) = stack.pop() {
                             let duration = event.at - opened_at;
                             if duration > 0.0 {
@@ -464,10 +472,14 @@ impl ProfileData {
         // Collapse consecutive recursive calls to the same frame so that
         // e.g. ackermann→ackermann→ackermann appears as a single frame
         // in the stack rather than inflating inclusive time.
-        let build_stack = |node_id: u64| -> Vec<usize> {
+        let build_stack = |node_id: u64| -> Result<Vec<usize>> {
             let mut stack = Vec::new();
             let mut id = node_id;
+            let mut visited = HashSet::new();
             loop {
+                if !visited.insert(id) {
+                    anyhow::bail!("V8 profile node graph contains a cycle at node {id}");
+                }
                 if let Some(&node_idx) = id_to_idx.get(&id) {
                     let frame_idx = node_to_frame[node_idx];
                     // Skip if same frame as the previous entry (recursion)
@@ -481,7 +493,7 @@ impl ProfileData {
                 }
             }
             stack.reverse();
-            stack
+            Ok(stack)
         };
 
         // Convert samples + timeDeltas into Speedscope evented format
@@ -490,7 +502,7 @@ impl ProfileData {
         let mut prev_stack: Vec<usize> = Vec::new();
 
         for (i, &sample_id) in profile.samples.iter().enumerate() {
-            let stack = build_stack(sample_id);
+            let stack = build_stack(sample_id)?;
             let delta = profile.time_deltas[i] / 1000.0; // microseconds → ms
             if !delta.is_finite() || delta < 0.0 {
                 anyhow::bail!("V8 profile contains an invalid time delta");
@@ -2552,6 +2564,42 @@ Duration: 1s
         assert!(p.frames[1].name.contains("app.js:1"));
         assert!(p.frames[2].name.contains("compute"));
         assert!(p.frames[3].name.contains("sort"));
+    }
+
+    #[test]
+    fn load_v8_cpuprofile_rejects_parent_cycles() {
+        let cyclic = r#"{
+            "nodes": [
+                {"id":1,"callFrame":{"functionName":"a","scriptId":"1","url":"a.js","lineNumber":0,"columnNumber":0},"children":[2]},
+                {"id":2,"callFrame":{"functionName":"b","scriptId":"1","url":"a.js","lineNumber":1,"columnNumber":0},"children":[1]}
+            ],
+            "startTime":0,"endTime":1,"samples":[1],"timeDeltas":[1]
+        }"#;
+        let error = match ProfileData::load_v8_cpuprofile(cyclic) {
+            Ok(_) => panic!("cyclic parent graph was accepted"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("cycle"));
+    }
+
+    #[test]
+    fn speedscope_rejects_a_close_for_the_wrong_open_frame() {
+        let malformed = r#"{
+            "shared":{"frames":[{"name":"a"},{"name":"b"}]},
+            "profiles":[{"events":[
+                {"type":"O","at":0.0,"frame":0},
+                {"type":"O","at":1.0,"frame":1},
+                {"type":"C","at":2.0,"frame":0}
+            ]}]
+        }"#;
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("bad.json");
+        std::fs::write(&path, malformed).unwrap();
+        let error = match ProfileData::load(&path) {
+            Ok(_) => panic!("mismatched close event was accepted"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("does not match"));
     }
 
     #[test]
