@@ -458,11 +458,12 @@ pub fn startup_log_path() -> PathBuf {
 /// Must be called from the forked daemon child, after `setsid()`.
 pub fn detach_stdio(log_path: &std::path::Path) {
     use std::os::unix::io::AsRawFd;
-    if let Ok(dn) = std::fs::OpenOptions::new()
+    let devnull = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
         .open("/dev/null")
-    {
+        .ok();
+    if let Some(dn) = &devnull {
         let _ = nix::unistd::dup2(dn.as_raw_fd(), 0);
         let _ = nix::unistd::dup2(dn.as_raw_fd(), 1);
     }
@@ -473,6 +474,10 @@ pub fn detach_stdio(log_path: &std::path::Path) {
         .open(log_path)
     {
         let _ = nix::unistd::dup2(f.as_raw_fd(), 2);
+    } else if let Some(dn) = &devnull {
+        // Never retain the parent's capture pipe merely because the
+        // preferred startup log could not be opened.
+        let _ = nix::unistd::dup2(dn.as_raw_fd(), 2);
     }
 }
 
@@ -1123,13 +1128,10 @@ fn handle_quit_with(
     loop {
         if let Ok(mut guard) = session.try_lock() {
             let keep_session_tmp = !persist_session_on_exit_with(&mut guard, read_dir);
-            // A failed durable copy means the private source tree is still
-            // the only evidence. Leave the debugger alive as well, so its
-            // live capture remains available while the caller recovers the
-            // raw files and retries persistence.
-            if !keep_session_tmp {
-                guard.proc.quit(backend.quit_command());
-            }
+            // Preserve raw evidence after a failed durable copy, but always
+            // stop the owned debugger before the daemon exits. Once the
+            // socket is removed there is no way to recover a live child.
+            guard.proc.quit(backend.quit_command());
             break ("stopped".to_string(), keep_session_tmp);
         }
         std::thread::sleep(Duration::from_millis(50));
@@ -4517,7 +4519,7 @@ mod tests {
         cleanup_session_tmp_at(&source, keep_session_tmp);
         assert!(source.join("cleanup-capture.data").exists());
         assert!(outside.exists());
-        assert!(session.lock().unwrap().proc.is_alive());
+        assert!(!session.lock().unwrap().proc.is_alive());
         assert!(!save_path.exists());
         assert!(!raw_destination.join("cleanup-capture.data").exists());
 
@@ -4611,7 +4613,7 @@ mod tests {
         );
         cleanup_session_tmp_at(&source, keep_session_tmp);
         assert!(artifact.exists());
-        assert!(session.lock().unwrap().proc.is_alive());
+        assert!(!session.lock().unwrap().proc.is_alive());
         assert!(!save_path.exists());
     }
 
