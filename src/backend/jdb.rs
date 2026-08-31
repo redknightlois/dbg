@@ -3,7 +3,7 @@ use std::sync::OnceLock;
 use regex::Regex;
 use serde_json::{Map, Value};
 
-use super::canonical::{BreakLoc, CanonicalOps, HitEvent};
+use super::canonical::{BreakLoc, CanonicalOps, HitEvent, unsupported};
 use super::{Backend, Dependency, DependencyCheck, SpawnConfig};
 
 pub struct JdbBackend;
@@ -163,7 +163,8 @@ impl CanonicalOps for JdbBackend {
         Ok("where".into())
     }
     fn op_frame(&self, n: u32) -> anyhow::Result<String> {
-        Ok(format!("up {n}"))
+        let _ = n;
+        Err(unsupported("jdb", "absolute frame selection"))
     }
     fn op_locals(&self) -> anyhow::Result<String> {
         Ok("locals".into())
@@ -461,6 +462,12 @@ mod tests {
     #[test]
     fn format_breakpoint() {
         assert_eq!(JdbBackend.format_breakpoint("Main:10"), "stop at Main:10");
+    }
+
+    #[test]
+    fn canonical_frame_does_not_translate_absolute_index_to_relative_up() {
+        let error = JdbBackend.op_frame(2).unwrap_err();
+        assert!(error.to_string().contains("not supported"));
     }
 
     #[test]

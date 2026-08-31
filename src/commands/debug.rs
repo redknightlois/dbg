@@ -479,7 +479,7 @@ mod tests {
         let d = dispatch_to("break src/foo.rs:42", &b);
         let (op, cmd, dec) = native_of(d);
         assert_eq!(op, "break");
-        assert_eq!(cmd, "breakpoint set --file src/foo.rs --line 42");
+        assert_eq!(cmd, "breakpoint set --file \"src/foo.rs\" --line 42");
         assert!(dec);
     }
 

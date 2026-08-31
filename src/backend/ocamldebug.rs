@@ -3,7 +3,7 @@ use std::sync::OnceLock;
 use regex::Regex;
 use serde_json::{Map, Value};
 
-use super::canonical::{BreakLoc, CanonicalOps, HitEvent};
+use super::canonical::{BreakLoc, CanonicalOps, HitEvent, unsupported};
 use super::{Backend, Dependency, DependencyCheck, SpawnConfig};
 
 pub struct OcamlDebugBackend;
@@ -174,7 +174,9 @@ impl CanonicalOps for OcamlDebugBackend {
                 format!("break @ {module} {line}")
             }
             BreakLoc::Fqn(name) => format!("break {name}"),
-            BreakLoc::ModuleMethod { module, method: _ } => format!("break @ {module}"),
+            BreakLoc::ModuleMethod { .. } => {
+                return Err(unsupported("ocamldebug", "module-method breakpoints"));
+            }
         })
     }
     fn op_run(&self, _args: &[String]) -> anyhow::Result<String> {
@@ -334,6 +336,17 @@ mod tests {
             OcamlDebugBackend.format_breakpoint("parse_expr"),
             "break parse_expr"
         );
+    }
+
+    #[test]
+    fn canonical_module_method_breakpoint_is_explicitly_unsupported() {
+        let error = OcamlDebugBackend
+            .op_break(&BreakLoc::ModuleMethod {
+                module: "Parser".into(),
+                method: "parse_expr".into(),
+            })
+            .unwrap_err();
+        assert!(error.to_string().contains("not supported"));
     }
 
     #[test]

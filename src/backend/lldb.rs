@@ -158,7 +158,10 @@ impl CanonicalOps for LldbBackend {
     fn op_break(&self, loc: &BreakLoc) -> anyhow::Result<String> {
         Ok(match loc {
             BreakLoc::FileLine { file, line } => {
-                format!("breakpoint set --file {file} --line {line}")
+                format!(
+                    "breakpoint set --file {} --line {line}",
+                    lldb_command_arg(file)
+                )
             }
             BreakLoc::Fqn(name) => format!("breakpoint set --name {name}"),
             BreakLoc::ModuleMethod { module, method } => {
@@ -549,7 +552,21 @@ mod tests {
                 line: 42,
             })
             .unwrap();
-        assert_eq!(s, "breakpoint set --file main.c --line 42");
+        assert_eq!(s, "breakpoint set --file \"main.c\" --line 42");
+    }
+
+    #[test]
+    fn canonical_break_quotes_file_paths() {
+        let command = LldbBackend
+            .op_break(&BreakLoc::FileLine {
+                file: "src/my file.cpp".into(),
+                line: 20,
+            })
+            .unwrap();
+        assert_eq!(
+            command,
+            "breakpoint set --file \"src/my file.cpp\" --line 20"
+        );
     }
 
     #[test]

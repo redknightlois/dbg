@@ -120,7 +120,7 @@ impl Backend for PerfBackend {
         const PARANOID: &str = "/proc/sys/kernel/perf_event_paranoid";
         if let Ok(contents) = std::fs::read_to_string(PARANOID) {
             if let Ok(level) = contents.trim().parse::<i32>() {
-                if level >= 3 {
+                if level >= 3 && !has_perf_record_privilege() {
                     anyhow::bail!(
                         "kernel.perf_event_paranoid={level} blocks `perf record` for \
                          unprivileged users.\n  \
@@ -165,6 +165,38 @@ impl Backend for PerfBackend {
             include_str!("../../skills/references/adapters/perf.md"),
         )]
     }
+}
+
+#[cfg(target_os = "linux")]
+fn has_perf_record_privilege() -> bool {
+    if unsafe { nix::libc::geteuid() } == 0 {
+        return true;
+    }
+    let Ok(status) = std::fs::read_to_string("/proc/self/status") else {
+        return false;
+    };
+    perf_capabilities_allow_recording(&status)
+}
+
+#[cfg(target_os = "linux")]
+fn perf_capabilities_allow_recording(status: &str) -> bool {
+    let Some(raw) = status
+        .lines()
+        .find_map(|line| line.strip_prefix("CapEff:").map(str::trim))
+    else {
+        return false;
+    };
+    let Ok(caps) = u128::from_str_radix(raw.trim_start_matches("0x"), 16) else {
+        return false;
+    };
+    const CAP_SYS_ADMIN: u32 = 21;
+    const CAP_PERFMON: u32 = 38;
+    caps & ((1u128 << CAP_SYS_ADMIN) | (1u128 << CAP_PERFMON)) != 0
+}
+
+#[cfg(not(target_os = "linux"))]
+fn has_perf_record_privilege() -> bool {
+    false
 }
 
 #[cfg(test)]
@@ -252,6 +284,20 @@ mod tests {
     #[test]
     fn format_breakpoint_empty() {
         assert_eq!(PerfBackend.format_breakpoint("anything"), "");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn perf_capability_detection_accepts_perfmon_and_sys_admin() {
+        assert!(perf_capabilities_allow_recording(&format!(
+            "CapEff:\t{:x}\n",
+            1u128 << 38
+        )));
+        assert!(perf_capabilities_allow_recording(&format!(
+            "CapEff:\t{:x}\n",
+            1u128 << 21
+        )));
+        assert!(!perf_capabilities_allow_recording("CapEff:\t0\n"));
     }
 
     #[test]

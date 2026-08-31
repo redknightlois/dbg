@@ -23,22 +23,28 @@ impl Backend for GhciBackend {
     }
 
     fn spawn_config(&self, target: &str, args: &[String]) -> anyhow::Result<SpawnConfig> {
-        let mut spawn_args = vec![
+        let spawn_args = vec![
             "-v0".into(),                  // suppress GHC version/loading noise
             "-fbreak-on-exception".into(), // break on exceptions (useful for debugging)
             "-ignore-dot-ghci".into(),     // don't load user .ghci (predictable behaviour)
             target.into(),
         ];
-        spawn_args.extend(args.iter().cloned());
+        let mut init_commands = vec![":set -fghci-hist-size=50".into()];
+        if !args.is_empty() {
+            init_commands.push(format!(
+                ":set args {}",
+                args.iter()
+                    .map(|arg| ghci_command_arg(arg))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            ));
+        }
 
         Ok(SpawnConfig {
             bin: find_bin("ghci"),
             args: spawn_args,
             env: vec![],
-            init_commands: vec![
-                // Enable useful debugging defaults
-                ":set -fghci-hist-size=50".into(),
-            ],
+            init_commands,
         })
     }
 
@@ -162,6 +168,10 @@ impl Backend for GhciBackend {
     fn canonical_ops(&self) -> Option<&dyn CanonicalOps> {
         Some(self)
     }
+}
+
+fn ghci_command_arg(value: &str) -> String {
+    format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
 }
 
 impl CanonicalOps for GhciBackend {
@@ -345,6 +355,15 @@ mod tests {
         assert!(cfg.args.contains(&"-v0".to_string()));
         assert!(cfg.args.contains(&"-fbreak-on-exception".to_string()));
         assert!(cfg.args.contains(&"Main.hs".to_string()));
+    }
+
+    #[test]
+    fn spawn_config_sets_program_arguments_in_ghci() {
+        let cfg = GhciBackend
+            .spawn_config("Main.hs", &["one two".into(), "three".into()])
+            .unwrap();
+        assert!(!cfg.args.contains(&"one two".to_string()));
+        assert_eq!(cfg.init_commands[1], ":set args \"one two\" \"three\"");
     }
 
     #[test]

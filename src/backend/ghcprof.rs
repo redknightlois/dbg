@@ -40,7 +40,13 @@ impl Backend for GhcProfBackend {
             (bin_str, Some(cmd))
         } else {
             // Already compiled with -prof -rtsopts
-            (target.to_string(), None)
+            let path = std::path::Path::new(target);
+            let absolute = if path.is_absolute() {
+                path.to_path_buf()
+            } else {
+                std::env::current_dir()?.join(path)
+            };
+            (absolute.display().to_string(), None)
         };
 
         // Step 2: Run with profiling RTS flags
@@ -168,7 +174,10 @@ mod tests {
     fn spawn_config_precompiled_binary() {
         let cfg = GhcProfBackend.spawn_config("./myapp", &[]).unwrap();
         // No compile step — first command runs the binary
-        assert!(cfg.init_commands[0].contains("./myapp"));
+        assert!(cfg.init_commands[0].contains("/myapp"));
+        assert!(
+            cfg.init_commands[0].contains(&std::env::current_dir().unwrap().display().to_string())
+        );
         assert!(cfg.init_commands[0].contains("+RTS -p -RTS"));
         // Should NOT contain ghc -prof
         assert!(!cfg.init_commands[0].contains("ghc -prof"));
