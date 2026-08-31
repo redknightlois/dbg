@@ -1290,7 +1290,10 @@ pub fn cmd_source(db: &GpuDb, args: &[&str]) {
 // ---------------------------------------------------------------------------
 
 pub fn cmd_memory(db: &GpuDb, args: &[&str]) {
-    let total: i64 = db.scalar_f64("SELECT COUNT(*) FROM allocations") as i64;
+    let alloc_filter = db.allocation_filter_for("allocations");
+    let total: i64 = db.scalar_f64(&format!(
+        "SELECT COUNT(*) FROM allocations WHERE {alloc_filter}"
+    )) as i64;
     if total == 0 {
         println!("no allocation data");
         println!(
@@ -1303,17 +1306,20 @@ pub fn cmd_memory(db: &GpuDb, args: &[&str]) {
     let (n_alloc, n_free, sum_alloc): (i64, i64, i64) = db
         .conn
         .query_row(
-            "SELECT SUM(CASE WHEN op = 'alloc' THEN 1 ELSE 0 END),
+            &format!(
+                "SELECT SUM(CASE WHEN op = 'alloc' THEN 1 ELSE 0 END),
                 SUM(CASE WHEN op = 'free'  THEN 1 ELSE 0 END),
                 COALESCE(SUM(CASE WHEN op = 'alloc' THEN bytes ELSE 0 END), 0)
-         FROM allocations",
+         FROM allocations
+         WHERE {alloc_filter}"
+            ),
             [],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .unwrap_or((0, 0, 0));
 
     let events: Vec<(f64, String, i64, i64)> = db.query_vec(
-        "SELECT start_us, op, address, bytes FROM allocations ORDER BY start_us",
+        &format!("SELECT start_us, op, address, bytes FROM allocations WHERE {alloc_filter} ORDER BY start_us"),
         [],
         |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
     );
@@ -1365,9 +1371,11 @@ pub fn cmd_memory(db: &GpuDb, args: &[&str]) {
     }
     println!();
 
-    let big_sql = "SELECT address, bytes, start_us FROM allocations
-                   WHERE op = 'alloc' ORDER BY bytes DESC LIMIT ?1";
-    let bigs: Vec<(i64, i64, f64)> = db.query_vec(big_sql, [n as i64], |row| {
+    let big_sql = format!(
+        "SELECT address, bytes, start_us FROM allocations
+                   WHERE op = 'alloc' AND {alloc_filter} ORDER BY bytes DESC LIMIT ?1"
+    );
+    let bigs: Vec<(i64, i64, f64)> = db.query_vec(&big_sql, [n as i64], |row| {
         Ok((row.get(0)?, row.get(1)?, row.get(2)?))
     });
     if !bigs.is_empty() {
@@ -1378,9 +1386,11 @@ pub fn cmd_memory(db: &GpuDb, args: &[&str]) {
             let lifetime = db
                 .conn
                 .query_row(
-                    "SELECT start_us FROM allocations
-                 WHERE op = 'free' AND address = ?1 AND start_us > ?2
+                    &format!(
+                        "SELECT start_us FROM allocations
+                 WHERE op = 'free' AND address = ?1 AND start_us > ?2 AND {alloc_filter}
                  ORDER BY start_us LIMIT 1",
+                    ),
                     rusqlite::params![addr, start],
                     |row| row.get::<_, f64>(0),
                 )

@@ -1,3 +1,4 @@
+use std::collections::{BTreeSet, HashMap};
 use std::path::Path;
 use std::{fs::File, io::Read};
 
@@ -23,6 +24,10 @@ struct TraceEvent {
     ph: String,
     ts: Option<f64>,
     dur: Option<f64>,
+    #[serde(default)]
+    pid: Option<i64>,
+    #[serde(default)]
+    tid: Option<i64>,
     #[serde(default)]
     args: Option<serde_json::Value>,
 }
@@ -216,6 +221,8 @@ fn import_ops(dest: &Connection, events: &[TraceEvent], layer_id: i64) -> Result
         end_us: f64,
         module_path: Option<String>,
         input_shapes: Option<String>,
+        pid: Option<i64>,
+        tid: Option<i64>,
     }
 
     let mut invocations: Vec<OpInvocation> = Vec::new();
@@ -240,6 +247,8 @@ fn import_ops(dest: &Connection, events: &[TraceEvent], layer_id: i64) -> Result
                     .or_else(|| a.get("input_shapes"))
                     .map(|v| v.to_string())
             }),
+            pid: event.pid,
+            tid: event.tid,
         });
     }
 
@@ -262,42 +271,76 @@ fn import_ops(dest: &Connection, events: &[TraceEvent], layer_id: i64) -> Result
         op_ids.push(dest.last_insert_rowid());
     }
 
-    // Step 3: Correlate kernel launches to ops by temporal containment.
-    // A kernel belongs to the innermost (shortest) op whose time window contains
-    // the kernel's start timestamp.
-    // Sort invocations by duration ascending so innermost ops are checked first.
-    let mut containment_order: Vec<usize> = (0..invocations.len()).collect();
-    containment_order.sort_by(|&a, &b| {
-        let da = invocations[a].end_us - invocations[a].start_us;
-        let db = invocations[b].end_us - invocations[b].start_us;
-        da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
-    });
-
-    // Collect kernel launches from this layer
+    // Step 3: Correlate kernel launches to ops by temporal containment and
+    // execution context. Use a sweep line so supported high-volume traces do
+    // not perform an operators × kernels nested scan.
     let mut kern_stmt = dest.prepare(
-        "SELECT id, kernel_name, start_us FROM launches WHERE layer_id = ?1 AND start_us IS NOT NULL"
+        "SELECT id, kernel_name, start_us FROM launches
+         WHERE layer_id = ?1 AND start_us IS NOT NULL ORDER BY id",
     )?;
-    let kernels: Vec<(i64, String, f64)> = kern_stmt
+    let kernel_rows: Vec<(i64, String, f64)> = kern_stmt
         .query_map(params![layer_id], |row| {
             Ok((row.get(0)?, row.get(1)?, row.get(2)?))
         })?
         .filter_map(|r| r.ok())
         .collect();
+    let kernel_contexts = events
+        .iter()
+        .filter(|event| event.ph == "X" && event.cat == "kernel")
+        .map(|event| (event.pid, event.tid))
+        .collect::<Vec<_>>();
+    if kernel_rows.len() != kernel_contexts.len() {
+        bail!("Chrome trace kernel identity count changed during import");
+    }
+    let mut kernels = kernel_rows
+        .into_iter()
+        .zip(kernel_contexts)
+        .map(|((id, name, start), context)| (id, name, start, context))
+        .collect::<Vec<_>>();
+    kernels.sort_by(|a, b| a.2.partial_cmp(&b.2).unwrap_or(std::cmp::Ordering::Equal));
+
+    let mut starts = (0..invocations.len()).collect::<Vec<_>>();
+    starts.sort_by(|&a, &b| {
+        invocations[a]
+            .start_us
+            .partial_cmp(&invocations[b].start_us)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let mut ends = (0..invocations.len()).collect::<Vec<_>>();
+    ends.sort_by(|&a, &b| {
+        invocations[a]
+            .end_us
+            .partial_cmp(&invocations[b].end_us)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let mut next_start = 0;
+    let mut next_end = 0;
+    let mut active: HashMap<(Option<i64>, Option<i64>), BTreeSet<(u64, usize)>> = HashMap::new();
 
     let mut map_stmt = dest.prepare(
         "INSERT OR IGNORE INTO op_kernel_map (op_id, kernel_name, launch_id) VALUES (?1, ?2, ?3)",
     )?;
-    for (launch_id, kernel_name, k_start) in &kernels {
-        // Find innermost containing op
-        for &index in &containment_order {
+    for (launch_id, kernel_name, k_start, context) in &kernels {
+        while next_start < starts.len() && invocations[starts[next_start]].start_us <= *k_start {
+            let index = starts[next_start];
             let inv = &invocations[index];
-            if *k_start >= inv.start_us && *k_start <= inv.end_us {
-                if let Some(&op_id) = op_ids.get(index) {
-                    map_stmt.execute(params![op_id, kernel_name, launch_id])?;
-                    // Accumulate GPU time for this op
-                    // (We don't have per-launch duration easily here, query it)
-                    break;
-                }
+            active
+                .entry((inv.pid, inv.tid))
+                .or_default()
+                .insert(((inv.end_us - inv.start_us).to_bits(), index));
+            next_start += 1;
+        }
+        while next_end < ends.len() && invocations[ends[next_end]].end_us < *k_start {
+            let index = ends[next_end];
+            let inv = &invocations[index];
+            if let Some(set) = active.get_mut(&(inv.pid, inv.tid)) {
+                set.remove(&((inv.end_us - inv.start_us).to_bits(), index));
+            }
+            next_end += 1;
+        }
+        if let Some((_, index)) = active.get(context).and_then(|set| set.first()) {
+            if let Some(&op_id) = op_ids.get(*index) {
+                map_stmt.execute(params![op_id, kernel_name, launch_id])?;
             }
         }
     }

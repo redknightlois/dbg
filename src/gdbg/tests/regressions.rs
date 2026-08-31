@@ -178,7 +178,8 @@ fn wall_time_includes_transfers() {
         &[("H2D", 0.0, 1000.0, 1_000_000)],
     );
 
-    import_wall_time(&db.conn).unwrap();
+    let layer = db.timeline_layer_id().unwrap();
+    import_wall_time(&db.conn, layer).unwrap();
     let wall: f64 = db.meta("wall_time_us").parse().unwrap();
 
     assert!(
@@ -190,7 +191,8 @@ fn wall_time_includes_transfers() {
 #[test]
 fn wall_time_launches_only_when_no_transfers() {
     let (db, _d) = make_db(&[("k", 100.0, 50.0, 7), ("k", 200.0, 50.0, 7)], &[]);
-    import_wall_time(&db.conn).unwrap();
+    let layer = db.timeline_layer_id().unwrap();
+    import_wall_time(&db.conn, layer).unwrap();
     let wall: f64 = db.meta("wall_time_us").parse().unwrap();
     assert!(
         (wall - 150.0).abs() < 0.01,

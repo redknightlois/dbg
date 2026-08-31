@@ -48,13 +48,16 @@ pub fn import_nsys_rep(dest: &Connection, nsys_path: &Path, layer_id: i64) -> Re
     import_nvtx_regions(dest, &src, layer_id)?;
     import_device_info(dest, &src)?;
 
-    if !has_kernels {
+    let runtime_api_count = if !has_kernels {
         // No GPU kernel data — WSL2 or missing CUPTI permissions.
-        // Fall back to CUDA runtime API data for basic launch counts.
-        import_runtime_api(dest, &src, layer_id)?;
-    }
+        // Retain CPU-side CUDA API counts as metadata, but do not insert them
+        // as GPU launches.
+        import_runtime_api(dest, &src, layer_id)?
+    } else {
+        0
+    };
 
-    import_wall_time(dest)?;
+    import_wall_time(dest, layer_id)?;
 
     let imported: i64 = dest.query_row(
         "SELECT
@@ -65,7 +68,7 @@ pub fn import_nsys_rep(dest: &Connection, nsys_path: &Path, layer_id: i64) -> Re
         params![layer_id],
         |row| row.get(0),
     )?;
-    if imported == 0 {
+    if imported == 0 && runtime_api_count == 0 {
         bail!("NSYS report contains no recognized activity rows");
     }
 
@@ -354,16 +357,16 @@ fn import_nvtx_regions(dest: &Connection, src: &Connection, layer_id: i64) -> Re
 // Fallback: CUDA runtime API (when GPU kernel tracing unavailable, e.g. WSL2)
 // ---------------------------------------------------------------------------
 
-fn import_runtime_api(dest: &Connection, src: &Connection, layer_id: i64) -> Result<()> {
+fn import_runtime_api(dest: &Connection, src: &Connection, _layer_id: i64) -> Result<usize> {
     let table = match find_table(src, &["CUPTI_ACTIVITY_KIND_RUNTIME"]) {
         Ok(t) => t,
-        Err(_) => return Ok(()),
+        Err(_) => return Ok(0),
     };
 
     // StringIds table maps nameId → function name
     let has_strings = find_table(src, &["StringIds"]).is_ok();
     if !has_strings {
-        return Ok(());
+        return Ok(0);
     }
 
     // Get cudaLaunchKernel calls with timing from the runtime API
@@ -376,12 +379,6 @@ fn import_runtime_api(dest: &Connection, src: &Connection, layer_id: i64) -> Res
     );
 
     let mut read = src.prepare(&sql)?;
-    let mut write = dest.prepare(
-        "INSERT INTO launches
-            (kernel_name, duration_us, start_us, correlation_id, layer_id)
-         VALUES (?1, ?2, ?3, ?4, ?5)",
-    )?;
-
     let rows = read.query_map([], |row| {
         Ok((
             row.get::<_, String>(0)?,
@@ -392,24 +389,16 @@ fn import_runtime_api(dest: &Connection, src: &Connection, layer_id: i64) -> Res
     })?;
 
     let mut count = 0;
+    let mut total_runtime_us = 0.0;
     let mut row_count = 0;
     for row in rows {
         row_count += 1;
         if row_count > MAX_NSYS_ROWS {
             bail!("NSYS runtime table exceeds the maximum of {MAX_NSYS_ROWS} rows");
         }
-        let (_api_name, start_ns, end_ns, corr_id) = row?;
+        let (_api_name, start_ns, end_ns, _corr_id) = row?;
         let duration_us = duration_us(start_ns, end_ns, "runtime API event")?;
-        let start_us = start_ns as f64 / 1000.0;
-        // We only know this is a cudaLaunchKernel call — the actual kernel name
-        // is in the GPU activity trace which isn't available.
-        write.execute(params![
-            "cudaLaunchKernel (GPU trace unavailable)",
-            duration_us,
-            start_us,
-            corr_id,
-            layer_id
-        ])?;
+        total_runtime_us += duration_us;
         count += 1;
     }
 
@@ -421,9 +410,17 @@ fn import_runtime_api(dest: &Connection, src: &Connection, layer_id: i64) -> Res
                      Showing CPU-side cudaLaunchKernel API timing only. \
                      For full GPU profiling, run on native Linux with root or appropriate permissions."],
         )?;
+        dest.execute(
+            "INSERT OR REPLACE INTO meta (key, value) VALUES ('nsys_runtime_api_count', ?1)",
+            params![count.to_string()],
+        )?;
+        dest.execute(
+            "INSERT OR REPLACE INTO meta (key, value) VALUES ('nsys_runtime_api_time_us', ?1)",
+            params![total_runtime_us.to_string()],
+        )?;
     }
 
-    Ok(())
+    Ok(count)
 }
 
 // ---------------------------------------------------------------------------
@@ -456,18 +453,18 @@ fn import_device_info(dest: &Connection, src: &Connection) -> Result<()> {
 // Wall time — computed from launch + transfer span
 // ---------------------------------------------------------------------------
 
-pub(crate) fn import_wall_time(dest: &Connection) -> Result<()> {
+pub(crate) fn import_wall_time(dest: &Connection, layer_id: i64) -> Result<()> {
     // Span covers both kernel launches and memory transfers — whichever
     // starts earliest to whichever ends latest.
     let wall: f64 = dest.query_row(
         "SELECT COALESCE(MAX(end_us) - MIN(start_us), 0) FROM (
                  SELECT start_us, start_us + duration_us AS end_us
-                 FROM launches WHERE start_us IS NOT NULL
+                 FROM launches WHERE start_us IS NOT NULL AND layer_id = ?1
                  UNION ALL
                  SELECT start_us, start_us + duration_us AS end_us
-                 FROM transfers WHERE start_us IS NOT NULL
+                 FROM transfers WHERE start_us IS NOT NULL AND layer_id = ?1
              )",
-        [],
+        params![layer_id],
         |row| row.get(0),
     )?;
     if !wall.is_finite() || wall < 0.0 {
@@ -659,8 +656,27 @@ mod tests {
     #[test]
     fn import_wall_time_empty() {
         let db = GpuDb::create(&tempfile::tempdir().unwrap().keep().join("t.db")).unwrap();
-        import_wall_time(&db.conn).unwrap();
+        let layer = db.add_layer("nsys", "empty", None, None, None).unwrap();
+        import_wall_time(&db.conn, layer).unwrap();
         assert_eq!(db.meta("wall_time_us"), "0");
+    }
+
+    #[test]
+    fn import_wall_time_does_not_mix_capture_layers() {
+        let db = GpuDb::create(&tempfile::tempdir().unwrap().keep().join("layers.db")).unwrap();
+        let old = db.add_layer("torch", "old", None, None, None).unwrap();
+        let current = db.add_layer("nsys", "new", None, None, None).unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO launches (kernel_name, start_us, duration_us, layer_id)
+                 VALUES ('old', 10000, 500, ?1), ('new', 20, 5, ?2)",
+                params![old, current],
+            )
+            .unwrap();
+
+        import_wall_time(&db.conn, current).unwrap();
+
+        assert_eq!(db.meta("wall_time_us"), "5");
     }
 
     #[test]
@@ -703,11 +719,8 @@ mod tests {
             .add_layer("nsys", &path.to_string_lossy(), None, None, None)
             .unwrap();
         import_nsys_rep(&db.conn, &path, layer).unwrap();
-        assert_eq!(db.total_launch_count(), 1);
-        let name: String = db
-            .conn
-            .query_row("SELECT kernel_name FROM launches", [], |row| row.get(0))
-            .unwrap();
-        assert!(name.contains("GPU trace unavailable"));
+        assert_eq!(db.total_launch_count(), 0);
+        assert_eq!(db.meta("nsys_runtime_api_count"), "1");
+        assert_eq!(db.meta("nsys_runtime_api_time_us"), "0.1");
     }
 }

@@ -580,7 +580,7 @@ impl GpuDb {
                     OR EXISTS (SELECT 1 FROM transfers WHERE layer_id = layer.id)
                     OR EXISTS (SELECT 1 FROM regions WHERE layer_id = layer.id)
                  )
-                 ORDER BY id LIMIT 1",
+                 ORDER BY id DESC LIMIT 1",
                 params![source],
                 |row| row.get::<_, i64>(0),
             ) {
@@ -706,23 +706,56 @@ impl GpuDb {
             return;
         }
 
-        // Re-correlate: for each op, sum kernel durations from the timeline layer.
+        // Mappings with a source launch ID represent individual occurrences.
+        // IDs are not comparable across profiler layers, so rank same-name
+        // occurrences by time and pair them one-to-one. Legacy/name-only
+        // mappings represent an aggregate relationship and intentionally sum
+        // the selected layer's same-name launches once per operator.
         if let Err(e) = self.conn.execute(
-            "UPDATE ops SET gpu_time_us = (
-                SELECT COALESCE(SUM(l.duration_us), 0)
-                FROM op_kernel_map okm
-                JOIN launches l ON l.layer_id = ?1
-                    AND (l.id = okm.launch_id
-                         OR (okm.launch_id IS NULL
-                             AND l.kernel_name = okm.kernel_name)
-                         OR (NOT EXISTS (
-                                SELECT 1 FROM launches mapped
-                                WHERE mapped.id = okm.launch_id
-                                  AND mapped.layer_id = ?1
-                            )
-                             AND l.kernel_name = okm.kernel_name))
-                WHERE okm.op_id = ops.id
-            )",
+            "WITH exact_mappings AS (
+                SELECT mappings.op_id, mappings.kernel_name,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY mappings.kernel_name
+                           ORDER BY source.start_us, mappings.launch_id, mappings.op_id
+                       ) AS occurrence
+                FROM op_kernel_map AS mappings
+                JOIN launches AS source ON source.id = mappings.launch_id
+                WHERE mappings.launch_id IS NOT NULL
+             ), timeline_launches AS (
+                SELECT kernel_name, duration_us,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY kernel_name ORDER BY start_us, id
+                       ) AS occurrence
+                FROM launches WHERE layer_id = ?1
+             ), contributions AS (
+                SELECT mappings.op_id, launches.duration_us
+                FROM exact_mappings AS mappings
+                JOIN timeline_launches AS launches
+                  ON launches.kernel_name = mappings.kernel_name
+                 AND launches.occurrence = mappings.occurrence
+                UNION ALL
+                SELECT mappings.op_id, launches.duration_us
+                FROM (
+                    SELECT DISTINCT fallback.op_id, fallback.kernel_name
+                    FROM op_kernel_map AS fallback
+                    WHERE fallback.launch_id IS NULL
+                      AND NOT EXISTS (
+                          SELECT 1 FROM op_kernel_map AS exact
+                          WHERE exact.op_id = fallback.op_id
+                            AND exact.kernel_name = fallback.kernel_name
+                            AND exact.launch_id IS NOT NULL
+                      )
+                ) AS mappings
+                JOIN launches
+                  ON launches.layer_id = ?1
+                 AND launches.kernel_name = mappings.kernel_name
+             ), totals AS (
+                SELECT op_id, SUM(duration_us) AS gpu_time_us
+                FROM contributions GROUP BY op_id
+             )
+             UPDATE ops SET gpu_time_us = COALESCE((
+                 SELECT totals.gpu_time_us FROM totals WHERE totals.op_id = ops.id
+             ), 0)",
             params![tl_id],
         ) {
             eprintln!("recompute_op_gpu_times failed: {e}");
@@ -768,6 +801,22 @@ impl GpuDb {
         self.scalar_f64(&format!(
             "SELECT COALESCE(SUM(duration_us), 0) FROM launches WHERE {tl}"
         ))
+    }
+
+    pub fn allocation_filter_for(&self, alias: &str) -> String {
+        if !alias.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+            return "0=1".to_string();
+        }
+        match self.conn.query_row(
+            "SELECT layer_id FROM allocations
+             WHERE layer_id IS NOT NULL
+             ORDER BY layer_id DESC LIMIT 1",
+            [],
+            |row| row.get::<_, i64>(0),
+        ) {
+            Ok(id) => format!("({alias}.layer_id = {id})"),
+            Err(_) => "1=1".to_string(),
+        }
     }
 
     /// Kernel `(start_us, end_us)` intervals from `launches`, timeline-filtered,
@@ -1536,6 +1585,148 @@ mod tests {
         assert_ne!(db.timeline_layer_id(), Some(empty));
         assert_eq!(db.timeline_layer_id(), Some(populated));
         assert_eq!(db.total_launch_count(), 1);
+    }
+
+    #[test]
+    fn timeline_uses_the_newest_populated_layer_for_a_source() {
+        let db = temp_db();
+        let old = db.add_layer("nsys", "old.rep", None, None, None).unwrap();
+        let new = db.add_layer("nsys", "new.rep", None, None, None).unwrap();
+        for (layer, name) in [(old, "old"), (new, "new")] {
+            db.conn
+                .execute(
+                    "INSERT INTO launches (kernel_name, duration_us, layer_id)
+                     VALUES (?1, 1.0, ?2)",
+                    params![name, layer],
+                )
+                .unwrap();
+        }
+        assert_eq!(db.timeline_layer_id(), Some(new));
+    }
+
+    #[test]
+    fn allocation_filter_uses_only_the_newest_populated_layer() {
+        let db = temp_db();
+        let old = db.add_layer("nsys", "old.rep", None, None, None).unwrap();
+        let new = db.add_layer("nsys", "new.rep", None, None, None).unwrap();
+        for (layer, bytes) in [(old, 100), (new, 7)] {
+            db.conn
+                .execute(
+                    "INSERT INTO allocations (op, address, bytes, start_us, layer_id)
+                     VALUES ('alloc', ?1, ?1, 0, ?2)",
+                    params![bytes, layer],
+                )
+                .unwrap();
+        }
+        let filter = db.allocation_filter_for("allocations");
+        let bytes: i64 = db
+            .conn
+            .query_row(
+                &format!("SELECT SUM(bytes) FROM allocations WHERE {filter}"),
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(bytes, 7);
+    }
+
+    #[test]
+    fn recompute_deduplicates_repeated_source_mappings() {
+        let db = temp_db();
+        let timeline = db.add_layer("nsys", "trace.rep", None, None, None).unwrap();
+        let source = db
+            .add_layer("torch", "trace.json", None, None, None)
+            .unwrap();
+        for duration in [2.0, 3.0, 5.0] {
+            db.conn
+                .execute(
+                    "INSERT INTO launches (kernel_name, duration_us, layer_id)
+                     VALUES ('same', ?1, ?2)",
+                    params![duration, timeline],
+                )
+                .unwrap();
+        }
+        db.conn
+            .execute(
+                "INSERT INTO ops (name, gpu_time_us, layer_id) VALUES ('op', 0, ?1)",
+                params![source],
+            )
+            .unwrap();
+        for start in [10.0, 20.0] {
+            db.conn
+                .execute(
+                    "INSERT INTO launches (kernel_name, duration_us, start_us, layer_id)
+                     VALUES ('same', 1.0, ?1, ?2)",
+                    params![start, source],
+                )
+                .unwrap();
+            let launch_id = db.conn.last_insert_rowid();
+            db.conn
+                .execute(
+                    "INSERT INTO op_kernel_map (op_id, kernel_name, launch_id)
+                     VALUES (1, 'same', ?1)",
+                    params![launch_id],
+                )
+                .unwrap();
+        }
+
+        db.recompute_op_gpu_times();
+
+        let gpu_time: f64 = db
+            .conn
+            .query_row("SELECT gpu_time_us FROM ops WHERE id=1", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(gpu_time, 5.0);
+    }
+
+    #[test]
+    fn recompute_assigns_same_name_occurrences_to_distinct_ops_once() {
+        let db = temp_db();
+        let timeline = db.add_layer("nsys", "trace.rep", None, None, None).unwrap();
+        let source = db
+            .add_layer("torch", "trace.json", None, None, None)
+            .unwrap();
+        for duration in [2.0, 3.0] {
+            db.conn
+                .execute(
+                    "INSERT INTO launches (kernel_name, duration_us, layer_id)
+                     VALUES ('same', ?1, ?2)",
+                    params![duration, timeline],
+                )
+                .unwrap();
+        }
+        for (op_id, start) in [(1, 10.0), (2, 20.0)] {
+            db.conn
+                .execute(
+                    "INSERT INTO ops (id, name, gpu_time_us, layer_id)
+                     VALUES (?1, 'op', 0, ?2)",
+                    params![op_id, source],
+                )
+                .unwrap();
+            db.conn
+                .execute(
+                    "INSERT INTO launches (kernel_name, duration_us, start_us, layer_id)
+                     VALUES ('same', 1.0, ?1, ?2)",
+                    params![start, source],
+                )
+                .unwrap();
+            db.conn
+                .execute(
+                    "INSERT INTO op_kernel_map (op_id, kernel_name, launch_id)
+                     VALUES (?1, 'same', ?2)",
+                    params![op_id, db.conn.last_insert_rowid()],
+                )
+                .unwrap();
+        }
+
+        db.recompute_op_gpu_times();
+
+        let times: Vec<f64> = db.query_vec("SELECT gpu_time_us FROM ops ORDER BY id", [], |row| {
+            row.get(0)
+        });
+        assert_eq!(times, vec![2.0, 3.0]);
     }
 
     #[test]
