@@ -195,7 +195,7 @@ fn resolve_dotnet(target: &str) -> Result<String> {
         // project and hand back the resulting DLL/apphost from the
         // project's own bin/Debug/ tree (not the cwd's).
         if is_dotnet_project(path) {
-            let name = path_stem_str(path)?;
+            let name = dotnet_output_name(path)?;
             let csproj_str = path
                 .to_str()
                 .context("csproj path contains non-UTF8 characters")?;
@@ -226,7 +226,7 @@ fn resolve_dotnet(target: &str) -> Result<String> {
     // Directory with .csproj
     if path.is_dir() {
         let csproj = find_csproj(path)?;
-        let name = path_stem_str(&csproj)?;
+        let name = dotnet_output_name(&csproj)?;
         let csproj_str = csproj
             .to_str()
             .context("csproj path contains non-UTF8 characters")?;
@@ -246,6 +246,25 @@ fn resolve_dotnet(target: &str) -> Result<String> {
     }
 
     bail!("cannot resolve: {target}")
+}
+
+fn dotnet_output_name(project: &Path) -> Result<String> {
+    let fallback = path_stem_str(project)?;
+    let contents = std::fs::read_to_string(project)?;
+    let Some(start) = contents.find("<AssemblyName>") else {
+        return Ok(fallback);
+    };
+    let value_start = start + "<AssemblyName>".len();
+    let Some(relative_end) = contents[value_start..].find("</AssemblyName>") else {
+        bail!("unterminated <AssemblyName> in {}", project.display());
+    };
+    let value = contents[value_start..value_start + relative_end].trim();
+    if value.is_empty()
+        || Path::new(value).file_name().and_then(|name| name.to_str()) != Some(value)
+    {
+        bail!("invalid <AssemblyName> in {}", project.display());
+    }
+    Ok(value.to_string())
 }
 
 fn find_csproj(dir: &Path) -> Result<PathBuf> {
@@ -471,6 +490,12 @@ fn resolve_go(target: &str) -> Result<String> {
             .unwrap_or(Path::new("."));
         let stem = p.file_stem().and_then(|s| s.to_str()).unwrap_or("app");
         let output_path = parent.join(stem);
+        if output_path.exists() {
+            bail!(
+                "refusing to overwrite existing Go build output: {}",
+                output_path.display()
+            );
+        }
         let file_name = p.file_name().and_then(|s| s.to_str()).unwrap_or(target);
         let args = ["build", "-gcflags=all=-N -l", "-o", stem, file_name];
         let output = run_go_build(parent, &args)?;
@@ -539,6 +564,18 @@ mod tests {
         std::fs::write(tfm.join("Broken.dll"), "").unwrap();
         let got = find_dotnet_output(tmp.path(), "Broken").unwrap();
         assert!(got.ends_with("Broken.dll"), "got: {got}");
+    }
+
+    #[test]
+    fn dotnet_output_name_honors_assembly_name() {
+        let tmp = TempDir::new().unwrap();
+        let project = tmp.path().join("Demo.csproj");
+        std::fs::write(
+            &project,
+            "<Project><PropertyGroup><AssemblyName>Worker</AssemblyName></PropertyGroup></Project>",
+        )
+        .unwrap();
+        assert_eq!(dotnet_output_name(&project).unwrap(), "Worker");
     }
 
     /// Regression: `dbg start dotnet-trace Broken.csproj` passed the
@@ -637,6 +674,18 @@ mod tests {
             !out.contains("nested/nested"),
             "duplicated output path: {out}"
         );
+    }
+
+    #[test]
+    fn resolve_go_refuses_to_overwrite_sibling_file() {
+        let tmp = TempDir::new().unwrap();
+        let source = tmp.path().join("server.go");
+        let existing = tmp.path().join("server");
+        std::fs::write(&source, "package main\nfunc main() {}\n").unwrap();
+        std::fs::write(&existing, "keep me").unwrap();
+        let error = resolve_go(source.to_str().unwrap()).unwrap_err();
+        assert!(error.to_string().contains("refusing to overwrite"));
+        assert_eq!(std::fs::read_to_string(existing).unwrap(), "keep me");
     }
 
     #[test]

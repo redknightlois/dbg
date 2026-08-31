@@ -1069,9 +1069,6 @@ fn cmd_start(registry: &Registry, args: &[String]) -> Result<()> {
     unsafe {
         std::env::set_var("DBG_SESSION", &slug);
     }
-    // Publish this as the newest daemon in the cwd so env-less
-    // clients in other shells find it by default.
-    daemon::write_latest_pointer(&slug);
     let peers = daemon::live_slugs_in_cwd();
     if !peers.is_empty() {
         eprintln!(
@@ -1251,6 +1248,12 @@ fn cmd_start(registry: &Registry, args: &[String]) -> Result<()> {
                 }
             }
 
+            // Publish only a session that has made it through validation,
+            // process creation, and the daemon readiness probe. A rejected
+            // start must not hide the previous live session from env-less
+            // clients.
+            daemon::write_latest_pointer(&slug);
+
             // Set breakpoints FIRST — some adapters (delve, DAP) need
             // every breakpoint registered before the program starts,
             // otherwise they never fire. If any `--break` fails we
@@ -1283,25 +1286,22 @@ fn cmd_start(registry: &Registry, args: &[String]) -> Result<()> {
                 }
             }
 
+            if !bp_ok {
+                bail!("one or more requested breakpoints failed to register");
+            }
+
             // Auto-run — but only when every breakpoint stuck. --run
             // means "start the debuggee (and let it stop at your
             // breakpoints)", not "run past all breakpoints". See
             // `dbg help start`.
             if do_run {
-                if !bp_ok && !breakpoints.is_empty() {
-                    eprintln!(
-                        "dbg: skipping --run because a breakpoint failed to register. \
-                         Fix the breakpoint or omit --break and drive with `dbg run` manually."
-                    );
+                let cmd = if backend.canonical_ops().is_some() {
+                    "run".to_string()
                 } else {
-                    let cmd = if backend.canonical_ops().is_some() {
-                        "run".to_string()
-                    } else {
-                        backend.run_command().to_string()
-                    };
-                    let resp = daemon::send_command(&cmd)?;
-                    println!("{resp}");
-                }
+                    backend.run_command().to_string()
+                };
+                let resp = daemon::send_command(&cmd)?;
+                println!("{resp}");
             }
 
             Ok(())

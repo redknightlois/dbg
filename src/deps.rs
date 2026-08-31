@@ -5,6 +5,24 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+fn is_executable_file(path: &Path) -> bool {
+    let Ok(metadata) = path.metadata() else {
+        return false;
+    };
+    if !metadata.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        metadata.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
+
 /// How to verify a dependency is installed.
 pub enum DependencyCheck {
     /// Check that a binary exists on PATH (optionally with minimum version).
@@ -57,7 +75,7 @@ pub fn check_dep(dep: Dependency) -> DepStatus {
                         .or_else(|_| {
                             for dir in extra_tool_dirs() {
                                 let path = dir.join(name);
-                                if path.is_file() {
+                                if is_executable_file(&path) {
                                     return Ok(path.display().to_string());
                                 }
                             }
@@ -69,7 +87,12 @@ pub fn check_dep(dep: Dependency) -> DepStatus {
                     // actually works (catches broken installs like a
                     // Homebrew GHC that can't find libc).
                     if let Some((probe_bin, probe_args)) = version_cmd {
-                        let runnable = Command::new(probe_bin)
+                        let probe_path = if probe_bin == name {
+                            path.clone()
+                        } else {
+                            find_bin(probe_bin)
+                        };
+                        let runnable = Command::new(&probe_path)
                             .args(*probe_args)
                             .stdout(std::process::Stdio::null())
                             .stderr(std::process::Stdio::null())
@@ -80,7 +103,7 @@ pub fn check_dep(dep: Dependency) -> DepStatus {
                                 name: dep.name,
                                 ok: false,
                                 detail: format!(
-                                    "{path} (found but broken — `{probe_bin}` failed to run)"
+                                    "{path} (found but broken — `{probe_path}` failed to run)"
                                 ),
                                 install: dep.install,
                                 warning: None,
@@ -130,11 +153,28 @@ pub fn find_bin(name: &str) -> String {
     }
     for dir in extra_tool_dirs() {
         let path = dir.join(name);
-        if path.is_file() {
+        if is_executable_file(&path) {
             return path.display().to_string();
         }
     }
     name.to_string()
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn executable_discovery_rejects_regular_files_without_execute_permission() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("tool");
+        std::fs::write(&path, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(!is_executable_file(&path));
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(is_executable_file(&path));
+    }
 }
 
 // ---------------------------------------------------------------------------
