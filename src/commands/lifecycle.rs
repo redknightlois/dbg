@@ -701,14 +701,16 @@ fn diff_hits(a_db: &SessionDb, b_path: &Path, a_label: &str, b_label: &str) -> S
             SELECT s.lang, s.fqn, COUNT(bh.id) AS hits_a
             FROM symbols s
             LEFT JOIN breakpoint_hits bh
-                ON bh.session_id = s.session_id AND bh.location_key = s.fqn
+                ON bh.session_id = s.session_id
+               AND bh.location_key = s.file || ':' || s.line
             GROUP BY s.lang, s.fqn
         ),
         b AS (
             SELECT s.lang, s.fqn, COUNT(bh.id) AS hits_b
             FROM other_db.symbols s
             LEFT JOIN other_db.breakpoint_hits bh
-                ON bh.session_id = s.session_id AND bh.location_key = s.fqn
+                ON bh.session_id = s.session_id
+               AND bh.location_key = s.file || ':' || s.line
             GROUP BY s.lang, s.fqn
         ),
         combined AS (
@@ -1174,8 +1176,8 @@ mod tests {
         active
             .conn()
             .execute(
-                "INSERT INTO symbols (session_id, lang, fqn, raw)
-             VALUES ((SELECT id FROM sessions LIMIT 1), 'cpp', 'foo', 'foo')",
+                "INSERT INTO symbols (session_id, lang, fqn, file, line, raw)
+             VALUES ((SELECT id FROM sessions LIMIT 1), 'cpp', 'foo', 'a.cpp', 10, 'foo')",
                 [],
             )
             .unwrap();
@@ -1184,7 +1186,7 @@ mod tests {
                 .conn()
                 .execute(
                     "INSERT INTO breakpoint_hits (session_id, location_key, hit_seq, ts)
-                 VALUES ((SELECT id FROM sessions LIMIT 1), 'foo', ?1, datetime('now'))",
+                 VALUES ((SELECT id FROM sessions LIMIT 1), 'a.cpp:10', ?1, datetime('now'))",
                     params![seq],
                 )
                 .unwrap();
@@ -1192,8 +1194,8 @@ mod tests {
         other
             .conn()
             .execute(
-                "INSERT INTO symbols (session_id, lang, fqn, raw)
-             VALUES ((SELECT id FROM sessions LIMIT 1), 'cpp', 'bar', 'bar')",
+                "INSERT INTO symbols (session_id, lang, fqn, file, line, raw)
+             VALUES ((SELECT id FROM sessions LIMIT 1), 'cpp', 'bar', 'b.cpp', 20, 'bar')",
                 [],
             )
             .unwrap();
@@ -1202,7 +1204,7 @@ mod tests {
                 .conn()
                 .execute(
                     "INSERT INTO breakpoint_hits (session_id, location_key, hit_seq, ts)
-                 VALUES ((SELECT id FROM sessions LIMIT 1), 'bar', ?1, datetime('now'))",
+                 VALUES ((SELECT id FROM sessions LIMIT 1), 'b.cpp:20', ?1, datetime('now'))",
                     params![seq],
                 )
                 .unwrap();

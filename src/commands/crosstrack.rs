@@ -307,8 +307,7 @@ pub fn run(q: &Query, db: &SessionDb, ctx: &RunCtx<'_>) -> String {
 }
 
 /// The `<stem>:<line>` prefix — strips directory AND extension so
-/// `/a/b/Algos.java:17` → `Algos:17`. Matches jdb's `Algos.fibonacci:17`
-/// via `LIKE 'Algos:' || '%'` (prefix match).
+/// `/a/b/Algos.java:17` → `Algos:17`.
 fn stem_line_key(loc: &str) -> String {
     let (file, line) = match loc.rsplit_once(':') {
         Some(x) => x,
@@ -323,6 +322,26 @@ fn stem_line_key(loc: &str) -> String {
         None => base,
     };
     format!("{stem}:{line}")
+}
+
+/// SQL LIKE pattern for jdb's `Class.method:line` location shape.
+fn stem_method_pattern(loc: &str) -> String {
+    let stem_line = stem_line_key(loc);
+    let Some((stem, line)) = stem_line.rsplit_once(':') else {
+        return escape_location_like(&stem_line);
+    };
+    format!(
+        "{}.%:{}",
+        escape_location_like(stem),
+        escape_location_like(line)
+    )
+}
+
+fn escape_location_like(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_")
 }
 
 /// The `<basename>:<line>` suffix of a `file:line` key. When the agent
@@ -356,21 +375,26 @@ fn cmd_hits(db: &SessionDb, loc: &str) -> String {
     // `/abs/path/to/main.go:22` matches the `./main.go:22` form delve
     // stores, the `src/main.rs:42` form lldb stores, and so on.
     // Also try stem:line (strip file extension) so `Algos.java:17`
-    // matches jdb's `Algos:17` or `Algos.fibonacci:17`.
+    // matches jdb's `Algos:17`, `Algos.fibonacci:17`, and their
+    // package-qualified forms without treating line 17 as a prefix of 170.
     let exact = loc.to_string();
     let (tail, stem_tail) = loc_keys(loc);
+    let stem_method = stem_method_pattern(loc);
     let mut stmt = match db.conn().prepare(
         "SELECT hit_seq, thread, ts, locals_json
          FROM breakpoint_hits
          WHERE location_key = ?1
             OR location_key LIKE '%' || ?2
-            OR location_key LIKE ?3 || '%'
+            OR location_key = ?3
+            OR location_key LIKE '%.' || ?3
+            OR location_key LIKE ?4 ESCAPE char(92)
+            OR location_key LIKE '%.' || ?4 ESCAPE char(92)
          ORDER BY hit_seq ASC",
     ) {
         Ok(s) => s,
         Err(e) => return format!("[error: {e}]"),
     };
-    let rows = stmt.query_map(params![exact, tail, stem_tail], |r| {
+    let rows = stmt.query_map(params![exact, tail, stem_tail, stem_method], |r| {
         Ok((
             r.get::<_, i64>(0)?,
             r.get::<_, Option<String>>(1)?,
@@ -379,7 +403,10 @@ fn cmd_hits(db: &SessionDb, loc: &str) -> String {
         ))
     });
     let rows = match rows {
-        Ok(it) => it.collect::<Result<Vec<_>, _>>().unwrap_or_default(),
+        Ok(it) => match it.collect::<Result<Vec<_>, _>>() {
+            Ok(rows) => rows,
+            Err(e) => return format!("[error: {e}]"),
+        },
         Err(e) => return format!("[error: {e}]"),
     };
     if rows.is_empty() {
@@ -406,17 +433,21 @@ fn cmd_hits(db: &SessionDb, loc: &str) -> String {
 /// descending. With `top=Some(n)`, truncates to the n most-frequent.
 fn cmd_hits_grouped(db: &SessionDb, loc: &str, field: &str, top: Option<usize>) -> String {
     let (tail, stem_tail) = loc_keys(loc);
+    let stem_method = stem_method_pattern(loc);
     let mut stmt = match db.conn().prepare(
         "SELECT locals_json FROM breakpoint_hits
          WHERE location_key = ?1
             OR location_key LIKE '%' || ?2
-            OR location_key LIKE ?3 || '%'",
+            OR location_key = ?3
+            OR location_key LIKE '%.' || ?3
+            OR location_key LIKE ?4 ESCAPE char(92)
+            OR location_key LIKE '%.' || ?4 ESCAPE char(92)",
     ) {
         Ok(s) => s,
         Err(e) => return format!("[error: {e}]"),
     };
     let rows: Vec<Option<String>> = stmt
-        .query_map(params![loc, tail, stem_tail], |r| {
+        .query_map(params![loc, tail, stem_tail, stem_method], |r| {
             r.get::<_, Option<String>>(0)
         })
         .and_then(|it| it.collect::<Result<Vec<_>, _>>())
@@ -591,17 +622,23 @@ fn no_hits_message(db: &SessionDb, loc: &str, verb: &str) -> String {
 /// `loc`. Used to enumerate options in error messages.
 fn collect_captured_names(db: &SessionDb, loc: &str) -> Vec<String> {
     let (tail, stem_tail) = loc_keys(loc);
+    let stem_method = stem_method_pattern(loc);
     let Ok(mut stmt) = db.conn().prepare(
         "SELECT locals_json FROM breakpoint_hits
          WHERE (location_key = ?1
                 OR location_key LIKE '%' || ?2
-                OR location_key LIKE ?3 || '%')
+                OR location_key = ?3
+                OR location_key LIKE '%.' || ?3
+                OR location_key LIKE ?4 ESCAPE char(92)
+                OR location_key LIKE '%.' || ?4 ESCAPE char(92))
            AND locals_json IS NOT NULL",
     ) else {
         return Vec::new();
     };
     let rows: Vec<String> = stmt
-        .query_map(params![loc, tail, stem_tail], |r| r.get::<_, String>(0))
+        .query_map(params![loc, tail, stem_tail, stem_method], |r| {
+            r.get::<_, String>(0)
+        })
         .and_then(|it| it.collect::<Result<Vec<_>, _>>())
         .unwrap_or_default();
     let mut names: std::collections::BTreeSet<String> = Default::default();
@@ -644,15 +681,19 @@ fn locals_summary(locals_json: &str) -> Option<String> {
 
 fn cmd_hit_diff(db: &SessionDb, loc: &str, a: u32, b: u32) -> String {
     let (tail, stem_tail) = loc_keys(loc);
+    let stem_method = stem_method_pattern(loc);
     let fetch = |seq: u32| -> Option<(Option<String>, Option<String>)> {
         db.conn()
             .query_row(
                 "SELECT locals_json, stack_json
                  FROM breakpoint_hits
                  WHERE (location_key = ?1 OR location_key LIKE '%' || ?2
-                        OR location_key LIKE ?3 || '%')
-                   AND hit_seq = ?4",
-                params![loc, tail, stem_tail, seq as i64],
+                        OR location_key = ?3
+                        OR location_key LIKE '%.' || ?3
+                        OR location_key LIKE ?4 ESCAPE char(92)
+                        OR location_key LIKE '%.' || ?4 ESCAPE char(92))
+                   AND hit_seq = ?5",
+                params![loc, tail, stem_tail, stem_method, seq as i64],
                 |r| {
                     Ok((
                         r.get::<_, Option<String>>(0)?,
@@ -716,18 +757,22 @@ fn cmd_hit_diff(db: &SessionDb, loc: &str, a: u32, b: u32) -> String {
 
 fn cmd_hit_trend(db: &SessionDb, loc: &str, field: &str) -> String {
     let (tail, stem_tail) = loc_keys(loc);
+    let stem_method = stem_method_pattern(loc);
     let mut stmt = match db.conn().prepare(
         "SELECT hit_seq, locals_json FROM breakpoint_hits
          WHERE location_key = ?1
             OR location_key LIKE '%' || ?2
-            OR location_key LIKE ?3 || '%'
+            OR location_key = ?3
+            OR location_key LIKE '%.' || ?3
+            OR location_key LIKE ?4 ESCAPE char(92)
+            OR location_key LIKE '%.' || ?4 ESCAPE char(92)
          ORDER BY hit_seq ASC",
     ) {
         Ok(s) => s,
         Err(e) => return format!("[error: {e}]"),
     };
     let rows: Vec<(i64, Option<String>)> = stmt
-        .query_map(params![loc, tail, stem_tail], |r| {
+        .query_map(params![loc, tail, stem_tail, stem_method], |r| {
             Ok((r.get::<_, i64>(0)?, r.get::<_, Option<String>>(1)?))
         })
         .and_then(|it| it.collect::<Result<Vec<_>, _>>())
@@ -1305,6 +1350,19 @@ mod tests {
         assert!(out.contains("2 hit(s)"), "{out}");
         assert!(out.contains("a=0"));
         assert!(out.contains("a=1"));
+    }
+
+    #[test]
+    fn java_line_matching_does_not_treat_line_as_a_decimal_prefix() {
+        let tmp = TempDir::new().unwrap();
+        let (db, _) = db_and_ctx(&tmp);
+        insert_hit(&db, "com.example.Algos:17", 1, "{}", None);
+        insert_hit(&db, "Algos.fibonacci:17", 2, "{}", None);
+        insert_hit(&db, "com.example.Algos.sort:17", 3, "{}", None);
+        insert_hit(&db, "com.example.Algos:170", 4, "{}", None);
+        let out = cmd_hits(&db, "/repo/com/example/Algos.java:17");
+        assert!(out.contains("3 hit(s)"), "{out}");
+        assert!(!out.contains("4 hit(s)"), "{out}");
     }
 
     // ---------- hits ----------
