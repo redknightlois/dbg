@@ -45,6 +45,7 @@ use crate::pty::{DebuggerIo, EventKind, LogHandle};
 const MAX_DAP_FRAME_BYTES: usize = 8 * 1024 * 1024;
 const MAX_DAP_HEADER_BYTES: usize = 4096;
 const MAX_DAP_PENDING_REQUESTS: usize = 4096;
+const MAX_DAP_STACK_HELPERS: usize = 64;
 const DAP_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
 
 struct SpawnedChildGuard(Option<Child>);
@@ -365,6 +366,7 @@ enum DriverCmd {
         arguments: Value,
         resp: Sender<Result<Value, String>>,
         arm_action: bool,
+        cancelled: Arc<AtomicBool>,
     },
     Shutdown,
 }
@@ -592,6 +594,7 @@ impl DapTransport {
                 arguments,
                 resp: tx,
                 arm_action: false,
+                cancelled: Arc::new(AtomicBool::new(false)),
             })
             .map_err(|_| anyhow!("DAP driver thread gone"))?;
         Ok(rx)
@@ -618,18 +621,23 @@ impl DapTransport {
         arm_action: bool,
     ) -> Result<Value> {
         let (tx, rx) = mpsc::channel();
+        let cancelled = Arc::new(AtomicBool::new(false));
         self.driver_tx
             .send(DriverCmd::Call {
                 command: command.to_string(),
                 arguments,
                 resp: tx,
                 arm_action,
+                cancelled: cancelled.clone(),
             })
             .map_err(|_| anyhow!("DAP driver thread gone"))?;
         match rx.recv_timeout(timeout) {
             Ok(Ok(v)) => Ok(v),
             Ok(Err(e)) => Err(anyhow!("DAP {command}: {e}")),
-            Err(_) => Err(anyhow!("DAP {command}: timeout")),
+            Err(_) => {
+                cancelled.store(true, Ordering::Release);
+                Err(anyhow!("DAP {command}: timeout"))
+            }
         }
     }
 
@@ -2132,7 +2140,7 @@ fn driver_loop(
     // complete Content-Length-framed message.
     let mut decoder = DapFrameDecoder::new();
     let mut next_seq: i64 = 1;
-    let mut pending: HashMap<i64, (String, Sender<Result<Value, String>>)> = HashMap::new();
+    let mut pending: HashMap<i64, PendingRequest> = HashMap::new();
     loop {
         if shutdown.load(Ordering::Relaxed) {
             break;
@@ -2147,7 +2155,30 @@ fn driver_loop(
                     mark_dead(&state);
                     return;
                 }
-                Ok(n) => decoder.inbox.extend_from_slice(&buf[..n]),
+                Ok(n) => {
+                    decoder.inbox.extend_from_slice(&buf[..n]);
+                    // Parse while reading rather than waiting for the socket
+                    // to become idle. A peer that continuously keeps the
+                    // socket readable must not bypass the frame-size bound.
+                    loop {
+                        match decoder.next_frame() {
+                            Ok(Some(bytes)) => {
+                                if let Ok(v) = serde_json::from_slice::<Value>(&bytes) {
+                                    dispatch_incoming(
+                                        v,
+                                        &mut pending,
+                                        &state,
+                                        &log,
+                                        &mut stream,
+                                        &mut next_seq,
+                                    );
+                                }
+                            }
+                            Ok(None) => break,
+                            Err(_) => continue,
+                        }
+                    }
+                }
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
                 Err(_) => {
                     drain_pending(&mut pending);
@@ -2157,25 +2188,7 @@ fn driver_loop(
             }
         }
 
-        // Parse as many complete messages as are in the inbox.
-        loop {
-            match decoder.next_frame() {
-                Ok(Some(bytes)) => {
-                    if let Ok(v) = serde_json::from_slice::<Value>(&bytes) {
-                        dispatch_incoming(
-                            v,
-                            &mut pending,
-                            &state,
-                            &log,
-                            &mut stream,
-                            &mut next_seq,
-                        );
-                    }
-                }
-                Ok(None) => break,
-                Err(_) => continue,
-            }
-        }
+        prune_cancelled(&mut pending);
 
         // Drain outbound command channel.
         loop {
@@ -2190,7 +2203,11 @@ fn driver_loop(
                     arguments,
                     resp,
                     arm_action,
+                    cancelled,
                 }) => {
+                    if cancelled.load(Ordering::Acquire) {
+                        continue;
+                    }
                     if pending.len() >= MAX_DAP_PENDING_REQUESTS {
                         let _ = resp.send(Err("DAP request queue is full".into()));
                         continue;
@@ -2212,7 +2229,14 @@ fn driver_loop(
                         let _ = resp.send(Err(format!("write failed: {e}")));
                         continue;
                     }
-                    pending.insert(seq, (command, resp));
+                    pending.insert(
+                        seq,
+                        PendingRequest {
+                            command,
+                            resp,
+                            cancelled,
+                        },
+                    );
                 }
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
@@ -2231,9 +2255,31 @@ fn driver_loop(
 /// parked in `pending` would time out with the generic "timeout" error.
 /// Drain them with a clearer "driver dead" message so callers can
 /// distinguish a dead adapter from a slow one.
-fn drain_pending(pending: &mut HashMap<i64, (String, Sender<Result<Value, String>>)>) {
-    for (_seq, (_cmd, tx)) in pending.drain() {
-        let _ = tx.send(Err("DAP driver thread exited".into()));
+struct PendingRequest {
+    command: String,
+    resp: Sender<Result<Value, String>>,
+    cancelled: Arc<AtomicBool>,
+}
+
+fn prune_cancelled(pending: &mut HashMap<i64, PendingRequest>) {
+    pending.retain(|_, request| !request.cancelled.load(Ordering::Acquire));
+}
+
+fn can_schedule_stack_helper(pending: &HashMap<i64, PendingRequest>) -> bool {
+    pending.len() < MAX_DAP_PENDING_REQUESTS
+        && pending
+            .values()
+            .filter(|request| request.command == "stackTrace")
+            .count()
+            < MAX_DAP_STACK_HELPERS
+}
+
+fn drain_pending(pending: &mut HashMap<i64, PendingRequest>) {
+    for (_seq, request) in pending.drain() {
+        let _ = request.resp.send(Err(format!(
+            "DAP driver thread exited while waiting for {}",
+            request.command
+        )));
     }
 }
 
@@ -2390,7 +2436,7 @@ fn write_frame(stream: &mut TcpStream, frame: &Value) -> std::io::Result<()> {
 
 fn dispatch_incoming(
     v: Value,
-    pending: &mut HashMap<i64, (String, Sender<Result<Value, String>>)>,
+    pending: &mut HashMap<i64, PendingRequest>,
     state: &Arc<(Mutex<State>, Condvar)>,
     log: &LogHandle,
     stream: &mut TcpStream,
@@ -2400,17 +2446,17 @@ fn dispatch_incoming(
     match ty {
         "response" => {
             let req_seq = v.get("request_seq").and_then(|v| v.as_i64()).unwrap_or(0);
-            if let Some((_cmd, tx)) = pending.remove(&req_seq) {
+            if let Some(request) = pending.remove(&req_seq) {
                 if v.get("success").and_then(|s| s.as_bool()) == Some(true) {
                     let body = v.get("body").cloned().unwrap_or(Value::Null);
-                    let _ = tx.send(Ok(body));
+                    let _ = request.resp.send(Ok(body));
                 } else {
                     let msg = v
                         .get("message")
                         .and_then(|m| m.as_str())
                         .unwrap_or("request failed")
                         .to_string();
-                    let _ = tx.send(Err(msg));
+                    let _ = request.resp.send(Err(msg));
                 }
             }
         }
@@ -2461,6 +2507,9 @@ fn dispatch_incoming(
                         // handler can build a structured HitEvent. We
                         // bypass the call_blocking path (driver can't
                         // block on itself) and write directly.
+                        if !can_schedule_stack_helper(pending) {
+                            return;
+                        }
                         let seq = *next_seq;
                         *next_seq += 1;
                         let frame = json!({
@@ -2470,15 +2519,22 @@ fn dispatch_incoming(
                             "arguments": { "threadId": tid, "startFrame": 0, "levels": 20 },
                         });
                         let (tx, rx) = mpsc::channel::<Result<Value, String>>();
-                        pending.insert(seq, ("stackTrace".into(), tx));
+                        let cancelled = Arc::new(AtomicBool::new(false));
+                        pending.insert(
+                            seq,
+                            PendingRequest {
+                                command: "stackTrace".into(),
+                                resp: tx,
+                                cancelled: cancelled.clone(),
+                            },
+                        );
                         let _ = write_frame(stream, &frame);
                         // Defer the response-waiting onto a short-lived
                         // helper thread so we don't block the driver.
                         let state2 = state.clone();
-                        std::thread::spawn(move || {
-                            if let Ok(Ok(body)) = rx.recv_timeout(Duration::from_secs(5)) {
-                                handle_stack_response(body, &state2, stop_generation);
-                            }
+                        std::thread::spawn(move || match rx.recv_timeout(Duration::from_secs(5)) {
+                            Ok(Ok(body)) => handle_stack_response(body, &state2, stop_generation),
+                            _ => cancelled.store(true, Ordering::Release),
                         });
                     } else {
                         let (lock, cvar) = &**state;
@@ -2951,6 +3007,39 @@ mod tests {
                 .map(|_| json!({ "verified": true }))
                 .collect::<Vec<_>>()
         })
+    }
+
+    #[test]
+    fn timed_out_requests_are_removed_from_the_pending_bound() {
+        let (tx, _rx) = mpsc::channel();
+        let cancelled = Arc::new(AtomicBool::new(true));
+        let mut pending = HashMap::from([(
+            1,
+            PendingRequest {
+                command: "threads".into(),
+                resp: tx,
+                cancelled,
+            },
+        )]);
+        prune_cancelled(&mut pending);
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn stopped_event_helpers_have_a_small_independent_bound() {
+        let mut pending = HashMap::new();
+        for seq in 0..MAX_DAP_STACK_HELPERS {
+            let (tx, _rx) = mpsc::channel();
+            pending.insert(
+                seq as i64,
+                PendingRequest {
+                    command: "stackTrace".into(),
+                    resp: tx,
+                    cancelled: Arc::new(AtomicBool::new(false)),
+                },
+            );
+        }
+        assert!(!can_schedule_stack_helper(&pending));
     }
 
     fn assert_no_breakpoint_state(transport: &DapTransport, next_id: u32) {

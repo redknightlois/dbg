@@ -1,7 +1,7 @@
 use std::collections::VecDeque;
 use std::os::fd::{AsRawFd, BorrowedFd, OwnedFd};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender};
 use std::sync::{Arc, Condvar, LazyLock, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -173,11 +173,14 @@ pub struct EventEntry {
 /// are dropped silently. The `last_seq` counter keeps incrementing even
 /// across drops so agents can tell if they missed events.
 const MAX_EVENTS: usize = 2048;
+const MAX_EVENT_LOG_BYTES: usize = 8 * 1024 * 1024;
+const MAX_PENDING_PTY_EVENTS: usize = 256;
 
 struct EventLog {
     entries: VecDeque<EventEntry>,
     last_seq: u64,
     started: Instant,
+    bytes: usize,
 }
 
 impl EventLog {
@@ -186,15 +189,25 @@ impl EventLog {
             entries: VecDeque::with_capacity(MAX_EVENTS),
             last_seq: 0,
             started: Instant::now(),
+            bytes: 0,
         }
     }
 
-    fn push(&mut self, kind: EventKind, bytes: Vec<u8>) {
+    fn push(&mut self, kind: EventKind, mut bytes: Vec<u8>) {
         self.last_seq += 1;
         let ts_ms = self.started.elapsed().as_millis() as u64;
-        if self.entries.len() == MAX_EVENTS {
-            self.entries.pop_front();
+        if bytes.len() > MAX_EVENT_LOG_BYTES {
+            bytes.truncate(MAX_EVENT_LOG_BYTES);
         }
+        while self.entries.len() == MAX_EVENTS
+            || self.bytes.saturating_add(bytes.len()) > MAX_EVENT_LOG_BYTES
+        {
+            let Some(removed) = self.entries.pop_front() else {
+                break;
+            };
+            self.bytes = self.bytes.saturating_sub(removed.bytes.len());
+        }
+        self.bytes += bytes.len();
         self.entries.push_back(EventEntry {
             seq: self.last_seq,
             ts_ms,
@@ -345,6 +358,7 @@ pub struct DebuggerProcess {
     /// without pinning the session mutex.
     log: LogHandle,
     shutdown: Arc<AtomicBool>,
+    synchronized: AtomicBool,
     reader: Option<JoinHandle<()>>,
     prompt_re: Regex,
 }
@@ -357,6 +371,8 @@ impl DebuggerProcess {
         env_extra: &[(String, String)],
         prompt_pattern: &str,
     ) -> Result<Self> {
+        // Validate all fallible configuration before creating a child.
+        let prompt_re = Regex::new(prompt_pattern).context("invalid prompt pattern")?;
         let OpenptyResult { master, slave } = openpty(None, None)?;
 
         // Safety: fork is unsafe because it duplicates the process.
@@ -399,30 +415,27 @@ impl DebuggerProcess {
             ForkResult::Parent { child } => {
                 drop(slave);
 
-                let prompt_re = Regex::new(prompt_pattern).context("invalid prompt pattern")?;
                 let reader_prompt_re = prompt_re.clone();
                 let master_fd = master.as_raw_fd();
-                let (tx, rx) = mpsc::channel::<PtyEvent>();
+                let (tx, rx) = mpsc::sync_channel::<PtyEvent>(MAX_PENDING_PTY_EVENTS);
                 let shutdown = Arc::new(AtomicBool::new(false));
                 let child_reaped = Arc::new(AtomicBool::new(false));
                 let reader_shutdown = shutdown.clone();
-                let reader_reaped = child_reaped.clone();
                 let log = LogHandle::new();
                 let reader_log = log.clone();
 
-                let reader = std::thread::Builder::new()
+                let reader = match std::thread::Builder::new()
                     .name("dbg-pty-reader".into())
                     .spawn(move || {
-                        reader_loop(
-                            master_fd,
-                            reader_prompt_re,
-                            tx,
-                            reader_shutdown,
-                            reader_log,
-                            reader_reaped,
-                        )
-                    })
-                    .context("failed to spawn reader thread")?;
+                        reader_loop(master_fd, reader_prompt_re, tx, reader_shutdown, reader_log)
+                    }) {
+                    Ok(reader) => reader,
+                    Err(error) => {
+                        let _ = nix::sys::signal::kill(child, Signal::SIGKILL);
+                        let _ = nix::sys::wait::waitpid(child, None);
+                        return Err(error).context("failed to spawn reader thread");
+                    }
+                };
 
                 Ok(Self {
                     master,
@@ -431,6 +444,7 @@ impl DebuggerProcess {
                     rx: Mutex::new(rx),
                     log,
                     shutdown,
+                    synchronized: AtomicBool::new(true),
                     reader: Some(reader),
                     prompt_re,
                 })
@@ -471,7 +485,9 @@ impl DebuggerProcess {
                     saw_data = true;
                     accumulated.push(&bytes);
                 }
-                Ok(PtyEvent::Prompt) => {}
+                Ok(PtyEvent::Prompt) => {
+                    self.synchronized.store(true, Ordering::Release);
+                }
                 Ok(PtyEvent::Exit) => break,
                 Err(_) => break,
             }
@@ -495,6 +511,7 @@ impl DebuggerProcess {
             match rx.recv_timeout(remaining) {
                 Ok(PtyEvent::Data(bytes)) => collected.push(&bytes),
                 Ok(PtyEvent::Prompt) => {
+                    self.synchronized.store(true, Ordering::Release);
                     return Ok(strip_ansi(&collected.into_string()));
                 }
                 Ok(PtyEvent::Exit) => bail!("debugger exited before producing prompt"),
@@ -515,6 +532,11 @@ impl DebuggerProcess {
     /// `drain_pending()` first; this method only collects events that
     /// arrive after the command is written.
     pub fn send_and_wait(&self, cmd: &str, timeout: Duration) -> Result<String> {
+        if !self.synchronized.load(Ordering::Acquire) {
+            bail!(
+                "PTY command stream is waiting for the prompt from a timed-out command; retry after the debugger becomes ready"
+            );
+        }
         // Sticky "session has exited" guard. Once the child is gone,
         // the reader-thread channel is drained/closed and the loop
         // below would bail with "reader thread disconnected" — loudly
@@ -552,15 +574,22 @@ still available: `dbg hits <loc>`, `dbg stack`, `dbg locals`, `dbg cross <sym>`,
         loop {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
+                self.synchronized.store(false, Ordering::Release);
                 bail!("timeout waiting for prompt");
             }
             match rx.recv_timeout(remaining) {
                 Ok(PtyEvent::Data(bytes)) => collected.push(&bytes),
-                Ok(PtyEvent::Prompt) => break,
+                Ok(PtyEvent::Prompt) => {
+                    self.synchronized.store(true, Ordering::Release);
+                    break;
+                }
                 Ok(PtyEvent::Exit) => {
                     bail!("debugger exited while running `{cmd}`")
                 }
-                Err(RecvTimeoutError::Timeout) => bail!("timeout waiting for prompt"),
+                Err(RecvTimeoutError::Timeout) => {
+                    self.synchronized.store(false, Ordering::Release);
+                    bail!("timeout waiting for prompt")
+                }
                 Err(RecvTimeoutError::Disconnected) => {
                     // Reader thread exited — child is gone. Return the
                     // sticky status so the agent sees a consistent
@@ -642,6 +671,14 @@ still available: `dbg hits <loc>`, `dbg stack`, `dbg locals`, `dbg cross <sym>`,
             if self.is_alive() {
                 let _ = nix::sys::signal::kill(self.child_pid, Signal::SIGKILL);
             }
+            self.wait_for_child_exit(Duration::from_secs(1));
+        }
+    }
+
+    fn wait_for_child_exit(&self, timeout: Duration) {
+        let deadline = Instant::now() + timeout;
+        while self.is_alive() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
         }
     }
 }
@@ -681,10 +718,9 @@ impl DebuggerIo for DebuggerProcess {
 fn reader_loop(
     master_fd: std::os::fd::RawFd,
     prompt_re: Regex,
-    tx: Sender<PtyEvent>,
+    tx: SyncSender<PtyEvent>,
     shutdown: Arc<AtomicBool>,
     log: LogHandle,
-    child_reaped: Arc<AtomicBool>,
 ) {
     let mut buf = [0u8; 4096];
     // Pending output bytes not yet emitted. Flushed to a single Output
@@ -698,16 +734,17 @@ fn reader_loop(
     const PROMPT_PROBE_BYTES: usize = 64 * 1024;
     let mut prompt_probe: Vec<u8> = Vec::new();
 
-    let flush_output = |pending: &mut Vec<u8>, tx: &Sender<PtyEvent>, log: &LogHandle| -> bool {
-        if pending.is_empty() {
-            return true;
-        }
-        let bytes = std::mem::take(pending);
-        log.push(EventKind::Output, bytes.clone());
-        tx.send(PtyEvent::Data(bytes)).is_ok()
-    };
+    let flush_output =
+        |pending: &mut Vec<u8>, tx: &SyncSender<PtyEvent>, log: &LogHandle| -> bool {
+            if pending.is_empty() {
+                return true;
+            }
+            let bytes = std::mem::take(pending);
+            log.push(EventKind::Output, bytes.clone());
+            tx.send(PtyEvent::Data(bytes)).is_ok()
+        };
 
-    let emit_marker = |kind: EventKind, tx: &Sender<PtyEvent>, log: &LogHandle| -> bool {
+    let emit_marker = |kind: EventKind, tx: &SyncSender<PtyEvent>, log: &LogHandle| -> bool {
         log.push(kind, Vec::new());
         let ev = match kind {
             EventKind::Prompt => PtyEvent::Prompt,
@@ -734,7 +771,6 @@ fn reader_loop(
             Ok(_) => {}
             Err(nix::errno::Errno::EINTR) => continue,
             Err(_) => {
-                child_reaped.store(true, Ordering::Release);
                 let _ = flush_output(&mut pending, &tx, &log);
                 let _ = emit_marker(EventKind::Exit, &tx, &log);
                 return;
@@ -743,7 +779,6 @@ fn reader_loop(
 
         let n = match nix::unistd::read(master_fd, &mut buf) {
             Ok(0) => {
-                child_reaped.store(true, Ordering::Release);
                 let _ = flush_output(&mut pending, &tx, &log);
                 let _ = emit_marker(EventKind::Exit, &tx, &log);
                 return;
@@ -751,7 +786,6 @@ fn reader_loop(
             Ok(n) => n,
             Err(nix::errno::Errno::EINTR) => continue,
             Err(_) => {
-                child_reaped.store(true, Ordering::Release);
                 let _ = flush_output(&mut pending, &tx, &log);
                 let _ = emit_marker(EventKind::Exit, &tx, &log);
                 return;
@@ -801,6 +835,16 @@ impl Drop for DebuggerProcess {
         self.shutdown.store(true, Ordering::Relaxed);
         if !self.child_reaped.load(Ordering::Acquire) && self.is_alive() {
             let _ = nix::sys::signal::kill(self.child_pid, Signal::SIGTERM);
+            self.wait_for_child_exit(Duration::from_millis(250));
+            if self.is_alive() {
+                let _ = nix::sys::signal::kill(self.child_pid, Signal::SIGKILL);
+                self.wait_for_child_exit(Duration::from_secs(1));
+            }
+        }
+        // Release a reader blocked on bounded-channel backpressure before
+        // joining it during shutdown.
+        if let Ok(rx) = self.rx.lock() {
+            while rx.try_recv().is_ok() {}
         }
         if let Some(h) = self.reader.take() {
             // Best-effort: reader polls shutdown flag every 100ms.
@@ -815,6 +859,83 @@ mod tests {
     use std::sync::{Arc, Barrier};
     use std::thread;
     use std::time::Instant;
+
+    #[test]
+    fn event_log_is_bounded_by_bytes_as_well_as_entries() {
+        let mut log = EventLog::new();
+        log.push(EventKind::Output, vec![b'a'; 5 * 1024 * 1024]);
+        log.push(EventKind::Output, vec![b'b'; 5 * 1024 * 1024]);
+        assert!(log.bytes <= MAX_EVENT_LOG_BYTES);
+        assert_eq!(log.entries.len(), 1);
+        assert_eq!(log.entries[0].bytes[0], b'b');
+    }
+
+    #[test]
+    fn invalid_prompt_is_rejected_before_a_child_is_created() {
+        let error = match DebuggerProcess::spawn("/bin/sh", &[], &[], "(") {
+            Ok(_) => panic!("invalid prompt unexpectedly created a child"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("invalid prompt pattern"));
+    }
+
+    #[test]
+    fn timed_out_command_blocks_new_commands_until_its_prompt_is_drained() {
+        let script = "printf 'dbg> '; while IFS= read -r line; do if [ \"$line\" = slow ]; then sleep 0.15; fi; printf 'ok\\ndbg> '; done";
+        let process =
+            DebuggerProcess::spawn("/bin/sh", &["-c".into(), script.into()], &[], r"dbg> ")
+                .unwrap();
+        process.wait_for_prompt(Duration::from_secs(2)).unwrap();
+        assert!(
+            process
+                .send_and_wait("slow", Duration::from_millis(10))
+                .unwrap_err()
+                .to_string()
+                .contains("timeout")
+        );
+        assert!(
+            process
+                .send_and_wait("next", Duration::from_millis(10))
+                .unwrap_err()
+                .to_string()
+                .contains("timed-out command")
+        );
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(
+            process
+                .drain_pending()
+                .is_some_and(|output| output.contains("ok"))
+        );
+        assert_eq!(
+            process
+                .send_and_wait("next", Duration::from_secs(1))
+                .unwrap(),
+            "ok"
+        );
+    }
+
+    #[test]
+    fn drop_kills_and_reaps_a_child_that_ignores_term() {
+        let process = DebuggerProcess::spawn(
+            "/bin/sh",
+            &[
+                "-c".into(),
+                "trap '' TERM; printf 'dbg> '; while :; do sleep 1; done".into(),
+            ],
+            &[],
+            r"dbg> ",
+        )
+        .unwrap();
+        process.wait_for_prompt(Duration::from_secs(2)).unwrap();
+        let pid = process.child_pid();
+
+        drop(process);
+
+        assert_eq!(
+            nix::sys::wait::waitpid(pid, Some(nix::sys::wait::WaitPidFlag::WNOHANG)),
+            Err(nix::errno::Errno::ECHILD)
+        );
+    }
 
     fn large_output_process(ready: &std::path::Path, release: &std::path::Path) -> DebuggerProcess {
         let script = r#"
