@@ -16,6 +16,12 @@ go/go.sum
 csharp/bin/
 csharp/obj/
 
+# Scenario-local generated outputs
+scenarios/**/bin/
+scenarios/**/obj/
+scenarios/**/broken
+scenarios/**/perf.data
+
 # Zig
 zig/zig-cache/
 zig/zig-out/

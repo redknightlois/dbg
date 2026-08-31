@@ -3,7 +3,7 @@ name: Deploy to GitHub Pages
 on:
   push:
     branches: [main]
-    paths: [public/**]
+    paths: [public/**, .github/workflows/pages.yml]
 
 permissions:
   pages: write
