@@ -1,7 +1,7 @@
 use std::collections::VecDeque;
 use std::os::fd::{AsRawFd, BorrowedFd, OwnedFd};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::mpsc::RecvTimeoutError;
 use std::sync::{Arc, Condvar, LazyLock, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -21,6 +21,12 @@ static ANSI_RE: LazyLock<Regex> =
 /// PTY while the caller waits for the protocol prompt.
 pub const MAX_COMMAND_OUTPUT_BYTES: usize = 256 * 1024;
 const COMMAND_OUTPUT_HALF: usize = MAX_COMMAND_OUTPUT_BYTES / 2;
+
+/// How long a resync waits in silence for the reply of a command that was
+/// written while the stream was unsynchronized. The debugger runs such a
+/// command right after the stale prompt, or it already read the command as
+/// input; a buffered command slower than this window is misattributed.
+const BUFFERED_REPLY_QUIET: Duration = Duration::from_millis(200);
 
 /// Bounded response capture. Keep both ends of a large response: debugger
 /// stop records normally occur at the end, while the beginning still
@@ -175,6 +181,88 @@ pub struct EventEntry {
 const MAX_EVENTS: usize = 2048;
 const MAX_EVENT_LOG_BYTES: usize = 8 * 1024 * 1024;
 const MAX_PENDING_PTY_EVENTS: usize = 256;
+const MAX_PENDING_PTY_BYTES: usize = 4 * 1024 * 1024;
+
+/// Reader-to-consumer queue. `send` never blocks: the reader must keep
+/// draining the pty while no command runs, so the queue evicts its oldest
+/// `Data` event (the `EventLog` keeps a copy) once it holds more than
+/// `MAX_PENDING_PTY_EVENTS` events or `MAX_PENDING_PTY_BYTES` bytes.
+/// Markers are evicted only when no `Data` event remains.
+struct PendingEvents {
+    state: Mutex<PendingState>,
+    ready: Condvar,
+}
+
+struct PendingState {
+    events: VecDeque<PtyEvent>,
+    bytes: usize,
+    closed: bool,
+}
+
+impl PendingEvents {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(PendingState {
+                events: VecDeque::new(),
+                bytes: 0,
+                closed: false,
+            }),
+            ready: Condvar::new(),
+        }
+    }
+
+    fn send(&self, event: PtyEvent) {
+        let mut state = self.state.lock().unwrap();
+        if let PtyEvent::Data(bytes) = &event {
+            state.bytes += bytes.len();
+        }
+        state.events.push_back(event);
+        while state.events.len() > MAX_PENDING_PTY_EVENTS || state.bytes > MAX_PENDING_PTY_BYTES {
+            let index = state
+                .events
+                .iter()
+                .position(|event| matches!(event, PtyEvent::Data(_)))
+                .unwrap_or(0);
+            if let Some(PtyEvent::Data(bytes)) = state.events.remove(index) {
+                state.bytes -= bytes.len();
+            }
+        }
+        self.ready.notify_all();
+    }
+
+    /// Mark the producer gone; consumers see `Disconnected` once the queue is empty.
+    fn close(&self) {
+        self.state.lock().unwrap().closed = true;
+        self.ready.notify_all();
+    }
+
+    fn pop(state: &mut PendingState) -> Option<PtyEvent> {
+        let event = state.events.pop_front()?;
+        if let PtyEvent::Data(bytes) = &event {
+            state.bytes -= bytes.len();
+        }
+        Some(event)
+    }
+
+    fn try_recv(&self) -> Option<PtyEvent> {
+        Self::pop(&mut self.state.lock().unwrap())
+    }
+
+    fn recv_timeout(&self, timeout: Duration) -> Result<PtyEvent, RecvTimeoutError> {
+        let guard = self.state.lock().unwrap();
+        let (mut state, _) = self
+            .ready
+            .wait_timeout_while(guard, timeout, |state| {
+                state.events.is_empty() && !state.closed
+            })
+            .unwrap();
+        match Self::pop(&mut state) {
+            Some(event) => Ok(event),
+            None if state.closed => Err(RecvTimeoutError::Disconnected),
+            None => Err(RecvTimeoutError::Timeout),
+        }
+    }
+}
 
 struct EventLog {
     entries: VecDeque<EventEntry>,
@@ -349,16 +437,20 @@ pub struct DebuggerProcess {
     master: OwnedFd,
     child_pid: Pid,
     child_reaped: Arc<AtomicBool>,
-    /// Wrapped in a Mutex so `DebuggerProcess: Sync`. The Receiver
-    /// itself isn't `Sync`, but all access paths hold the daemon's
-    /// session lock, so contention here is zero.
-    rx: Mutex<Receiver<PtyEvent>>,
+    /// Consumers hold this lock for a whole receive so one command's
+    /// events are never split between two consumers.
+    rx: Mutex<Arc<PendingEvents>>,
     /// Shared handle to the reader's event log. Clonable — daemon
     /// handlers grab their own clone so they can wait on the condvar
     /// without pinning the session mutex.
     log: LogHandle,
     shutdown: Arc<AtomicBool>,
     synchronized: AtomicBool,
+    /// Commands written while unsynchronized whose prompt may still arrive.
+    buffered: AtomicUsize,
+    /// Output that a resync consumed before a stale prompt; `drain_pending`
+    /// returns it.
+    stale: Mutex<BoundedOutput>,
     reader: Option<JoinHandle<()>>,
     prompt_re: Regex,
 }
@@ -417,7 +509,8 @@ impl DebuggerProcess {
 
                 let reader_prompt_re = prompt_re.clone();
                 let master_fd = master.as_raw_fd();
-                let (tx, rx) = mpsc::sync_channel::<PtyEvent>(MAX_PENDING_PTY_EVENTS);
+                let rx = Arc::new(PendingEvents::new());
+                let tx = rx.clone();
                 let shutdown = Arc::new(AtomicBool::new(false));
                 let child_reaped = Arc::new(AtomicBool::new(false));
                 let reader_shutdown = shutdown.clone();
@@ -427,7 +520,14 @@ impl DebuggerProcess {
                 let reader = match std::thread::Builder::new()
                     .name("dbg-pty-reader".into())
                     .spawn(move || {
-                        reader_loop(master_fd, reader_prompt_re, tx, reader_shutdown, reader_log)
+                        reader_loop(
+                            master_fd,
+                            reader_prompt_re,
+                            &tx,
+                            reader_shutdown,
+                            reader_log,
+                        );
+                        tx.close();
                     }) {
                     Ok(reader) => reader,
                     Err(error) => {
@@ -445,6 +545,8 @@ impl DebuggerProcess {
                     log,
                     shutdown,
                     synchronized: AtomicBool::new(true),
+                    buffered: AtomicUsize::new(0),
+                    stale: Mutex::new(BoundedOutput::new()),
                     reader: Some(reader),
                     prompt_re,
                 })
@@ -477,25 +579,29 @@ impl DebuggerProcess {
     /// already ack-prompted the `cont`).
     pub fn drain_pending(&self) -> Option<String> {
         let rx = self.rx.lock().unwrap();
-        let mut accumulated = BoundedOutput::new();
-        let mut saw_data = false;
+        let mut accumulated =
+            std::mem::replace(&mut *self.stale.lock().unwrap(), BoundedOutput::new());
         loop {
             match rx.try_recv() {
-                Ok(PtyEvent::Data(bytes)) => {
-                    saw_data = true;
-                    accumulated.push(&bytes);
-                }
-                Ok(PtyEvent::Prompt) => {
-                    self.synchronized.store(true, Ordering::Release);
-                }
-                Ok(PtyEvent::Exit) => break,
-                Err(_) => break,
+                Some(PtyEvent::Data(bytes)) => accumulated.push(&bytes),
+                Some(PtyEvent::Prompt) => self.saw_prompt(),
+                Some(PtyEvent::Exit) | None => break,
             }
         }
-        if !saw_data {
+        if accumulated.total == 0 {
             return None;
         }
         Some(strip_ansi(&accumulated.into_string()))
+    }
+
+    /// Account for one prompt: the first one ends an unsynchronized stream,
+    /// and each later one answers one buffered command.
+    fn saw_prompt(&self) {
+        if self.synchronized.swap(true, Ordering::AcqRel) {
+            let _ = self
+                .buffered
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1));
+        }
     }
 
     /// Wait for the initial prompt after spawn.
@@ -511,7 +617,7 @@ impl DebuggerProcess {
             match rx.recv_timeout(remaining) {
                 Ok(PtyEvent::Data(bytes)) => collected.push(&bytes),
                 Ok(PtyEvent::Prompt) => {
-                    self.synchronized.store(true, Ordering::Release);
+                    self.saw_prompt();
                     return Ok(strip_ansi(&collected.into_string()));
                 }
                 Ok(PtyEvent::Exit) => bail!("debugger exited before producing prompt"),
@@ -531,12 +637,54 @@ impl DebuggerProcess {
     /// Call sites that need to handle async stop events should call
     /// `drain_pending()` first; this method only collects events that
     /// arrive after the command is written.
+    ///
+    /// `timeout` bounds the whole call. After a timeout, the stream is
+    /// unsynchronized until a prompt arrives. The call first waits for that
+    /// prompt, and for the prompts of commands written while unsynchronized,
+    /// then sends `cmd` as usual. The output before those prompts goes to
+    /// `drain_pending`. When the stale prompt does not arrive, `cmd` is
+    /// written as input to the timed-out command (for example the answer to
+    /// a `(y or n)` question) and the call returns an error without waiting
+    /// for a reply. When the deadline cuts the quiet window of a buffered
+    /// command short, the call returns an error and does not write `cmd`.
     pub fn send_and_wait(&self, cmd: &str, timeout: Duration) -> Result<String> {
-        if !self.synchronized.load(Ordering::Acquire) {
-            bail!(
-                "PTY command stream is waiting for the prompt from a timed-out command; retry after the debugger becomes ready"
-            );
+        let deadline = Instant::now() + timeout;
+        {
+            let rx = self.rx.lock().unwrap();
+            let mut stale = self.stale.lock().unwrap();
+            loop {
+                let synchronized = self.synchronized.load(Ordering::Acquire);
+                if synchronized && self.buffered.load(Ordering::Acquire) == 0 {
+                    break;
+                }
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                let wait = if synchronized {
+                    remaining.min(BUFFERED_REPLY_QUIET)
+                } else {
+                    remaining
+                };
+                match rx.recv_timeout(wait) {
+                    Ok(PtyEvent::Data(bytes)) => stale.push(&bytes),
+                    Ok(PtyEvent::Prompt) => self.saw_prompt(),
+                    // A quiet wait cut short does not prove the buffered command was read as input.
+                    Err(RecvTimeoutError::Timeout)
+                        if synchronized && wait < BUFFERED_REPLY_QUIET =>
+                    {
+                        bail!(
+                            "timeout waiting for the prompt of a buffered command; `{cmd}` was not sent"
+                        );
+                    }
+                    Ok(PtyEvent::Exit) | Err(_) => {
+                        // A buffered command that stays silent for the full window was read as input.
+                        if synchronized {
+                            self.buffered.store(0, Ordering::Release);
+                        }
+                        break;
+                    }
+                }
+            }
         }
+        let resync = !self.synchronized.load(Ordering::Acquire);
         // Sticky "session has exited" guard. Once the child is gone,
         // the reader-thread channel is drained/closed and the loop
         // below would bail with "reader thread disconnected" — loudly
@@ -567,10 +715,15 @@ still available: `dbg hits <loc>`, `dbg stack`, `dbg locals`, `dbg cross <sym>`,
             }
             return Err(e);
         }
+        if resync {
+            self.buffered.fetch_add(1, Ordering::AcqRel);
+            bail!(
+                "PTY input `{cmd}` went to a timed-out command, which has not returned to the prompt; the debugger either read it as input or runs it once the prompt returns, so check the state before sending it again"
+            );
+        }
 
         let rx = self.rx.lock().unwrap();
         let mut collected = BoundedOutput::new();
-        let deadline = Instant::now() + timeout;
         loop {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
@@ -586,10 +739,7 @@ still available: `dbg hits <loc>`, `dbg stack`, `dbg locals`, `dbg cross <sym>`,
                 Ok(PtyEvent::Exit) => {
                     bail!("debugger exited while running `{cmd}`")
                 }
-                Err(RecvTimeoutError::Timeout) => {
-                    self.synchronized.store(false, Ordering::Release);
-                    bail!("timeout waiting for prompt")
-                }
+                Err(RecvTimeoutError::Timeout) => continue,
                 Err(RecvTimeoutError::Disconnected) => {
                     // Reader thread exited — child is gone. Return the
                     // sticky status so the agent sees a consistent
@@ -718,14 +868,14 @@ impl DebuggerIo for DebuggerProcess {
 fn reader_loop(
     master_fd: std::os::fd::RawFd,
     prompt_re: Regex,
-    tx: SyncSender<PtyEvent>,
+    tx: &PendingEvents,
     shutdown: Arc<AtomicBool>,
     log: LogHandle,
 ) {
     let mut buf = [0u8; 4096];
     // Pending output bytes not yet emitted. Flushed to a single Output
-    // event when a prompt is detected, when it grows past 64KB, or on
-    // exit.
+    // event when a prompt is detected, when it grows past 64KB, when the
+    // pty is idle for one poll interval, or on exit.
     let mut pending: Vec<u8> = Vec::new();
     // Keep a bounded copy separate from `pending`. The latter is flushed
     // during very large responses; without this probe, a prompt split
@@ -734,17 +884,16 @@ fn reader_loop(
     const PROMPT_PROBE_BYTES: usize = 64 * 1024;
     let mut prompt_probe: Vec<u8> = Vec::new();
 
-    let flush_output =
-        |pending: &mut Vec<u8>, tx: &SyncSender<PtyEvent>, log: &LogHandle| -> bool {
-            if pending.is_empty() {
-                return true;
-            }
-            let bytes = std::mem::take(pending);
-            log.push(EventKind::Output, bytes.clone());
-            tx.send(PtyEvent::Data(bytes)).is_ok()
-        };
+    let flush_output = |pending: &mut Vec<u8>, tx: &PendingEvents, log: &LogHandle| {
+        if pending.is_empty() {
+            return;
+        }
+        let bytes = std::mem::take(pending);
+        log.push(EventKind::Output, bytes.clone());
+        tx.send(PtyEvent::Data(bytes));
+    };
 
-    let emit_marker = |kind: EventKind, tx: &SyncSender<PtyEvent>, log: &LogHandle| -> bool {
+    let emit_marker = |kind: EventKind, tx: &PendingEvents, log: &LogHandle| {
         log.push(kind, Vec::new());
         let ev = match kind {
             EventKind::Prompt => PtyEvent::Prompt,
@@ -756,7 +905,7 @@ fn reader_loop(
                 unreachable!("emit_marker called with {kind:?}")
             }
         };
-        tx.send(ev).is_ok()
+        tx.send(ev);
     };
 
     loop {
@@ -767,27 +916,31 @@ fn reader_loop(
         let borrowed = unsafe { BorrowedFd::borrow_raw(master_fd) };
         let pollfd = PollFd::new(borrowed, PollFlags::POLLIN);
         match poll(&mut [pollfd], 100u16) {
-            Ok(0) => continue,
+            // Idle output with no prompt, such as a `(y or n)` question.
+            Ok(0) => {
+                flush_output(&mut pending, tx, &log);
+                continue;
+            }
             Ok(_) => {}
             Err(nix::errno::Errno::EINTR) => continue,
             Err(_) => {
-                let _ = flush_output(&mut pending, &tx, &log);
-                let _ = emit_marker(EventKind::Exit, &tx, &log);
+                flush_output(&mut pending, tx, &log);
+                emit_marker(EventKind::Exit, tx, &log);
                 return;
             }
         }
 
         let n = match nix::unistd::read(master_fd, &mut buf) {
             Ok(0) => {
-                let _ = flush_output(&mut pending, &tx, &log);
-                let _ = emit_marker(EventKind::Exit, &tx, &log);
+                flush_output(&mut pending, tx, &log);
+                emit_marker(EventKind::Exit, tx, &log);
                 return;
             }
             Ok(n) => n,
             Err(nix::errno::Errno::EINTR) => continue,
             Err(_) => {
-                let _ = flush_output(&mut pending, &tx, &log);
-                let _ = emit_marker(EventKind::Exit, &tx, &log);
+                flush_output(&mut pending, tx, &log);
+                emit_marker(EventKind::Exit, tx, &log);
                 return;
             }
         };
@@ -805,20 +958,14 @@ fn reader_loop(
         let probe_str = String::from_utf8_lossy(&prompt_probe);
         let cleaned = strip_ansi(&probe_str);
         if prompt_re.is_match(&cleaned) {
-            if !flush_output(&mut pending, &tx, &log) {
-                return;
-            }
-            if !emit_marker(EventKind::Prompt, &tx, &log) {
-                return;
-            }
+            flush_output(&mut pending, tx, &log);
+            emit_marker(EventKind::Prompt, tx, &log);
             prompt_probe.clear();
         } else if pending.len() > 64 * 1024 {
             // Safety valve: stream large outputs to the log without
             // waiting for a prompt. Agents tailing via `dbg events`
             // still see progress on long-running commands.
-            if !flush_output(&mut pending, &tx, &log) {
-                return;
-            }
+            flush_output(&mut pending, tx, &log);
         }
     }
 }
@@ -840,11 +987,6 @@ impl Drop for DebuggerProcess {
                 let _ = nix::sys::signal::kill(self.child_pid, Signal::SIGKILL);
                 self.wait_for_child_exit(Duration::from_secs(1));
             }
-        }
-        // Release a reader blocked on bounded-channel backpressure before
-        // joining it during shutdown.
-        if let Ok(rx) = self.rx.lock() {
-            while rx.try_recv().is_ok() {}
         }
         if let Some(h) = self.reader.take() {
             // Best-effort: reader polls shutdown flag every 100ms.
@@ -911,6 +1053,245 @@ mod tests {
                 .send_and_wait("next", Duration::from_secs(1))
                 .unwrap(),
             "ok"
+        );
+    }
+
+    #[test]
+    fn reader_keeps_logging_without_a_consumer() {
+        let process = DebuggerProcess::spawn(
+            "/bin/sh",
+            &["-c".into(), "printf 'dbg> '; yes".into()],
+            &[],
+            r"dbg> ",
+        )
+        .unwrap();
+        process.wait_for_prompt(Duration::from_secs(2)).unwrap();
+        std::thread::sleep(Duration::from_millis(500));
+        let a = process.log().last_seq();
+        std::thread::sleep(Duration::from_millis(500));
+        let b = process.log().last_seq();
+        assert!(b > a, "reader stalled at seq {a}");
+        let rx = process.rx.lock().unwrap();
+        let state = rx.state.lock().unwrap();
+        assert!(state.events.len() <= MAX_PENDING_PTY_EVENTS);
+        assert!(state.bytes <= MAX_PENDING_PTY_BYTES);
+    }
+
+    #[test]
+    fn pending_events_evict_data_before_markers() {
+        let queue = PendingEvents::new();
+        queue.send(PtyEvent::Prompt);
+        for _ in 0..MAX_PENDING_PTY_EVENTS {
+            queue.send(PtyEvent::Data(vec![b'x']));
+        }
+        assert!(matches!(queue.try_recv(), Some(PtyEvent::Prompt)));
+        let mut data = 0;
+        while let Some(event) = queue.try_recv() {
+            assert!(matches!(event, PtyEvent::Data(_)));
+            data += 1;
+        }
+        assert_eq!(data, MAX_PENDING_PTY_EVENTS - 1);
+        queue.close();
+        assert!(matches!(
+            queue.recv_timeout(Duration::from_millis(10)),
+            Err(RecvTimeoutError::Disconnected)
+        ));
+    }
+
+    #[test]
+    fn timed_out_command_without_a_prompt_recovers_through_input() {
+        let script = "printf 'dbg> '; while IFS= read -r line; do if [ \"$line\" = slow ]; then sleep 0.15; printf 'Continue? (y or n) '; else printf 'ok\\ndbg> '; fi; done";
+        let process =
+            DebuggerProcess::spawn("/bin/sh", &["-c".into(), script.into()], &[], r"dbg> ")
+                .unwrap();
+        process.wait_for_prompt(Duration::from_secs(2)).unwrap();
+        assert!(
+            process
+                .send_and_wait("slow", Duration::from_millis(10))
+                .unwrap_err()
+                .to_string()
+                .contains("timeout")
+        );
+        std::thread::sleep(Duration::from_millis(400));
+        assert!(
+            process
+                .drain_pending()
+                .is_some_and(|output| output.contains("Continue?"))
+        );
+        let recovered = (0..5).any(|_| {
+            let ok = process
+                .send_and_wait("next", Duration::from_secs(1))
+                .is_ok_and(|output| output == "ok");
+            process.drain_pending();
+            ok
+        });
+        assert!(recovered);
+    }
+
+    #[test]
+    fn command_after_a_timeout_runs_once_and_reports_its_reply() {
+        let script = "printf 'dbg> '; while IFS= read -r line; do if [ \"$line\" = slow ]; then sleep 0.3; printf 'slow-done\\ndbg> '; else printf \"ran:$line\\ndbg> \"; fi; done";
+        let process =
+            DebuggerProcess::spawn("/bin/sh", &["-c".into(), script.into()], &[], r"dbg> ")
+                .unwrap();
+        process.wait_for_prompt(Duration::from_secs(2)).unwrap();
+        assert!(
+            process
+                .send_and_wait("slow", Duration::from_millis(10))
+                .unwrap_err()
+                .to_string()
+                .contains("timeout")
+        );
+        let reply = process
+            .send_and_wait("next", Duration::from_secs(2))
+            .unwrap();
+        assert!(reply.contains("ran:next"), "{reply}");
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(
+            !process
+                .drain_pending()
+                .is_some_and(|output| output.contains("ran:next"))
+        );
+    }
+
+    fn spawn_script(script: &str) -> DebuggerProcess {
+        let process =
+            DebuggerProcess::spawn("/bin/sh", &["-c".into(), script.into()], &[], r"dbg> ")
+                .unwrap();
+        process.wait_for_prompt(Duration::from_secs(2)).unwrap();
+        process
+    }
+
+    fn assert_times_out(process: &DebuggerProcess, cmd: &str) {
+        let error = process
+            .send_and_wait(cmd, Duration::from_millis(10))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("timeout"), "{error}");
+    }
+
+    #[test]
+    fn one_timeout_bounds_the_resync_and_the_reply() {
+        let process = spawn_script(
+            "printf 'dbg> '; while IFS= read -r line; do if [ \"$line\" = slow ]; then sleep 0.4; else sleep 2; fi; printf 'done\\ndbg> '; done",
+        );
+        assert_times_out(&process, "slow");
+        let started = Instant::now();
+        assert!(
+            process
+                .send_and_wait("slower", Duration::from_millis(500))
+                .is_err()
+        );
+        let elapsed = started.elapsed();
+        assert!(elapsed < Duration::from_millis(800), "{elapsed:?}");
+    }
+
+    #[test]
+    fn stop_banner_of_a_timed_out_command_reaches_drain_pending() {
+        let process = spawn_script(
+            "printf 'dbg> '; while IFS= read -r line; do if [ \"$line\" = slow ]; then sleep 0.3; printf 'Breakpoint 1, main () at a.c:3\\ndbg> '; else printf \"ran:$line\\ndbg> \"; fi; done",
+        );
+        assert_times_out(&process, "slow");
+        let reply = process
+            .send_and_wait("next", Duration::from_secs(2))
+            .unwrap();
+        let drained = process.drain_pending().unwrap_or_default();
+        assert!(
+            reply.contains("Breakpoint 1") || drained.contains("Breakpoint 1"),
+            "reply: {reply}; drained: {drained}"
+        );
+        assert!(reply.contains("ran:next"), "{reply}");
+    }
+
+    #[test]
+    fn discarded_resync_output_is_bounded_and_keeps_its_end() {
+        let bytes = 4 * MAX_COMMAND_OUTPUT_BYTES;
+        let process = spawn_script(&format!(
+            "printf 'dbg> '; while IFS= read -r line; do if [ \"$line\" = slow ]; then sleep 0.3; head -c {bytes} /dev/zero | tr '\\0' x; printf '\\nBreakpoint 1\\ndbg> '; else printf \"ran:$line\\ndbg> \"; fi; done"
+        ));
+        assert_times_out(&process, "slow");
+        process
+            .send_and_wait("next", Duration::from_secs(5))
+            .unwrap();
+        let drained = process.drain_pending().unwrap();
+        assert!(
+            drained.len() <= MAX_COMMAND_OUTPUT_BYTES,
+            "{}",
+            drained.len()
+        );
+        assert!(drained.contains("Breakpoint 1"));
+    }
+
+    #[test]
+    fn reply_after_a_resync_bail_belongs_to_the_next_command() {
+        let process = spawn_script(
+            "printf 'dbg> '; while IFS= read -r line; do if [ \"$line\" = slow ]; then sleep 0.5; printf 'slow-done\\ndbg> '; else printf \"ran:$line\\ndbg> \"; fi; done",
+        );
+        assert_times_out(&process, "slow");
+        let error = process
+            .send_and_wait("a", Duration::from_millis(10))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("timed-out command"), "{error}");
+        let reply = process.send_and_wait("b", Duration::from_secs(2)).unwrap();
+        assert!(
+            reply.contains("ran:b") && !reply.contains("ran:a"),
+            "{reply}"
+        );
+        let drained = process.drain_pending().unwrap_or_default();
+        assert_eq!(drained.matches("ran:a").count(), 1, "{drained}");
+    }
+
+    #[test]
+    fn reply_after_a_truncated_resync_window_belongs_to_the_next_command() {
+        let temp = tempfile::tempdir().unwrap();
+        let [ready, release_slow, release_a] =
+            ["ready", "release-slow", "release-a"].map(|name| temp.path().join(name));
+        let process = spawn_script(&format!(
+            r#"
+gate() {{ while [ ! -f "$1" ]; do sleep 0.001; done; }}
+printf 'dbg> '
+while IFS= read -r line; do
+    if [ "$line" = slow ]; then
+        gate '{release_slow}'
+        printf 'slow-done\ndbg> '
+        : > '{ready}'
+    elif [ "$line" = a ]; then
+        gate '{release_a}'
+        printf 'ran:a\ndbg> '
+    else
+        printf "ran:$line\ndbg> "
+    fi
+done
+"#,
+            ready = ready.display(),
+            release_slow = release_slow.display(),
+            release_a = release_a.display(),
+        ));
+        assert_times_out(&process, "slow");
+        let error = process
+            .send_and_wait("a", Duration::from_millis(10))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("timed-out command"), "{error}");
+        std::fs::write(&release_slow, b"release").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !ready.exists() {
+            assert!(Instant::now() < deadline, "`slow` must print its prompt");
+            thread::sleep(Duration::from_millis(1));
+        }
+        // The stale prompt is already written and `a` is gated, so a timeout
+        // below the quiet window always cuts that window short.
+        let error = process
+            .send_and_wait("b", BUFFERED_REPLY_QUIET * 3 / 4)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("`b` was not sent"), "{error}");
+        std::fs::write(&release_a, b"release").unwrap();
+        let reply = process.send_and_wait("c", Duration::from_secs(2)).unwrap();
+        assert!(
+            reply.contains("ran:c") && !reply.contains("ran:b"),
+            "{reply}"
         );
     }
 
