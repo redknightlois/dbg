@@ -2494,6 +2494,9 @@ fn dispatch_incoming(
                         // but its delayed helper must not create a hit for
                         // a later continue.
                         s.pending_hit = None;
+                        // Only this stop's stackTrace response sets frames.
+                        s.top_frame = None;
+                        s.call_frames.clear();
                         s.stop_generation
                     };
                     if let Some(tid) = thread_id {
@@ -2507,7 +2510,16 @@ fn dispatch_incoming(
                         // handler can build a structured HitEvent. We
                         // bypass the call_blocking path (driver can't
                         // block on itself) and write directly.
+                        // At the helper cap, publish a location-less hit so a
+                        // waiter still observes this stop.
                         if !can_schedule_stack_helper(pending) {
+                            let (lock, cvar) = &**state;
+                            let mut s = lock.lock().unwrap();
+                            s.pending_hit = Some(HitEvent {
+                                thread: Some(tid.to_string()),
+                                ..HitEvent::default()
+                            });
+                            cvar.notify_all();
                             return;
                         }
                         let seq = *next_seq;
@@ -3040,6 +3052,58 @@ mod tests {
             );
         }
         assert!(!can_schedule_stack_helper(&pending));
+    }
+
+    #[test]
+    fn stopped_event_at_the_helper_cap_is_still_observable() {
+        let state = Arc::new((Mutex::new(State::new()), Condvar::new()));
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let peer = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut pending = HashMap::new();
+        let mut receivers = Vec::new();
+        for seq in 0..MAX_DAP_STACK_HELPERS {
+            let (tx, rx) = mpsc::channel();
+            receivers.push(rx);
+            pending.insert(
+                seq as i64,
+                PendingRequest {
+                    command: "stackTrace".into(),
+                    resp: tx,
+                    cancelled: Arc::new(AtomicBool::new(false)),
+                },
+            );
+        }
+        {
+            let mut s = state.0.lock().unwrap();
+            s.top_frame = Some(json!({"id": 1000}));
+            s.call_frames.push(json!({"id": 1000}));
+        }
+        let log = LogHandle::new();
+        let mut next_seq = 100;
+        dispatch_incoming(
+            json!({"type":"event", "event":"stopped", "body":{"threadId":7}}),
+            &mut pending,
+            &state,
+            &log,
+            &mut stream,
+            &mut next_seq,
+        );
+        drop(peer);
+        let (lock, _) = &*state;
+        let guard = lock.lock().unwrap();
+        assert!(guard.paused);
+        assert_eq!(pending.len(), MAX_DAP_STACK_HELPERS);
+        assert_eq!(
+            guard
+                .pending_hit
+                .as_ref()
+                .and_then(|hit| hit.thread.as_deref()),
+            Some("7")
+        );
+        assert!(!guard.pending_is_unscoped);
+        assert!(guard.top_frame.is_none());
+        assert!(guard.call_frames.is_empty());
     }
 
     fn assert_no_breakpoint_state(transport: &DapTransport, next_id: u32) {
@@ -3576,6 +3640,11 @@ mod tests {
         let mut pending = HashMap::new();
         let log = LogHandle::new();
         let mut next_seq = 1;
+        {
+            let mut s = state.0.lock().unwrap();
+            s.top_frame = Some(json!({"id": 1000}));
+            s.call_frames.push(json!({"id": 1000}));
+        }
         dispatch_incoming(
             json!({"type":"event", "event":"stopped", "body":{"threadId":null}}),
             &mut pending,
@@ -3589,6 +3658,8 @@ mod tests {
         let guard = lock.lock().unwrap();
         assert!(guard.pending_is_unscoped);
         assert!(guard.pending_hit.is_some());
+        assert!(guard.top_frame.is_none());
+        assert!(guard.call_frames.is_empty());
     }
 
     #[test]
