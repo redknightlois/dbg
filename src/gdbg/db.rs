@@ -72,6 +72,27 @@ pub fn like_param(pattern: &str) -> String {
     format!("%{}%", escape_sql_like(pattern))
 }
 
+/// Meta keys whose value belongs to one capture layer.
+const LAYER_META_KEYS: [&str; 2] = ["wall_time_us", "device"];
+
+fn layer_meta_key(layer_id: i64, key: &str) -> String {
+    format!("{key}@{layer_id}")
+}
+
+/// Record `key` for `layer_id`, and as the most recent write of `key`.
+pub(crate) fn set_layer_meta(
+    conn: &Connection,
+    layer_id: i64,
+    key: &str,
+    value: &str,
+) -> Result<()> {
+    conn.execute(
+        "INSERT OR REPLACE INTO meta (key, value) VALUES (?1, ?3), (?2, ?3)",
+        params![layer_meta_key(layer_id, key), key, value],
+    )?;
+    Ok(())
+}
+
 impl GpuDb {
     /// Create a new session database at the given path.
     pub fn create(path: &Path) -> Result<Self> {
@@ -392,7 +413,17 @@ impl GpuDb {
     // Meta
     // -----------------------------------------------------------------------
 
+    /// A layer-scoped key describes the newest layer, the one an import
+    /// is filling.
     pub fn set_meta(&self, key: &str, value: &str) -> Result<()> {
+        if LAYER_META_KEYS.contains(&key) {
+            let newest: Option<i64> =
+                self.conn
+                    .query_row("SELECT MAX(id) FROM layers", [], |row| row.get(0))?;
+            if let Some(layer_id) = newest {
+                return set_layer_meta(&self.conn, layer_id, key, value);
+            }
+        }
         self.conn.execute(
             "INSERT OR REPLACE INTO meta (key, value) VALUES (?1, ?2)",
             params![key, value],
@@ -400,13 +431,25 @@ impl GpuDb {
         Ok(())
     }
 
+    /// A layer-scoped key reads the value of the timeline layer, so it
+    /// describes the same capture as the timeline rows. Without one, it
+    /// reads the most recent write.
     pub fn meta(&self, key: &str) -> String {
-        self.conn
-            .query_row(
-                "SELECT value FROM meta WHERE key = ?1",
-                params![key],
-                |row| row.get(0),
-            )
+        let get = |key: &str| {
+            self.conn
+                .query_row(
+                    "SELECT value FROM meta WHERE key = ?1",
+                    params![key],
+                    |row| row.get::<_, String>(0),
+                )
+                .ok()
+        };
+        LAYER_META_KEYS
+            .contains(&key)
+            .then(|| self.timeline_layer_id())
+            .flatten()
+            .and_then(|layer_id| get(&layer_meta_key(layer_id, key)))
+            .or_else(|| get(key))
             .unwrap_or_default()
     }
 

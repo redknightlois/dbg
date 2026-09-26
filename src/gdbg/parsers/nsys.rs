@@ -3,6 +3,7 @@ use std::path::Path;
 use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, params};
 
+use crate::db::set_layer_meta;
 use crate::kernel::normalize_kernel_name;
 
 const MAX_IMPORT_BYTES: u64 = 1 * 1024 * 1024 * 1024;
@@ -46,7 +47,7 @@ pub fn import_nsys_rep(dest: &Connection, nsys_path: &Path, layer_id: i64) -> Re
     import_transfers(dest, &src, layer_id)?;
     import_allocations(dest, &src, layer_id)?;
     import_nvtx_regions(dest, &src, layer_id)?;
-    import_device_info(dest, &src)?;
+    import_device_info(dest, &src, layer_id)?;
 
     let runtime_api_count = if !has_kernels {
         // No GPU kernel data — WSL2 or missing CUPTI permissions.
@@ -427,7 +428,7 @@ fn import_runtime_api(dest: &Connection, src: &Connection, _layer_id: i64) -> Re
 // Device info
 // ---------------------------------------------------------------------------
 
-fn import_device_info(dest: &Connection, src: &Connection) -> Result<()> {
+fn import_device_info(dest: &Connection, src: &Connection, layer_id: i64) -> Result<()> {
     let table = match find_table(src, &["TARGET_INFO_CUDA_GPU", "TARGET_INFO_GPU"]) {
         Ok(t) => t,
         Err(_) => return Ok(()),
@@ -440,10 +441,7 @@ fn import_device_info(dest: &Connection, src: &Connection) -> Result<()> {
         .ok();
 
     if let Some(name) = name {
-        dest.execute(
-            "INSERT OR REPLACE INTO meta (key, value) VALUES ('device', ?1)",
-            params![name],
-        )?;
+        set_layer_meta(dest, layer_id, "device", &name)?;
     }
 
     Ok(())
@@ -471,10 +469,7 @@ pub(crate) fn import_wall_time(dest: &Connection, layer_id: i64) -> Result<()> {
         bail!("NSYS wall-time span is invalid: {wall}");
     }
 
-    dest.execute(
-        "INSERT OR REPLACE INTO meta (key, value) VALUES ('wall_time_us', ?1)",
-        params![wall.to_string()],
-    )?;
+    set_layer_meta(dest, layer_id, "wall_time_us", &wall.to_string())?;
 
     Ok(())
 }
@@ -677,6 +672,29 @@ mod tests {
         import_wall_time(&db.conn, current).unwrap();
 
         assert_eq!(db.meta("wall_time_us"), "5");
+    }
+
+    #[test]
+    fn wall_time_and_device_describe_the_timeline_layer() {
+        let db = GpuDb::create(&tempfile::tempdir().unwrap().keep().join("meta.db")).unwrap();
+        let a = db.add_layer("nsys", "a.rep", None, None, None).unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO launches (kernel_name, start_us, duration_us, layer_id)
+                 VALUES ('k', 0, 100, ?1)",
+                params![a],
+            )
+            .unwrap();
+        import_wall_time(&db.conn, a).unwrap();
+        db.set_meta("device", "A100").unwrap();
+
+        let b = db.add_layer("nsys", "b.rep", None, None, None).unwrap();
+        import_wall_time(&db.conn, b).unwrap();
+        db.set_meta("device", "H100").unwrap();
+
+        assert_eq!(db.timeline_layer_id(), Some(a));
+        assert_eq!(db.meta("wall_time_us"), "100");
+        assert_eq!(db.meta("device"), "A100");
     }
 
     #[test]
