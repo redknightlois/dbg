@@ -286,8 +286,7 @@ fn main() -> Result<()> {
         // was forwarded to the debugger, where pdb/lldb/jdb report it
         // as an unknown command with no hint that `dbg kill` exists.
         v if is_kill_alias(v) => {
-            let msg = daemon::kill_daemon()?;
-            println!("{msg}");
+            println!("{}", daemon::kill_daemon()?.message);
             Ok(())
         }
         "status" if !daemon::is_running() => {
@@ -1248,47 +1247,54 @@ fn cmd_start(registry: &Registry, args: &[String]) -> Result<()> {
                 }
             }
 
-            // Publish only a session that has made it through validation,
-            // process creation, and the daemon readiness probe. A rejected
-            // start must not hide the previous live session from env-less
-            // clients.
-            daemon::write_latest_pointer(&slug);
-
             // Set breakpoints FIRST — some adapters (delve, DAP) need
             // every breakpoint registered before the program starts,
             // otherwise they never fire. If any `--break` fails we
             // refuse to auto-run to avoid the silent "ran past the
             // breakpoint" failure mode.
-            let mut bp_ok = true;
-            for bp in &breakpoints {
-                let cmd = if backend.canonical_ops().is_some() {
-                    format!("break {bp}")
-                } else {
-                    backend.format_breakpoint(bp)
-                };
-                let resp = daemon::send_command(&cmd)?;
-                println!("{resp}");
-                let lc = resp.to_lowercase();
-                if lc.contains("[error")
-                    || lc.contains("could not")
-                    || lc.contains("cannot find")
-                    || lc.contains("no source")
-                    || lc.contains("unable to set")
-                    || lc.contains("blank or comment")
-                {
-                    bp_ok = false;
-                    if lc.contains("blank or comment") {
-                        eprintln!(
-                            "dbg: `{bp}` points at a blank/comment line — pdb won't stop there. \
+            let register_breakpoints = || -> Result<bool> {
+                let mut bp_ok = true;
+                for bp in &breakpoints {
+                    let cmd = if backend.canonical_ops().is_some() {
+                        format!("break {bp}")
+                    } else {
+                        backend.format_breakpoint(bp)
+                    };
+                    let resp = daemon::send_command(&cmd)?;
+                    println!("{resp}");
+                    let lc = resp.to_lowercase();
+                    if lc.contains("[error")
+                        || lc.contains("could not")
+                        || lc.contains("cannot find")
+                        || lc.contains("no source")
+                        || lc.contains("unable to set")
+                        || lc.contains("blank or comment")
+                        || lc.contains("end of file")
+                    {
+                        bp_ok = false;
+                        if lc.contains("blank or comment") {
+                            eprintln!(
+                                "dbg: `{bp}` points at a blank/comment line — pdb won't stop there. \
                              Pick an executable line (or use `--break <function_name>`)."
-                        );
+                            );
+                        }
                     }
                 }
-            }
 
-            if !bp_ok {
+                Ok(bp_ok)
+            };
+            // A rejected start stops its daemon and never publishes it.
+            let registered = register_breakpoints();
+            if !matches!(registered, Ok(true)) {
+                if let Some(warning) = rejected_kill_warning(&slug, daemon::kill_daemon()) {
+                    eprintln!("{warning}");
+                }
+                registered?;
                 bail!("one or more requested breakpoints failed to register");
             }
+
+            // The single write of a new session to the latest-session pointer.
+            daemon::write_latest_pointer(&slug);
 
             // Auto-run — but only when every breakpoint stuck. --run
             // means "start the debuggee (and let it stop at your
@@ -1309,9 +1315,45 @@ fn cmd_start(registry: &Registry, args: &[String]) -> Result<()> {
     }
 }
 
+/// The warning a rejected start prints when its daemon did not stop.
+fn rejected_kill_warning(slug: &str, kill: Result<daemon::KillOutcome>) -> Option<String> {
+    match kill {
+        Ok(outcome) if outcome.still_alive => Some(format!(
+            "dbg: the rejected session {slug} did not stop: {}",
+            outcome.message
+        )),
+        Ok(_) => None,
+        Err(e) => Some(format!(
+            "dbg: failed to stop the rejected session {slug}: {e:#}"
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rejected_start_reports_a_daemon_that_did_not_stop() {
+        let outcome = |still_alive| {
+            Ok(daemon::KillOutcome {
+                message: daemon::still_alive_message("bye", "s1", "42", 5),
+                still_alive,
+            })
+        };
+        let warning = rejected_kill_warning("s1", outcome(true)).unwrap();
+        assert!(
+            warning.contains("s1") && warning.contains("pid=42") && warning.contains("SIGKILL")
+        );
+        assert!(warning.contains("DBG_SESSION=s1 dbg kill"), "{warning}");
+        assert!(!warning.contains("`dbg kill`"), "{warning}");
+        assert!(rejected_kill_warning("s1", outcome(false)).is_none());
+        assert!(
+            rejected_kill_warning("s1", Err(anyhow::anyhow!("boom")))
+                .unwrap()
+                .contains("boom")
+        );
+    }
 
     #[test]
     fn autodetect_go_prefers_dap() {

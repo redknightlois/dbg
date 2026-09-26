@@ -732,11 +732,8 @@ pub fn run_daemon(
     std::fs::write(&pid_path(), daemon_pid_record(std::process::id() as i32))?;
     let _ = std::fs::remove_file(&socket_path());
     let listener = UnixListener::bind(&socket_path()).context("failed to bind socket")?;
-    // Point the cwd's "latest" pointer at ourselves so env-less clients
-    // in other shells find this daemon by default. Parent also writes
-    // this pre-fork; re-asserting here is idempotent and covers the
-    // case where the parent's write was lost/raced.
-    write_latest_pointer(&session_slug());
+    // The daemon never writes the latest-session pointer: `dbg start`
+    // publishes it once every requested breakpoint has registered.
 
     let shutdown_requested = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let active_connections = std::sync::Arc::new(AtomicUsize::new(0));
@@ -2127,6 +2124,15 @@ fn raw_evidence_present(root: &Path) -> std::io::Result<bool> {
     })
 }
 
+/// The session DB and its SQLite sidecars, which `SessionDb::save_to`
+/// persists; they are not raw evidence.
+fn is_session_db_file(name: &std::ffi::OsStr) -> bool {
+    matches!(
+        name.to_str(),
+        Some("session.db" | "session.db-wal" | "session.db-shm" | "session.db-journal")
+    )
+}
+
 fn raw_evidence_present_with(
     root: &Path,
     read_dir: &dyn Fn(
@@ -2161,7 +2167,7 @@ fn raw_evidence_present_inner(
         let entry = entry?;
         let path = entry.path();
         let metadata = std::fs::symlink_metadata(&path)?;
-        let is_session_db = entry.file_name() == "session.db";
+        let is_session_db = is_session_db_file(&entry.file_name());
         match metadata {
             // A rejected symlink is still evidence. Treating it as empty
             // would let shutdown delete the only copy after persistence
@@ -2315,10 +2321,7 @@ fn copy_raw_tree_portable_inner(
                 format!("raw evidence contains a symbolic link: {}", from.display()),
             ));
         }
-        if skip_session_db
-            && from.file_name().and_then(|n| n.to_str()) == Some("session.db")
-            && meta.is_file()
-        {
+        if skip_session_db && from.file_name().is_some_and(is_session_db_file) && meta.is_file() {
             continue;
         }
         if meta.is_dir() {
@@ -2589,7 +2592,7 @@ fn copy_raw_tree_unix(src: &Path, dst: &Path) -> std::io::Result<()> {
         visit_source_entries(parent_fd, |name| {
             let source_entry = open_source_entry(parent_fd, &name)?;
             let metadata = source_entry.metadata()?;
-            if skip_session_db && name.to_str() == Some("session.db") && metadata.is_file() {
+            if skip_session_db && is_session_db_file(&name) && metadata.is_file() {
                 // A regular session.db is the SQLite metadata already saved
                 // separately. Inspect it through the no-follow descriptor,
                 // but do not copy it as raw evidence.
@@ -3204,10 +3207,27 @@ fn try_reserve_for_cleanup(slug: &str) -> Option<nix::fcntl::Flock<File>> {
     nix::fcntl::Flock::lock(file, nix::fcntl::FlockArg::LockExclusiveNonblock).ok()
 }
 
+/// The reply of `kill_daemon`, and whether the daemon outlived the kill
+/// timeout with its runtime files left in place.
+pub struct KillOutcome {
+    pub message: String,
+    pub still_alive: bool,
+}
+
+/// The retry hint names the session, since a bare `dbg kill` can resolve to
+/// a different one.
+pub fn still_alive_message(response: &str, slug: &str, pid: &str, timeout_secs: u64) -> String {
+    format!(
+        "{response} (warning: daemon pid={pid} still alive after {timeout_secs}s; \
+         runtime files left intact to avoid orphaning the session. Retry \
+         `DBG_SESSION={slug} dbg kill`, raise DBG_KILL_TIMEOUT_SECS, or send SIGKILL manually)"
+    )
+}
+
 /// Kill the running daemon. Blocks until the process is gone and
-/// socket/pid files are cleared — callers that immediately spawn a
-/// new daemon need this to be synchronous.
-pub fn kill_daemon() -> Result<String> {
+/// socket/pid files are cleared, or until the kill timeout expires;
+/// callers that immediately spawn a new daemon need this to be synchronous.
+pub fn kill_daemon() -> Result<KillOutcome> {
     // Resolve the target slug *once* up front. The daemon's own
     // cleanup clears the `.latest` pointer on graceful exit, so
     // subsequent re-evaluations of `session_slug()` would fall through
@@ -3220,7 +3240,10 @@ pub fn kill_daemon() -> Result<String> {
             let _ = std::fs::remove_file(pid_path_for(&slug));
             drop(lock);
         }
-        return Ok("stopped".into());
+        return Ok(KillOutcome {
+            message: "stopped".into(),
+            still_alive: false,
+        });
     }
     let response = send_command_for_slug(&slug, "quit").unwrap_or_else(|_| "stopped".into());
     // Wait for the daemon to actually exit before reaping its runtime
@@ -3253,18 +3276,20 @@ pub fn kill_daemon() -> Result<String> {
             .unwrap_or("")
             .trim()
             .to_string();
-        return Ok(format!(
-            "{response} (warning: daemon pid={pid} still alive after {timeout_secs}s — \
-             runtime files left intact to avoid orphaning the session. Retry \
-             `dbg kill`, raise DBG_KILL_TIMEOUT_SECS, or send SIGKILL manually)"
-        ));
+        return Ok(KillOutcome {
+            message: still_alive_message(&response, &slug, &pid, timeout_secs),
+            still_alive: true,
+        });
     }
     if let Some(lock) = try_reserve_for_cleanup(&slug) {
         let _ = std::fs::remove_file(socket_path_for(&slug));
         let _ = std::fs::remove_file(pid_path_for(&slug));
         drop(lock);
     }
-    Ok(response)
+    Ok(KillOutcome {
+        message: response,
+        still_alive: false,
+    })
 }
 
 /// Wait for the socket file to appear.
@@ -4300,7 +4325,9 @@ mod tests {
         std::fs::write(pid_path(), std::process::id().to_string()).unwrap();
         std::fs::write(socket_path(), "").unwrap();
 
-        let result = kill_daemon().expect("kill_daemon must not error");
+        let outcome = kill_daemon().expect("kill_daemon must not error");
+        assert!(outcome.still_alive);
+        let result = outcome.message;
         assert!(
             result.contains("still alive"),
             "expected warning about stuck daemon, got: {result}"
@@ -4553,6 +4580,17 @@ mod tests {
         std::os::unix::fs::symlink(&outside, source.join("session.db")).unwrap();
 
         assert!(raw_evidence_present(&source).unwrap());
+    }
+
+    #[test]
+    fn session_db_sidecars_are_not_raw_evidence() {
+        let tmp = TempDir::new().unwrap();
+        for name in ["session.db", "session.db-wal", "session.db-shm"] {
+            std::fs::write(tmp.path().join(name), b"sqlite").unwrap();
+        }
+        assert!(!raw_evidence_present(tmp.path()).unwrap());
+        std::fs::write(tmp.path().join("capture.data"), b"capture").unwrap();
+        assert!(raw_evidence_present(tmp.path()).unwrap());
     }
 
     #[test]
