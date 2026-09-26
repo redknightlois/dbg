@@ -560,6 +560,18 @@ fn run_go_build(parent: &Path, args: &[&str]) -> Result<Output> {
         .context("go not found")
 }
 
+/// True when `<dir>/<name>` carries the build info of a single-file debug
+/// build, which is the output `resolve_go` writes.
+fn is_dbg_go_build(dir: &Path, name: &str) -> bool {
+    let Ok(output) = run_go_build(dir, &["version", "-m", name]) else {
+        return false;
+    };
+    let info = String::from_utf8_lossy(&output.stdout);
+    output.status.success()
+        && info.contains("\tpath\tcommand-line-arguments\n")
+        && info.contains("\tbuild\t-gcflags=\"all=-N -l\"\n")
+}
+
 fn go_build_cache(parent: &Path) -> Result<std::path::PathBuf> {
     Ok(std::fs::canonicalize(parent)
         .with_context(|| format!("resolve Go build directory {}", parent.display()))?
@@ -590,9 +602,11 @@ fn resolve_go(target: &str) -> Result<String> {
             .unwrap_or(Path::new("."));
         let stem = p.file_stem().and_then(|s| s.to_str()).unwrap_or("app");
         let output_path = parent.join(stem);
-        if output_path.exists() {
+        if let Ok(meta) = std::fs::symlink_metadata(&output_path)
+            && !(meta.is_file() && is_dbg_go_build(parent, stem))
+        {
             bail!(
-                "refusing to overwrite existing Go build output: {}",
+                "refusing to overwrite existing path that is not a dbg build: {}",
                 output_path.display()
             );
         }
@@ -852,6 +866,39 @@ mod tests {
     }
 
     #[test]
+    fn resolve_go_rebuilds_its_own_output_but_not_a_foreign_file() {
+        if Command::new("go").arg("version").output().is_err() || !go_toolchain_can_build() {
+            return;
+        }
+        let tmp = TempDir::new().unwrap();
+        let src = tmp.path().join("hello.go");
+        std::fs::write(&src, "package main\nfunc main() {}\n").unwrap();
+        let first = resolve_go(src.to_str().unwrap()).expect("first build");
+        assert!(tmp.path().join("hello").is_file());
+        std::fs::write(&src, "package main\nfunc main() { println(1) }\n").unwrap();
+        let second = resolve_go(src.to_str().unwrap()).expect("rebuild of dbg's own output");
+        assert_eq!(first, second);
+
+        // Rule: dbg overwrites only its own debug build. Any other file at
+        // the output path, a plain `go build` included, is left untouched.
+        std::fs::write(
+            tmp.path().join("notes.go"),
+            "package main\nfunc main() {}\n",
+        )
+        .unwrap();
+        std::fs::write(tmp.path().join("notes"), "user data").unwrap();
+        std::fs::write(tmp.path().join("user.go"), "package main\nfunc main() {}\n").unwrap();
+        let built = run_go_build(tmp.path(), &["build", "-o", "user", "user.go"]).unwrap();
+        assert!(built.status.success());
+        for name in ["notes", "user"] {
+            let before = std::fs::read(tmp.path().join(name)).unwrap();
+            let source = tmp.path().join(format!("{name}.go"));
+            assert!(resolve_go(source.to_str().unwrap()).is_err(), "{name}");
+            assert_eq!(std::fs::read(tmp.path().join(name)).unwrap(), before);
+        }
+    }
+
+    #[test]
     fn resolve_go_nested_relative_target() {
         if Command::new("go").arg("version").output().is_err() || !go_toolchain_can_build() {
             return;
@@ -879,6 +926,29 @@ mod tests {
         let error = resolve_go(source.to_str().unwrap()).unwrap_err();
         assert!(error.to_string().contains("refusing to overwrite"));
         assert_eq!(std::fs::read_to_string(existing).unwrap(), "keep me");
+    }
+
+    #[test]
+    fn resolve_go_refuses_to_overwrite_a_directory() {
+        if Command::new("go").arg("version").output().is_err() || !go_toolchain_can_build() {
+            return;
+        }
+        let tmp = TempDir::new().unwrap();
+        let nested = tmp.path().join("hello");
+        std::fs::create_dir(&nested).unwrap();
+        let program = "package main\nfunc main() {}\n";
+        std::fs::write(nested.join("hello.go"), program).unwrap();
+        resolve_go(nested.join("hello.go").to_str().unwrap()).unwrap();
+        let build = nested.join("hello");
+        let before = std::fs::read(&build).unwrap();
+        let source = tmp.path().join("hello.go");
+        std::fs::write(&source, program).unwrap();
+        let error = resolve_go(source.to_str().unwrap()).unwrap_err();
+        assert!(
+            error.to_string().contains("refusing to overwrite"),
+            "{error}"
+        );
+        assert_eq!(std::fs::read(&build).unwrap(), before);
     }
 
     #[test]
