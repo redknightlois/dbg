@@ -359,11 +359,15 @@ fn basename_line_key(loc: &str) -> String {
     format!("{base}:{line}")
 }
 
-/// `(basename:line, stem:line)` — the two relaxed forms of a location
-/// key paired with the original. Every cmd_* that resolves a `loc`
-/// against the `breakpoint_hits.location_key` column needs both.
+/// `(basename:line, stem:line)`: the two relaxed forms of a location
+/// key paired with the original, escaped for `LIKE ... ESCAPE char(92)`.
+/// Every cmd_* that resolves a `loc` against the
+/// `breakpoint_hits.location_key` column needs both.
 fn loc_keys(loc: &str) -> (String, String) {
-    (basename_line_key(loc), stem_line_key(loc))
+    (
+        escape_location_like(&basename_line_key(loc)),
+        escape_location_like(&stem_line_key(loc)),
+    )
 }
 
 // ============================================================
@@ -384,9 +388,9 @@ fn cmd_hits(db: &SessionDb, loc: &str) -> String {
         "SELECT hit_seq, thread, ts, locals_json
          FROM breakpoint_hits
          WHERE location_key = ?1
-            OR location_key LIKE '%' || ?2
-            OR location_key = ?3
-            OR location_key LIKE '%.' || ?3
+            OR location_key LIKE '%' || ?2 ESCAPE char(92)
+            OR location_key LIKE ?3 ESCAPE char(92)
+            OR location_key LIKE '%.' || ?3 ESCAPE char(92)
             OR location_key LIKE ?4 ESCAPE char(92)
             OR location_key LIKE '%.' || ?4 ESCAPE char(92)
          ORDER BY hit_seq ASC",
@@ -437,9 +441,9 @@ fn cmd_hits_grouped(db: &SessionDb, loc: &str, field: &str, top: Option<usize>) 
     let mut stmt = match db.conn().prepare(
         "SELECT locals_json FROM breakpoint_hits
          WHERE location_key = ?1
-            OR location_key LIKE '%' || ?2
-            OR location_key = ?3
-            OR location_key LIKE '%.' || ?3
+            OR location_key LIKE '%' || ?2 ESCAPE char(92)
+            OR location_key LIKE ?3 ESCAPE char(92)
+            OR location_key LIKE '%.' || ?3 ESCAPE char(92)
             OR location_key LIKE ?4 ESCAPE char(92)
             OR location_key LIKE '%.' || ?4 ESCAPE char(92)",
     ) {
@@ -626,9 +630,9 @@ fn collect_captured_names(db: &SessionDb, loc: &str) -> Vec<String> {
     let Ok(mut stmt) = db.conn().prepare(
         "SELECT locals_json FROM breakpoint_hits
          WHERE (location_key = ?1
-                OR location_key LIKE '%' || ?2
-                OR location_key = ?3
-                OR location_key LIKE '%.' || ?3
+                OR location_key LIKE '%' || ?2 ESCAPE char(92)
+                OR location_key LIKE ?3 ESCAPE char(92)
+                OR location_key LIKE '%.' || ?3 ESCAPE char(92)
                 OR location_key LIKE ?4 ESCAPE char(92)
                 OR location_key LIKE '%.' || ?4 ESCAPE char(92))
            AND locals_json IS NOT NULL",
@@ -687,9 +691,9 @@ fn cmd_hit_diff(db: &SessionDb, loc: &str, a: u32, b: u32) -> String {
             .query_row(
                 "SELECT locals_json, stack_json
                  FROM breakpoint_hits
-                 WHERE (location_key = ?1 OR location_key LIKE '%' || ?2
-                        OR location_key = ?3
-                        OR location_key LIKE '%.' || ?3
+                 WHERE (location_key = ?1 OR location_key LIKE '%' || ?2 ESCAPE char(92)
+                        OR location_key LIKE ?3 ESCAPE char(92)
+                        OR location_key LIKE '%.' || ?3 ESCAPE char(92)
                         OR location_key LIKE ?4 ESCAPE char(92)
                         OR location_key LIKE '%.' || ?4 ESCAPE char(92))
                    AND hit_seq = ?5",
@@ -761,9 +765,9 @@ fn cmd_hit_trend(db: &SessionDb, loc: &str, field: &str) -> String {
     let mut stmt = match db.conn().prepare(
         "SELECT hit_seq, locals_json FROM breakpoint_hits
          WHERE location_key = ?1
-            OR location_key LIKE '%' || ?2
-            OR location_key = ?3
-            OR location_key LIKE '%.' || ?3
+            OR location_key LIKE '%' || ?2 ESCAPE char(92)
+            OR location_key LIKE ?3 ESCAPE char(92)
+            OR location_key LIKE '%.' || ?3 ESCAPE char(92)
             OR location_key LIKE ?4 ESCAPE char(92)
             OR location_key LIKE '%.' || ?4 ESCAPE char(92)
          ORDER BY hit_seq ASC",
@@ -1229,14 +1233,14 @@ fn count_hits_for_symbol(db: &SessionDb, symbol: &str) -> i64 {
         "SELECT file, line FROM symbols
          WHERE file IS NOT NULL AND line IS NOT NULL
            AND ( fqn = ?1
-                 OR fqn LIKE '%.' || ?1
-                 OR fqn LIKE '%::' || ?1
-                 OR fqn LIKE '%/' || ?1 )",
+                 OR fqn LIKE '%.' || ?2 ESCAPE char(92)
+                 OR fqn LIKE '%::' || ?2 ESCAPE char(92)
+                 OR fqn LIKE '%/' || ?2 ESCAPE char(92) )",
     ) else {
         return 0;
     };
     let rows: Vec<(String, i64)> = stmt
-        .query_map(params![symbol], |r| {
+        .query_map(params![symbol, escape_location_like(symbol)], |r| {
             Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
         })
         .and_then(|it| it.collect::<Result<Vec<_>, _>>())
@@ -1253,9 +1257,8 @@ fn count_hits_for_symbol(db: &SessionDb, symbol: &str) -> i64 {
             .query_row(
                 "SELECT COUNT(*) FROM breakpoint_hits
                  WHERE location_key = ?1
-                    OR location_key LIKE '%/' || ?1
-                    OR location_key LIKE '%' || ?1",
-                params![tail],
+                    OR location_key LIKE '%' || ?2 ESCAPE char(92)",
+                params![tail, escape_location_like(&tail)],
                 |r| r.get(0),
             )
             .unwrap_or(0);
@@ -1363,6 +1366,19 @@ mod tests {
         let out = cmd_hits(&db, "/repo/com/example/Algos.java:17");
         assert!(out.contains("3 hit(s)"), "{out}");
         assert!(!out.contains("4 hit(s)"), "{out}");
+    }
+
+    #[test]
+    fn location_wildcards_in_a_file_stem_match_literally() {
+        let tmp = TempDir::new().unwrap();
+        let (db, _) = db_and_ctx(&tmp);
+        insert_hit(&db, "com.myXmod:17", 1, "{}", None);
+        insert_hit(&db, "pkg/myXmod.java:17", 2, "{}", None);
+        let out = cmd_hits(&db, "/repo/my_mod.java:17");
+        assert!(out.contains("no hits"), "{out}");
+        insert_hit(&db, "com.my_mod:17", 3, "{}", None);
+        let out = cmd_hits(&db, "/repo/my_mod.java:17");
+        assert!(out.contains("1 hit(s)"), "{out}");
     }
 
     // ---------- hits ----------
@@ -1542,6 +1558,23 @@ mod tests {
             !out.contains("source snapshots:0"),
             "source-snapshots line regressed to the unspaced form:\n{out}"
         );
+    }
+
+    #[test]
+    fn cross_symbol_wildcards_match_literally() {
+        let tmp = TempDir::new().unwrap();
+        let (db, _) = db_and_ctx(&tmp);
+        db.conn()
+            .execute(
+                "INSERT INTO symbols (session_id, lang, fqn, file, line, raw)
+                 VALUES ((SELECT id FROM sessions LIMIT 1), 'java', 'pkg.myXfn',
+                         'Main.java', 42, 'myXfn')",
+                [],
+            )
+            .unwrap();
+        insert_hit(&db, "Main.java:42", 1, "{}", None);
+        let out = cmd_cross(&db, "my_fn");
+        assert!(out.contains("breakpoint hits: 0"), "{out}");
     }
 
     #[test]
