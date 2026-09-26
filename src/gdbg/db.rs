@@ -708,14 +708,15 @@ impl GpuDb {
 
         // Mappings with a source launch ID represent individual occurrences.
         // IDs are not comparable across profiler layers, so rank same-name
-        // occurrences by time and pair them one-to-one. Legacy/name-only
+        // occurrences by time within each source layer and pair each
+        // layer's ranks one-to-one with the timeline layer's. Legacy/name-only
         // mappings represent an aggregate relationship and intentionally sum
         // the selected layer's same-name launches once per operator.
         if let Err(e) = self.conn.execute(
             "WITH exact_mappings AS (
                 SELECT mappings.op_id, mappings.kernel_name,
                        ROW_NUMBER() OVER (
-                           PARTITION BY mappings.kernel_name
+                           PARTITION BY source.layer_id, mappings.kernel_name
                            ORDER BY source.start_us, mappings.launch_id, mappings.op_id
                        ) AS occurrence
                 FROM op_kernel_map AS mappings
@@ -1727,6 +1728,58 @@ mod tests {
             row.get(0)
         });
         assert_eq!(times, vec![2.0, 3.0]);
+    }
+
+    fn two_source_layers_one_timeline_launch(timeline_us: f64, starts: [f64; 2]) -> Vec<f64> {
+        let db = temp_db();
+        let timeline = db.add_layer("nsys", "trace.rep", None, None, None).unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO launches (kernel_name, duration_us, start_us, layer_id)
+                 VALUES ('k', ?1, 0, ?2)",
+                params![timeline_us, timeline],
+            )
+            .unwrap();
+        for (op_id, (file, start)) in [(1, ("a.json", starts[0])), (2, ("b.json", starts[1]))] {
+            let source = db.add_layer("torch", file, None, None, None).unwrap();
+            db.conn
+                .execute(
+                    "INSERT INTO ops (id, name, gpu_time_us, layer_id) VALUES (?1, 'op', 0, ?2)",
+                    params![op_id, source],
+                )
+                .unwrap();
+            db.conn
+                .execute(
+                    "INSERT INTO launches (kernel_name, duration_us, start_us, layer_id)
+                     VALUES ('k', 1.0, ?1, ?2)",
+                    params![start, source],
+                )
+                .unwrap();
+            db.conn
+                .execute(
+                    "INSERT INTO op_kernel_map (op_id, kernel_name, launch_id) VALUES (?1, 'k', ?2)",
+                    params![op_id, db.conn.last_insert_rowid()],
+                )
+                .unwrap();
+        }
+        db.recompute_op_gpu_times();
+        db.query_vec("SELECT gpu_time_us FROM ops ORDER BY id", [], |row| {
+            row.get(0)
+        })
+    }
+
+    #[test]
+    fn recompute_ranks_occurrences_within_each_source_layer() {
+        assert_eq!(
+            two_source_layers_one_timeline_launch(2.0, [10.0, 5.0]),
+            vec![2.0, 2.0]
+        );
+    }
+
+    #[test]
+    fn recompute_does_not_zero_an_exact_mapping_from_a_second_source_layer() {
+        let times = two_source_layers_one_timeline_launch(4.0, [10.0, 20.0]);
+        assert!(times.iter().all(|&t| t != 0.0), "{times:?}");
     }
 
     #[test]
