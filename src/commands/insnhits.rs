@@ -1438,7 +1438,7 @@ pub mod pt {
                 ),
                 Mode::Window(d) => d,
             };
-            let pid = find_pid(ctx.target_binary).ok_or_else(|| {
+            let pid = find_pid(ctx.target_binary)?.ok_or_else(|| {
                 anyhow::anyhow!(
                     "no running process found for `{}`. Start the workload first; \
                      PT attaches to a live PID.",
@@ -1507,7 +1507,7 @@ pub mod pt {
     /// which silently picks up unrelated processes (browser tabs whose
     /// titles contain the target name). `-x` matches the comm field
     /// exactly so the wrong PID is never returned.
-    fn find_pid(binary: &str) -> Option<i32> {
+    fn find_pid(binary: &str) -> Result<Option<i32>> {
         let basename = Path::new(binary)
             .file_name()
             .and_then(|s| s.to_str())
@@ -1515,9 +1515,11 @@ pub mod pt {
         // comm is truncated to 15 chars by the kernel; truncate the
         // query the same way so long binary names still match.
         let comm: String = basename.chars().take(15).collect();
-        let out = Command::new("pgrep").arg("-x").arg(&comm).output().ok()?;
+        let Ok(out) = Command::new("pgrep").arg("-x").arg(&comm).output() else {
+            return Ok(None);
+        };
         if !out.status.success() {
-            return None;
+            return Ok(None);
         }
         find_matching_pid(
             binary,
@@ -1526,13 +1528,35 @@ pub mod pt {
         )
     }
 
-    fn find_matching_pid(binary: &str, candidates: &str, proc_root: &Path) -> Option<i32> {
-        let expected = std::fs::canonicalize(binary).ok()?;
-        candidates.lines().find_map(|line| {
+    /// Errs when a bare `binary` name matches more than one candidate.
+    fn find_matching_pid(binary: &str, candidates: &str, proc_root: &Path) -> Result<Option<i32>> {
+        // A target that resolves against neither cwd nor PATH, and is not
+        // absolute, can only be checked by its file name.
+        let expected = std::fs::canonicalize(binary)
+            .ok()
+            .or_else(|| std::fs::canonicalize(which::which(binary).ok()?).ok())
+            .or_else(|| Path::new(binary).is_absolute().then(|| binary.into()));
+        let mut matches = candidates.lines().filter_map(|line| {
             let pid = line.trim().parse::<i32>().ok()?;
-            let actual = std::fs::read_link(proc_root.join(pid.to_string()).join("exe")).ok()?;
-            (actual == expected).then_some(pid)
-        })
+            let link = std::fs::read_link(proc_root.join(pid.to_string()).join("exe")).ok()?;
+            // The kernel appends " (deleted)" once the binary is replaced or removed.
+            let link = link.to_string_lossy();
+            let actual = Path::new(link.strip_suffix(" (deleted)").unwrap_or(&link));
+            let matched = match &expected {
+                Some(expected) => actual == expected,
+                None => actual.file_name() == Path::new(binary).file_name(),
+            };
+            matched.then_some(pid)
+        });
+        let first = matches.next();
+        // A bare file name identifies a process only when one candidate has it.
+        if expected.is_none() && matches.next().is_some() {
+            anyhow::bail!(
+                "`{binary}` is ambiguous: more than one running process has that name. \
+                 Pass the full path of the binary."
+            );
+        }
+        Ok(first)
     }
 
     fn capture(pid: i32, window: Duration, out_path: &Path) -> Result<()> {
@@ -1671,8 +1695,59 @@ pub mod pt {
                     &expected.display().to_string(),
                     "10\n11\n",
                     &tmp.path().join("proc")
-                ),
+                )
+                .unwrap(),
                 Some(11)
+            );
+        }
+
+        #[test]
+        fn pid_selection_accepts_a_bare_name_and_a_deleted_executable() {
+            let tmp = tempfile::tempdir().unwrap();
+            let bin = tmp.path().join("bin");
+            std::fs::create_dir_all(&bin).unwrap();
+            let myapp = bin.join("dbg-test-myapp-not-on-path");
+            std::fs::write(&myapp, "x").unwrap();
+            let proc_root = tmp.path().join("proc");
+            let link = |pid: i32, target: &Path| {
+                let dir = proc_root.join(pid.to_string());
+                std::fs::create_dir_all(&dir).unwrap();
+                std::os::unix::fs::symlink(target, dir.join("exe")).unwrap();
+            };
+            link(41, &bin.join("other"));
+            link(42, &myapp);
+            let gone = bin.join("gone");
+            link(43, Path::new(&format!("{} (deleted)", gone.display())));
+
+            let bare = "dbg-test-myapp-not-on-path";
+            assert_eq!(
+                find_matching_pid(bare, "41\n42\n", &proc_root).unwrap(),
+                Some(42)
+            );
+            assert_eq!(find_matching_pid(bare, "41\n", &proc_root).unwrap(), None);
+            assert_eq!(
+                find_matching_pid(&gone.display().to_string(), "41\n43\n", &proc_root).unwrap(),
+                Some(43)
+            );
+            assert_eq!(
+                find_matching_pid(&myapp.display().to_string(), "41\n43\n", &proc_root).unwrap(),
+                None
+            );
+
+            let other_dir = tmp.path().join("elsewhere");
+            std::fs::create_dir_all(&other_dir).unwrap();
+            let twin = other_dir.join(bare);
+            std::fs::write(&twin, "x").unwrap();
+            link(40, &twin);
+            let ambiguous = find_matching_pid(bare, "40\n42\n", &proc_root)
+                .unwrap_err()
+                .to_string();
+            assert!(ambiguous.contains("ambiguous"), "{ambiguous}");
+            assert!(ambiguous.contains("full path"), "{ambiguous}");
+            assert!(!ambiguous.contains("no running process"), "{ambiguous}");
+            assert_eq!(
+                find_matching_pid(bare, "40\n", &proc_root).unwrap(),
+                Some(40)
             );
         }
     }
