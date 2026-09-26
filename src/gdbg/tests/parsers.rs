@@ -831,7 +831,7 @@ fn chrome_trace_innermost_op_wins() {
 }
 
 #[test]
-fn chrome_trace_correlation_respects_process_and_thread_identity() {
+fn chrome_trace_uncorrelated_kernel_prefers_an_op_on_its_own_thread() {
     use crate::db::GpuDb;
     use crate::parsers::chrome_trace::import_chrome_trace;
 
@@ -864,4 +864,78 @@ fn chrome_trace_correlation_respects_process_and_thread_identity() {
         )
         .unwrap();
     assert_eq!(mapped, "right-context");
+}
+
+#[test]
+fn chrome_trace_launcher_correlation_selects_the_launcher_thread() {
+    use crate::db::GpuDb;
+    use crate::parsers::chrome_trace::import_chrome_trace;
+
+    let db = GpuDb::create(&tempfile::tempdir().unwrap().keep().join("contexts.db")).unwrap();
+    let layer = db
+        .add_layer("torch", "trace.json", None, None, None)
+        .unwrap();
+    let trace = serde_json::json!({
+        "traceEvents": [
+            {"ph":"X", "cat":"cpu_op", "name":"wrong-shorter", "pid":1, "tid":1,
+             "ts":100.0, "dur":20.0, "args":{}},
+            {"ph":"X", "cat":"cpu_op", "name":"right-context", "pid":2, "tid":7,
+             "ts":0.0, "dur":200.0, "args":{}},
+            {"ph":"X", "cat":"cuda_runtime", "name":"cudaLaunchKernel", "pid":2, "tid":7,
+             "ts":50.0, "dur":4.0, "args":{"correlation":5}},
+            {"ph":"X", "cat":"kernel", "name":"kernel", "pid":0, "tid":7,
+             "ts":110.0, "dur":5.0, "args":{"correlation":5, "stream":7}}
+        ]
+    });
+    let file = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(file.path(), serde_json::to_vec(&trace).unwrap()).unwrap();
+
+    import_chrome_trace(&db.conn, file.path(), layer).unwrap();
+
+    let mapped: String = db
+        .conn
+        .query_row(
+            "SELECT ops.name FROM op_kernel_map
+             JOIN ops ON ops.id = op_kernel_map.op_id",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(mapped, "right-context");
+}
+
+#[test]
+fn chrome_trace_kernel_maps_through_external_id() {
+    use crate::db::GpuDb;
+    use crate::parsers::chrome_trace::import_chrome_trace;
+
+    let db = GpuDb::create(&tempfile::tempdir().unwrap().keep().join("ext.db")).unwrap();
+    let layer = db
+        .add_layer("torch", "trace.json", None, None, None)
+        .unwrap();
+    let trace = serde_json::json!({
+        "traceEvents": [
+            {"ph":"X", "cat":"cpu_op", "name":"launcher", "pid":1, "tid":3,
+             "ts":0.0, "dur":10.0, "args":{"External id":9}},
+            {"ph":"X", "cat":"cpu_op", "name":"bystander", "pid":1, "tid":4,
+             "ts":100.0, "dur":50.0, "args":{"External id":10}},
+            {"ph":"X", "cat":"kernel", "name":"kernel", "pid":0, "tid":7,
+             "ts":120.0, "dur":5.0, "args":{"External id":9}}
+        ]
+    });
+    let file = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(file.path(), serde_json::to_vec(&trace).unwrap()).unwrap();
+
+    import_chrome_trace(&db.conn, file.path(), layer).unwrap();
+
+    let mapped: String = db
+        .conn
+        .query_row(
+            "SELECT ops.name FROM op_kernel_map
+             JOIN ops ON ops.id = op_kernel_map.op_id",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(mapped, "launcher");
 }

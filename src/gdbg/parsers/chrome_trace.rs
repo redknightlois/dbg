@@ -231,9 +231,8 @@ fn import_ops(dest: &Connection, events: &[TraceEvent], layer_id: i64) -> Result
         if event.ph != "X" {
             continue;
         }
-        match event.cat.as_str() {
-            "cpu_op" | "user_annotation" | "Operator" => {}
-            _ => continue,
+        if !is_op_category(&event.cat) {
+            continue;
         }
         let (ts, dur) = event_timing(event)?;
         invocations.push(OpInvocation {
@@ -284,20 +283,56 @@ fn import_ops(dest: &Connection, events: &[TraceEvent], layer_id: i64) -> Result
         })?
         .filter_map(|r| r.ok())
         .collect();
-    let kernel_contexts = events
+    // A kernel attaches through a matching op `External id`, else through the
+    // launch call that shares its `correlation` (an op on the launch thread),
+    // else through its own start time: an op on the kernel's own (pid, tid)
+    // wins, and the innermost containing op on any thread is the fallback.
+    let op_by_external = events
+        .iter()
+        .filter(|event| event.ph == "X" && is_op_category(&event.cat))
+        .enumerate()
+        .filter_map(|(index, event)| Some((event_id(event, "External id")?, index)))
+        .collect::<HashMap<_, _>>();
+    let launcher_by_correlation = events
+        .iter()
+        .filter(|event| event.ph == "X" && is_launch_category(&event.cat))
+        .filter_map(|event| {
+            Some((
+                event_id(event, "correlation")?,
+                ((event.pid, event.tid), event.ts?),
+            ))
+        })
+        .collect::<HashMap<_, _>>();
+    let kernel_probes = events
         .iter()
         .filter(|event| event.ph == "X" && event.cat == "kernel")
-        .map(|event| (event.pid, event.tid))
+        .map(|event| {
+            if let Some(&index) =
+                event_id(event, "External id").and_then(|id| op_by_external.get(&id))
+            {
+                Probe::Op(index)
+            } else if let Some(&(context, ts)) =
+                event_id(event, "correlation").and_then(|id| launcher_by_correlation.get(&id))
+            {
+                Probe::At(ts, context, false)
+            } else {
+                Probe::At(event.ts.unwrap_or_default(), (event.pid, event.tid), true)
+            }
+        })
         .collect::<Vec<_>>();
-    if kernel_rows.len() != kernel_contexts.len() {
+    if kernel_rows.len() != kernel_probes.len() {
         bail!("Chrome trace kernel identity count changed during import");
     }
     let mut kernels = kernel_rows
         .into_iter()
-        .zip(kernel_contexts)
-        .map(|((id, name, start), context)| (id, name, start, context))
+        .zip(kernel_probes)
+        .map(|((id, name, _), probe)| (id, name, probe))
         .collect::<Vec<_>>();
-    kernels.sort_by(|a, b| a.2.partial_cmp(&b.2).unwrap_or(std::cmp::Ordering::Equal));
+    kernels.sort_by(|a, b| {
+        a.2.time()
+            .partial_cmp(&b.2.time())
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
 
     let mut starts = (0..invocations.len()).collect::<Vec<_>>();
     starts.sort_by(|&a, &b| {
@@ -315,33 +350,38 @@ fn import_ops(dest: &Connection, events: &[TraceEvent], layer_id: i64) -> Result
     });
     let mut next_start = 0;
     let mut next_end = 0;
-    let mut active: HashMap<(Option<i64>, Option<i64>), BTreeSet<(u64, usize)>> = HashMap::new();
+    // Ordered innermost first. A context lookup scans the set: its size is the
+    // op nesting depth summed over threads at one instant.
+    let mut active: BTreeSet<(u64, usize)> = BTreeSet::new();
 
     let mut map_stmt = dest.prepare(
         "INSERT OR IGNORE INTO op_kernel_map (op_id, kernel_name, launch_id) VALUES (?1, ?2, ?3)",
     )?;
-    for (launch_id, kernel_name, k_start, context) in &kernels {
-        while next_start < starts.len() && invocations[starts[next_start]].start_us <= *k_start {
-            let index = starts[next_start];
-            let inv = &invocations[index];
-            active
-                .entry((inv.pid, inv.tid))
-                .or_default()
-                .insert(((inv.end_us - inv.start_us).to_bits(), index));
-            next_start += 1;
-        }
-        while next_end < ends.len() && invocations[ends[next_end]].end_us < *k_start {
-            let index = ends[next_end];
-            let inv = &invocations[index];
-            if let Some(set) = active.get_mut(&(inv.pid, inv.tid)) {
-                set.remove(&((inv.end_us - inv.start_us).to_bits(), index));
+    for (launch_id, kernel_name, probe) in &kernels {
+        let index = match *probe {
+            Probe::Op(index) => Some(index),
+            Probe::At(at, context, any_thread) => {
+                while next_start < starts.len() && invocations[starts[next_start]].start_us <= at {
+                    let index = starts[next_start];
+                    let inv = &invocations[index];
+                    active.insert(((inv.end_us - inv.start_us).to_bits(), index));
+                    next_start += 1;
+                }
+                while next_end < ends.len() && invocations[ends[next_end]].end_us < at {
+                    let index = ends[next_end];
+                    let inv = &invocations[index];
+                    active.remove(&((inv.end_us - inv.start_us).to_bits(), index));
+                    next_end += 1;
+                }
+                let mut innermost = active.iter().map(|&(_, index)| index);
+                innermost
+                    .clone()
+                    .find(|&index| (invocations[index].pid, invocations[index].tid) == context)
+                    .or_else(|| innermost.next().filter(|_| any_thread))
             }
-            next_end += 1;
-        }
-        if let Some((_, index)) = active.get(context).and_then(|set| set.first()) {
-            if let Some(&op_id) = op_ids.get(*index) {
-                map_stmt.execute(params![op_id, kernel_name, launch_id])?;
-            }
+        };
+        if let Some(&op_id) = index.and_then(|index| op_ids.get(index)) {
+            map_stmt.execute(params![op_id, kernel_name, launch_id])?;
         }
     }
 
@@ -357,6 +397,37 @@ fn import_ops(dest: &Connection, events: &[TraceEvent], layer_id: i64) -> Result
     dest.execute(update_sql, params![layer_id])?;
 
     Ok(())
+}
+
+/// Where a kernel attaches: a known op, or the innermost op that contains a
+/// time on one `(pid, tid)`. When the flag is set and that `(pid, tid)` has
+/// no such op, the innermost op on any thread is taken.
+enum Probe {
+    Op(usize),
+    At(f64, (Option<i64>, Option<i64>), bool),
+}
+
+impl Probe {
+    fn time(&self) -> f64 {
+        match self {
+            Probe::Op(_) => f64::NEG_INFINITY,
+            Probe::At(at, ..) => *at,
+        }
+    }
+}
+
+fn is_op_category(cat: &str) -> bool {
+    matches!(cat, "cpu_op" | "user_annotation" | "Operator")
+}
+
+/// Host-side CUDA API calls (`cuda_runtime`, `cuda_driver`, legacy `Runtime`).
+fn is_launch_category(cat: &str) -> bool {
+    let cat = cat.to_ascii_lowercase();
+    cat.contains("runtime") || cat.contains("driver")
+}
+
+fn event_id(event: &TraceEvent, key: &str) -> Option<i64> {
+    value_for(&event.args, key)?.as_i64()
 }
 
 // ---------------------------------------------------------------------------
@@ -467,6 +538,12 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM ops", [], |row| row.get(0))
             .unwrap();
         assert_eq!(op_count, 1);
+
+        let mapped: i64 = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM op_kernel_map", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(mapped, 1);
     }
 
     #[test]
