@@ -248,23 +248,123 @@ fn resolve_dotnet(target: &str) -> Result<String> {
     bail!("cannot resolve: {target}")
 }
 
+/// Offset of the `>` that ends an XML tag, skipping quoted attribute values.
+fn tag_end(tag: &str) -> Option<usize> {
+    let mut quote = None;
+    tag.char_indices().find_map(|(i, c)| {
+        match (quote, c) {
+            (Some(q), _) if c == q => quote = None,
+            (None, '"' | '\'') => quote = Some(c),
+            (None, '>') => return Some(i),
+            _ => {}
+        }
+        None
+    })
+}
+
+/// Whether a tag, with or without its `<`, has an attribute named exactly `Condition`.
+fn has_condition_attribute(tag: &str) -> bool {
+    let tag = tag.trim_start_matches('<');
+    let mut rest = tag.trim_start_matches(|c: char| !c.is_whitespace());
+    loop {
+        let Some(eq) = rest.find('=') else {
+            return false;
+        };
+        if rest[..eq].trim() == "Condition" {
+            return true;
+        }
+        rest = rest[eq + 1..].trim_start();
+        let Some(quote) = rest.chars().next().filter(|c| matches!(c, '"' | '\'')) else {
+            return false;
+        };
+        let Some(end) = rest[1..].find(quote) else {
+            return false;
+        };
+        rest = &rest[end + 2..];
+    }
+}
+
+/// Output assembly name of a project: the last `<AssemblyName>` outside XML
+/// comments, with CDATA text kept and `$(MSBuildProjectName)` expanded. A
+/// conditional value or one that uses any other property is an error that
+/// names the project.
 fn dotnet_output_name(project: &Path) -> Result<String> {
-    let fallback = path_stem_str(project)?;
-    let contents = std::fs::read_to_string(project)?;
-    let Some(start) = contents.find("<AssemblyName>") else {
-        return Ok(fallback);
+    let project_name = path_stem_str(project)?;
+    let mut contents = std::fs::read_to_string(project)?;
+    // Comments are removed. CDATA text is kept with its markup characters escaped.
+    while let Some((start, close)) = [("<!--", "-->"), ("<![CDATA[", "]]>")]
+        .into_iter()
+        .filter_map(|(open, close)| Some((contents.find(open)?, close)))
+        .min()
+    {
+        let Some(len) = contents[start..].find(close) else {
+            bail!("unterminated XML comment or CDATA in {}", project.display());
+        };
+        let text = if close == "]]>" {
+            contents[start + "<![CDATA[".len()..start + len]
+                .replace('&', "&amp;")
+                .replace('<', "&lt;")
+                .replace('>', "&gt;")
+        } else {
+            String::new()
+        };
+        contents.replace_range(start..start + len + close.len(), &text);
+    }
+    let Some(start) = contents.rfind("<AssemblyName") else {
+        return Ok(project_name);
     };
-    let value_start = start + "<AssemblyName>".len();
-    let Some(relative_end) = contents[value_start..].find("</AssemblyName>") else {
+    let unsupported = || {
+        anyhow::anyhow!(
+            "cannot evaluate <AssemblyName> in {}; build the project and pass the output DLL",
+            project.display()
+        )
+    };
+    let Some(open_len) = tag_end(&contents[start..]) else {
         bail!("unterminated <AssemblyName> in {}", project.display());
     };
-    let value = contents[value_start..value_start + relative_end].trim();
+    let open_tag = &contents[start..start + open_len];
+    // Whether each element still open at <AssemblyName> applies only under a condition.
+    let mut conditional = Vec::new();
+    let mut rest = &contents[..start];
+    while let Some(lt) = rest.find('<') {
+        rest = &rest[lt + 1..];
+        let Some(end) = tag_end(rest) else {
+            break;
+        };
+        let tag = &rest[..end];
+        rest = &rest[end + 1..];
+        if tag.starts_with('/') {
+            conditional.pop();
+        } else if !tag.starts_with(['?', '!']) && !tag.ends_with('/') {
+            conditional.push(
+                has_condition_attribute(tag) || tag.split_whitespace().next() == Some("Otherwise"),
+            );
+        }
+    }
+    if has_condition_attribute(open_tag) || conditional.contains(&true) {
+        return Err(unsupported());
+    }
+    let value_start = start + open_len + 1;
+    let Some(len) = contents[value_start..].find("</AssemblyName>") else {
+        bail!("unterminated <AssemblyName> in {}", project.display());
+    };
+    let value = contents[value_start..value_start + len]
+        .trim()
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&apos;", "'")
+        .replace("&amp;", "&")
+        .replace("$(MSBuildProjectName)", &project_name);
+    if value.contains("$(") {
+        return Err(unsupported());
+    }
     if value.is_empty()
-        || Path::new(value).file_name().and_then(|name| name.to_str()) != Some(value)
+        || Path::new(&value).file_name().and_then(|name| name.to_str()) != Some(value.as_str())
     {
         bail!("invalid <AssemblyName> in {}", project.display());
     }
-    Ok(value.to_string())
+    Ok(value)
 }
 
 fn find_csproj(dir: &Path) -> Result<PathBuf> {
@@ -576,6 +676,99 @@ mod tests {
         )
         .unwrap();
         assert_eq!(dotnet_output_name(&project).unwrap(), "Worker");
+    }
+
+    #[test]
+    fn dotnet_output_name_expands_project_name_and_ignores_comments() {
+        let tmp = TempDir::new().unwrap();
+        let project = tmp.path().join("Demo.csproj");
+        let name = |contents: &str| {
+            std::fs::write(&project, contents).unwrap();
+            dotnet_output_name(&project)
+        };
+        assert_eq!(
+            name("<Project><PropertyGroup><AssemblyName>$(MSBuildProjectName).Worker</AssemblyName></PropertyGroup></Project>").unwrap(),
+            "Demo.Worker"
+        );
+        assert_eq!(
+            name("<Project><!-- <AssemblyName>Old</AssemblyName> --><PropertyGroup></PropertyGroup></Project>").unwrap(),
+            "Demo"
+        );
+        assert_eq!(
+            name("<Project><PropertyGroup><AssemblyName>Worker</AssemblyName></PropertyGroup><PropertyGroup Condition=\"'$(Configuration)'=='Release'\"><Optimize>true</Optimize></PropertyGroup></Project>").unwrap(),
+            "Worker"
+        );
+        assert_eq!(
+            name("<Project><Choose><When Condition=\"'$(OS)'=='Windows_NT'\"><PropertyGroup><X>1</X></PropertyGroup></When></Choose><Import Project=\"a.props\" Condition=\"'$(V)' > '1'\" /><PropertyGroup><AssemblyName>Worker</AssemblyName></PropertyGroup></Project>").unwrap(),
+            "Worker"
+        );
+        assert_eq!(
+            name("<Project><Choose><When Condition=\"'$(OS)'=='Unix'\"><X>1</X></When><Otherwise><X>2</X></Otherwise></Choose><PropertyGroup><AssemblyName>Worker</AssemblyName></PropertyGroup></Project>").unwrap(),
+            "Worker"
+        );
+        for unevaluable in [
+            "<Project><PropertyGroup><AssemblyName>$(RootNamespace)</AssemblyName></PropertyGroup></Project>",
+            "<Project><PropertyGroup Condition=\"'$(Configuration)'=='Debug'\"><AssemblyName>Dbg</AssemblyName></PropertyGroup></Project>",
+            "<Project><Choose><When Condition=\"'$(OS)'=='Windows_NT'\"><PropertyGroup><AssemblyName>WinName</AssemblyName></PropertyGroup></When></Choose></Project>",
+            "<Project><PropertyGroup><AssemblyName Condition=\"'$(OS)'=='Unix'\">UnixName</AssemblyName></PropertyGroup></Project>",
+            "<Project><Choose><When Condition=\"'$(Configuration)'=='Debug'\"><PropertyGroup><AssemblyName>DebugName</AssemblyName></PropertyGroup></When><Otherwise><PropertyGroup><AssemblyName>ReleaseName</AssemblyName></PropertyGroup></Otherwise></Choose></Project>",
+            "<Project><Choose><When Condition=\"'$(Configuration)'=='Debug'\"><X>1</X></When><Otherwise><Choose><When Condition=\"'$(OS)'=='Unix'\"><X>2</X></When></Choose><PropertyGroup><AssemblyName>Nested</AssemblyName></PropertyGroup></Otherwise></Choose></Project>",
+        ] {
+            let error = name(unevaluable).unwrap_err().to_string();
+            assert!(error.contains("Demo.csproj"), "{error}");
+        }
+    }
+
+    #[test]
+    fn dotnet_output_name_skips_cdata_text() {
+        let tmp = TempDir::new().unwrap();
+        let project = tmp.path().join("Worker.csproj");
+        std::fs::write(
+            &project,
+            "<Project Sdk=\"Microsoft.NET.Sdk\"><UsingTask TaskName=\"T\" TaskFactory=\"RoslynCodeTaskFactory\" AssemblyFile=\"$(MSBuildToolsPath)\\Microsoft.Build.Tasks.Core.dll\" Condition=\"'$(OS)' == 'Windows_NT'\"><Task><Code Type=\"Fragment\" Language=\"cs\"><![CDATA[ if (a > 0 && b < 1) { } // <AssemblyName>Fake</AssemblyName> <!-- ]]></Code></Task></UsingTask><PropertyGroup><AssemblyName>Custom</AssemblyName></PropertyGroup></Project>",
+        )
+        .unwrap();
+        assert_eq!(dotnet_output_name(&project).unwrap(), "Custom");
+    }
+
+    #[test]
+    fn dotnet_output_name_keeps_cdata_text_of_the_value() {
+        let tmp = TempDir::new().unwrap();
+        let project = tmp.path().join("Demo.csproj");
+        let name = |value: &str| {
+            std::fs::write(&project, format!("<Project Sdk=\"Microsoft.NET.Sdk\"><PropertyGroup><AssemblyName>{value}</AssemblyName></PropertyGroup></Project>")).unwrap();
+            dotnet_output_name(&project)
+        };
+        assert_eq!(name("My<![CDATA[App]]>").unwrap(), "MyApp");
+        assert_eq!(name("<![CDATA[App]]>").unwrap(), "App");
+        assert_eq!(name("<![CDATA[A&B]]>").unwrap(), "A&B");
+        assert_eq!(name("<![CDATA[a<b]]>").unwrap(), "a<b");
+    }
+
+    #[test]
+    fn dotnet_output_name_needs_an_attribute_named_condition() {
+        let tmp = TempDir::new().unwrap();
+        let project = tmp.path().join("Demo.csproj");
+        let name = |contents: &str| {
+            std::fs::write(&project, contents).unwrap();
+            dotnet_output_name(&project)
+        };
+        for unconditional in [
+            "<Project><PropertyGroup Label=\"Conditions\"><AssemblyName>Worker</AssemblyName></PropertyGroup></Project>",
+            "<Project><PropertyGroup MyConditionalFlag=\"true\"><AssemblyName>Worker</AssemblyName></PropertyGroup></Project>",
+            "<Project><PropertyGroup><AssemblyName Label=\"NoCondition\">Worker</AssemblyName></PropertyGroup></Project>",
+            "<Project><PropertyGroup Label=\"a Condition='x'\"><AssemblyName>Worker</AssemblyName></PropertyGroup></Project>",
+        ] {
+            assert_eq!(name(unconditional).unwrap(), "Worker", "{unconditional}");
+        }
+        for conditional in [
+            "<Project><PropertyGroup Condition='$(X)'><AssemblyName>Worker</AssemblyName></PropertyGroup></Project>",
+            "<Project><PropertyGroup Label=\"L\" Condition = \"'$(X)'=='1'\"><AssemblyName>Worker</AssemblyName></PropertyGroup></Project>",
+            "<Project><PropertyGroup><AssemblyName\nCondition\n=\n'$(X)'>Worker</AssemblyName></PropertyGroup></Project>",
+        ] {
+            let error = name(conditional).unwrap_err().to_string();
+            assert!(error.contains("cannot evaluate"), "{error}");
+        }
     }
 
     /// Regression: `dbg start dotnet-trace Broken.csproj` passed the
