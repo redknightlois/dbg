@@ -1289,13 +1289,7 @@ impl DapTransport {
         if lhs.is_empty() || rhs.is_empty() {
             bail!("usage: dbg set <lhs> = <expr>");
         }
-        let frame_id = {
-            let (lock, _) = &*self.state;
-            let s = lock.lock().unwrap();
-            s.top_frame
-                .as_ref()
-                .and_then(|f| f.get("id").and_then(|v| v.as_i64()))
-        };
+        let frame_id = self.stop_frame_id()?;
         let mut args = json!({
             "expression": lhs,
             "value": rhs,
@@ -1387,14 +1381,30 @@ impl DapTransport {
         bail!("variable `{lhs}` not found in any frame scope")
     }
 
+    /// Frame id of the current stop, or `None` when the session is not
+    /// paused. A paused session whose stop has no known frame is an error
+    /// that names the recovery command, so no request falls back to the
+    /// adapter's global scope.
+    fn stop_frame_id(&self) -> Result<Option<i64>> {
+        let (lock, _) = &*self.state;
+        let s = lock.lock().unwrap();
+        let id = s
+            .top_frame
+            .as_ref()
+            .and_then(|f| f.get("id").and_then(|v| v.as_i64()));
+        if id.is_none() && s.paused {
+            let thread = s
+                .current_thread
+                .map_or_else(|| "<id>".to_string(), |tid| tid.to_string());
+            bail!(
+                "paused, but no frame is known for the current stop; run `dbg thread {thread}` to load its frames"
+            );
+        }
+        Ok(id)
+    }
+
     fn evaluate(&self, expr: &str, timeout: Duration) -> Result<String> {
-        let frame_id = {
-            let (lock, _) = &*self.state;
-            let s = lock.lock().unwrap();
-            s.top_frame
-                .as_ref()
-                .and_then(|f| f.get("id").and_then(|v| v.as_i64()))
-        };
+        let frame_id = self.stop_frame_id()?;
         let mut args = json!({
             "expression": expr,
             "context": "repl",
@@ -1411,14 +1421,9 @@ impl DapTransport {
     }
 
     fn collect_locals(&self, timeout: Duration) -> Result<String> {
-        let frame_id = {
-            let (lock, _) = &*self.state;
-            let s = lock.lock().unwrap();
-            s.top_frame
-                .as_ref()
-                .and_then(|f| f.get("id").and_then(|v| v.as_i64()))
-                .ok_or_else(|| anyhow!("locals: not paused"))?
-        };
+        let frame_id = self
+            .stop_frame_id()?
+            .ok_or_else(|| anyhow!("locals: not paused"))?;
         let scopes_resp = self.call_blocking("scopes", json!({ "frameId": frame_id }), timeout)?;
         let scopes = scopes_resp
             .get("scopes")
@@ -3106,6 +3111,28 @@ mod tests {
         assert!(guard.call_frames.is_empty());
     }
 
+    #[test]
+    fn paused_without_a_frame_refuses_frameless_requests() {
+        let (transport, calls) = test_transport(vec![Ok(json!({"result": "1"}))]);
+        transport.state.0.lock().unwrap().paused = true;
+        let timeout = Duration::from_secs(1);
+        let error = transport.evaluate("x", timeout).unwrap_err().to_string();
+        assert!(error.contains("no frame"), "{error}");
+        let error = transport
+            .set_expression("x = 1", timeout)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("no frame"), "{error}");
+        let error = transport.collect_locals(timeout).unwrap_err().to_string();
+        assert!(!error.contains("not paused"), "{error}");
+        assert_eq!(calls.load(Ordering::Relaxed), 0);
+
+        transport.state.0.lock().unwrap().paused = false;
+        assert_eq!(transport.evaluate("x", timeout).unwrap(), "1");
+        let error = transport.collect_locals(timeout).unwrap_err().to_string();
+        assert!(error.contains("not paused"), "{error}");
+    }
+
     fn assert_no_breakpoint_state(transport: &DapTransport, next_id: u32) {
         let (lock, _) = &*transport.state;
         let state = lock.lock().unwrap();
@@ -3660,6 +3687,40 @@ mod tests {
         assert!(guard.pending_hit.is_some());
         assert!(guard.top_frame.is_none());
         assert!(guard.call_frames.is_empty());
+    }
+
+    #[test]
+    fn frameless_stop_names_the_recovery_command() {
+        let (transport, calls) = test_transport(vec![]);
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let peer = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut pending = HashMap::new();
+        let mut next_seq = 1;
+        transport.state.0.lock().unwrap().top_frame = Some(json!({"id": 1000}));
+        let timeout = Duration::from_secs(1);
+        for (body, command) in [
+            (json!({}), "dbg thread <id>"),
+            (json!({"threadId": 7}), "dbg thread 7"),
+        ] {
+            dispatch_incoming(
+                json!({"type":"event", "event":"stopped", "body": body}),
+                &mut pending,
+                &transport.state,
+                &transport.log,
+                &mut stream,
+                &mut next_seq,
+            );
+            let error = transport.evaluate("x", timeout).unwrap_err().to_string();
+            assert!(error.contains(command), "{error}");
+            let error = transport
+                .set_expression("x = 1", timeout)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains(command), "{error}");
+        }
+        drop(peer);
+        assert_eq!(calls.load(Ordering::Relaxed), 0);
     }
 
     #[test]
