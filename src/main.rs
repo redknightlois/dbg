@@ -1194,10 +1194,17 @@ fn cmd_start(registry: &Registry, args: &[String]) -> Result<()> {
             }
             std::process::exit(0);
         }
-        ForkResult::Parent { .. } => {
-            // Wait for socket
-            if !daemon::wait_for_socket(Duration::from_secs(30)) {
+        ForkResult::Parent { child } => {
+            let timeout_secs = std::env::var("DBG_START_TIMEOUT_SECS")
+                .ok()
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(30);
+            if !daemon::wait_for_socket(Duration::from_secs(timeout_secs)) {
+                // A start reported as failed leaves no daemon behind.
+                let _ = nix::sys::signal::kill(child, nix::sys::signal::Signal::SIGKILL);
+                let _ = nix::sys::wait::waitpid(child, None);
                 let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+                daemon::cleanup_after_startup_error();
                 if log.trim().is_empty() {
                     bail!("daemon failed to start");
                 } else {

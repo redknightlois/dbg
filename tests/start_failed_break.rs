@@ -125,3 +125,52 @@ fn only_an_accepted_start_publishes_the_latest_session() {
     assert_eq!(seen.into_iter().collect::<Vec<_>>(), accepted);
     dbg(&["kill"]);
 }
+
+/// Live processes that run the `dbg` binary and carry `tag` in their environment.
+fn tagged_dbg_processes(tag: &str) -> Vec<i32> {
+    let exe = std::fs::canonicalize(env!("CARGO_BIN_EXE_dbg")).unwrap();
+    let marker = format!("DBG_TEST_TAG={tag}");
+    std::fs::read_dir("/proc")
+        .unwrap()
+        .flatten()
+        .filter_map(|entry| entry.file_name().to_str()?.parse::<i32>().ok())
+        .filter(|pid| std::fs::read_link(format!("/proc/{pid}/exe")).ok().as_ref() == Some(&exe))
+        .filter(|pid| {
+            std::fs::read(format!("/proc/{pid}/environ"))
+                .is_ok_and(|env| env.split(|&b| b == 0).any(|var| var == marker.as_bytes()))
+        })
+        .collect()
+}
+
+#[test]
+fn socket_wait_failure_leaves_no_daemon() {
+    if Command::new("python3").arg("--version").output().is_err() {
+        return;
+    }
+    let work = tempfile::tempdir().unwrap();
+    let runtime = tempfile::tempdir().unwrap();
+    std::fs::write(work.path().join("hello.py"), "print(\"hi\")\n").unwrap();
+    let tag = runtime.path().display().to_string();
+    // A zero socket wait expires before any daemon can bind its socket.
+    let start = Command::new(env!("CARGO_BIN_EXE_dbg"))
+        .args(["start", "pdb", "hello.py"])
+        .current_dir(work.path())
+        .env("XDG_RUNTIME_DIR", runtime.path())
+        .env("DBG_START_TIMEOUT_SECS", "0")
+        .env("DBG_TEST_TAG", &tag)
+        .env_remove("DBG_SESSION")
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&start.stderr);
+    assert!(!start.status.success(), "{stderr}");
+    assert!(stderr.contains("daemon failed to start"), "{stderr}");
+
+    let survivors = tagged_dbg_processes(&tag);
+    for &pid in &survivors {
+        let _ = Command::new("kill").args(["-9", &pid.to_string()]).status();
+    }
+    assert!(survivors.is_empty(), "{survivors:?}");
+    let status = stdout(&dbg(work.path(), runtime.path(), &["status"]));
+    assert!(status.contains("no session"), "{status}");
+    assert!(pid_files(runtime.path()).is_empty());
+}
