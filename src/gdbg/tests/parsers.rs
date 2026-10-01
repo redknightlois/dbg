@@ -867,6 +867,37 @@ fn chrome_trace_uncorrelated_kernel_prefers_an_op_on_its_own_thread() {
 }
 
 #[test]
+fn chrome_trace_uncorrelated_kernel_without_an_own_thread_op_stays_unmapped() {
+    use crate::db::GpuDb;
+    use crate::parsers::chrome_trace::import_chrome_trace;
+
+    let db = GpuDb::create(&tempfile::tempdir().unwrap().keep().join("contexts.db")).unwrap();
+    let layer = db
+        .add_layer("torch", "trace.json", None, None, None)
+        .unwrap();
+    let trace = serde_json::json!({
+        "traceEvents": [
+            {"ph":"X", "cat":"cpu_op", "name":"other-thread", "pid":2, "tid":1,
+             "ts":0.0, "dur":200.0, "args":{}},
+            {"ph":"X", "cat":"cpu_op", "name":"other-process", "pid":3, "tid":7,
+             "ts":0.0, "dur":200.0, "args":{}},
+            {"ph":"X", "cat":"kernel", "name":"kernel", "pid":2, "tid":7,
+             "ts":110.0, "dur":5.0, "args":{}}
+        ]
+    });
+    let file = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(file.path(), serde_json::to_vec(&trace).unwrap()).unwrap();
+
+    import_chrome_trace(&db.conn, file.path(), layer).unwrap();
+
+    let mapped: i64 = db
+        .conn
+        .query_row("SELECT COUNT(*) FROM op_kernel_map", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(mapped, 0);
+}
+
+#[test]
 fn chrome_trace_launcher_correlation_selects_the_launcher_thread() {
     use crate::db::GpuDb;
     use crate::parsers::chrome_trace::import_chrome_trace;

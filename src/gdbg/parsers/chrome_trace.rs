@@ -285,8 +285,8 @@ fn import_ops(dest: &Connection, events: &[TraceEvent], layer_id: i64) -> Result
         .collect();
     // A kernel attaches through a matching op `External id`, else through the
     // launch call that shares its `correlation` (an op on the launch thread),
-    // else through its own start time: an op on the kernel's own (pid, tid)
-    // wins, and the innermost containing op on any thread is the fallback.
+    // else through its own start time and an op on the kernel's own (pid, tid).
+    // A kernel with none of these stays unmapped.
     let op_by_external = events
         .iter()
         .filter(|event| event.ph == "X" && is_op_category(&event.cat))
@@ -314,9 +314,9 @@ fn import_ops(dest: &Connection, events: &[TraceEvent], layer_id: i64) -> Result
             } else if let Some(&(context, ts)) =
                 event_id(event, "correlation").and_then(|id| launcher_by_correlation.get(&id))
             {
-                Probe::At(ts, context, false)
+                Probe::At(ts, context)
             } else {
-                Probe::At(event.ts.unwrap_or_default(), (event.pid, event.tid), true)
+                Probe::At(event.ts.unwrap_or_default(), (event.pid, event.tid))
             }
         })
         .collect::<Vec<_>>();
@@ -360,7 +360,7 @@ fn import_ops(dest: &Connection, events: &[TraceEvent], layer_id: i64) -> Result
     for (launch_id, kernel_name, probe) in &kernels {
         let index = match *probe {
             Probe::Op(index) => Some(index),
-            Probe::At(at, context, any_thread) => {
+            Probe::At(at, context) => {
                 while next_start < starts.len() && invocations[starts[next_start]].start_us <= at {
                     let index = starts[next_start];
                     let inv = &invocations[index];
@@ -373,11 +373,10 @@ fn import_ops(dest: &Connection, events: &[TraceEvent], layer_id: i64) -> Result
                     active.remove(&((inv.end_us - inv.start_us).to_bits(), index));
                     next_end += 1;
                 }
-                let mut innermost = active.iter().map(|&(_, index)| index);
-                innermost
-                    .clone()
+                active
+                    .iter()
+                    .map(|&(_, index)| index)
                     .find(|&index| (invocations[index].pid, invocations[index].tid) == context)
-                    .or_else(|| innermost.next().filter(|_| any_thread))
             }
         };
         if let Some(&op_id) = index.and_then(|index| op_ids.get(index)) {
@@ -400,11 +399,10 @@ fn import_ops(dest: &Connection, events: &[TraceEvent], layer_id: i64) -> Result
 }
 
 /// Where a kernel attaches: a known op, or the innermost op that contains a
-/// time on one `(pid, tid)`. When the flag is set and that `(pid, tid)` has
-/// no such op, the innermost op on any thread is taken.
+/// time on one `(pid, tid)`.
 enum Probe {
     Op(usize),
-    At(f64, (Option<i64>, Option<i64>), bool),
+    At(f64, (Option<i64>, Option<i64>)),
 }
 
 impl Probe {
@@ -520,7 +518,7 @@ mod tests {
                     "ph": "X",
                     "ts": 900.0,
                     "dur": 120.0,
-                    "pid": 1, "tid": 0
+                    "pid": 1, "tid": 1
                 }
             ]
         }"#;
