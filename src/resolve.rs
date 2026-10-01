@@ -591,9 +591,17 @@ fn run_go_build(parent: &Path, args: &[&str]) -> Result<Output> {
         .context("go not found")
 }
 
-/// True when `<dir>/<name>` carries the build info of a single-file debug
-/// build, which is the output `resolve_go` writes.
-fn is_dbg_go_build(dir: &Path, name: &str) -> bool {
+/// The linker flag that records the source file in the build info. The name is
+/// hex-encoded so that no character needs quoting. The symbol does not exist, so
+/// the flag does not change the binary.
+fn go_source_marker(source: &str) -> String {
+    let hex: String = source.bytes().map(|b| format!("{b:02x}")).collect();
+    format!("-X dbg.source={hex}")
+}
+
+/// True when `<dir>/<name>` carries the build info of the single-file debug
+/// build that `resolve_go` writes from `<dir>/<source>`.
+fn is_dbg_go_build(dir: &Path, name: &str, source: &str) -> bool {
     let Ok(output) = run_go_build(dir, &["version", "-m", name]) else {
         return false;
     };
@@ -601,6 +609,10 @@ fn is_dbg_go_build(dir: &Path, name: &str) -> bool {
     output.status.success()
         && info.contains("\tpath\tcommand-line-arguments\n")
         && info.contains("\tbuild\t-gcflags=\"all=-N -l\"\n")
+        && info.contains(&format!(
+            "\tbuild\t-ldflags=\"{}\"\n",
+            go_source_marker(source)
+        ))
 }
 
 fn go_build_cache(parent: &Path) -> Result<std::path::PathBuf> {
@@ -633,16 +645,24 @@ fn resolve_go(target: &str) -> Result<String> {
             .unwrap_or(Path::new("."));
         let stem = p.file_stem().and_then(|s| s.to_str()).unwrap_or("app");
         let output_path = parent.join(stem);
+        let file_name = p.file_name().and_then(|s| s.to_str()).unwrap_or(target);
         if let Ok(meta) = std::fs::symlink_metadata(&output_path)
-            && !(meta.is_file() && is_dbg_go_build(parent, stem))
+            && !(meta.is_file() && is_dbg_go_build(parent, stem, file_name))
         {
             bail!(
                 "refusing to overwrite existing path that is not a dbg build: {}",
                 output_path.display()
             );
         }
-        let file_name = p.file_name().and_then(|s| s.to_str()).unwrap_or(target);
-        let args = ["build", "-gcflags=all=-N -l", "-o", stem, file_name];
+        let ldflags = format!("-ldflags={}", go_source_marker(file_name));
+        let args = [
+            "build",
+            "-gcflags=all=-N -l",
+            &ldflags,
+            "-o",
+            stem,
+            file_name,
+        ];
         let output = run_go_build(parent, &args)?;
         if !output.status.success() {
             bail!(go_build_error(&output.stderr));
@@ -964,6 +984,29 @@ mod tests {
             assert!(resolve_go(source.to_str().unwrap()).is_err(), "{name}");
             assert_eq!(std::fs::read(tmp.path().join(name)).unwrap(), before);
         }
+    }
+
+    #[test]
+    fn resolve_go_keeps_a_debug_build_of_another_source() {
+        if Command::new("go").arg("version").output().is_err() || !go_toolchain_can_build() {
+            return;
+        }
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(
+            tmp.path().join("main.go"),
+            "package main\nfunc main() { println(\"user\") }\n",
+        )
+        .unwrap();
+        let server = tmp.path().join("server.go");
+        std::fs::write(&server, "package main\nfunc main() { println(\"dbg\") }\n").unwrap();
+        let args = ["build", "-gcflags=all=-N -l", "-o", "server", "main.go"];
+        assert!(run_go_build(tmp.path(), &args).unwrap().status.success());
+        let before = std::fs::read(tmp.path().join("server")).unwrap();
+        let error = resolve_go(server.to_str().unwrap())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("refusing to overwrite"), "{error}");
+        assert_eq!(std::fs::read(tmp.path().join("server")).unwrap(), before);
     }
 
     #[test]
