@@ -310,7 +310,15 @@ fn dotnet_output_name(project: &Path) -> Result<String> {
         };
         contents.replace_range(start..start + len + close.len(), &text);
     }
-    let Some(start) = contents.rfind("<AssemblyName") else {
+    // The last <AssemblyName> element decides, as in MSBuild evaluation.
+    let Some(start) = contents
+        .rmatch_indices("<AssemblyName")
+        .map(|(i, _)| i)
+        .find(|&i| {
+            contents[i + "<AssemblyName".len()..]
+                .starts_with(|c: char| c.is_whitespace() || c == '>' || c == '/')
+        })
+    else {
         return Ok(project_name);
     };
     let unsupported = || {
@@ -343,6 +351,10 @@ fn dotnet_output_name(project: &Path) -> Result<String> {
     }
     if has_condition_attribute(open_tag) || conditional.contains(&true) {
         return Err(unsupported());
+    }
+    // An empty property falls back to the SDK default, the project name.
+    if open_tag.ends_with('/') {
+        return Ok(project_name);
     }
     let value_start = start + open_len + 1;
     let Some(len) = contents[value_start..].find("</AssemblyName>") else {
@@ -709,6 +721,35 @@ mod tests {
         )
         .unwrap();
         assert_eq!(dotnet_output_name(&project).unwrap(), "Worker");
+    }
+
+    #[test]
+    fn dotnet_output_name_matches_the_exact_element_and_reads_self_closing_as_absent() {
+        let tmp = TempDir::new().unwrap();
+        let project = tmp.path().join("Demo.csproj");
+        let name = |properties: &str| {
+            std::fs::write(
+                &project,
+                format!("<Project><PropertyGroup>{properties}</PropertyGroup></Project>"),
+            )
+            .unwrap();
+            dotnet_output_name(&project).unwrap()
+        };
+        assert_eq!(
+            name("<AssemblyName>Worker</AssemblyName><AssemblyNameSuffix>x</AssemblyNameSuffix>"),
+            "Worker"
+        );
+        assert_eq!(name("<AssemblyNameSuffix>x</AssemblyNameSuffix>"), "Demo");
+        assert_eq!(name("<AssemblyName />"), "Demo");
+        assert_eq!(name("<AssemblyName/>"), "Demo");
+        assert_eq!(
+            name("<AssemblyName>Worker</AssemblyName><AssemblyName />"),
+            "Demo"
+        );
+        assert_eq!(
+            name("<AssemblyName />\n<AssemblyName\n>Worker</AssemblyName>"),
+            "Worker"
+        );
     }
 
     #[test]
