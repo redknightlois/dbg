@@ -348,21 +348,40 @@ fn dotnet_output_name(project: &Path) -> Result<String> {
     let Some(len) = contents[value_start..].find("</AssemblyName>") else {
         bail!("unterminated <AssemblyName> in {}", project.display());
     };
-    let value = contents[value_start..value_start + len]
-        .trim()
-        .replace("&lt;", "<")
-        .replace("&gt;", ">")
-        .replace("&quot;", "\"")
-        .replace("&apos;", "'")
-        .replace("&amp;", "&")
-        .replace("$(MSBuildProjectName)", &project_name);
+    let invalid = || anyhow::anyhow!("invalid <AssemblyName> in {}", project.display());
+    // Entity references are decoded in a single pass, as an XML parser does.
+    let mut value = String::new();
+    let mut rest = contents[value_start..value_start + len].trim();
+    while let Some(amp) = rest.find('&') {
+        value.push_str(&rest[..amp]);
+        let end = rest[amp..].find(';').ok_or_else(invalid)? + amp;
+        let entity = &rest[amp + 1..end];
+        let decoded = match entity {
+            "lt" => Some('<'),
+            "gt" => Some('>'),
+            "quot" => Some('"'),
+            "apos" => Some('\''),
+            "amp" => Some('&'),
+            _ => entity
+                .strip_prefix('#')
+                .and_then(|n| match n.strip_prefix('x') {
+                    Some(hex) => u32::from_str_radix(hex, 16).ok(),
+                    None => n.parse().ok(),
+                })
+                .and_then(char::from_u32),
+        };
+        value.push(decoded.ok_or_else(invalid)?);
+        rest = &rest[end + 1..];
+    }
+    value.push_str(rest);
+    let value = value.replace("$(MSBuildProjectName)", &project_name);
     if value.contains("$(") {
         return Err(unsupported());
     }
     if value.is_empty()
         || Path::new(&value).file_name().and_then(|name| name.to_str()) != Some(value.as_str())
     {
-        bail!("invalid <AssemblyName> in {}", project.display());
+        return Err(invalid());
     }
     Ok(value)
 }
@@ -722,6 +741,8 @@ mod tests {
         );
         for unevaluable in [
             "<Project><PropertyGroup><AssemblyName>$(RootNamespace)</AssemblyName></PropertyGroup></Project>",
+            "<Project><PropertyGroup><AssemblyName>&#36;(RootNamespace)</AssemblyName></PropertyGroup></Project>",
+            "<Project><PropertyGroup><AssemblyName>&#x24;(RootNamespace)</AssemblyName></PropertyGroup></Project>",
             "<Project><PropertyGroup Condition=\"'$(Configuration)'=='Debug'\"><AssemblyName>Dbg</AssemblyName></PropertyGroup></Project>",
             "<Project><Choose><When Condition=\"'$(OS)'=='Windows_NT'\"><PropertyGroup><AssemblyName>WinName</AssemblyName></PropertyGroup></When></Choose></Project>",
             "<Project><PropertyGroup><AssemblyName Condition=\"'$(OS)'=='Unix'\">UnixName</AssemblyName></PropertyGroup></Project>",
@@ -729,7 +750,10 @@ mod tests {
             "<Project><Choose><When Condition=\"'$(Configuration)'=='Debug'\"><X>1</X></When><Otherwise><Choose><When Condition=\"'$(OS)'=='Unix'\"><X>2</X></When></Choose><PropertyGroup><AssemblyName>Nested</AssemblyName></PropertyGroup></Otherwise></Choose></Project>",
         ] {
             let error = name(unevaluable).unwrap_err().to_string();
-            assert!(error.contains("Demo.csproj"), "{error}");
+            assert!(
+                error.contains("cannot evaluate") && error.contains("Demo.csproj"),
+                "{error}"
+            );
         }
     }
 
@@ -757,6 +781,9 @@ mod tests {
         assert_eq!(name("<![CDATA[App]]>").unwrap(), "App");
         assert_eq!(name("<![CDATA[A&B]]>").unwrap(), "A&B");
         assert_eq!(name("<![CDATA[a<b]]>").unwrap(), "a<b");
+        assert_eq!(name("&#65;pp").unwrap(), "App");
+        assert_eq!(name("&#x41;pp").unwrap(), "App");
+        assert_eq!(name("&amp;#36;(X)").unwrap(), "&#36;(X)");
     }
 
     #[test]
