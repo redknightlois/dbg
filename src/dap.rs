@@ -2549,9 +2549,15 @@ fn dispatch_incoming(
                         // Defer the response-waiting onto a short-lived
                         // helper thread so we don't block the driver.
                         let state2 = state.clone();
-                        std::thread::spawn(move || match rx.recv_timeout(Duration::from_secs(5)) {
-                            Ok(Ok(body)) => handle_stack_response(body, &state2, stop_generation),
-                            _ => cancelled.store(true, Ordering::Release),
+                        std::thread::spawn(move || {
+                            let body = match rx.recv_timeout(Duration::from_secs(5)) {
+                                Ok(Ok(body)) => Some(body),
+                                _ => {
+                                    cancelled.store(true, Ordering::Release);
+                                    None
+                                }
+                            };
+                            handle_stack_response(body, &state2, stop_generation, tid);
                         });
                     } else {
                         let (lock, cvar) = &**state;
@@ -2619,9 +2625,17 @@ fn dispatch_incoming(
     }
 }
 
-fn handle_stack_response(body: Value, state: &Arc<(Mutex<State>, Condvar)>, stop_generation: u64) {
+/// A `None` body means the stackTrace request failed or was not answered;
+/// the stop is then published without a location, on the stopped thread.
+fn handle_stack_response(
+    body: Option<Value>,
+    state: &Arc<(Mutex<State>, Condvar)>,
+    stop_generation: u64,
+    thread_id: i64,
+) {
     let frames = body
-        .get("stackFrames")
+        .as_ref()
+        .and_then(|b| b.get("stackFrames"))
         .and_then(|v| v.as_array())
         .cloned()
         .unwrap_or_default();
@@ -2671,7 +2685,10 @@ fn handle_stack_response(body: Value, state: &Arc<(Mutex<State>, Condvar)>, stop
         // frames. Publish a structured placeholder only after that answer;
         // this keeps the wait ordering deterministic without inventing a
         // hit before enrichment completes.
-        s.pending_hit = Some(HitEvent::default());
+        s.pending_hit = Some(HitEvent {
+            thread: body.is_none().then(|| thread_id.to_string()),
+            ..HitEvent::default()
+        });
     }
     s.pending_action_generation = s.action_generation;
     s.enriched_stop_generation = stop_generation;
@@ -3879,6 +3896,61 @@ mod tests {
     }
 
     #[test]
+    fn a_failed_stack_trace_still_publishes_a_location_less_stop() {
+        let state = Arc::new((Mutex::new(State::new()), Condvar::new()));
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let _peer = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut pending = HashMap::new();
+        let log = LogHandle::new();
+        let mut next_seq = 100;
+        dispatch_incoming(
+            json!({"type":"event", "event":"stopped", "body":{"threadId":7}}),
+            &mut pending,
+            &state,
+            &log,
+            &mut stream,
+            &mut next_seq,
+        );
+        dispatch_incoming(
+            json!({"type":"response", "request_seq":100, "success":false, "message":"no stack"}),
+            &mut pending,
+            &state,
+            &log,
+            &mut stream,
+            &mut next_seq,
+        );
+        let (lock, cvar) = &*state;
+        // The cap only ends a failing run; a published hit wakes the wait at once.
+        let (guard, _) = cvar
+            .wait_timeout_while(lock.lock().unwrap(), Duration::from_secs(30), |s| {
+                s.pending_hit.is_none()
+            })
+            .unwrap();
+        let hit = guard
+            .pending_hit
+            .as_ref()
+            .expect("failed stackTrace published no stop");
+        assert_eq!(hit.thread.as_deref(), Some("7"));
+        assert!(hit.file.is_none() && hit.line.is_none());
+    }
+
+    #[test]
+    fn a_failed_stack_trace_for_a_superseded_stop_publishes_nothing() {
+        let state = Arc::new((Mutex::new(State::new()), Condvar::new()));
+        let (lock, _) = &*state;
+        let stale = {
+            let mut s = lock.lock().unwrap();
+            let stale = s.stop_generation.wrapping_add(1);
+            s.stop_generation = stale.wrapping_add(1);
+            assert_ne!(s.enriched_stop_generation, stale);
+            stale
+        };
+        handle_stack_response(None, &state, stale, 7);
+        assert!(lock.lock().unwrap().pending_hit.is_none());
+    }
+
+    #[test]
     fn a_consumed_stop_cannot_be_recreated_by_a_late_stack_helper() {
         let state = Arc::new((Mutex::new(State::new()), Condvar::new()));
         {
@@ -3894,7 +3966,7 @@ mod tests {
                 "source": { "path": "old.rs" }
             }]
         });
-        handle_stack_response(body.clone(), &state, 7);
+        handle_stack_response(Some(body.clone()), &state, 7, 1);
         {
             let (lock, _) = &*state;
             assert_eq!(
@@ -3911,7 +3983,7 @@ mod tests {
 
         // The daemon consumed the stop and began a later action. A delayed
         // helper from the earlier stop must not repopulate pending state.
-        handle_stack_response(body, &state, 7);
+        handle_stack_response(Some(body), &state, 7, 1);
         let (lock, _) = &*state;
         assert!(lock.lock().unwrap().pending_hit.is_none());
     }
