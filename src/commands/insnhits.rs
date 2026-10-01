@@ -1530,8 +1530,8 @@ pub mod pt {
 
     /// Errs when a bare `binary` name matches more than one candidate.
     fn find_matching_pid(binary: &str, candidates: &str, proc_root: &Path) -> Result<Option<i32>> {
-        // A target that resolves against neither cwd nor PATH, and is not
-        // absolute, can only be checked by its file name.
+        // A bare name that resolves against neither cwd nor PATH can only be
+        // checked by its file name. A path with a directory never matches by name.
         let expected = std::fs::canonicalize(binary)
             .ok()
             .or_else(|| std::fs::canonicalize(which::which(binary).ok()?).ok())
@@ -1544,7 +1544,10 @@ pub mod pt {
             let actual = Path::new(link.strip_suffix(" (deleted)").unwrap_or(&link));
             let matched = match &expected {
                 Some(expected) => actual == expected,
-                None => actual.file_name() == Path::new(binary).file_name(),
+                None => {
+                    Path::new(binary).parent() == Some(Path::new(""))
+                        && actual.file_name() == Path::new(binary).file_name()
+                }
             };
             matched.then_some(pid)
         });
@@ -1725,6 +1728,11 @@ pub mod pt {
                 Some(42)
             );
             assert_eq!(find_matching_pid(bare, "41\n", &proc_root).unwrap(), None);
+            link(44, Path::new("/usr/bin/dbg-test-myapp-not-on-path"));
+            assert_eq!(
+                find_matching_pid("build/dbg-test-myapp-not-on-path", "44\n", &proc_root).unwrap(),
+                None
+            );
             assert_eq!(
                 find_matching_pid(&gone.display().to_string(), "41\n43\n", &proc_root).unwrap(),
                 Some(43)
