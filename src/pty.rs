@@ -641,17 +641,20 @@ impl DebuggerProcess {
     /// `timeout` bounds the whole call. After a timeout, the stream is
     /// unsynchronized until a prompt arrives. The call first waits for that
     /// prompt, and for the prompts of commands written while unsynchronized,
-    /// then sends `cmd` as usual. The output before those prompts goes to
-    /// `drain_pending`. When the stale prompt does not arrive, `cmd` is
-    /// written as input to the timed-out command (for example the answer to
-    /// a `(y or n)` question) and the call returns an error without waiting
-    /// for a reply. When the deadline cuts the quiet window of a buffered
-    /// command short, the call returns an error and does not write `cmd`.
+    /// then sends `cmd` as usual. The output read by that wait goes to
+    /// `drain_pending`. When the wait reaches the prompt after it read output,
+    /// the call returns an error that holds the output and does not write
+    /// `cmd`. When the stale prompt does not arrive, `cmd` is written as input
+    /// to the timed-out command (for example the answer to a `(y or n)`
+    /// question) and the call returns an error without waiting for a reply.
+    /// When the deadline cuts the quiet window of a buffered command short,
+    /// the call returns an error and does not write `cmd`.
     pub fn send_and_wait(&self, cmd: &str, timeout: Duration) -> Result<String> {
         let deadline = Instant::now() + timeout;
         {
             let rx = self.rx.lock().unwrap();
             let mut stale = self.stale.lock().unwrap();
+            let mut resynced = BoundedOutput::new();
             loop {
                 let synchronized = self.synchronized.load(Ordering::Acquire);
                 if synchronized && self.buffered.load(Ordering::Acquire) == 0 {
@@ -664,7 +667,10 @@ impl DebuggerProcess {
                     remaining
                 };
                 match rx.recv_timeout(wait) {
-                    Ok(PtyEvent::Data(bytes)) => stale.push(&bytes),
+                    Ok(PtyEvent::Data(bytes)) => {
+                        stale.push(&bytes);
+                        resynced.push(&bytes);
+                    }
                     Ok(PtyEvent::Prompt) => self.saw_prompt(),
                     // A quiet wait cut short does not prove the buffered command was read as input.
                     Err(RecvTimeoutError::Timeout)
@@ -682,6 +688,15 @@ impl DebuggerProcess {
                         break;
                     }
                 }
+            }
+            // Output read here can hold a stop banner, which the caller must see before `cmd` runs.
+            if resynced.total > 0 && self.synchronized.load(Ordering::Acquire) {
+                bail!(
+                    "`{cmd}` was not sent: an earlier command printed this output first:\n{}",
+                    self.prompt_re
+                        .replace_all(&strip_ansi(&resynced.into_string()), "")
+                        .trim()
+                );
             }
         }
         let resync = !self.synchronized.load(Ordering::Acquire);
@@ -1142,9 +1157,7 @@ mod tests {
                 .to_string()
                 .contains("timeout")
         );
-        let reply = process
-            .send_and_wait("next", Duration::from_secs(2))
-            .unwrap();
+        let reply = send_after_resync(&process, "next", "slow-done");
         assert!(reply.contains("ran:next"), "{reply}");
         std::thread::sleep(Duration::from_millis(200));
         assert!(
@@ -1160,6 +1173,19 @@ mod tests {
                 .unwrap();
         process.wait_for_prompt(Duration::from_secs(2)).unwrap();
         process
+    }
+
+    /// Expects `cmd` to be refused because the resync read `earlier`, then sends it again.
+    fn send_after_resync(process: &DebuggerProcess, cmd: &str, earlier: &str) -> String {
+        let error = process
+            .send_and_wait(cmd, Duration::from_secs(2))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains(&format!("`{cmd}` was not sent")) && error.contains(earlier),
+            "{error}"
+        );
+        process.send_and_wait(cmd, Duration::from_secs(2)).unwrap()
     }
 
     fn assert_times_out(process: &DebuggerProcess, cmd: &str) {
@@ -1187,20 +1213,43 @@ mod tests {
     }
 
     #[test]
-    fn stop_banner_of_a_timed_out_command_reaches_drain_pending() {
-        let process = spawn_script(
-            "printf 'dbg> '; while IFS= read -r line; do if [ \"$line\" = slow ]; then sleep 0.3; printf 'Breakpoint 1, main () at a.c:3\\ndbg> '; else printf \"ran:$line\\ndbg> \"; fi; done",
+    fn stop_banner_read_by_a_resync_reaches_the_caller_before_the_next_command_runs() {
+        let temp = tempfile::tempdir().unwrap();
+        let release = temp.path().join("release");
+        let process = spawn_script(&format!(
+            r#"
+printf 'dbg> '
+while IFS= read -r line; do
+    if [ "$line" = continue1 ]; then
+        while [ ! -f '{release}' ]; do sleep 0.001; done
+        printf 'Breakpoint 1, a.c:10\ndbg> '
+    else
+        printf 'Breakpoint 2, a.c:20\ndbg> '
+    fi
+done
+"#,
+            release = release.display(),
+        ));
+        assert_times_out(&process, "continue1");
+        assert_eq!(process.drain_pending(), None);
+        std::fs::write(&release, b"release").unwrap();
+        let error = process
+            .send_and_wait("continue2", Duration::from_secs(2))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("`continue2` was not sent") && error.contains("Breakpoint 1"),
+            "{error}"
         );
-        assert_times_out(&process, "slow");
-        let reply = process
-            .send_and_wait("next", Duration::from_secs(2))
-            .unwrap();
         let drained = process.drain_pending().unwrap_or_default();
         assert!(
-            reply.contains("Breakpoint 1") || drained.contains("Breakpoint 1"),
-            "reply: {reply}; drained: {drained}"
+            drained.contains("Breakpoint 1") && !drained.contains("Breakpoint 2"),
+            "{drained}"
         );
-        assert!(reply.contains("ran:next"), "{reply}");
+        let reply = process
+            .send_and_wait("continue2", Duration::from_secs(2))
+            .unwrap();
+        assert_eq!(reply, "Breakpoint 2, a.c:20");
     }
 
     #[test]
@@ -1212,7 +1261,7 @@ mod tests {
         assert_times_out(&process, "slow");
         process
             .send_and_wait("next", Duration::from_secs(5))
-            .unwrap();
+            .unwrap_err();
         let drained = process.drain_pending().unwrap();
         assert!(
             drained.len() <= MAX_COMMAND_OUTPUT_BYTES,
@@ -1233,7 +1282,7 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("timed-out command"), "{error}");
-        let reply = process.send_and_wait("b", Duration::from_secs(2)).unwrap();
+        let reply = send_after_resync(&process, "b", "ran:a");
         assert!(
             reply.contains("ran:b") && !reply.contains("ran:a"),
             "{reply}"
@@ -1288,7 +1337,7 @@ done
             .to_string();
         assert!(error.contains("`b` was not sent"), "{error}");
         std::fs::write(&release_a, b"release").unwrap();
-        let reply = process.send_and_wait("c", Duration::from_secs(2)).unwrap();
+        let reply = send_after_resync(&process, "c", "ran:a");
         assert!(
             reply.contains("ran:c") && !reply.contains("ran:b"),
             "{reply}"
