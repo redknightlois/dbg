@@ -45,6 +45,7 @@ fn main() -> Result<()> {
             Ok(())
         }
         "--from" => cmd_from(&cli.args[1..]),
+        "codegen" => cmd_codegen(&cli.args[1..]),
         "help" | "--help" | "-h" => {
             print_usage();
             Ok(())
@@ -62,7 +63,8 @@ fn print_usage() {
     println!("  gdbg --from <name>              Reload a saved session");
     println!("  gdbg list                       List saved sessions");
     println!("  gdbg diff <a> <b>               Diff two saved sessions");
-    println!("  gdbg check                      Check tool dependencies\n");
+    println!("  gdbg check                      Check tool dependencies");
+    println!("  gdbg codegen <action> ...       Build, capture and diff CUDA PTX/SASS\n");
     println!("Targets:");
     println!("  ./cuda_app                      CUDA binary (nsys + ncu)");
     println!("  train.py                        PyTorch script (nsys + ncu + torch.profiler)");
@@ -74,6 +76,20 @@ fn print_usage() {
     println!("  3. Op mapping (torch/proton)    — which Python op launched which kernel\n");
     println!("Session data is stored in a SQLite database — no reparsing needed.");
     println!("Type 'help' in the REPL for full command list.");
+}
+
+/// Runs the embedded stdlib-only Python helper; it owns argument parsing and exit codes.
+fn cmd_codegen(args: &[String]) -> Result<()> {
+    let python = std::env::var("GDBG_PYTHON").unwrap_or_else(|_| "python3".into());
+    let status = std::process::Command::new(&python)
+        .args(["-I", "-c", include_str!("codegen.py")])
+        .args(args)
+        .env("GDBG_CODEGEN_CAPTURE_C", include_str!("codegen_capture.c"))
+        .status()
+        .with_context(|| {
+            format!("cannot run {python}; set GDBG_PYTHON to a Python 3 interpreter")
+        })?;
+    std::process::exit(status.code().unwrap_or(1));
 }
 
 fn cmd_diff(args: &[String]) -> Result<()> {

@@ -10,7 +10,10 @@ gdbg --from <name>       # reload a saved session
 gdbg list                # list saved sessions
 gdbg diff <a> <b>        # compare two saved sessions
 gdbg check               # verify dependencies are installed
+gdbg codegen ...         # build, capture, diff and archive CUDA PTX/SASS
 ```
+
+For kernel machine code (offline PTX/SASS builds for an explicit target, loaded-module capture, structured diffs and the reference archive), see [`gdbg-codegen.md`](./gdbg-codegen.md).
 
 ## Preconditions
 

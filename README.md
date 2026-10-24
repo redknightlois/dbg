@@ -181,7 +181,10 @@ Data tables print a header followed by ` | ` separated rows. Names, paths and ti
 gdbg train.py          # collect + analyze
 gdbg --from baseline   # reload a saved session
 gdbg check             # verify nsys/ncu are installed
+gdbg codegen compare --arch sm_90 --out cmp ref.cu cand.cu   # structured PTX/SASS diff
 ```
+
+`gdbg codegen` builds PTX, cubin and SASS for an explicit target from `.cu` files or `torch` `load_inline` calls (read statically, never executed), captures the cubins a workload loads, diffs them per kernel, and archives accepted references with a required-kernel inventory. See [`skills/references/adapters/gdbg-codegen.md`](skills/references/adapters/gdbg-codegen.md).
 
 Run `dbg` with no arguments to see which backends are ready on your machine.
 

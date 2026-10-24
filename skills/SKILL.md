@@ -12,7 +12,8 @@ description: >
   "what instructions", "is it vectorized", "check codegen", "show assembly",
   "SIMD", "bounds checks", "jitdasm", "diff two runs", "regression hunt",
   "GPU", "CUDA", "kernel", "training is slow", "optimize GPU", "roofline",
-  "occupancy", "memory bound", "compute bound", "kernel fusion".
+  "occupancy", "memory bound", "compute bound", "kernel fusion", "PTX", "SASS",
+  "cubin", "compare kernel codegen".
   Also use when you would otherwise guess at runtime state, add print statements,
   or rewrite code without runtime evidence.
 ---
@@ -34,6 +35,7 @@ Match the backend to the question, not only the language:
 | Profile Python, Node, Go, or .NET | `pyprofile`, `nodeprof`, `pprof`, or `dotnet-trace` |
 | Inspect .NET JIT code | `jitdasm` |
 | Profile CUDA, PyTorch, Triton, JAX, or GPU kernels | `gdbg` |
+| Inspect or compare CUDA PTX, SASS, or loaded cubins | `gdbg codegen` |
 
 Use `dbg start` auto-detection only for the default debugger. Pass the backend
 explicitly for profiling, memory analysis, or JIT inspection. Never run
@@ -47,6 +49,7 @@ Load only the material needed for the current investigation:
 |---|---|
 | Start a specific debugger or profiler | The matching file under `references/adapters/` |
 | Profile GPU code | `references/adapters/gdbg.md` |
+| Inspect or compare CUDA machine code | `references/adapters/gdbg-codegen.md` |
 | Check exact canonical command support or translation | `references/adapters/_canonical-commands.md` |
 | Plan an ambiguous, intermittent, comparative, or CPU/GPU investigation | `references/adapters/_taxonomy-debug.md` |
 

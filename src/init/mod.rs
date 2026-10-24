@@ -6,7 +6,7 @@ use crate::backend::Registry;
 
 const SKILL_MD: &str = include_str!("../../skills/SKILL.md");
 const VERSION: &str = env!("CARGO_PKG_VERSION");
-const SHARED_ADAPTERS: [(&str, &str); 3] = [
+const SHARED_ADAPTERS: [(&str, &str); 4] = [
     (
         "_canonical-commands.md",
         include_str!("../../skills/references/adapters/_canonical-commands.md"),
@@ -18,6 +18,10 @@ const SHARED_ADAPTERS: [(&str, &str); 3] = [
     (
         "gdbg.md",
         include_str!("../../skills/references/adapters/gdbg.md"),
+    ),
+    (
+        "gdbg-codegen.md",
+        include_str!("../../skills/references/adapters/gdbg-codegen.md"),
     ),
 ];
 
@@ -228,7 +232,12 @@ mod tests {
     fn bundled_adapters_include_shared_references() {
         let registry = Registry::new();
         let adapters = bundled_adapters(&registry);
-        for name in ["_canonical-commands.md", "_taxonomy-debug.md", "gdbg.md"] {
+        for name in [
+            "_canonical-commands.md",
+            "_taxonomy-debug.md",
+            "gdbg.md",
+            "gdbg-codegen.md",
+        ] {
             assert!(adapters.iter().any(|(filename, _)| *filename == name));
         }
     }

@@ -41,6 +41,12 @@ Self-contained "broken" programs paired with an `instructions.md` describing the
 | 23 | Bandwidth-bound elementwise kernel mistaken for compute-bound | CUDA | gdbg / ncu roofline, DRAM throughput |
 | 24 | Hardcoded tile sizes regress on production shapes | Triton | gdbg / ncu occupancy + autotune |
 
+### GPU codegen (26)
+
+| # | Scenario | Stack | Surface exercised |
+|---|---|---|---|
+| 26 | "Pure refactor" changes the sm_90 machine code | CUDA via `load_inline` | gdbg codegen / PTX and SASS structured diff |
+
 ## How to use a scenario
 
 ```bash
