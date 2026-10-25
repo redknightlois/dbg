@@ -878,7 +878,9 @@ fn nsys_copy_kinds_and_unified_memory_faults_preserve_their_contract() {
         "CREATE TABLE CUPTI_ACTIVITY_KIND_MEMCPY (
             copyKind INTEGER, start INTEGER, end INTEGER, bytes INTEGER, streamId INTEGER);
          CREATE TABLE CUDA_UM_GPU_PAGE_FAULT_EVENTS (numberOfPageFaults INTEGER);
-         INSERT INTO CUDA_UM_GPU_PAGE_FAULT_EVENTS VALUES (4), (7);",
+         INSERT INTO CUDA_UM_GPU_PAGE_FAULT_EVENTS VALUES (4), (7);
+         CREATE TABLE NVTX_EVENTS (text TEXT, start INTEGER, end INTEGER);
+         INSERT INTO NVTX_EVENTS VALUES ('CCCL', -1000, NULL), ('candidate', 1000, 2000);",
     )
     .unwrap();
     let kinds = [
@@ -916,6 +918,11 @@ fn nsys_copy_kinds_and_unified_memory_faults_preserve_their_contract() {
     let summary: serde_json::Value =
         serde_json::from_str(&db.meta(&format!("nsys_um_gpu_faults_{layer}"))).unwrap();
     assert_eq!(summary, serde_json::json!({"events": 2, "page_faults": 11}));
+    assert_eq!(db.scalar_f64("SELECT COUNT(*) FROM regions"), 1.0);
+    assert_eq!(
+        db.scalar_f64("SELECT duration_us FROM regions WHERE name='candidate'"),
+        1.0
+    );
     commands::cmd_transfers(&db, &[]);
 
     src.execute("INSERT INTO CUDA_UM_GPU_PAGE_FAULT_EVENTS VALUES (-1)", [])
@@ -933,7 +940,7 @@ fn nsys_copy_kinds_and_unified_memory_faults_preserve_their_contract() {
     );
     assert_eq!(db.scalar_f64("SELECT COUNT(*) FROM layers"), 1.0);
     assert_eq!(db.transfer_count(), kinds.len());
-    src.execute_batch("DELETE FROM CUPTI_ACTIVITY_KIND_MEMCPY; DELETE FROM CUDA_UM_GPU_PAGE_FAULT_EVENTS WHERE numberOfPageFaults < 0;").unwrap();
+    src.execute_batch("DELETE FROM CUPTI_ACTIVITY_KIND_MEMCPY; DELETE FROM NVTX_EVENTS; DELETE FROM CUDA_UM_GPU_PAGE_FAULT_EVENTS WHERE numberOfPageFaults < 0;").unwrap();
     let faults_only = db
         .import_layer(
             "nsys",

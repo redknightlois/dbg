@@ -364,7 +364,7 @@ fn import_nvtx_regions(dest: &Connection, src: &Connection, layer_id: i64) -> Re
 
     let mut read = src.prepare(&format!(
         "SELECT text, start, end FROM {table}
-         WHERE text IS NOT NULL
+         WHERE text IS NOT NULL AND end IS NOT NULL
          ORDER BY start LIMIT {MAX_NSYS_ROWS_PLUS_ONE}"
     ))?;
 
