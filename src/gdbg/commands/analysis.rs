@@ -2,7 +2,7 @@ use std::path::Path;
 
 use super::{
     GpuDb, compute_gpu_gaps, detect_warmup_count, find_hottest_window, fmt_bytes, fmt_us,
-    like_param, merge_intervals, parse_count, parse_pattern, require_op_layer, trunc,
+    like_param, merge_intervals, parse_count, parse_pattern, require_op_layer,
 };
 use rusqlite::params_from_iter;
 
@@ -120,12 +120,11 @@ pub fn cmd_roofline(db: &GpuDb, args: &[&str]) {
         }
     };
 
-    println!("  Kernel                            Bound     Compute%  Memory%   Occupancy");
-    println!("  ────────────────────────────────── ──────── ──────── ──────── ──────────");
+    println!("Kernel | Bound | Compute% | Memory% | Occupancy");
     for (name, bound, cmp, mem, occ) in &rows {
         println!(
-            "  {:<34} {:<8} {:>7.1}% {:>7.1}% {:>8}",
-            trunc(name, 34),
+            "{} | {} | {:.1}% | {:.1}% | {}",
+            name,
             bound.as_deref().unwrap_or("?"),
             cmp.unwrap_or(0.0),
             mem.unwrap_or(0.0),
@@ -158,8 +157,7 @@ pub fn cmd_occupancy(db: &GpuDb, args: &[&str]) {
             Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
         });
 
-    println!("  Kernel                            Occupancy  Regs  ShmemK  Limiting");
-    println!("  ────────────────────────────────── ───────── ───── ─────── ────────");
+    println!("Kernel | Occupancy | Regs | ShmemK | Limiting");
     for (name, occ, regs, shmem) in &rows {
         let limit = if regs.unwrap_or(0) > 64 {
             "registers"
@@ -169,8 +167,8 @@ pub fn cmd_occupancy(db: &GpuDb, args: &[&str]) {
             "block size"
         };
         println!(
-            "  {:<34} {:>8.1}% {:>5} {:>6}  {}",
-            trunc(name, 34),
+            "{} | {:.1}% | {} | {} | {}",
+            name,
             occ,
             regs.map(|v| v.to_string()).unwrap_or_else(|| "?".into()),
             shmem
@@ -298,12 +296,8 @@ pub fn cmd_warmup(db: &GpuDb) {
             0.0
         };
 
-        println!(
-            "  Warmup: {} ({})\n",
-            trunc(kernel_name, 50),
-            fmt_us(steady_median)
-        );
-        println!("  Launch   Duration    Cumulative");
+        println!("  Warmup: {} ({})\n", kernel_name, fmt_us(steady_median));
+        println!("Launch | Duration | Cumulative");
         let mut cumulative = 0.0;
         let show = (warmup_end + 3).min(launches.len());
         for (i, (_, dur)) in launches.iter().take(show).enumerate() {
@@ -316,7 +310,7 @@ pub fn cmd_warmup(db: &GpuDb) {
                 ""
             };
             println!(
-                "  {:<6}   {:>10}  {:>10}{marker}",
+                "{} | {} | {}{marker}",
                 i + 1,
                 fmt_us(*dur),
                 fmt_us(cumulative)
@@ -392,13 +386,12 @@ pub fn cmd_small(db: &GpuDb, args: &[&str]) {
     let total_time: f64 = rows.iter().map(|r| r.3).sum();
 
     println!("  Short Kernels (avg < {threshold_us:.0}us):\n");
-    println!("  #  Kernel                            Avg       Launches  Total");
-    println!("  ── ────────────────────────────────── ───────── ──────── ─────────");
+    println!("# | Kernel | Avg | Launches | Total");
     for (i, (name, cnt, avg, total)) in rows.iter().enumerate() {
         println!(
-            "  {:<2} {:<34} {:>9} {:>8} {:>9}",
+            "{} | {} | {} | {} | {}",
             i + 1,
-            trunc(name, 34),
+            name,
             fmt_us(*avg),
             cnt,
             fmt_us(*total)
@@ -470,16 +463,15 @@ pub fn cmd_fuse(db: &GpuDb, args: &[&str]) {
     let total_gap: f64 = rows.iter().map(|r| r.2).sum();
 
     println!("  Sequential Launch Candidates (same stream, < 5us gap):\n");
-    println!("  #  Kernel A → Kernel B                              Count  Avg Gap  Type");
-    println!("  ── ──────────────────────────────────────────────── ────── ──────── ─────────");
+    println!("# | Kernel A → Kernel B | Count | Avg Gap | Type");
     for (i, ((a, b), (gap_sum, _, count))) in sorted.iter().enumerate() {
         let avg_gap = gap_sum / *count as f64;
         let kind = if a == b { "batch" } else { "fuse" };
         println!(
-            "  {:<2} {} → {}  {:>5}  {:>7}  {}",
+            "{} | {} → {} | {} | {} | {}",
             i + 1,
-            trunc(a, 24),
-            trunc(b, 24),
+            a,
+            b,
             count,
             fmt_us(avg_gap),
             kind
@@ -581,17 +573,11 @@ fn detect_kernel_sequences(db: &GpuDb, limit: usize) {
     sorted.truncate(limit);
 
     println!("\n  Repeating Kernel Sequences (CUDA graph candidates):\n");
-    println!("  #  Length  Reps    GPU Time     Sequence");
-    println!("  ── ─────── ─────── ──────────── ─────────────────────────────────────────");
+    println!("# | Length | Reps | GPU Time | Sequence");
     for (i, (_, f)) in sorted.iter().enumerate() {
-        let seq = f
-            .names
-            .iter()
-            .map(|n| trunc(n, 20))
-            .collect::<Vec<_>>()
-            .join(" → ");
+        let seq = f.names.join(" → ");
         println!(
-            "  {:<2} {:>7} {:>7} {:>12} {}",
+            "{} | {} | {} | {} | {}",
             i + 1,
             f.names.len(),
             f.reps,
@@ -638,8 +624,7 @@ pub fn cmd_concurrency(db: &GpuDb) {
         );
     } else {
         println!("  {} streams active:\n", streams.len());
-        println!("  Stream  Launches  Active Time  % of Total");
-        println!("  ─────── ──────── ──────────── ──────────");
+        println!("Stream | Launches | Active Time | % of Total");
         let gpu_total = db.total_gpu_time_us();
         for (sid, cnt, total) in &streams {
             let pct = if gpu_total > 0.0 {
@@ -647,13 +632,7 @@ pub fn cmd_concurrency(db: &GpuDb) {
             } else {
                 0.0
             };
-            println!(
-                "  {:>6}  {:>7}  {:>11}  {:>9.1}%",
-                sid,
-                cnt,
-                fmt_us(*total),
-                pct
-            );
+            println!("{} | {} | {} | {:.1}%", sid, cnt, fmt_us(*total), pct);
         }
         println!();
     }
@@ -729,14 +708,9 @@ pub fn cmd_hotpath(db: &GpuDb) {
     }
 
     println!("  Operator CPU totals (inclusive; nested operations can overlap):\n");
-    println!("  Op                               CPU Time   Attributed GPU Time");
+    println!("Op | CPU Time | Attributed GPU Time");
     for (name, cpu, gpu, _) in &ops {
-        println!(
-            "  {:<34} {:>9} {:>9}",
-            trunc(name, 34),
-            fmt_us(*cpu),
-            fmt_us(*gpu)
-        );
+        println!("{} | {} | {}", name, fmt_us(*cpu), fmt_us(*gpu));
     }
     println!(
         "\n  Separate profiler runs can cover different regions. Operator totals do not establish the elapsed critical path or CPU/GPU boundedness."
@@ -768,20 +742,14 @@ pub fn cmd_compare_ops(db: &GpuDb, args: &[&str]) {
     }
 
     println!("  Operator CPU time and attributed GPU time:\n");
-    println!("  Op                               CPU Time   GPU Time   CPU/GPU ratio");
+    println!("Op | CPU Time | GPU Time | CPU/GPU ratio");
     for (name, cpu, gpu) in &ops {
         let ratio = if *gpu > 0.0 {
             format!("{:.1}:1", cpu / gpu)
         } else {
             "unmapped".into()
         };
-        println!(
-            "  {:<34} {:>9} {:>9} {:>12}",
-            trunc(name, 34),
-            fmt_us(*cpu),
-            fmt_us(*gpu),
-            ratio
-        );
+        println!("{} | {} | {} | {}", name, fmt_us(*cpu), fmt_us(*gpu), ratio);
     }
     println!(
         "\n  Inclusive operator times can overlap; cross-capture ratios are not GPU utilization or bottleneck measurements."
@@ -826,8 +794,7 @@ pub fn cmd_top_ops(db: &GpuDb, args: &[&str]) {
 
     let total_gpu = db.total_gpu_time_us();
     println!("  Ops by GPU Time:\n");
-    println!("  #  Op                               GPU Time   % GPU    CPU Time   Ratio");
-    println!("  ── ───────────────────────────────── ────────── ──────── ────────── ──────");
+    println!("# | Op | GPU Time | % GPU | CPU Time | Ratio");
     for (i, (name, cpu, gpu, _)) in rows.iter().enumerate() {
         let pct = if total_gpu > 0.0 {
             gpu / total_gpu * 100.0
@@ -840,9 +807,9 @@ pub fn cmd_top_ops(db: &GpuDb, args: &[&str]) {
             "∞".into()
         };
         println!(
-            "  {:<2} {:<34} {:>9} {:>7.1}% {:>9} {:>6}",
+            "{} | {} | {} | {:.1}% | {} | {}",
             i + 1,
-            trunc(name, 34),
+            name,
             fmt_us(*gpu),
             pct,
             fmt_us(*cpu),
@@ -908,8 +875,7 @@ pub fn cmd_breakdown(db: &GpuDb, args: &[&str]) {
 
         let kernel_total: f64 = kernels.iter().map(|k| k.2).sum();
         println!("  Kernels ({} total GPU time):\n", fmt_us(kernel_total));
-        println!("    Kernel                            Total      %     Avg       Launches");
-        println!("    ────────────────────────────────── ───────── ────── ───────── ────────");
+        println!("Kernel | Total | % | Avg | Launches");
         for (kname, launches, total, avg) in &kernels {
             let pct = if kernel_total > 0.0 {
                 total / kernel_total * 100.0
@@ -917,8 +883,8 @@ pub fn cmd_breakdown(db: &GpuDb, args: &[&str]) {
                 0.0
             };
             println!(
-                "    {:<34} {:>9} {:>5.1}% {:>9} {:>7}",
-                trunc(kname, 34),
+                "{} | {} | {:.1}% | {} | {}",
+                kname,
                 fmt_us(*total),
                 pct,
                 fmt_us(*avg),
@@ -1113,11 +1079,7 @@ pub fn cmd_outliers(db: &GpuDb, args: &[&str]) {
     let t_max = launches.last().map(|(s, d)| *s + *d).unwrap_or(0.0);
     let span = t_max - t_min;
 
-    println!(
-        "  Outliers: {} ({} launches)\n",
-        trunc(&name, 60),
-        total_cnt
-    );
+    println!("  Outliers: {} ({} launches)\n", &name, total_cnt);
     println!("  Distribution:");
     println!(
         "    median: {}   p90: {}   p99: {}   max: {}",
@@ -1136,8 +1098,7 @@ pub fn cmd_outliers(db: &GpuDb, args: &[&str]) {
         top_n,
         top_n as f64 / cnt as f64 * 100.0
     );
-    println!("  #   Idx   Timeline     Start        Duration    vs median");
-    println!("  ─── ───── ──────────── ──────────── ─────────── ─────────");
+    println!("# | Idx | Timeline | Start | Duration | vs median");
     for (i, &(idx, start, dur)) in outliers.iter().enumerate() {
         let tpos = if span > 0.0 {
             (start - t_min) / span * 100.0
@@ -1146,7 +1107,7 @@ pub fn cmd_outliers(db: &GpuDb, args: &[&str]) {
         };
         let ratio = dur / median.max(1e-9);
         println!(
-            "  {:<3} {:>5} {:>11.1}% {:>12} {:>11} {:>7.1}x",
+            "{} | {} | {:.1}% | {} | {} | {:.1}x",
             i + 1,
             idx,
             tpos,
@@ -1220,23 +1181,10 @@ pub fn cmd_source(db: &GpuDb, args: &[&str]) {
     }
 
     println!("  Launch sites for kernels matching '{pattern}':\n");
-    println!("  Op                                       Hits  GPU Time    Source");
-    println!(
-        "  ──────────────────────────────────────── ───── ─────────── ──────────────────────────────"
-    );
+    println!("Op | Hits | GPU Time | Source");
     for (name, mp, hits, gpu_us) in &rows {
-        let src = if mp.is_empty() {
-            "—".to_string()
-        } else {
-            trunc(mp, 40)
-        };
-        println!(
-            "  {:<40} {:>5} {:>11} {}",
-            trunc(name, 40),
-            hits,
-            fmt_us(*gpu_us),
-            src
-        );
+        let src = if mp.is_empty() { "—" } else { mp.as_str() };
+        println!("{} | {} | {} | {}", name, hits, fmt_us(*gpu_us), src);
     }
 }
 
@@ -1338,8 +1286,7 @@ pub fn cmd_memory(db: &GpuDb, args: &[&str]) {
     });
     if !bigs.is_empty() {
         println!("  Largest Allocations:");
-        println!("  #  Size         Start        Lifetime");
-        println!("  ── ──────────── ──────────── ──────────────");
+        println!("# | Size | Start | Lifetime");
         for (i, (addr, bytes, start)) in bigs.iter().enumerate() {
             let lifetime = db
                 .conn
@@ -1356,7 +1303,7 @@ pub fn cmd_memory(db: &GpuDb, args: &[&str]) {
                 .map(|fr| fmt_us(fr - *start))
                 .unwrap_or_else(|| "no free recorded".into());
             println!(
-                "  {:<2} {:>12} {:>12} {}",
+                "{} | {} | {} | {}",
                 i + 1,
                 fmt_bytes(*bytes),
                 fmt_us(*start),
@@ -1428,12 +1375,7 @@ pub fn cmd_bandwidth(db: &GpuDb, args: &[&str]) {
     let time_of: std::collections::HashMap<String, f64> = time_rows.into_iter().collect();
 
     println!("  Per-kernel Memory Bandwidth:\n");
-    println!(
-        "  #  Kernel                            Achieved     Peak       % peak  Bound    GPU Time"
-    );
-    println!(
-        "  ── ────────────────────────────────── ──────────── ────────── ─────── ──────── ──────────"
-    );
+    println!("# | Kernel | Achieved | Peak | % peak | Bound | GPU Time");
     let shown = rows.iter().take(n);
     let mut flagged = 0usize;
     for (i, (name, ach, peak, bound)) in shown.enumerate() {
@@ -1453,9 +1395,9 @@ pub fn cmd_bandwidth(db: &GpuDb, args: &[&str]) {
             _ => "",
         };
         println!(
-            "  {:<2} {:<34} {:>9.1} GB/s {:>6} GB/s {:>6}  {:<8} {:>10}{flag}",
+            "{} | {} | {:.1} GB/s {} GB/s {} | {} | {}{flag}",
             i + 1,
-            trunc(name, 34),
+            name,
             ach,
             peak_str,
             pct_str,
@@ -1571,27 +1513,19 @@ pub fn cmd_critical_path(db: &GpuDb, args: &[&str]) {
     let mut ranked: Vec<_> = agg.into_iter().collect();
     ranked.sort_by(|a, b| b.1.1.partial_cmp(&a.1.1).unwrap());
     println!("\n  Top kernels on chain:");
-    println!("  Kernel                                     Launches  Time       % chain");
-    println!("  ────────────────────────────────────────── ──────── ────────── ────────");
+    println!("Kernel | Launches | Time | % chain");
     for (name, (cnt, total)) in ranked.iter().take(8) {
         let pct = if best.kernel_time > 0.0 {
             total / best.kernel_time * 100.0
         } else {
             0.0
         };
-        println!(
-            "  {:<42} {:>8} {:>10} {:>6.1}%",
-            trunc(name, 42),
-            cnt,
-            fmt_us(*total),
-            pct
-        );
+        println!("{} | {} | {} | {:.1}%", name, cnt, fmt_us(*total), pct);
     }
 
     if chains.len() > 1 {
         println!("\n  Other long chains:");
-        println!("  #  Stream  Span        Active      Util   Kernels");
-        println!("  ── ─────── ─────────── ─────────── ────── ────────");
+        println!("# | Stream | Span | Active | Util | Kernels");
         for (i, c) in chains.iter().skip(1).take(5).enumerate() {
             let span = c.end - c.start;
             let util = if span > 0.0 {
@@ -1600,7 +1534,7 @@ pub fn cmd_critical_path(db: &GpuDb, args: &[&str]) {
                 0.0
             };
             println!(
-                "  {:<2} {:>7} {:>11} {:>11} {:>5.0}% {:>7}",
+                "{} | {} | {} | {} | {:.0}% | {}",
                 i + 2,
                 c.stream,
                 fmt_us(span),
@@ -1703,7 +1637,7 @@ pub fn cmd_stream_graph(db: &GpuDb, args: &[&str]) {
             }
         }
         let row: String = line.into_iter().collect();
-        println!("  s{:<4} │{row}│", stream);
+        println!("  s{} │{row}│", stream);
     }
     let axis: String = "─".repeat(width);
     println!("        └{axis}┘");
@@ -1711,7 +1645,7 @@ pub fn cmd_stream_graph(db: &GpuDb, args: &[&str]) {
     println!("\n  Legend:");
     for (i, (name, total)) in kernel_rank.iter().take(glyphs.len().min(20)).enumerate() {
         let g = glyphs.get(i).copied().unwrap_or('*');
-        println!("    {g}  {:<50} {}", trunc(name, 50), fmt_us(*total));
+        println!("{g} | {} | {}", name, fmt_us(*total));
     }
     if kernel_rank.len() > 20 {
         println!("    ({} more kernels not shown)", kernel_rank.len() - 20);
@@ -1726,7 +1660,7 @@ pub fn cmd_hotspot(db: &GpuDb, args: &[&str]) {
     let window_us: f64 = match args.first().and_then(|s| s.parse::<f64>().ok()) {
         Some(v) if v > 0.0 => v,
         _ => {
-            println!("usage: hotspot <window_us>  (e.g. 10000 for 10ms)");
+            println!("usage: hotspot <window_us> | (e.g. 10000 for 10ms)");
             return;
         }
     };
@@ -1771,17 +1705,10 @@ pub fn cmd_hotspot(db: &GpuDb, args: &[&str]) {
     let mut ranked: Vec<_> = agg.into_iter().collect();
     ranked.sort_by(|a, b| b.1.1.partial_cmp(&a.1.1).unwrap());
 
-    println!("\n  Kernel                                     Launches  Time in window  % busy");
-    println!("  ────────────────────────────────────────── ──────── ─────────────── ───────");
+    println!("\n | Kernel | Launches | Time in window | % busy");
     for (name, (cnt, t)) in ranked.iter().take(15) {
         let pct = if busy > 0.0 { t / busy * 100.0 } else { 0.0 };
-        println!(
-            "  {:<42} {:>8} {:>15} {:>6.1}%",
-            trunc(name, 42),
-            cnt,
-            fmt_us(*t),
-            pct
-        );
+        println!("{} | {} | {} | {:.1}%", name, cnt, fmt_us(*t), pct);
     }
 }
 
@@ -1840,12 +1767,11 @@ pub fn cmd_launches(db: &GpuDb, args: &[&str]) {
 
     println!(
         "  Launches of {} ({} total, showing {})\n",
-        trunc(&name, 70),
+        &name,
         cnt,
         rows.len()
     );
-    println!("  #    Start         Duration    Gap        Stream  Grid            Block");
-    println!("  ──── ───────────── ─────────── ────────── ─────── ─────────────── ───────────────");
+    println!("# | Start | Duration | Gap | Stream | Grid | Block");
     let mut prev_end: Option<f64> = None;
     for (i, (start, dur, gx, gy, gz, bx, by, bz, sid)) in rows.iter().enumerate() {
         let gap = prev_end.map(|e| start - e);
@@ -1868,14 +1794,14 @@ pub fn cmd_launches(db: &GpuDb, args: &[&str]) {
         };
         let sid_s = sid.map(|s| s.to_string()).unwrap_or_else(|| "?".into());
         println!(
-            "  {:<4} {:>13} {:>11} {:>10} {:>7} {:<15} {:<15}",
+            "{} | {} | {} | {} | {} | {} | {}",
             i + 1,
             fmt_us(*start),
             fmt_us(*dur),
             gap_s,
             sid_s,
-            trunc(&grid, 15),
-            trunc(&block, 15)
+            &grid,
+            &block
         );
         prev_end = Some(start + dur);
     }
@@ -1986,15 +1912,14 @@ pub fn cmd_compare(db: &GpuDb, args: &[&str]) {
     let stddev = |var: f64| var.max(0.0).sqrt();
     let cv = |mean: f64, var: f64| if mean > 0.0 { stddev(var) / mean } else { 0.0 };
 
-    println!("  Kernel A: {}", trunc(&a.0, 70));
-    println!("  Kernel B: {}\n", trunc(&b.0, 70));
-    println!("  Metric            A                 B                 Ratio B/A");
-    println!("  ────────────────  ────────────────  ────────────────  ──────────");
+    println!("  Kernel A: {}", &a.0);
+    println!("  Kernel B: {}\n", &b.0);
+    println!("Metric | A | B | Ratio B/A");
     let row = |label: &str, va: String, vb: String, ratio: Option<f64>| {
         let r = ratio
             .map(|r| format!("{r:.2}x"))
             .unwrap_or_else(|| "—".into());
-        println!("  {:<16}  {:<16}  {:<16}  {r}", label, va, vb);
+        println!("{} | {} | {} | {r}", label, va, vb);
     };
     row(
         "Launches",
@@ -2039,31 +1964,11 @@ pub fn cmd_compare(db: &GpuDb, args: &[&str]) {
         let fmt_opt_s = |v: Option<String>| v.unwrap_or_else(|| "?".into());
         let (oa, ca, mma, ba, bda) = ma.unwrap_or((None, None, None, None, None));
         let (ob, cb, mmb, bb, bdb) = mb.unwrap_or((None, None, None, None, None));
-        println!(
-            "  Occupancy        {:<16}  {:<16}",
-            fmt_opt_pct(oa),
-            fmt_opt_pct(ob)
-        );
-        println!(
-            "  Compute tput     {:<16}  {:<16}",
-            fmt_opt_pct(ca),
-            fmt_opt_pct(cb)
-        );
-        println!(
-            "  Memory tput      {:<16}  {:<16}",
-            fmt_opt_pct(mma),
-            fmt_opt_pct(mmb)
-        );
-        println!(
-            "  Bandwidth        {:<16}  {:<16}",
-            fmt_opt_bw(ba),
-            fmt_opt_bw(bb)
-        );
-        println!(
-            "  Boundedness      {:<16}  {:<16}",
-            fmt_opt_s(bda),
-            fmt_opt_s(bdb)
-        );
+        println!("Occupancy | {} | {}", fmt_opt_pct(oa), fmt_opt_pct(ob));
+        println!("Compute tput | {} | {}", fmt_opt_pct(ca), fmt_opt_pct(cb));
+        println!("Memory tput | {} | {}", fmt_opt_pct(mma), fmt_opt_pct(mmb));
+        println!("Bandwidth | {} | {}", fmt_opt_bw(ba), fmt_opt_bw(bb));
+        println!("Boundedness | {} | {}", fmt_opt_s(bda), fmt_opt_s(bdb));
     }
 }
 
@@ -2197,12 +2102,7 @@ pub fn cmd_regressions(db: &GpuDb, args: &[&str]) {
             return;
         }
         println!("  {label} ({})", v.len());
-        println!(
-            "  Kernel                                     Before      After       Delta        %       Launches"
-        );
-        println!(
-            "  ────────────────────────────────────────── ─────────── ─────────── ──────────── ──────── ─────────"
-        );
+        println!("Kernel | Before | After | Delta | % | Launches");
         for c in v.iter().take(15) {
             let sign = if c.delta_us >= 0.0 { "+" } else { "" };
             let launches = if c.before_cnt == c.after_cnt {
@@ -2211,8 +2111,8 @@ pub fn cmd_regressions(db: &GpuDb, args: &[&str]) {
                 format!("{}→{}", c.before_cnt, c.after_cnt)
             };
             println!(
-                "  {:<42} {:>11} {:>11} {:>11} {sign}{:>6.1}% {:>9}",
-                trunc(&c.name, 42),
+                "{} | {} | {} | {} | {sign}{:.1}% | {}",
+                &c.name,
                 fmt_us(c.before),
                 fmt_us(c.after),
                 fmt_us(c.delta_us.abs()),
@@ -2229,7 +2129,7 @@ pub fn cmd_regressions(db: &GpuDb, args: &[&str]) {
         println!("  NEW kernels in current run ({}):", new_kernels.len());
         new_kernels.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
         for (n, t, c) in new_kernels.iter().take(10) {
-            println!("    + {:<50} {} ({} launches)", trunc(n, 50), fmt_us(*t), c);
+            println!("+ {} | {} ({} launches)", n, fmt_us(*t), c);
         }
         println!();
     }
@@ -2237,7 +2137,7 @@ pub fn cmd_regressions(db: &GpuDb, args: &[&str]) {
         println!("  GONE from current run ({}):", gone_kernels.len());
         gone_kernels.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
         for (n, t, c) in gone_kernels.iter().take(10) {
-            println!("    - {:<50} {} ({} launches)", trunc(n, 50), fmt_us(*t), c);
+            println!("- {} | {} ({} launches)", n, fmt_us(*t), c);
         }
         println!();
     }

@@ -57,15 +57,6 @@ pub(crate) fn fmt_bytes(b: i64) -> String {
     }
 }
 
-pub(crate) fn trunc(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        s.to_string()
-    } else {
-        let end: String = s.chars().take(max - 3).collect();
-        format!("{end}...")
-    }
-}
-
 /// Escape regex metacharacters in a kernel name for use in ncu `--kernel-name "regex:..."`.
 pub(crate) fn escape_regex(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 8);

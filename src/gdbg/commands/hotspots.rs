@@ -1,6 +1,4 @@
-use super::{
-    GpuDb, fmt_us, gpu_busy_us, like_param, parse_count, parse_pattern, require_op_layer, trunc,
-};
+use super::{GpuDb, fmt_us, gpu_busy_us, like_param, parse_count, parse_pattern, require_op_layer};
 use rusqlite::params_from_iter;
 
 // ---------------------------------------------------------------------------
@@ -30,7 +28,7 @@ pub fn cmd_stats(db: &GpuDb) {
     if wall_us > 0.0 {
         println!("  Wall time:    {}", fmt_us(wall_us));
     } else {
-        println!("  Wall time:    N/A (nsys did not record — re-run `gdbg collect`)");
+        println!("Wall time: | N/A (nsys did not record — re-run `gdbg collect`)");
     }
     let fmt_pct = |v: f64| {
         if wall_us > 0.0 {
@@ -75,7 +73,7 @@ pub fn cmd_stats(db: &GpuDb) {
     let has_torch = db.has_layer("torch");
 
     if layers.is_empty() {
-        println!("  Layers:       (none)");
+        println!("Layers: | (none)");
     } else {
         println!("  Layers:       {}", layers.join(" + "));
     }
@@ -179,12 +177,7 @@ pub fn cmd_kernels(db: &GpuDb, args: &[&str]) {
         ))
     });
 
-    println!(
-        "  #  Kernel                          Time      %     Launches   Avg       Stddev    Tail%  Bound"
-    );
-    println!(
-        "  ── ──────────────────────────────── ──────── ────── ────────── ───────── ───────── ────── ────────────"
-    );
+    println!("# | Kernel | Time | % | Launches | Avg | Stddev | Tail% | Bound");
     for (i, (name, cnt, total, avg, var, bound, cmp, mem)) in rows.iter().enumerate() {
         let pct = if gpu_total > 0.0 {
             total / gpu_total * 100.0
@@ -204,9 +197,9 @@ pub fn cmd_kernels(db: &GpuDb, args: &[&str]) {
             None => "—".into(),
         };
         println!(
-            "  {:<2} {:<32} {:>8} {:>5.1}% {:>9} {:>9} {:>9} {:>6} {:<12}",
+            "{} | {} | {} | {:.1}% | {} | {} | {} | {} | {}",
             i + 1,
-            trunc(name, 32),
+            name,
             fmt_us(*total),
             pct,
             cnt,
@@ -271,13 +264,12 @@ pub fn cmd_ops(db: &GpuDb, args: &[&str]) {
         }),
     };
 
-    println!("  #  Op                               CPU Time    Module");
-    println!("  ── ───────────────────────────────── ────────── ────────────");
+    println!("# | Op | CPU Time | Module");
     for (i, (name, module, cpu_time)) in rows.iter().enumerate() {
         println!(
-            "  {:<2} {:<34} {:>9}  {}",
+            "{} | {} | {} | {}",
             i + 1,
-            trunc(name, 34),
+            name,
             fmt_us(*cpu_time),
             module.as_deref().unwrap_or("")
         );

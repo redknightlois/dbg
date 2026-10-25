@@ -173,6 +173,8 @@ Pick your language and paste the prompt into Claude or Codex:
 
 `gdbg` is a separate binary that auto-collects GPU profiling data in three phases (timeline, hardware metrics, op mapping), stores everything in a single SQLite session, and provides an interactive REPL with 30+ analysis commands — roofline classification, occupancy ranking, kernel fusion candidates, compute/memory boundedness, op-to-kernel drill-down, and more.
 
+Data tables print a header followed by ` | ` separated rows. Names, paths and timestamps are printed in full, without column clipping or divider lines.
+
 ```bash
 gdbg train.py          # collect + analyze
 gdbg --from baseline   # reload a saved session

@@ -1,4 +1,4 @@
-use std::io::{self, BufRead, Write};
+use std::io::{self, BufRead, IsTerminal, Write};
 
 use anyhow::Result;
 
@@ -13,8 +13,10 @@ pub fn run(db: &mut GpuDb) -> Result<()> {
     println!();
 
     loop {
-        print!("gpu> ");
-        stdout.flush()?;
+        if stdin.is_terminal() {
+            print!("gpu> ");
+            stdout.flush()?;
+        }
 
         let mut line = String::new();
         if stdin.lock().read_line(&mut line)? == 0 {

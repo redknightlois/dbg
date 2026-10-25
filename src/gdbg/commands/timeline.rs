@@ -1,6 +1,5 @@
 use super::{
-    GpuDb, compute_gpu_gaps, fmt_bytes, fmt_us, merge_intervals, parse_count, trunc,
-    xfer_kernel_overlap,
+    GpuDb, compute_gpu_gaps, fmt_bytes, fmt_us, merge_intervals, parse_count, xfer_kernel_overlap,
 };
 
 // ---------------------------------------------------------------------------
@@ -101,8 +100,7 @@ pub fn cmd_transfers(db: &GpuDb, args: &[&str]) {
     });
 
     println!("  By Direction:");
-    println!("  Kind  Count    Total         Time        Avg BW       Size range");
-    println!("  ───── ──────── ───────────── ─────────── ──────────── ────────────");
+    println!("Kind | Count | Total | Time | Avg BW | Size range");
     for (kind, cnt, bytes, dur, min_b, max_b) in &kinds {
         let bw = if *dur > 0.0 {
             format!("{:.1} GB/s", *bytes as f64 / dur / 1000.0)
@@ -115,7 +113,7 @@ pub fn cmd_transfers(db: &GpuDb, args: &[&str]) {
             format!("{}-{}", fmt_bytes(*min_b), fmt_bytes(*max_b))
         };
         println!(
-            "  {:<5} {:>8} {:>13} {:>11} {:>12} {}",
+            "{} | {} | {} | {} | {} | {}",
             kind,
             cnt,
             fmt_bytes(*bytes),
@@ -170,8 +168,7 @@ pub fn cmd_transfers(db: &GpuDb, args: &[&str]) {
     });
 
     println!("\n  Top {} by Duration:", rows.len());
-    println!("  #  Kind  Size        Duration    BW          Stream  Notes");
-    println!("  ── ───── ────────── ────────── ──────────── ─────── ────────");
+    println!("# | Kind | Size | Duration | BW | Stream | Notes");
     for (i, (kind, bytes, dur, sid)) in rows.iter().enumerate() {
         let bw_num = if *dur > 0.0 {
             *bytes as f64 / dur / 1000.0
@@ -194,7 +191,7 @@ pub fn cmd_transfers(db: &GpuDb, args: &[&str]) {
                 ""
             };
         println!(
-            "  {:<2} {:<5} {:>10} {:>10} {:>11} {:>6}  {}",
+            "{} | {} | {} | {} | {} | {} | {}",
             i + 1,
             kind,
             fmt_bytes(*bytes),
@@ -234,8 +231,7 @@ fn print_transfer_cdf(db: &GpuDb, total_time: f64) {
     }
 
     println!("\n  Cumulative time by transfer size:");
-    println!("  Size bucket    Count    Time         Bucket %  Cumulative %");
-    println!("  ────────────── ──────── ──────────── ───────── ────────────");
+    println!("Size bucket | Count | Time | Bucket % | Cumulative %");
     let mut idx = 0usize;
     let mut cum = 0.0;
     for &(limit, label) in &buckets {
@@ -253,7 +249,7 @@ fn print_transfer_cdf(db: &GpuDb, total_time: f64) {
         let bpct = bucket_time / total_time * 100.0;
         let cpct = cum / total_time * 100.0;
         println!(
-            "  {:<14} {:>8} {:>12} {:>8.1}% {:>11.1}%",
+            "{} | {} | {} | {:.1}% | {:.1}%",
             label,
             cnt,
             fmt_us(bucket_time),
@@ -298,28 +294,17 @@ pub fn cmd_gaps(db: &GpuDb, args: &[&str]) {
     } else {
         println!();
     }
-    println!("  #  Start        Duration     Before → After");
-    println!("  ── ──────────── ──────────── ────────────────────────────────");
+    println!("# | Start | Duration | Before | After");
     for (i, (start, dur)) in rows.iter().enumerate() {
         let before = kernel_ending_at_or_before(db, *start);
         let after = kernel_starting_at_or_after(db, *start + *dur);
-        let edge = format!(
-            "{} → {}",
-            before
-                .as_deref()
-                .map(|n| trunc(n, 22))
-                .unwrap_or_else(|| "—".into()),
-            after
-                .as_deref()
-                .map(|n| trunc(n, 22))
-                .unwrap_or_else(|| "—".into())
-        );
         println!(
-            "  {:<2} {:>12} {:>12} {}",
+            "{} | {} | {} | {} | {}",
             i + 1,
             fmt_us(*start),
             fmt_us(*dur),
-            edge
+            before.as_deref().unwrap_or("—"),
+            after.as_deref().unwrap_or("—")
         );
     }
 }
@@ -377,7 +362,7 @@ pub fn cmd_overlap(db: &GpuDb) {
             overlap_us / xfer_time * 100.0
         );
     } else if xfer_time > 0.0 {
-        println!("    Concurrent:        none (transfers and compute are serialized)");
+        println!("Concurrent: | none (transfers and compute are serialized)");
     }
     if wall_us > 0.0 {
         println!("    GPU utilization:   {:.1}%", gpu_us / wall_us * 100.0);
@@ -395,8 +380,7 @@ pub fn cmd_overlap(db: &GpuDb) {
     );
     if !kinds.is_empty() {
         println!("\n    By direction:");
-        println!("    Kind   Transfer   Overlap    %");
-        println!("    ────── ────────── ────────── ──────");
+        println!("Kind | Transfer | Overlap | %");
         for kind in &kinds {
             let (dir_time, dir_overlap) = xfer_kernel_overlap(db, Some(kind));
             if dir_time <= 0.0 {
@@ -404,7 +388,7 @@ pub fn cmd_overlap(db: &GpuDb) {
             }
             let pct = dir_overlap / dir_time * 100.0;
             println!(
-                "    {:<6} {:>10} {:>10} {:>5.1}%",
+                "{} | {} | {} | {:.1}%",
                 kind,
                 fmt_us(dir_time),
                 fmt_us(dir_overlap),
@@ -432,10 +416,9 @@ pub fn cmd_streams(db: &GpuDb) {
         println!("no stream data");
         return;
     }
-    println!("  Stream  Kernels  Active Time");
-    println!("  ─────── ──────── ────────────");
+    println!("Stream | Kernels | Active Time");
     for (sid, cnt, total) in &rows {
-        println!("  {:>6}  {:>7}  {:>11}", sid, cnt, fmt_us(*total));
+        println!("{} | {} | {}", sid, cnt, fmt_us(*total));
     }
 }
 
@@ -459,16 +442,15 @@ pub fn cmd_timeline(db: &GpuDb, args: &[&str]) {
         println!("no timeline data");
         return;
     }
-    println!("  #  Start        Duration    Stream  Kernel");
-    println!("  ── ──────────── ────────── ──────── ────────────────────────────────");
+    println!("# | Start | Duration | Stream | Kernel");
     for (i, (name, start, dur, sid)) in rows.iter().enumerate() {
         println!(
-            "  {:<2} {:>12} {:>10} {:>7}  {}",
+            "{} | {} | {} | {} | {}",
             i + 1,
             fmt_us(*start),
             fmt_us(*dur),
             sid.map(|s| s.to_string()).unwrap_or_else(|| "?".into()),
-            trunc(name, 40)
+            name
         );
     }
 }

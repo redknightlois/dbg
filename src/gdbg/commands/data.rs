@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use super::{GpuDb, escape_regex, fmt_us, trunc};
+use super::{GpuDb, escape_regex, fmt_us};
 
 // ---------------------------------------------------------------------------
 // layers
@@ -22,15 +22,14 @@ pub fn cmd_layers(db: &GpuDb) {
         println!("no layers loaded");
         return;
     }
-    println!("  #  Source  File                                     Collected          Secs");
-    println!("  ── ─────── ──────────────────────────────────────── ────────────────── ─────");
+    println!("# | Source | File | Collected | Secs");
     for (id, source, file, at, secs) in &rows {
         println!(
-            "  {:<2} {:<7} {:<43} {:<18} {}",
+            "{} | {} | {} | {} | {}",
             id,
             source,
-            trunc(file, 43),
-            &at[..at.len().min(18)],
+            file,
+            at,
             secs.map(|s| format!("{s:.1}"))
                 .unwrap_or_else(|| "?".into())
         );
@@ -209,11 +208,11 @@ pub fn cmd_suggest(db: &GpuDb) {
                 let pct = dom_time / gpu_us * 100.0;
                 println!(
                     "  {n}. One kernel accounts for {pct:.0}% of GPU time: {}",
-                    trunc(&dom_name, 60)
+                    &dom_name
                 );
                 println!(
                     "     Try: bound '{}' — optimize the hotspot directly.\n",
-                    trunc(&dom_name, 40)
+                    &dom_name
                 );
                 n += 1;
             }
@@ -252,40 +251,20 @@ pub fn cmd_list() {
                 println!("no saved sessions");
                 return;
             }
-            println!("  Name                    Device          Kernels  Layers           Created");
-            println!(
-                "  ─────────────────────── ─────────────── ──────── ──────────────── ────────────────"
-            );
+            println!("Name | Device | Kernels | Layers | Created");
             for s in &sessions {
                 let dev = if s.device.is_empty() { "?" } else { &s.device };
                 println!(
-                    "  {:<23} {:<15} {:>7}  {:<16} {}",
-                    trunc(&s.name, 23),
-                    trunc(dev, 15),
+                    "{} | {} | {} | {} | {}",
+                    &s.name,
+                    dev,
                     s.kernel_count,
                     s.layers.join("+"),
-                    created_prefix(&s.created)
+                    s.created
                 );
             }
         }
         Err(e) => println!("list failed: {e}"),
-    }
-}
-
-fn created_prefix(created: &str) -> String {
-    created.chars().take(16).collect()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::created_prefix;
-
-    #[test]
-    fn saved_date_prefix_is_utf8_safe() {
-        let created = "2026-07-28T12:évidence";
-        let prefix = created_prefix(created);
-        assert_eq!(prefix.chars().count(), 16);
-        assert!(created.starts_with(&prefix));
     }
 }
 
@@ -349,8 +328,7 @@ pub fn cmd_diff(db: &GpuDb, args: &[&str]) {
         };
 
     println!("  Diff: current vs {name}\n");
-    println!("  Kernel                            Before     After      Delta");
-    println!("  ────────────────────────────────── ────────── ────────── ──────────");
+    println!("Kernel | Before | After | Delta");
     for (kname, before, after) in &rows {
         let delta = if *before > 0.0 {
             let pct = (after - before) / before * 100.0;
@@ -359,8 +337,8 @@ pub fn cmd_diff(db: &GpuDb, args: &[&str]) {
             "new".into()
         };
         println!(
-            "  {:<34} {:>10} {:>10} {:>10}",
-            trunc(kname, 34),
+            "{} | {} | {} | {}",
+            kname,
             fmt_us(*before),
             fmt_us(*after),
             delta
