@@ -390,9 +390,8 @@ pub fn cmd_small(db: &GpuDb, args: &[&str]) {
 
     let total_launches: i64 = rows.iter().map(|r| r.1).sum();
     let total_time: f64 = rows.iter().map(|r| r.3).sum();
-    let overhead_est = total_launches as f64 * 5.0;
 
-    println!("  Small Kernels (avg < {threshold_us:.0}us, launch overhead may dominate):\n");
+    println!("  Short Kernels (avg < {threshold_us:.0}us):\n");
     println!("  #  Kernel                            Avg       Launches  Total");
     println!("  ── ────────────────────────────────── ───────── ──────── ─────────");
     for (i, (name, cnt, avg, total)) in rows.iter().enumerate() {
@@ -410,14 +409,10 @@ pub fn cmd_small(db: &GpuDb, args: &[&str]) {
         rows.len(),
         total_launches
     );
+    println!("  Summed kernel time: {}", fmt_us(total_time));
     println!(
-        "  Estimated launch overhead: {} (at ~5us/launch)",
-        fmt_us(overhead_est)
+        "  Duration alone does not establish launch overhead; inspect gaps and critical-path, including graph replay boundaries."
     );
-    println!("  Actual compute time:       {}", fmt_us(total_time));
-    if overhead_est > total_time {
-        println!("  Launch overhead EXCEEDS compute — consider kernel fusion or torch.compile()");
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -491,12 +486,14 @@ pub fn cmd_fuse(db: &GpuDb, args: &[&str]) {
         );
     }
     println!(
-        "\n  Total reclaimable gap: {} across {} pairs",
+        "\n  Observed adjacent gaps: {} across {} pairs",
         fmt_us(total_gap),
         rows.len()
     );
-    println!("  'batch' = same kernel, use CUDA graphs or larger batch sizes");
-    println!("  'fuse'  = different kernels, use torch.compile() or manual fusion");
+    println!("  'batch' = repeated kernel; 'fuse' = different adjacent kernels");
+    println!(
+        "  Adjacency does not prove dependencies or fusibility; pairs may cross graph replay boundaries."
+    );
 
     detect_kernel_sequences(db, n);
 }
@@ -602,7 +599,9 @@ fn detect_kernel_sequences(db: &GpuDb, limit: usize) {
             seq
         );
     }
-    println!("  → capture these with torch.cuda.graph or cudaGraph APIs to remove launch overhead");
+    println!(
+        "  Repeated sequences may already be CUDA graph nodes; inspect launch provenance before changing execution."
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -729,44 +728,19 @@ pub fn cmd_hotpath(db: &GpuDb) {
         return;
     }
 
-    let total_cpu: f64 = ops.iter().map(|o| o.1).sum();
-    let total_gpu = db.total_gpu_time_us();
-
-    println!("  Critical Path (ops by CPU time):\n");
-    println!("  Op                               CPU Time   GPU Time   Bound");
-    println!("  ───────────────────────────────── ────────── ────────── ─────");
+    println!("  Operator CPU totals (inclusive; nested operations can overlap):\n");
+    println!("  Op                               CPU Time   Attributed GPU Time");
     for (name, cpu, gpu, _) in &ops {
-        let bound = if *gpu < 0.01 {
-            "overhead"
-        } else if cpu / gpu.max(0.01) > 10.0 {
-            "CPU"
-        } else if gpu / cpu.max(0.01) > 2.0 {
-            "GPU"
-        } else {
-            "balanced"
-        };
         println!(
-            "  {:<34} {:>9} {:>9}  {bound}",
+            "  {:<34} {:>9} {:>9}",
             trunc(name, 34),
             fmt_us(*cpu),
             fmt_us(*gpu)
         );
     }
-
     println!(
-        "\n  Total CPU: {}  Total GPU: {}",
-        fmt_us(total_cpu),
-        fmt_us(total_gpu)
+        "\n  Separate profiler runs can cover different regions. Operator totals do not establish the elapsed critical path or CPU/GPU boundedness."
     );
-    let ratio = total_cpu / total_gpu.max(0.01);
-    if ratio > 10.0 {
-        println!("  Workload is CPU-bound ({ratio:.0}:1 CPU:GPU ratio)");
-        println!("  Consider: larger batch size, torch.compile(), or CUDA graphs");
-    } else if ratio < 0.5 {
-        println!("  Workload is GPU-bound — optimize kernel efficiency");
-    } else {
-        println!("  Workload is balanced between CPU and GPU");
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -793,44 +767,25 @@ pub fn cmd_compare_ops(db: &GpuDb, args: &[&str]) {
         return;
     }
 
-    println!("  CPU vs GPU Time by Operator:\n");
-    println!("  Op                               CPU Time   GPU Time   Ratio      Assessment");
-    println!("  ───────────────────────────────── ────────── ────────── ────────── ──────────");
+    println!("  Operator CPU time and attributed GPU time:\n");
+    println!("  Op                               CPU Time   GPU Time   CPU/GPU ratio");
     for (name, cpu, gpu) in &ops {
-        let (ratio_str, assessment) = if *gpu < 0.01 {
-            ("∞".to_string(), "pure overhead")
+        let ratio = if *gpu > 0.0 {
+            format!("{:.1}:1", cpu / gpu)
         } else {
-            let r = cpu / gpu;
-            let a = if r > 100.0 {
-                "CPU-bound"
-            } else if r > 10.0 {
-                "CPU-heavy"
-            } else if r > 2.0 {
-                "balanced"
-            } else if r > 0.5 {
-                "GPU-heavy"
-            } else {
-                "GPU-bound"
-            };
-            (format!("{r:.0}:1"), a)
+            "unmapped".into()
         };
         println!(
-            "  {:<34} {:>9} {:>9} {:>10}  {assessment}",
+            "  {:<34} {:>9} {:>9} {:>12}",
             trunc(name, 34),
             fmt_us(*cpu),
             fmt_us(*gpu),
-            ratio_str
+            ratio
         );
     }
-
-    let total_cpu: f64 = ops.iter().map(|o| o.1).sum();
-    let total_gpu: f64 = ops.iter().map(|o| o.2).sum();
-    let gpu_util = if total_cpu > 0.0 {
-        total_gpu / total_cpu * 100.0
-    } else {
-        0.0
-    };
-    println!("\n  GPU utilization: {gpu_util:.1}% (GPU active time / CPU wall time)");
+    println!(
+        "\n  Inclusive operator times can overlap; cross-capture ratios are not GPU utilization or bottleneck measurements."
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1347,10 +1302,13 @@ pub fn cmd_memory(db: &GpuDb, args: &[&str]) {
             }
         }
     }
-    let leaked: i64 = live.values().sum();
-    let leak_count = live.len();
+    let unmatched: i64 = live.values().sum();
+    let unmatched_count = live.len();
 
-    println!("  GPU Memory Summary\n");
+    println!("  Recorded GPU Allocation Summary\n");
+    println!(
+        "  Capture boundaries and allocator caching can leave unmatched records; these do not prove leaks or physical VRAM residency."
+    );
     println!("  Events:    {n_alloc} allocs, {n_free} frees");
     println!(
         "  Total:     {} allocated across {n_alloc} events",
@@ -1361,13 +1319,13 @@ pub fn cmd_memory(db: &GpuDb, args: &[&str]) {
         fmt_bytes(peak),
         fmt_us(peak_time)
     );
-    if leak_count > 0 {
+    if unmatched_count > 0 {
         println!(
-            "  Leaked:    {} across {leak_count} allocations (not freed by exit)",
-            fmt_bytes(leaked)
+            "  Unmatched: {} across {unmatched_count} allocations (no free recorded)",
+            fmt_bytes(unmatched)
         );
     } else {
-        println!("  Leaked:    none");
+        println!("  Unmatched: none");
     }
     println!();
 
@@ -1396,7 +1354,7 @@ pub fn cmd_memory(db: &GpuDb, args: &[&str]) {
                 )
                 .ok()
                 .map(|fr| fmt_us(fr - *start))
-                .unwrap_or_else(|| "leaked".into());
+                .unwrap_or_else(|| "no free recorded".into());
             println!(
                 "  {:<2} {:>12} {:>12} {}",
                 i + 1,

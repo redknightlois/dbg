@@ -107,14 +107,27 @@ pub fn cmd_suggest(db: &GpuDb) {
                 .sum();
             let regex = top
                 .iter()
-                .map(|t| escape_regex(&t.0))
+                .map(|t| escape_regex(&db.native_kernel_name(&t.0)))
                 .collect::<Vec<_>>()
                 .join("|");
             println!(
                 "  {n}. Top {} kernels ({pct:.0}% of GPU) lack hardware metrics.",
                 top.len()
             );
-            println!("     Collect: ncu --set full --kernel-name \"regex:{regex}\" {target}\n");
+            if target.ends_with(".cu") {
+                println!(
+                    "     Re-profile the CUDA source with gdbg {target} to compile it before collection.\n"
+                );
+            } else {
+                let interpreter = if target.ends_with(".py") {
+                    "python3 "
+                } else {
+                    ""
+                };
+                println!(
+                    "     Collect: ncu --set full --kernel-name-base demangled --launch-count 1 --kernel-name \"regex:{regex}\" {interpreter}{target}\n"
+                );
+            }
             n += 1;
         }
     }
@@ -177,10 +190,10 @@ pub fn cmd_suggest(db: &GpuDb) {
         let tiny_count: i64 = db.scalar_f64(&tiny_sql) as i64;
         if tiny_count > 10 {
             println!(
-                "  {n}. {tiny_count} distinct kernels average under 10us — launch overhead likely dominates."
+                "  {n}. {tiny_count} distinct kernels average under 10us; duration alone does not establish launch overhead."
             );
             println!(
-                "     Try: torch.compile(), CUDA graphs, or manual kernel fusion.  See 'small' and 'fuse'.\n"
+                "     Inspect measured gaps, launch provenance, and graph replay boundaries with 'small' and 'fuse'.\n"
             );
             n += 1;
         }

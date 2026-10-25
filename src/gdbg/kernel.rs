@@ -157,4 +157,16 @@ mod tests {
         let torch = "void at::native::reduce_kernel<128, at::native::sum_functor<float>::operator()(T1)::{lambda(float)#1}>(T2)";
         assert_eq!(normalize_kernel_name(nsys), normalize_kernel_name(torch));
     }
+    #[test]
+    fn correlates_the_rtx4090_gemv_capture_without_merging_specializations() {
+        let nsys = "void <unnamed>::gemv_kernel<(unsigned int)8192, (unsigned int)1, (unsigned int)8>(__nv_bfloat16 *, const __nv_bfloat16 *, const __nv_bfloat16 *, unsigned int)";
+        let ncu = "void <unnamed>::gemv_kernel<8192, 1, 8>(__nv_bfloat16 *, const __nv_bfloat16 *, const __nv_bfloat16 *, unsigned int)";
+        let torch = "void (anonymous namespace)::gemv_kernel<8192u, 1u, 8u>(__nv_bfloat16*, __nv_bfloat16 const*, __nv_bfloat16 const*, unsigned int)";
+        assert_eq!(normalize_kernel_name(nsys), normalize_kernel_name(ncu));
+        assert_eq!(normalize_kernel_name(ncu), normalize_kernel_name(torch));
+        assert_ne!(
+            normalize_kernel_name(ncu),
+            normalize_kernel_name("gemv_kernel<4096,1,8>")
+        );
+    }
 }

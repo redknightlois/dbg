@@ -35,6 +35,7 @@ pub fn import_nsys_rep(dest: &Connection, nsys_path: &Path, layer_id: i64) -> Re
         "CUDA_GPU_MEMORY_USAGE_EVENTS",
         "NVTX_EVENTS",
         "CUPTI_ACTIVITY_KIND_RUNTIME",
+        "CUDA_UM_GPU_PAGE_FAULT_EVENTS",
     ]
     .iter()
     .any(|table| find_table(&src, &[*table]).is_ok());
@@ -44,6 +45,7 @@ pub fn import_nsys_rep(dest: &Connection, nsys_path: &Path, layer_id: i64) -> Re
 
     let has_kernels = import_kernels(dest, &src, layer_id)?;
     import_transfers(dest, &src, layer_id)?;
+    let fault_events = import_unified_memory_faults(dest, &src, layer_id)?;
     import_allocations(dest, &src, layer_id)?;
     import_nvtx_regions(dest, &src, layer_id)?;
     import_device_info(dest, &src)?;
@@ -68,7 +70,7 @@ pub fn import_nsys_rep(dest: &Connection, nsys_path: &Path, layer_id: i64) -> Re
         params![layer_id],
         |row| row.get(0),
     )?;
-    if imported == 0 && runtime_api_count == 0 {
+    if imported == 0 && runtime_api_count == 0 && fault_events == 0 {
         bail!("NSYS report contains no recognized activity rows");
     }
 
@@ -148,6 +150,7 @@ fn import_kernels(dest: &Connection, src: &Connection, layer_id: i64) -> Result<
         ))
     })?;
 
+    let mut native_names = std::collections::BTreeMap::new();
     let mut row_count = 0;
     for row in rows {
         row_count += 1;
@@ -156,6 +159,7 @@ fn import_kernels(dest: &Connection, src: &Connection, layer_id: i64) -> Result<
         }
         let (raw_name, start_ns, end_ns, gx, gy, gz, bx, by, bz, sid, cid) = row?;
         let name = normalize_kernel_name(&raw_name);
+        native_names.entry(name.clone()).or_insert(raw_name);
         let duration_us = duration_us(start_ns, end_ns, "kernel")?;
         let start_us = start_ns as f64 / 1000.0;
         write.execute(params![
@@ -173,6 +177,14 @@ fn import_kernels(dest: &Connection, src: &Connection, layer_id: i64) -> Result<
             layer_id
         ])?;
     }
+
+    dest.execute(
+        "INSERT OR REPLACE INTO meta (key, value) VALUES (?1, ?2)",
+        params![
+            format!("nsys_kernel_names_{layer_id}"),
+            serde_json::to_string(&native_names)?
+        ],
+    )?;
 
     // A present activity table is not the same as usable kernel data. An
     // empty table (or a StringIds join with no matching names) must allow the
@@ -219,8 +231,18 @@ fn import_transfers(dest: &Connection, src: &Connection, layer_id: i64) -> Resul
         let kind_str = match kind {
             1 => "H2D",
             2 => "D2H",
-            3 => "D2D",
-            _ => "Peer",
+            3 => "H2Array",
+            4 => "Array2H",
+            5 => "Array2Array",
+            6 => "Array2D",
+            7 => "D2Array",
+            8 => "D2D",
+            9 => "H2H",
+            10 => "Peer",
+            11 => "Unified H2D",
+            12 => "Unified D2H",
+            13 => "Unified D2D",
+            _ => "Unknown",
         };
         write.execute(params![
             kind_str,
@@ -238,6 +260,30 @@ fn import_transfers(dest: &Connection, src: &Connection, layer_id: i64) -> Resul
 // ---------------------------------------------------------------------------
 // GPU memory allocations
 // ---------------------------------------------------------------------------
+
+fn import_unified_memory_faults(dest: &Connection, src: &Connection, layer_id: i64) -> Result<i64> {
+    let Ok(table) = find_table(src, &["CUDA_UM_GPU_PAGE_FAULT_EVENTS"]) else {
+        return Ok(0);
+    };
+    let (events, faults, minimum): (i64, i64, i64) = src.query_row(
+        &format!("SELECT COUNT(*), COALESCE(SUM(numberOfPageFaults),0), COALESCE(MIN(numberOfPageFaults),0) FROM {table}"),
+        [],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+    )?;
+    if events > MAX_NSYS_ROWS as i64 || minimum < 0 {
+        bail!(
+            "NSYS Unified Memory fault table exceeds its row limit or contains negative fault counts"
+        );
+    }
+    dest.execute(
+        "INSERT OR REPLACE INTO meta (key, value) VALUES (?1, ?2)",
+        params![
+            format!("nsys_um_gpu_faults_{layer_id}"),
+            serde_json::json!({"events": events, "page_faults": faults}).to_string(),
+        ],
+    )?;
+    Ok(events)
+}
 
 /// Import CUDA device memory alloc/free events.  Requires nsys to have been
 /// run with `--cuda-memory-usage=true`; otherwise the source table is absent

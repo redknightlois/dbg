@@ -189,8 +189,8 @@ pub fn collect_all(db: &GpuDb, target: &str, args: &[String]) -> Result<()> {
     // Runs a collection phase, recording failures without aborting.
     let run_phase = |phase: &str, f: &dyn Fn() -> Result<()>| {
         if let Err(e) = f() {
-            eprintln!("{phase} collection failed: {e}");
-            let _ = db.add_failure(phase, &e.to_string());
+            eprintln!("{phase} collection failed: {e:#}");
+            let _ = db.add_failure(phase, &format!("{e:#}"));
         }
     };
 
@@ -278,6 +278,8 @@ fn collect_nsys(
     cmd.arg("--force-overwrite=true");
     // Enable GPU memory allocation tracking — needed for the `memory` command.
     cmd.arg("--cuda-memory-usage=true");
+    cmd.arg("--cuda-graph-trace=node");
+    cmd.arg("--cuda-um-gpu-page-faults=true");
 
     match kind {
         TargetKind::Python | TargetKind::PythonTorch | TargetKind::PythonTriton => {
@@ -290,6 +292,7 @@ fn collect_nsys(
         cmd.arg(a);
     }
 
+    let command = format!("{cmd:?}");
     let profile_output = run_cmd(&mut cmd, "nsys profile failed")?;
     let elapsed = start.elapsed().as_secs_f64();
 
@@ -342,7 +345,7 @@ fn collect_nsys(
     let _layer_id = db.import_layer(
         "nsys",
         &trace_rep.display().to_string(),
-        Some(&format!("nsys profile {target}")),
+        Some(&command),
         Some(elapsed),
         target_hash,
         |conn, layer_id| parsers::nsys::import_nsys_rep(conn, &sqlite_path, layer_id),
@@ -554,17 +557,14 @@ fn collect_torch(
 // ---------------------------------------------------------------------------
 
 fn top_kernel_names(db: &GpuDb, n: usize) -> Vec<String> {
-    let mut stmt = db
-        .conn
-        .prepare(
-            "SELECT kernel_name, SUM(duration_us) as total
-             FROM launches GROUP BY kernel_name
-             ORDER BY total DESC LIMIT ?1",
-        )
-        .unwrap();
-    stmt.query_map([n as i64], |row| row.get(0))
+    let mut stmt = db.conn.prepare(&format!(
+        "SELECT kernel_name, SUM(duration_us) as total FROM launches WHERE {} GROUP BY kernel_name ORDER BY total DESC LIMIT ?1",
+        db.timeline_filter(),
+    )).unwrap();
+    stmt.query_map([n as i64], |row| row.get::<_, String>(0))
         .unwrap()
         .filter_map(|r| r.ok())
+        .map(|name| db.native_kernel_name(&name))
         .collect()
 }
 
@@ -608,8 +608,8 @@ fn compile_cuda(source: &str) -> Result<String> {
 /// makes nvcc+ptxas print "Conflicting options" warnings on every
 /// build. Keep `-G` — gdbg needs device-side symbols for kernel
 /// attribution — and drop the redundant `-lineinfo`.
-pub(crate) fn cuda_compile_flags<'a>(output: &'a str, source: &'a str) -> [&'a str; 5] {
-    ["-g", "-G", "-o", output, source]
+pub(crate) fn cuda_compile_flags<'a>(output: &'a str, source: &'a str) -> [&'a str; 6] {
+    ["-g", "-G", "-arch=native", "-o", output, source]
 }
 
 /// Which Python module, if any, we should verify importable before
@@ -637,6 +637,7 @@ mod tests {
     #[test]
     fn cuda_compile_flags_does_not_pass_lineinfo_with_capital_g() {
         let flags = cuda_compile_flags("out", "in.cu");
+        assert!(flags.contains(&"-arch=native"));
         assert!(
             flags.contains(&"-G"),
             "-G must stay — gdbg needs device symbols: {flags:?}"
@@ -722,5 +723,28 @@ mod tests {
             "--steps".into(),
             "2".into(),
         ]));
+    }
+    #[test]
+    fn counter_collection_uses_native_names_while_queries_keep_canonical_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = GpuDb::create(&dir.path().join("native-names.db")).unwrap();
+        let layer = db
+            .add_layer("nsys", "trace.sqlite", None, None, None)
+            .unwrap();
+        let raw = "void <unnamed>::gemv_kernel<(unsigned int)8192>(float *)";
+        let canonical = crate::kernel::normalize_kernel_name(raw);
+        db.conn
+            .execute(
+                "INSERT INTO launches (kernel_name, duration_us, layer_id) VALUES (?1, 5, ?2)",
+                rusqlite::params![canonical, layer],
+            )
+            .unwrap();
+        db.set_meta(
+            &format!("nsys_kernel_names_{layer}"),
+            &serde_json::json!({canonical: raw}).to_string(),
+        )
+        .unwrap();
+        assert_eq!(top_kernel_names(&db, 1), vec![raw]);
+        assert_eq!(db.unique_kernel_count(), 1);
     }
 }

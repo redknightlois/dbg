@@ -69,16 +69,16 @@ After collection, `gdbg` drops into an interactive REPL. Key commands:
 | `outliers <kernel>` | Slow launches with their timeline positions |
 | `launches <kernel> [N]` | Per-launch time, launch shape, stream, and gap |
 | `source <kernel>` | Source or operator that launched a kernel |
-| `memory [N]` | GPU allocation peaks, leaks, largest blocks, and churn |
+| `memory [N]` | Recorded allocation peaks, unmatched allocations, largest blocks, and churn |
 | `bandwidth [N] [pattern]` | Achieved memory bandwidth from NCU metrics |
 | `compare <a> <b>` | Side-by-side statistics for two kernels |
 | `regressions <session> [%] [us]` | Regressions above relative and absolute thresholds |
 | `warmup` | Detect warmup launches before steady state |
-| `small [N]` | Kernels where launch overhead > compute |
-| `fuse [N]` | Sequential kernels that could be fused |
+| `small [N]` | Short kernels; inspect measured gaps before inferring launch overhead |
+| `fuse [N]` | Adjacent kernel sequences and observed gaps |
 | `concurrency` | Stream utilization and parallelism gaps |
-| `hotpath` | Critical path through ops (CPU vs GPU bound) |
-| `compare-ops [N]` | CPU vs GPU time ratio per operator |
+| `hotpath` | Inclusive CPU operator totals and GPU attribution |
+| `compare-ops [N]` | CPU / attributed GPU time per operator |
 | `breakdown <op>` | Which kernels an op expands into |
 | `idle-between <a> <b>` | GPU idle gap between two ops |
 | `hotspot <window_us>` | Hottest fixed-width interval |
@@ -138,3 +138,23 @@ After collection, `gdbg` drops into an interactive REPL. Key commands:
 | `ncu` permission denied | Run with `sudo` or set `/proc/sys/kernel/perf_event_paranoid` to -1 |
 | No ops data | Target doesn't use PyTorch — only nsys/ncu data available |
 | 0 GPU time on ops | Kernel names don't match between layers — check target consistency |
+
+## Interpreting advanced views
+
+`transfers` distinguishes explicit copies from capture-wide Unified Memory GPU
+fault counts. Missing fault coverage is unknown, not zero. Fault counts do not
+measure migration bytes or host-mapped GPU traffic. Collection enables graph
+node tracing and GPU fault events.
+
+`memory` reports recorded allocation lifetimes. An unmatched free does not
+establish a memory leak or physical VRAM residency. `small` and `fuse` report
+short kernels and adjacency; CUDA graph nodes and replay boundaries require
+measured gap analysis. CPU operator totals can include nested events and a
+different capture region, so `hotpath` and `compare-ops` do not infer a global
+CPU/GPU bottleneck from those totals.
+
+CUDA source targets compile for the current GPU with `-arch=native`. C++
+counter filters retain the profiler's native signature while database joins
+use canonical names. PyTorch traces accept integer or string track IDs;
+unique external IDs associate asynchronous GPU launches with CPU operators.
+Missing or ambiguous IDs remain unmapped.

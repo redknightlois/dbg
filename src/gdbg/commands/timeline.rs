@@ -1,10 +1,41 @@
-use super::{GpuDb, compute_gpu_gaps, fmt_bytes, fmt_us, parse_count, trunc, xfer_kernel_overlap};
+use super::{
+    GpuDb, compute_gpu_gaps, fmt_bytes, fmt_us, merge_intervals, parse_count, trunc,
+    xfer_kernel_overlap,
+};
 
 // ---------------------------------------------------------------------------
 // transfers
 // ---------------------------------------------------------------------------
 
+fn print_unified_memory_faults(db: &GpuDb) {
+    let Some(layer) = db.timeline_layer_id().or_else(|| {
+        db.conn
+            .query_row(
+                "SELECT id FROM layers WHERE source='nsys' ORDER BY id DESC LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .ok()
+    }) else {
+        return;
+    };
+    let value = db.meta(&format!("nsys_um_gpu_faults_{layer}"));
+    let summary = serde_json::from_str::<serde_json::Value>(&value).ok();
+    match summary
+        .as_ref()
+        .and_then(|s| Some((s["events"].as_u64()?, s["page_faults"].as_u64()?)))
+    {
+        Some((events, faults)) => println!(
+            "  Unified Memory GPU faults (whole capture): {events} events, {faults} page faults.\n  Fault counts are separate from explicit-copy bytes and times.\n"
+        ),
+        None => println!(
+            "  Unified Memory GPU fault coverage unavailable; re-capture with --cuda-um-gpu-page-faults=true.\n"
+        ),
+    }
+}
+
 pub fn cmd_transfers(db: &GpuDb, args: &[&str]) {
+    print_unified_memory_faults(db);
     if db.transfer_count() == 0 {
         println!("no memory transfers recorded");
         if !db.has_layer("nsys") {
@@ -34,25 +65,23 @@ pub fn cmd_transfers(db: &GpuDb, args: &[&str]) {
         fmt_us(total_time)
     );
     if wall_us > 0.0 {
+        let active: f64 = merge_intervals(&db.transfer_intervals(None))
+            .iter()
+            .map(|(s, e)| e - s)
+            .sum();
         println!(
-            "  {:.1}% of wall time spent on transfers",
-            total_time / wall_us * 100.0
+            "  Explicit-copy active time: {} ({:.1}% of capture span)",
+            fmt_us(active),
+            active / wall_us * 100.0
         );
     }
 
-    // Transfer vs compute ratio — indicates bandwidth-bound workload
     if kernel_time > 0.0 {
         let ratio = total_time / kernel_time;
-        let verdict = if ratio > 5.0 {
-            "BANDWIDTH-BOUND — PCIe dominates"
-        } else if ratio > 1.5 {
-            "transfer-heavy — consider async transfers or larger batches"
-        } else if ratio > 0.5 {
-            "mixed compute/transfer"
-        } else {
-            "compute-dominated"
-        };
-        println!("  Transfer:compute ratio = {ratio:.2}:1  ({verdict})");
+        println!("  Explicit-copy:kernel time ratio = {ratio:.2}:1");
+        println!(
+            "  Copy records exclude GPU accesses to host-mapped memory; durations can overlap."
+        );
     }
     println!();
 
@@ -331,25 +360,15 @@ pub fn cmd_overlap(db: &GpuDb) {
         return;
     }
 
-    let gpu_us = db.total_gpu_time_us();
+    let gpu_us: f64 = merge_intervals(&db.kernel_intervals())
+        .iter()
+        .map(|(s, e)| e - s)
+        .sum();
     let wall_us: f64 = db.meta("wall_time_us").parse().unwrap_or(0.0);
-    let xfer_time: f64 = db
-        .conn
-        .query_row(
-            &format!(
-                "SELECT COALESCE(SUM(duration_us),0) FROM transfers WHERE {}",
-                db.timeline_filter_for("transfers")
-            ),
-            [],
-            |row| row.get(0),
-        )
-        .unwrap();
-
-    // Compute actual overlap: how much transfer time runs concurrently with kernels.
-    let (_, overlap_us) = xfer_kernel_overlap(db, None);
+    let (xfer_time, overlap_us) = xfer_kernel_overlap(db, None);
 
     println!("  Compute/Transfer Overlap:");
-    println!("    GPU kernel time:   {}", fmt_us(gpu_us));
+    println!("    GPU active time:   {}", fmt_us(gpu_us));
     println!("    Transfer time:     {}", fmt_us(xfer_time));
     if xfer_time > 0.0 && overlap_us > 0.0 {
         println!(

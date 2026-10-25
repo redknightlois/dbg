@@ -865,3 +865,124 @@ fn chrome_trace_correlation_respects_process_and_thread_identity() {
         .unwrap();
     assert_eq!(mapped, "right-context");
 }
+
+#[test]
+fn nsys_copy_kinds_and_unified_memory_faults_preserve_their_contract() {
+    use crate::parsers::nsys::import_nsys_rep;
+    use rusqlite::Connection;
+
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("nsys.sqlite");
+    let src = Connection::open(&source).unwrap();
+    src.execute_batch(
+        "CREATE TABLE CUPTI_ACTIVITY_KIND_MEMCPY (
+            copyKind INTEGER, start INTEGER, end INTEGER, bytes INTEGER, streamId INTEGER);
+         CREATE TABLE CUDA_UM_GPU_PAGE_FAULT_EVENTS (numberOfPageFaults INTEGER);
+         INSERT INTO CUDA_UM_GPU_PAGE_FAULT_EVENTS VALUES (4), (7);",
+    )
+    .unwrap();
+    let kinds = [
+        (1, "H2D"),
+        (2, "D2H"),
+        (3, "H2Array"),
+        (8, "D2D"),
+        (10, "Peer"),
+        (11, "Unified H2D"),
+        (12, "Unified D2H"),
+        (13, "Unified D2D"),
+        (99, "Unknown"),
+    ];
+    for (kind, _) in kinds {
+        src.execute(
+            "INSERT INTO CUPTI_ACTIVITY_KIND_MEMCPY VALUES (?1, 1000, 2000, 8, 7)",
+            [kind],
+        )
+        .unwrap();
+    }
+    let db = GpuDb::create(&dir.path().join("session.db")).unwrap();
+    let layer = db
+        .import_layer(
+            "nsys",
+            source.to_str().unwrap(),
+            None,
+            None,
+            None,
+            |conn, id| import_nsys_rep(conn, &source, id),
+        )
+        .unwrap();
+    let imported: Vec<String> =
+        db.query_vec("SELECT kind FROM transfers ORDER BY id", [], |r| r.get(0));
+    assert_eq!(imported, kinds.map(|(_, kind)| kind.to_string()));
+    let summary: serde_json::Value =
+        serde_json::from_str(&db.meta(&format!("nsys_um_gpu_faults_{layer}"))).unwrap();
+    assert_eq!(summary, serde_json::json!({"events": 2, "page_faults": 11}));
+    commands::cmd_transfers(&db, &[]);
+
+    src.execute("INSERT INTO CUDA_UM_GPU_PAGE_FAULT_EVENTS VALUES (-1)", [])
+        .unwrap();
+    assert!(
+        db.import_layer(
+            "nsys",
+            source.to_str().unwrap(),
+            None,
+            None,
+            None,
+            |conn, id| import_nsys_rep(conn, &source, id)
+        )
+        .is_err()
+    );
+    assert_eq!(db.scalar_f64("SELECT COUNT(*) FROM layers"), 1.0);
+    assert_eq!(db.transfer_count(), kinds.len());
+    src.execute_batch("DELETE FROM CUPTI_ACTIVITY_KIND_MEMCPY; DELETE FROM CUDA_UM_GPU_PAGE_FAULT_EVENTS WHERE numberOfPageFaults < 0;").unwrap();
+    let faults_only = db
+        .import_layer(
+            "nsys",
+            source.to_str().unwrap(),
+            None,
+            None,
+            None,
+            |conn, id| import_nsys_rep(conn, &source, id),
+        )
+        .unwrap();
+    db.remove_layer(faults_only).unwrap();
+    assert!(
+        db.meta(&format!("nsys_um_gpu_faults_{faults_only}"))
+            .is_empty()
+    );
+}
+
+#[test]
+fn chrome_trace_string_tracks_and_async_external_ids_preserve_identity() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = GpuDb::create(&dir.path().join("tracks.db")).unwrap();
+    let trace = serde_json::json!({"traceEvents": [
+        {"ph":"M", "name":"process_name", "pid":"Spans", "tid":"Profiler"},
+        {"ph":"X", "cat":"cpu_op", "name":"launch", "pid":123, "tid":11, "ts":0, "dur":1, "args":{"External id":42}},
+        {"ph":"X", "cat":"kernel", "name":"async", "pid":0, "tid":7, "ts":10, "dur":3, "args":{"External id":42}},
+        {"ph":"X", "cat":"cpu_op", "name":"text_track", "pid":"123", "tid":"11", "ts":50, "dur":10},
+        {"ph":"X", "cat":"kernel", "name":"same_text_track", "pid":"123", "tid":"11", "ts":52, "dur":2},
+        {"ph":"X", "cat":"kernel", "name":"different_numeric_track", "pid":123, "tid":11, "ts":52, "dur":2},
+        {"ph":"X", "cat":"cpu_op", "name":"duplicate_one", "ts":100, "dur":10, "args":{"External id":99}},
+        {"ph":"X", "cat":"cpu_op", "name":"duplicate_two", "ts":100, "dur":10, "args":{"External id":99}},
+        {"ph":"X", "cat":"kernel", "name":"ambiguous", "ts":101, "dur":1, "args":{"External id":99}}
+    ]});
+    let path = dir.path().join("trace.json");
+    std::fs::write(&path, trace.to_string()).unwrap();
+    db.import_layer(
+        "torch",
+        path.to_str().unwrap(),
+        None,
+        None,
+        None,
+        |conn, id| import_chrome_trace(conn, &path, id),
+    )
+    .unwrap();
+    let links: Vec<(String,String)> = db.query_vec("SELECT m.kernel_name,o.name FROM op_kernel_map m JOIN ops o ON o.id=m.op_id ORDER BY m.kernel_name", [], |r| Ok((r.get(0)?,r.get(1)?)));
+    assert_eq!(
+        links,
+        vec![
+            ("async".into(), "launch".into()),
+            ("same_text_track".into(), "text_track".into())
+        ]
+    );
+}

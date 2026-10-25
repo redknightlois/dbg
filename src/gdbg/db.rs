@@ -143,7 +143,7 @@ impl GpuDb {
         if found != GDBG_SCHEMA_VERSION {
             bail!(
                 "gdbg session DB at {path} has schema_version={found}, \
-                 expected {expected}. No migration path — delete it and \
+                 expected {expected}. No migration path — keep raw captures and \
                  re-run `gdbg <target>` to rebuild from the raw captures.",
                 path = path.display(),
                 expected = GDBG_SCHEMA_VERSION,
@@ -437,6 +437,13 @@ impl GpuDb {
     pub fn remove_layer(&self, layer_id: i64) -> Result<()> {
         self.conn
             .execute("DELETE FROM layers WHERE id = ?1", params![layer_id])?;
+        self.conn.execute(
+            "DELETE FROM meta WHERE key IN (?1, ?2)",
+            [
+                format!("nsys_um_gpu_faults_{layer_id}"),
+                format!("nsys_kernel_names_{layer_id}"),
+            ],
+        )?;
         Ok(())
     }
 
@@ -588,6 +595,19 @@ impl GpuDb {
             }
         }
         None
+    }
+
+    /// External profiler filters use native spellings; database joins use canonical keys.
+    pub fn native_kernel_name(&self, canonical: &str) -> String {
+        self.timeline_layer_id()
+            .and_then(|layer| {
+                serde_json::from_str::<HashMap<String, String>>(
+                    &self.meta(&format!("nsys_kernel_names_{layer}")),
+                )
+                .ok()
+            })
+            .and_then(|names| names.get(canonical).cloned())
+            .unwrap_or_else(|| canonical.to_string())
     }
 
     /// SQL fragment to filter launches to the best timeline layer.
