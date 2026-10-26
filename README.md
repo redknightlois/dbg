@@ -172,6 +172,8 @@ Pick your language and paste the prompt into Claude or Codex:
 | triton | Triton kernels | nsys + ncu + proton |
 
 `gdbg` is a separate binary that auto-collects GPU profiling data in three phases (timeline, hardware metrics, op mapping), stores everything in a single SQLite session, and provides an interactive REPL with 30+ analysis commands — roofline classification, occupancy ranking, kernel fusion candidates, compute/memory boundedness, op-to-kernel drill-down, and more.
+Completed NCU captures are committed to SQLite before the next capture starts. An interrupted collection retains imported counters and raw files; partial counters do not establish full kernel or launch coverage.
+
 
 Data tables print a header followed by ` | ` separated rows. Names, paths and timestamps are printed in full, without column clipping or divider lines.
 

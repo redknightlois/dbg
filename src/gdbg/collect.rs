@@ -401,34 +401,26 @@ fn collect_ncu(
     } else {
         kernel_names.to_vec()
     };
-    let csv_path = collect_ncu_samples(db, session, &labels, |label| {
+    let description = format!(
+        "ncu --set full --kernel-name-base demangled {} {} {target}",
+        if all_kernels {
+            "all kernels"
+        } else {
+            "top five kernels"
+        },
+        if all_launches {
+            "all matching launches"
+        } else {
+            "--launch-count 1 per kernel"
+        }
+    );
+    collect_ncu_samples(db, session, &labels, &description, target_hash, |label| {
         let filter = if unfiltered { None } else { Some(label) };
         let mut cmd = ncu_command(target, args, filter, kind, all_launches);
         cmd.output()
             .with_context(|| format!("cannot start ncu for `{label}`"))
     })?;
     let elapsed = start.elapsed().as_secs_f64();
-
-    let _layer_id = db.import_layer(
-        "ncu",
-        &csv_path.display().to_string(),
-        Some(&format!(
-            "ncu --set full --kernel-name-base demangled {} {} {target}",
-            if all_kernels {
-                "all kernels"
-            } else {
-                "top five kernels"
-            },
-            if all_launches {
-                "all matching launches"
-            } else {
-                "--launch-count 1 per kernel"
-            }
-        )),
-        Some(elapsed),
-        target_hash,
-        |conn, layer_id| parsers::ncu::import_ncu_csv(conn, &csv_path, layer_id),
-    )?;
 
     eprintln!(
         "  ncu done in {elapsed:.1}s ({} kernels with metrics)",
@@ -441,10 +433,19 @@ fn collect_ncu_samples(
     db: &GpuDb,
     session: &Path,
     kernel_names: &[String],
+    command: &str,
+    target_hash: Option<&str>,
     mut run: impl FnMut(&str) -> Result<Output>,
 ) -> Result<PathBuf> {
     let csv_path = session.join("ncu_metrics.csv");
     let mut combined_csv = Vec::new();
+    let mut imported = 0;
+    let mut partial = false;
+    let mut layer_id = None;
+    let collection_started = Instant::now();
+    db.set_meta("ncu_collection_status", "collecting")?;
+    db.set_meta("ncu_requested_captures", &kernel_names.len().to_string())?;
+    db.set_meta("ncu_imported_captures", "0")?;
     for (index, kernel_name) in kernel_names.iter().enumerate() {
         let stdout_path = session.join(format!("ncu-{index}.stdout.csv"));
         let stderr_path = session.join(format!("ncu-{index}.stderr.log"));
@@ -453,32 +454,64 @@ fn collect_ncu_samples(
                 std::fs::write(&stdout_path, &output.stdout)?;
                 std::fs::write(&stderr_path, &output.stderr)?;
                 let stdout = String::from_utf8_lossy(&output.stdout);
-                if !output.status.success() {
-                    Some(format!("ncu exited with {}", output.status))
-                } else if !stdout.contains("\"Kernel Name\"")
+                let process_failure = (!output.status.success())
+                    .then(|| format!("ncu exited with {}", output.status));
+                if !stdout.contains("\"Kernel Name\"")
                     || !stdout.contains("\"Metric Name\"")
                     || !stdout.contains("\"Metric Value\"")
                 {
-                    Some("ncu returned no metric table".to_string())
+                    Some(
+                        process_failure
+                            .unwrap_or_else(|| "ncu returned no metric table".to_string()),
+                    )
                 } else {
-                    let keep_header = combined_csv.is_empty();
-                    for line in stdout.lines() {
-                        if !keep_header
-                            && line.contains("\"Kernel Name\"")
-                            && line.contains("\"Metric Name\"")
-                            && line.contains("\"Metric Value\"")
-                        {
-                            continue;
+                    let imported_sample = (|| -> Result<i64> {
+                        let transaction = db.conn.unchecked_transaction()?;
+                        let layer = match layer_id {
+                            Some(id) => id,
+                            None => db.add_layer(
+                                "ncu",
+                                &csv_path.display().to_string(),
+                                Some(command),
+                                None,
+                                target_hash,
+                            )?,
+                        };
+                        parsers::ncu::import_ncu_csv(&transaction, &stdout_path, layer)?;
+                        db.set_meta("ncu_imported_captures", &(imported + 1).to_string())?;
+                        transaction.execute(
+                            "UPDATE layers SET collection_secs=?1 WHERE id=?2",
+                            rusqlite::params![collection_started.elapsed().as_secs_f64(), layer],
+                        )?;
+                        transaction.commit()?;
+                        Ok(layer)
+                    })();
+                    match imported_sample {
+                        Err(error) => {
+                            Some(format!("cannot import completed ncu capture: {error:#}"))
                         }
-                        combined_csv.extend_from_slice(line.as_bytes());
-                        combined_csv.push(b'\n');
+                        Ok(layer) => {
+                            layer_id = Some(layer);
+                            imported += 1;
+                            let keep_header = combined_csv.is_empty();
+                            for line in stdout.lines() {
+                                if !keep_header
+                                    && line.contains("\"Kernel Name\"")
+                                    && line.contains("\"Metric Name\"")
+                                    && line.contains("\"Metric Value\"")
+                                {
+                                    continue;
+                                }
+                                combined_csv.extend_from_slice(line.as_bytes());
+                                combined_csv.push(b'\n');
+                            }
+                            if !combined_csv.ends_with(b"\n") {
+                                combined_csv.push(b'\n');
+                            }
+                            std::fs::write(&csv_path, &combined_csv)?;
+                            process_failure
+                        }
                     }
-                    if !combined_csv.ends_with(b"\n") {
-                        combined_csv.push(b'\n');
-                    }
-                    // Preserve each successful capture before collecting the next kernel.
-                    std::fs::write(&csv_path, &combined_csv)?;
-                    None
                 }
             }
             Err(error) => {
@@ -487,6 +520,7 @@ fn collect_ncu_samples(
             }
         };
         if let Some(reason) = failure {
+            partial = true;
             let message = format!(
                 "{reason} for `{kernel_name}`; raw output: {} and {}",
                 stdout_path.display(),
@@ -496,6 +530,14 @@ fn collect_ncu_samples(
             db.add_failure("ncu", &message)?;
         }
     }
+    db.set_meta(
+        "ncu_collection_status",
+        if !partial && imported == kernel_names.len() {
+            "complete"
+        } else {
+            "partial"
+        },
+    )?;
     if combined_csv.is_empty() {
         bail!(
             "ncu collected no metrics for any selected kernel; inspect the saved per-kernel logs"
@@ -759,27 +801,118 @@ mod tests {
             "last".to_string(),
         ];
         let mut visited = Vec::new();
-        let csv = collect_ncu_samples(&db, directory.path(), &names, |name| {
+        let csv = collect_ncu_samples(&db, directory.path(), &names, "test ncu", Some("test-target"), |name| {
             visited.push(name.to_string());
             let stdout = if name == "missing" {
                 "==WARNING== No kernels were profiled.\n".to_string()
             } else {
                 format!("==PROF== Connected to process 123\n\"Kernel Name\",\"Metric Name\",\"Metric Value\"\n\"{name}\",\"launch__registers_per_thread\",\"32\"\n")
             };
-            Ok(Output { status: std::process::ExitStatus::from_raw(0), stdout: stdout.into_bytes(), stderr: Vec::new() })
+            Ok(Output { status: std::process::ExitStatus::from_raw(if name == "last" { 1 << 8 } else { 0 }), stdout: stdout.into_bytes(), stderr: Vec::new() })
         }).unwrap();
         assert_eq!(visited, names);
         assert!(directory.path().join("ncu-1.stdout.csv").exists());
-        assert_eq!(db.failures().len(), 1);
-        let layer = db
-            .add_layer("ncu", &csv.to_string_lossy(), None, None, None)
+        assert_eq!(db.failures().len(), 2);
+        assert!(csv.exists());
+        let layers: i64 = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM layers WHERE source='ncu'", [], |r| {
+                r.get(0)
+            })
             .unwrap();
-        parsers::ncu::import_ncu_csv(&db.conn, &csv, layer).unwrap();
+        assert_eq!(layers, 1);
         let count: i64 = db
             .conn
-            .query_row("SELECT COUNT(*) FROM metrics", [], |r| r.get(0))
+            .query_row(
+                &format!(
+                    "SELECT COUNT(*) FROM metrics WHERE {}",
+                    db.metric_filter_for("metrics")
+                ),
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
         assert_eq!(count, 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ncu_commits_completed_capture_before_next_process_is_killed() {
+        use std::os::unix::process::ExitStatusExt;
+        const CHILD_DIR: &str = "GDBG_NCU_INTERRUPTION_TEST_DIR";
+        if let Some(directory) = std::env::var_os(CHILD_DIR) {
+            let directory = PathBuf::from(directory);
+            let db = GpuDb::create(&directory.join("session.db")).unwrap();
+            collect_ncu_samples(&db, &directory, &["first".into(), "blocked".into()],
+                "ncu test command", Some("frozen-source"), |name| {
+                    if name == "blocked" {
+                        std::fs::write(directory.join("second-started"), "ready").unwrap();
+                        loop { std::thread::sleep(std::time::Duration::from_millis(100)); }
+                    }
+                    Ok(Output {
+                        status: std::process::ExitStatus::from_raw(0),
+                        stdout: b"\"Kernel Name\",\"Metric Name\",\"Metric Value\"\n\"first\",\"launch__registers_per_thread\",\"32\"\n".to_vec(),
+                        stderr: Vec::new(),
+                    })
+                }).unwrap();
+            unreachable!();
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "collect::tests::ncu_commits_completed_capture_before_next_process_is_killed",
+            ])
+            .env(CHILD_DIR, directory.path())
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + std::time::Duration::from_secs(5);
+        while !directory.path().join("second-started").exists() && Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        child.kill().unwrap();
+        let status = child.wait().unwrap();
+        assert_eq!(status.signal(), Some(9));
+        assert!(
+            directory.path().join("second-started").exists(),
+            "collector never started the second capture"
+        );
+        let db = GpuDb::open(&directory.path().join("session.db")).unwrap();
+        assert_eq!(db.kernels_with_metrics(), 1);
+        let (file, command, hash): (String, String, String) = db
+            .conn
+            .query_row(
+                "SELECT file,command_used,target_hash FROM layers WHERE source='ncu'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert!(file.ends_with("ncu_metrics.csv"));
+        assert!(directory.path().join("ncu-0.stdout.csv").exists());
+        assert_eq!(
+            (command.as_str(), hash.as_str()),
+            ("ncu test command", "frozen-source")
+        );
+        let state: String = db
+            .conn
+            .query_row(
+                "SELECT value FROM meta WHERE key='ncu_collection_status'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(state, "collecting");
+        let imported: String = db
+            .conn
+            .query_row(
+                "SELECT value FROM meta WHERE key='ncu_imported_captures'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(imported, "1");
+        assert!(directory.path().join("ncu_metrics.csv").exists());
     }
 
     #[cfg(unix)]
@@ -789,16 +922,23 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let db = GpuDb::create(&directory.path().join("session.db")).unwrap();
         let names = vec!["failed".to_string(), "unavailable".to_string()];
-        let error = collect_ncu_samples(&db, directory.path(), &names, |name| {
-            if name == "unavailable" {
-                bail!("cannot start collector");
-            }
-            Ok(Output {
-                status: std::process::ExitStatus::from_raw(1 << 8),
-                stdout: Vec::new(),
-                stderr: b"counter unavailable".to_vec(),
-            })
-        })
+        let error = collect_ncu_samples(
+            &db,
+            directory.path(),
+            &names,
+            "test ncu",
+            Some("test-target"),
+            |name| {
+                if name == "unavailable" {
+                    bail!("cannot start collector");
+                }
+                Ok(Output {
+                    status: std::process::ExitStatus::from_raw(1 << 8),
+                    stdout: Vec::new(),
+                    stderr: b"counter unavailable".to_vec(),
+                })
+            },
+        )
         .unwrap_err();
         assert!(error.to_string().contains("no metrics"));
         assert_eq!(db.failures().len(), 2);
