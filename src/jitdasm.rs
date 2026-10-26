@@ -100,10 +100,7 @@ fn empty_match_hint(pattern: &str, callers: &[&str]) -> String {
 /// narrow: a same-register xor is the only form treated as zero-init.
 fn is_zero_init_xor(line: &str) -> bool {
     let lower = line.to_ascii_lowercase();
-    let (mnemonic, operands) = match lower
-        .trim()
-        .split_once(|c: char| c.is_ascii_whitespace())
-    {
+    let (mnemonic, operands) = match lower.trim().split_once(|c: char| c.is_ascii_whitespace()) {
         Some(pair) => pair,
         None => return false,
     };
@@ -239,7 +236,10 @@ impl JitIndex {
             }
         }
 
-        JitIndex { methods, call_graph }
+        JitIndex {
+            methods,
+            call_graph,
+        }
     }
 
     /// Callers that reference `pattern` in a `call` instruction. Used
@@ -343,10 +343,7 @@ impl JitIndex {
             caller_methods.len()
         );
         for m in &caller_methods {
-            out.push_str(&format!(
-                "════════ parent: {} ════════\n",
-                m.name
-            ));
+            out.push_str(&format!("════════ parent: {} ════════\n", m.name));
             out.push_str(&m.body);
             out.push('\n');
         }
@@ -470,17 +467,35 @@ impl JitIndex {
             .collect();
 
         let count = |pats: &[&str]| -> usize {
-            instructions.iter().filter(|l| pats.iter().any(|p| l.contains(p))).count()
+            instructions
+                .iter()
+                .filter(|l| pats.iter().any(|p| l.contains(p)))
+                .count()
         };
 
         let avx512 = count(&["zmm"]);
         let avx2 = count(&["ymm"]);
         let sse = count(&["xmm"]);
         let fma = count(&["vfmadd", "vfmsub", "vfnmadd", "vfnmsub"]);
-        let neon = instructions.iter().filter(|l| l.contains("{v") && (l.contains("ld1") || l.contains("st1") || l.contains("fmla") || l.contains("fmul"))).count();
-        let sve = instructions.iter().filter(|l| (l.contains("ld1w") || l.contains("st1w")) && l.contains("z")).count();
+        let neon = instructions
+            .iter()
+            .filter(|l| {
+                l.contains("{v")
+                    && (l.contains("ld1")
+                        || l.contains("st1")
+                        || l.contains("fmla")
+                        || l.contains("fmul"))
+            })
+            .count();
+        let sve = instructions
+            .iter()
+            .filter(|l| (l.contains("ld1w") || l.contains("st1w")) && l.contains("z"))
+            .count();
         let bounds = count(&["RNGCHKFAIL"]);
-        let spills = instructions.iter().filter(|l| l.contains("mov") && l.contains("[rsp")).count();
+        let spills = instructions
+            .iter()
+            .filter(|l| l.contains("mov") && l.contains("[rsp"))
+            .count();
 
         let label = if pattern.is_empty() || pattern == "." {
             "--- all methods ---".to_string()
@@ -529,10 +544,21 @@ impl JitIndex {
     /// optionally scoped to a name-substring filter.
     pub fn cmd_simd_filtered(&self, pattern: &str) -> String {
         const SIMD_PATTERNS: &[&str] = &[
-            "vmovups", "vmovaps", "vmulps", "vaddps", "vfmadd", "vdpps",
-            "vxorps", "vperm", "vbroadcast",
+            "vmovups",
+            "vmovaps",
+            "vmulps",
+            "vaddps",
+            "vfmadd",
+            "vdpps",
+            "vxorps",
+            "vperm",
+            "vbroadcast",
             // ARM NEON
-            "ld1", "st1", "fmla", "fmul.v", "fadd.v",
+            "ld1",
+            "st1",
+            "fmla",
+            "fmul.v",
+            "fadd.v",
         ];
 
         let methods = self.filter(pattern);
@@ -578,10 +604,7 @@ pub fn run_repl(asm_path: &str, default_pattern: &str) -> io::Result<()> {
     let text = std::fs::read_to_string(asm_path)?;
     let index = JitIndex::parse(&text);
 
-    eprintln!(
-        "--- ready: {} methods captured ---",
-        index.methods.len()
-    );
+    eprintln!("--- ready: {} methods captured ---", index.methods.len());
     if !default_pattern.is_empty() {
         eprintln!(
             "--- default filter: `{}` (stats/simd/hotspots narrow to this) ---",
@@ -611,13 +634,29 @@ pub fn run_repl(asm_path: &str, default_pattern: &str) -> io::Result<()> {
         let arg1 = parts.get(1).copied().unwrap_or("");
         let arg2 = parts.get(2).copied().unwrap_or("");
 
-        let pat = if arg2.is_empty() { arg1.to_string() } else { format!("{arg1} {arg2}") };
+        let pat = if arg2.is_empty() {
+            arg1.to_string()
+        } else {
+            format!("{arg1} {arg2}")
+        };
 
         // Default summary-style commands to the session's pattern
         // when the user didn't pass one. Explicit args always win.
-        let stats_arg = if arg1.is_empty() { default_pattern } else { arg1 };
-        let methods_arg = if arg1.is_empty() { default_pattern } else { arg1 };
-        let hotspots_arg = if arg2.is_empty() { default_pattern } else { arg2 };
+        let stats_arg = if arg1.is_empty() {
+            default_pattern
+        } else {
+            arg1
+        };
+        let methods_arg = if arg1.is_empty() {
+            default_pattern
+        } else {
+            arg1
+        };
+        let hotspots_arg = if arg2.is_empty() {
+            default_pattern
+        } else {
+            arg2
+        };
 
         let cmd = canonical_verb(cmd);
 
@@ -640,8 +679,7 @@ pub fn run_repl(asm_path: &str, default_pattern: &str) -> io::Result<()> {
                 index.cmd_hotspots(n, hotspots_arg)
             }
             "simd" => index.cmd_simd_filtered(default_pattern),
-            "help" => {
-                "jitdasm commands:\n  \
+            "help" => "jitdasm commands:\n  \
                  methods [pattern]    list methods with code sizes (sorted by size)\n  \
                  disasm <pattern>     show full disassembly for matching methods\n  \
                  search <instruction> find methods containing an instruction\n  \
@@ -652,8 +690,7 @@ pub fn run_repl(asm_path: &str, default_pattern: &str) -> io::Result<()> {
                  simd                 find all methods using SIMD instructions\n  \
                  help                 show this help\n  \
                  exit                 quit\n"
-                    .into()
-            }
+                .into(),
             "exit" | "quit" => {
                 // Leaving the REPL does NOT kill the daemon; the
                 // session keeps the capture file and any child
@@ -667,7 +704,10 @@ pub fn run_repl(asm_path: &str, default_pattern: &str) -> io::Result<()> {
                 );
                 break;
             }
-            _ => format!("unknown command: {}. Type 'help' for available commands.\n", cmd),
+            _ => format!(
+                "unknown command: {}. Type 'help' for available commands.\n",
+                cmd
+            ),
         };
 
         print!("{}", result);
@@ -701,8 +741,14 @@ mod tests {
     #[test]
     fn empty_match_hint_generic_when_no_callers_known() {
         let msg = empty_match_hint("FlatLongIntMap:TryGetValue", &[]);
-        assert!(msg.contains("inlined"), "hint should mention inlining: {msg}");
-        assert!(msg.contains("search"), "hint should suggest `search`: {msg}");
+        assert!(
+            msg.contains("inlined"),
+            "hint should mention inlining: {msg}"
+        );
+        assert!(
+            msg.contains("search"),
+            "hint should suggest `search`: {msg}"
+        );
         assert!(
             msg.contains("caller"),
             "hint should tell the agent to look at the caller: {msg}"
@@ -840,7 +886,11 @@ mod tests {
     fn parse_method_names() {
         let idx = JitIndex::parse(SAMPLE);
         let names: Vec<&str> = idx.methods.iter().map(|m| m.name.as_str()).collect();
-        assert!(names.iter().any(|n| n.contains("DotProduct") && !n.contains("Scalar")));
+        assert!(
+            names
+                .iter()
+                .any(|n| n.contains("DotProduct") && !n.contains("Scalar"))
+        );
         assert!(names.iter().any(|n| n.contains("ScalarDotProduct")));
         assert!(names.iter().any(|n| n.contains("Normalize")));
         assert!(names.iter().any(|n| n.contains("Pipeline:Run")));
@@ -849,13 +899,29 @@ mod tests {
     #[test]
     fn parse_code_bytes() {
         let idx = JitIndex::parse(SAMPLE);
-        let dot = idx.methods.iter().find(|m| m.name.contains("DotProduct") && !m.name.contains("Scalar")).unwrap();
+        let dot = idx
+            .methods
+            .iter()
+            .find(|m| m.name.contains("DotProduct") && !m.name.contains("Scalar"))
+            .unwrap();
         assert_eq!(dot.code_bytes, 250);
-        let scalar = idx.methods.iter().find(|m| m.name.contains("ScalarDotProduct")).unwrap();
+        let scalar = idx
+            .methods
+            .iter()
+            .find(|m| m.name.contains("ScalarDotProduct"))
+            .unwrap();
         assert_eq!(scalar.code_bytes, 96);
-        let norm = idx.methods.iter().find(|m| m.name.contains("Normalize")).unwrap();
+        let norm = idx
+            .methods
+            .iter()
+            .find(|m| m.name.contains("Normalize"))
+            .unwrap();
         assert_eq!(norm.code_bytes, 64);
-        let pipeline = idx.methods.iter().find(|m| m.name.contains("Pipeline")).unwrap();
+        let pipeline = idx
+            .methods
+            .iter()
+            .find(|m| m.name.contains("Pipeline"))
+            .unwrap();
         assert_eq!(pipeline.code_bytes, 48);
     }
 
@@ -883,8 +949,14 @@ mod tests {
         // Narrowed output must be a strict subset of the wide output.
         assert!(wide.len() >= narrow.len(), "wide should be >= narrow");
         // Narrow must not mention methods outside the filter.
-        assert!(!narrow.contains("Normalize"), "narrow leaked Normalize:\n{narrow}");
-        assert!(!narrow.contains("Pipeline:Run"), "narrow leaked Pipeline:\n{narrow}");
+        assert!(
+            !narrow.contains("Normalize"),
+            "narrow leaked Normalize:\n{narrow}"
+        );
+        assert!(
+            !narrow.contains("Pipeline:Run"),
+            "narrow leaked Pipeline:\n{narrow}"
+        );
     }
 
     #[test]
@@ -894,7 +966,10 @@ mod tests {
         let idx = JitIndex::parse(SAMPLE);
         let out = idx.cmd_stats(":DotProduct");
         assert!(out.contains("filter:"), "expected filter label: {out}");
-        assert!(out.contains("Methods:       1"), "expected 1 method:\n{out}");
+        assert!(
+            out.contains("Methods:       1"),
+            "expected 1 method:\n{out}"
+        );
     }
 
     #[test]

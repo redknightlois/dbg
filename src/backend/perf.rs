@@ -10,8 +10,12 @@ pub struct PerfBackend;
 fn is_perf_data_file(path: &std::path::Path) -> bool {
     use std::io::Read;
     let mut buf = [0u8; 8];
-    let Ok(mut f) = std::fs::File::open(path) else { return false };
-    if f.read_exact(&mut buf).is_err() { return false }
+    let Ok(mut f) = std::fs::File::open(path) else {
+        return false;
+    };
+    if f.read_exact(&mut buf).is_err() {
+        return false;
+    }
     &buf == b"PERFILE2"
 }
 
@@ -45,7 +49,7 @@ impl Backend for PerfBackend {
                 env: vec![("PS1".into(), "perf> ".into())],
                 init_commands: vec![
                     format!(
-                        "perf script -F comm,tid,time,ip,sym,dso -i {} > {} 2>/dev/null || true",
+                        "perf script -F comm,tid,time,ip,sym,dso -i {} > {} 2>/dev/null",
                         shell_escape(target),
                         shell_escape(&script_str),
                     ),
@@ -54,10 +58,7 @@ impl Backend for PerfBackend {
             })
         } else {
             // Record then emit script + report
-            let mut record_cmd = format!(
-                "perf record -g -- {}",
-                shell_escape(target)
-            );
+            let mut record_cmd = format!("perf record -g -- {}", shell_escape(target));
             for a in args {
                 record_cmd.push(' ');
                 record_cmd.push_str(&shell_escape(a));
@@ -70,7 +71,7 @@ impl Backend for PerfBackend {
                 init_commands: vec![
                     record_cmd,
                     format!(
-                        "perf script -F comm,tid,time,ip,sym,dso > {} 2>/dev/null || true",
+                        "perf script -F comm,tid,time,ip,sym,dso > {} 2>/dev/null",
                         shell_escape(&script_str),
                     ),
                     "perf report --stdio".into(),
@@ -119,7 +120,7 @@ impl Backend for PerfBackend {
         const PARANOID: &str = "/proc/sys/kernel/perf_event_paranoid";
         if let Ok(contents) = std::fs::read_to_string(PARANOID) {
             if let Ok(level) = contents.trim().parse::<i32>() {
-                if level >= 3 {
+                if level >= 3 && !has_perf_record_privilege() {
                     anyhow::bail!(
                         "kernel.perf_event_paranoid={level} blocks `perf record` for \
                          unprivileged users.\n  \
@@ -159,8 +160,43 @@ impl Backend for PerfBackend {
     }
 
     fn adapters(&self) -> Vec<(&'static str, &'static str)> {
-        vec![("perf.md", include_str!("../../skills/adapters/perf.md"))]
+        vec![(
+            "perf.md",
+            include_str!("../../skills/references/adapters/perf.md"),
+        )]
     }
+}
+
+#[cfg(target_os = "linux")]
+fn has_perf_record_privilege() -> bool {
+    if unsafe { nix::libc::geteuid() } == 0 {
+        return true;
+    }
+    let Ok(status) = std::fs::read_to_string("/proc/self/status") else {
+        return false;
+    };
+    perf_capabilities_allow_recording(&status)
+}
+
+#[cfg(target_os = "linux")]
+fn perf_capabilities_allow_recording(status: &str) -> bool {
+    let Some(raw) = status
+        .lines()
+        .find_map(|line| line.strip_prefix("CapEff:").map(str::trim))
+    else {
+        return false;
+    };
+    let Ok(caps) = u128::from_str_radix(raw.trim_start_matches("0x"), 16) else {
+        return false;
+    };
+    const CAP_SYS_ADMIN: u32 = 21;
+    const CAP_PERFMON: u32 = 38;
+    caps & ((1u128 << CAP_SYS_ADMIN) | (1u128 << CAP_PERFMON)) != 0
+}
+
+#[cfg(not(target_os = "linux"))]
+fn has_perf_record_privilege() -> bool {
+    false
 }
 
 #[cfg(test)]
@@ -194,12 +230,16 @@ mod tests {
             .unwrap();
         assert_eq!(cfg.bin, "bash");
         assert!(
-            cfg.init_commands.iter().any(|c| c.contains("perf report --stdio")),
-            "missing report: {:?}", cfg.init_commands
+            cfg.init_commands
+                .iter()
+                .any(|c| c.contains("perf report --stdio")),
+            "missing report: {:?}",
+            cfg.init_commands
         );
         assert!(
             cfg.init_commands.iter().any(|c| c.contains("perf script")),
-            "missing script step: {:?}", cfg.init_commands
+            "missing script step: {:?}",
+            cfg.init_commands
         );
         let _ = std::fs::remove_file(&tmp);
     }
@@ -212,11 +252,15 @@ mod tests {
         assert!(cfg.init_commands[0].contains("./myapp"));
         assert!(
             cfg.init_commands.iter().any(|c| c.contains("perf script")),
-            "missing script step: {:?}", cfg.init_commands
+            "missing script step: {:?}",
+            cfg.init_commands
         );
         assert!(
-            cfg.init_commands.iter().any(|c| c.contains("perf report --stdio")),
-            "missing report: {:?}", cfg.init_commands
+            cfg.init_commands
+                .iter()
+                .any(|c| c.contains("perf report --stdio")),
+            "missing report: {:?}",
+            cfg.init_commands
         );
     }
 
@@ -242,6 +286,20 @@ mod tests {
         assert_eq!(PerfBackend.format_breakpoint("anything"), "");
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn perf_capability_detection_accepts_perfmon_and_sys_admin() {
+        assert!(perf_capabilities_allow_recording(&format!(
+            "CapEff:\t{:x}\n",
+            1u128 << 38
+        )));
+        assert!(perf_capabilities_allow_recording(&format!(
+            "CapEff:\t{:x}\n",
+            1u128 << 21
+        )));
+        assert!(!perf_capabilities_allow_recording("CapEff:\t0\n"));
+    }
+
     #[test]
     fn spawn_config_record_has_separator() {
         let cfg = PerfBackend.spawn_config("./myapp", &[]).unwrap();
@@ -252,9 +310,7 @@ mod tests {
 
     #[test]
     fn spawn_config_escapes_target_with_spaces() {
-        let cfg = PerfBackend
-            .spawn_config("./my app", &[])
-            .unwrap();
+        let cfg = PerfBackend.spawn_config("./my app", &[]).unwrap();
         let cmd = &cfg.init_commands[0];
         assert!(cmd.contains("'./my app'"), "target not escaped: {cmd}");
     }
@@ -309,7 +365,9 @@ mod tests {
             .spawn_config(data_path.to_str().unwrap(), &[])
             .unwrap();
         assert!(
-            cfg.init_commands.iter().any(|c| c.contains("perf report --stdio -i")),
+            cfg.init_commands
+                .iter()
+                .any(|c| c.contains("perf report --stdio -i")),
             "PERFILE2-magic file should take the report path: {:?}",
             cfg.init_commands,
         );

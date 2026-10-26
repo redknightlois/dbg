@@ -1,7 +1,11 @@
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, ToSql, params};
+
+use crate::kernel::normalize_kernel_name;
 
 /// gdbg's schema version.
 ///
@@ -14,12 +18,16 @@ use rusqlite::{Connection, ToSql, params};
 /// Bumping this invalidates every saved `.gpu.db` file: `GpuDb::open`
 /// refuses to load anything that doesn't match, pointing the user at
 /// the raw `.nsys-rep` + `.csv` artifacts to re-ingest.
-pub const GDBG_SCHEMA_VERSION: i64 = 1;
+pub const GDBG_SCHEMA_VERSION: i64 = 3;
 
 /// A GPU profiling session backed by a SQLite database.
 pub struct GpuDb {
     pub conn: Connection,
     pub _path: PathBuf,
+    /// Keep the descriptor used to open the database alive. SQLite opens
+    /// `/proc/self/fd/N`, so a pathname or ancestor swap cannot redirect it.
+    database_file: std::fs::File,
+    attached_files: Mutex<HashMap<String, std::fs::File>>,
     /// Active focus filter (kernel name substring).
     pub focus: Option<String>,
     /// Active ignore filter (kernel name substring).
@@ -70,14 +78,18 @@ impl GpuDb {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let conn =
-            Connection::open(path).with_context(|| format!("cannot create {}", path.display()))?;
+        let opened = open_sqlite_path(path, true, true)
+            .with_context(|| format!("cannot create {}", path.display()))?;
+        let conn = opened.conn;
         conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")?;
         init_schema(&conn)?;
         conn.execute(&format!("PRAGMA user_version = {GDBG_SCHEMA_VERSION}"), [])?;
+        normalize_kernel_names_in(&conn)?;
         Ok(Self {
             conn,
             _path: path.to_path_buf(),
+            database_file: opened.file,
+            attached_files: Mutex::new(HashMap::new()),
             focus: None,
             ignore: None,
             region_filter: None,
@@ -92,26 +104,59 @@ impl GpuDb {
     /// directory are the durable artifact; re-run `gdbg <target>`
     /// to rebuild the index.
     pub fn open(path: &Path) -> Result<Self> {
-        if !path.exists() {
-            bail!("session not found: {}", path.display());
-        }
-        let conn =
-            Connection::open(path).with_context(|| format!("cannot open {}", path.display()))?;
+        // open_sqlite_path walks and opens the parent from a descriptor, then
+        // opens the final component with O_NOFOLLOW. Do not perform a public
+        // pathname check first: that would create a check/use race.
+        let opened = match open_sqlite_path(path, true, false) {
+            Ok(opened) => opened,
+            Err(write_error) => open_sqlite_path(path, false, false).with_context(|| {
+                format!(
+                    "cannot open {} for read or write: {write_error}",
+                    path.display()
+                )
+            })?,
+        };
+        Self::from_opened(path.to_path_buf(), opened)
+    }
+
+    fn from_opened(path: PathBuf, opened: OpenedSqlite) -> Result<Self> {
+        let OpenedSqlite {
+            conn: source,
+            file,
+            writable,
+        } = opened;
+        let conn = if writable {
+            source
+        } else {
+            // A read-only source can still contain legacy profiler spellings.
+            // Copy it to memory so normalization keeps saved-session queries
+            // consistent without changing the source file permissions.
+            let mut copy = Connection::open_in_memory()?;
+            let backup = rusqlite::backup::Backup::new(&source, &mut copy)?;
+            backup.run_to_completion(100, std::time::Duration::from_millis(10), None)?;
+            drop(backup);
+            copy
+        };
         let found: i64 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap_or(0);
         if found != GDBG_SCHEMA_VERSION {
             bail!(
                 "gdbg session DB at {path} has schema_version={found}, \
-                 expected {expected}. No migration path — delete it and \
+                 expected {expected}. No migration path — keep raw captures and \
                  re-run `gdbg <target>` to rebuild from the raw captures.",
                 path = path.display(),
                 expected = GDBG_SCHEMA_VERSION,
             );
         }
+        validate_schema_tables(&conn, &path)?;
+        normalize_kernel_names_transaction(&conn)
+            .with_context(|| format!("normalize kernel names in {}", path.display()))?;
         Ok(Self {
             conn,
-            _path: path.to_path_buf(),
+            _path: path,
+            database_file: file,
+            attached_files: Mutex::new(HashMap::new()),
             focus: None,
             ignore: None,
             region_filter: None,
@@ -126,24 +171,144 @@ impl GpuDb {
 
     /// Save this session by copying the DB to `.dbg/gpu/<name>.gpu.db`.
     pub fn save(&self, name: &str) -> Result<PathBuf> {
-        let dir = Self::session_dir();
-        std::fs::create_dir_all(&dir)?;
+        validate_saved_session_name(name)?;
+        let public_dir = Self::session_dir();
+        reject_path_symlinks(&public_dir, "GPU session directory")?;
+        let dbg_dir = public_dir
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("GPU session directory has no parent"))?;
+        reject_symlink(dbg_dir, "GPU state directory")?;
+        std::fs::create_dir_all(&public_dir)?;
+        let (dir, dir_guard) = open_gpu_session_dir(&public_dir)?;
         let dest = dir.join(format!("{name}.gpu.db"));
-        // Use SQLite backup API for safe copy of a live DB
-        let mut dest_conn = Connection::open(&dest)?;
+        let public_dest = public_dir.join(format!("{name}.gpu.db"));
+        reject_symlink(&dest, "GPU session destination")?;
+        // Use a new sibling and atomic rename. The destination is never
+        // reopened through a pathname which was checked earlier.
+        let tmp = dir.join(format!(
+            ".{}.tmp-{}-{}",
+            name,
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        #[cfg(unix)]
+        let guard = open_file_at_dir(
+            &dir_guard,
+            Path::new(tmp.file_name().expect("temporary database has a file name")),
+            true,
+            true,
+            true,
+        )?;
+        #[cfg(not(unix))]
+        let guard = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&tmp)?;
+        let mut dest_conn = open_sqlite_from_file(&guard, true)?;
         let backup = rusqlite::backup::Backup::new(&self.conn, &mut dest_conn)?;
         backup.run_to_completion(100, std::time::Duration::from_millis(10), None)?;
-        Ok(dest)
+        drop(backup);
+        drop(dest_conn);
+        drop(guard);
+        std::fs::rename(&tmp, &dest)?;
+        Ok(public_dest)
     }
 
     /// Load a saved session by name or path.
     pub fn load(name_or_path: &str) -> Result<Self> {
-        let path = if name_or_path.ends_with(".gpu.db") || name_or_path.contains('/') {
-            PathBuf::from(name_or_path)
-        } else {
-            Self::session_dir().join(format!("{name_or_path}.gpu.db"))
-        };
-        Self::open(&path)
+        if !name_or_path.contains('/') {
+            let name = name_or_path.strip_suffix(".gpu.db").unwrap_or(name_or_path);
+            return Self::load_saved_from_dir(&Self::session_dir(), name);
+        }
+        Self::open(Path::new(name_or_path))
+    }
+
+    fn load_saved_from_dir(public_dir: &Path, name: &str) -> Result<Self> {
+        validate_saved_session_name(name)?;
+        let (scan_dir, dir_guard) = open_gpu_session_dir(public_dir)?;
+        Self::load_saved_from_open_dir(public_dir, &scan_dir, &dir_guard, name)
+    }
+
+    #[cfg(unix)]
+    fn load_saved_from_open_dir(
+        public_dir: &Path,
+        _scan_dir: &Path,
+        dir_guard: &std::fs::File,
+        name: &str,
+    ) -> Result<Self> {
+        validate_saved_session_name(name)?;
+        let file_name = format!("{name}.gpu.db");
+        let (file, writable) =
+            match open_file_at_dir(dir_guard, Path::new(&file_name), true, false, false) {
+                Ok(file) => (file, true),
+                Err(write_error) => {
+                    let file =
+                        open_file_at_dir(dir_guard, Path::new(&file_name), false, false, false)
+                            .with_context(|| {
+                                format!(
+                                    "cannot open saved session for read or write: {write_error}"
+                                )
+                            })?;
+                    (file, false)
+                }
+            };
+        let conn = open_sqlite_from_file(&file, writable)?;
+        let public_path = public_dir.join(file_name);
+        Self::from_opened(
+            public_path,
+            OpenedSqlite {
+                conn,
+                file,
+                writable,
+            },
+        )
+    }
+
+    #[cfg(not(unix))]
+    fn load_saved_from_open_dir(
+        public_dir: &Path,
+        scan_dir: &Path,
+        _dir_guard: &std::fs::File,
+        name: &str,
+    ) -> Result<Self> {
+        validate_saved_session_name(name)?;
+        let mut db = Self::open(&scan_dir.join(format!("{name}.gpu.db")))?;
+        db._path = public_dir.join(format!("{name}.gpu.db"));
+        Ok(db)
+    }
+
+    /// Run one import and its layer creation as one SQLite transaction.
+    /// Parsers can insert many child rows before discovering malformed input;
+    /// rollback must remove those rows and the layer together.
+    pub fn import_layer(
+        &self,
+        source: &str,
+        file: &str,
+        command: Option<&str>,
+        secs: Option<f64>,
+        target_hash: Option<&str>,
+        import: impl FnOnce(&Connection, i64) -> Result<()>,
+    ) -> Result<i64> {
+        self.conn.execute_batch("BEGIN IMMEDIATE")?;
+        let result = (|| {
+            let layer_id = self.add_layer(source, file, command, secs, target_hash)?;
+            import(&self.conn, layer_id)?;
+            Ok(layer_id)
+        })();
+        match result {
+            Ok(id) => {
+                self.conn.execute_batch("COMMIT")?;
+                Ok(id)
+            }
+            Err(error) => {
+                let _ = self.conn.execute_batch("ROLLBACK");
+                Err(error)
+            }
+        }
     }
 
     /// List all saved sessions.
@@ -152,14 +317,55 @@ impl GpuDb {
         if !dir.exists() {
             return Ok(Vec::new());
         }
+        let (scan_dir, dir_guard) = open_gpu_session_dir(&dir)?;
+        Self::list_saved_from_open_dir(&scan_dir, &dir_guard)
+    }
+
+    fn list_saved_from_open_dir(
+        scan_dir: &Path,
+        dir_guard: &std::fs::File,
+    ) -> Result<Vec<SavedSession>> {
         let mut sessions = Vec::new();
-        for entry in std::fs::read_dir(&dir)? {
+        for entry in std::fs::read_dir(&scan_dir)? {
             let entry = entry?;
             let path = entry.path();
+            if std::fs::symlink_metadata(&path)
+                .is_ok_and(|metadata| metadata.file_type().is_symlink())
+            {
+                continue;
+            }
             if path.extension().is_some_and(|e| e == "db")
                 && path.to_str().is_some_and(|s| s.contains(".gpu."))
             {
-                if let Ok(db) = Self::open(&path) {
+                #[cfg(unix)]
+                let opened = {
+                    let file_name = entry.file_name();
+                    open_file_at_dir(&dir_guard, Path::new(&file_name), true, false, false)
+                        .map(|file| (file, true))
+                        .or_else(|write_error| {
+                            open_file_at_dir(&dir_guard, Path::new(&file_name), false, false, false)
+                                .map(|file| (file, false))
+                                .with_context(|| {
+                                    format!(
+                                        "cannot open saved session for read or write: {write_error}"
+                                    )
+                                })
+                        })
+                        .and_then(|(file, writable)| {
+                            let conn = open_sqlite_from_file(&file, writable)?;
+                            Self::from_opened(
+                                path.clone(),
+                                OpenedSqlite {
+                                    conn,
+                                    file,
+                                    writable,
+                                },
+                            )
+                        })
+                };
+                #[cfg(not(unix))]
+                let opened = Self::open(&path);
+                if let Ok(db) = opened {
                     let name = path
                         .file_stem()
                         .unwrap_or_default()
@@ -231,11 +437,25 @@ impl GpuDb {
     pub fn remove_layer(&self, layer_id: i64) -> Result<()> {
         self.conn
             .execute("DELETE FROM layers WHERE id = ?1", params![layer_id])?;
+        self.conn.execute(
+            "DELETE FROM meta WHERE key IN (?1, ?2)",
+            [
+                format!("nsys_um_gpu_faults_{layer_id}"),
+                format!("nsys_kernel_names_{layer_id}"),
+            ],
+        )?;
         Ok(())
     }
 
+    /// Normalize names in databases created by older gdbg versions.
+    ///
+    /// New imports already use the same key. This pass keeps saved sessions
+    /// compatible and makes every SQL equality join use the canonical key.
+    pub fn normalize_kernel_names(&self) -> Result<()> {
+        normalize_kernel_names_transaction(&self.conn)
+    }
+
     /// Execute a query and collect all rows via a mapping function.
-    /// Returns an empty Vec on any error (safe for diagnostic/display code).
     pub fn query_vec<T>(
         &self,
         sql: &str,
@@ -249,6 +469,18 @@ impl GpuDb {
             return Vec::new();
         };
         rows.filter_map(|r| r.ok()).collect()
+    }
+
+    pub fn query_vec_result<T>(
+        &self,
+        sql: &str,
+        params: impl rusqlite::Params,
+        f: impl FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<T>,
+    ) -> Result<Vec<T>> {
+        let mut stmt = self.conn.prepare(sql)?;
+        let rows = stmt.query_map(params, f)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
     }
 
     /// Check if target hashes are consistent across all layers.
@@ -344,10 +576,18 @@ impl GpuDb {
     /// Get the layer ID to use for timeline queries (prefer nsys, fall back to torch).
     /// Returns None if no timeline layer exists.
     pub fn timeline_layer_id(&self) -> Option<i64> {
-        // Prefer nsys (has real timestamps), fall back to torch
+        // Prefer nsys (has real timestamps), but only when it contains
+        // timeline rows. A failed or empty preferred layer must not mask a
+        // populated torch/proton layer.
         for source in &["nsys", "torch", "proton"] {
             if let Ok(id) = self.conn.query_row(
-                "SELECT id FROM layers WHERE source = ?1 ORDER BY id LIMIT 1",
+                "SELECT id FROM layers AS layer
+                 WHERE source = ?1 AND (
+                    EXISTS (SELECT 1 FROM launches WHERE layer_id = layer.id)
+                    OR EXISTS (SELECT 1 FROM transfers WHERE layer_id = layer.id)
+                    OR EXISTS (SELECT 1 FROM regions WHERE layer_id = layer.id)
+                 )
+                 ORDER BY id DESC LIMIT 1",
                 params![source],
                 |row| row.get::<_, i64>(0),
             ) {
@@ -355,6 +595,19 @@ impl GpuDb {
             }
         }
         None
+    }
+
+    /// External profiler filters use native spellings; database joins use canonical keys.
+    pub fn native_kernel_name(&self, canonical: &str) -> String {
+        self.timeline_layer_id()
+            .and_then(|layer| {
+                serde_json::from_str::<HashMap<String, String>>(
+                    &self.meta(&format!("nsys_kernel_names_{layer}")),
+                )
+                .ok()
+            })
+            .and_then(|names| names.get(canonical).cloned())
+            .unwrap_or_else(|| canonical.to_string())
     }
 
     /// SQL fragment to filter launches to the best timeline layer.
@@ -367,10 +620,54 @@ impl GpuDb {
 
     /// Like `timeline_filter`, but with a custom table alias.
     pub fn timeline_filter_for(&self, alias: &str) -> String {
+        if !alias.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+            return "0=1".to_string();
+        }
         match self.timeline_layer_id() {
             Some(id) => format!("{alias}.layer_id = {id}"),
             None => "1=1".to_string(),
         }
+    }
+
+    /// Restrict metric rows to the newest NCU layer. Rows without a layer
+    /// are retained for small hand-built compatibility databases.
+    pub fn metric_filter_for(&self, alias: &str) -> String {
+        if !alias.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+            return "0=1".to_string();
+        }
+        match self.conn.query_row(
+            "SELECT layer.id FROM layers AS layer
+             WHERE layer.source='ncu'
+               AND EXISTS (SELECT 1 FROM metrics WHERE layer_id = layer.id)
+             ORDER BY layer.id DESC LIMIT 1",
+            [],
+            |r| r.get::<_, i64>(0),
+        ) {
+            Ok(id) => format!("({alias}.layer_id = {id} OR {alias}.layer_id IS NULL)"),
+            Err(_) => "1=1".to_string(),
+        }
+    }
+
+    /// Select the hardware-metrics layer used by the current session.
+    pub fn metrics_layer_id(&self) -> Option<i64> {
+        self.conn
+            .query_row(
+                "SELECT layer.id FROM layers AS layer
+                 WHERE layer.source = 'ncu'
+                   AND EXISTS (SELECT 1 FROM metrics WHERE layer_id = layer.id)
+                 ORDER BY layer.id DESC LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .ok()
+    }
+
+    pub fn metrics_filter(&self) -> String {
+        self.metrics_filter_for("metrics")
+    }
+
+    pub fn metrics_filter_for(&self, alias: &str) -> String {
+        self.metric_filter_for(alias)
     }
 
     // -----------------------------------------------------------------------
@@ -429,16 +726,60 @@ impl GpuDb {
             return;
         }
 
-        // Re-correlate: for each op, sum kernel durations from the timeline layer.
-        let _ = self.conn.execute(
-            "UPDATE ops SET gpu_time_us = (
-                SELECT COALESCE(SUM(l.duration_us), 0)
-                FROM op_kernel_map okm
-                JOIN launches l ON l.kernel_name = okm.kernel_name AND l.layer_id = ?1
-                WHERE okm.op_id = ops.id
-            )",
+        // Mappings with a source launch ID represent individual occurrences.
+        // IDs are not comparable across profiler layers, so rank same-name
+        // occurrences by time and pair them one-to-one. Legacy/name-only
+        // mappings represent an aggregate relationship and intentionally sum
+        // the selected layer's same-name launches once per operator.
+        if let Err(e) = self.conn.execute(
+            "WITH exact_mappings AS (
+                SELECT mappings.op_id, mappings.kernel_name,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY mappings.kernel_name
+                           ORDER BY source.start_us, mappings.launch_id, mappings.op_id
+                       ) AS occurrence
+                FROM op_kernel_map AS mappings
+                JOIN launches AS source ON source.id = mappings.launch_id
+                WHERE mappings.launch_id IS NOT NULL
+             ), timeline_launches AS (
+                SELECT kernel_name, duration_us,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY kernel_name ORDER BY start_us, id
+                       ) AS occurrence
+                FROM launches WHERE layer_id = ?1
+             ), contributions AS (
+                SELECT mappings.op_id, launches.duration_us
+                FROM exact_mappings AS mappings
+                JOIN timeline_launches AS launches
+                  ON launches.kernel_name = mappings.kernel_name
+                 AND launches.occurrence = mappings.occurrence
+                UNION ALL
+                SELECT mappings.op_id, launches.duration_us
+                FROM (
+                    SELECT DISTINCT fallback.op_id, fallback.kernel_name
+                    FROM op_kernel_map AS fallback
+                    WHERE fallback.launch_id IS NULL
+                      AND NOT EXISTS (
+                          SELECT 1 FROM op_kernel_map AS exact
+                          WHERE exact.op_id = fallback.op_id
+                            AND exact.kernel_name = fallback.kernel_name
+                            AND exact.launch_id IS NOT NULL
+                      )
+                ) AS mappings
+                JOIN launches
+                  ON launches.layer_id = ?1
+                 AND launches.kernel_name = mappings.kernel_name
+             ), totals AS (
+                SELECT op_id, SUM(duration_us) AS gpu_time_us
+                FROM contributions GROUP BY op_id
+             )
+             UPDATE ops SET gpu_time_us = COALESCE((
+                 SELECT totals.gpu_time_us FROM totals WHERE totals.op_id = ops.id
+             ), 0)",
             params![tl_id],
-        );
+        ) {
+            eprintln!("recompute_op_gpu_times failed: {e}");
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -482,6 +823,22 @@ impl GpuDb {
         ))
     }
 
+    pub fn allocation_filter_for(&self, alias: &str) -> String {
+        if !alias.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+            return "0=1".to_string();
+        }
+        match self.conn.query_row(
+            "SELECT layer_id FROM allocations
+             WHERE layer_id IS NOT NULL
+             ORDER BY layer_id DESC LIMIT 1",
+            [],
+            |row| row.get::<_, i64>(0),
+        ) {
+            Ok(id) => format!("({alias}.layer_id = {id})"),
+            Err(_) => "1=1".to_string(),
+        }
+    }
+
     /// Kernel `(start_us, end_us)` intervals from `launches`, timeline-filtered,
     /// ordered by `start_us`. Skips rows where `start_us IS NULL`.
     pub fn kernel_intervals(&self) -> Vec<(f64, f64)> {
@@ -497,16 +854,21 @@ impl GpuDb {
     /// Skips rows where `start_us IS NULL`. If `kind` is `Some`, restricts to that
     /// transfer kind (e.g. "H2D", "D2H", "D2D").
     pub fn transfer_intervals(&self, kind: Option<&str>) -> Vec<(f64, f64)> {
+        let filter = self.timeline_filter_for("transfers");
         match kind {
             Some(k) => self.query_vec(
-                "SELECT start_us, start_us + duration_us FROM transfers
-                 WHERE start_us IS NOT NULL AND kind = ?1 ORDER BY start_us",
+                &format!(
+                    "SELECT start_us, start_us + duration_us FROM transfers
+                 WHERE start_us IS NOT NULL AND kind = ?1 AND {filter} ORDER BY start_us"
+                ),
                 [k],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             ),
             None => self.query_vec(
-                "SELECT start_us, start_us + duration_us FROM transfers
-                 WHERE start_us IS NOT NULL ORDER BY start_us",
+                &format!(
+                    "SELECT start_us, start_us + duration_us FROM transfers
+                 WHERE start_us IS NOT NULL AND {filter} ORDER BY start_us"
+                ),
                 [],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             ),
@@ -514,7 +876,8 @@ impl GpuDb {
     }
 
     pub fn transfer_count(&self) -> usize {
-        self.count("SELECT COUNT(*) FROM transfers")
+        let filter = self.timeline_filter_for("transfers");
+        self.count(&format!("SELECT COUNT(*) FROM transfers WHERE {filter}"))
     }
 
     pub fn stream_count(&self) -> usize {
@@ -525,7 +888,10 @@ impl GpuDb {
     }
 
     pub fn kernels_with_metrics(&self) -> usize {
-        self.count("SELECT COUNT(*) FROM metrics")
+        self.count(&format!(
+            "SELECT COUNT(*) FROM metrics m WHERE {}",
+            self.metric_filter_for("m")
+        ))
     }
 
     pub fn kernels_with_ops(&self) -> usize {
@@ -555,6 +921,7 @@ impl GpuDb {
                    WHERE name LIKE ? ESCAPE '\'
                      AND launches.start_us >= regions.start_us
                      AND launches.start_us <= regions.start_us + regions.duration_us
+                     AND (regions.layer_id IS NULL OR regions.layer_id = launches.layer_id)
                  )"
                 .to_string(),
             );
@@ -571,18 +938,267 @@ impl GpuDb {
     // -----------------------------------------------------------------------
 
     pub fn attach(&self, path: &str, alias: &str) -> Result<()> {
-        self.conn.execute_batch(&format!(
-            "ATTACH DATABASE '{}' AS {alias}",
-            path.replace('\'', "''")
-        ))?;
-        Ok(())
+        validate_sql_identifier(alias)?;
+        let path = Path::new(path);
+        let file = open_existing_file(path)?;
+        self.attach_file(file, alias)
+    }
+
+    /// Attach an already-open database. The duplicated descriptor remains
+    /// owned by this connection until SQLite has completed `DETACH`.
+    pub fn attach_db(&self, other: &Self, alias: &str) -> Result<()> {
+        validate_sql_identifier(alias)?;
+        self.attach_file(other.database_file.try_clone()?, alias)
+    }
+
+    fn attach_file(&self, file: std::fs::File, alias: &str) -> Result<()> {
+        validate_sql_identifier(alias)?;
+        #[cfg(unix)]
+        {
+            let attach_path = sqlite_fd_path(&file);
+            self.conn.execute_batch(&format!(
+                "ATTACH DATABASE '{}' AS {alias}",
+                attach_path.to_string_lossy().replace('\'', "''")
+            ))?;
+            self.attached_files
+                .lock()
+                .unwrap()
+                .insert(alias.to_string(), file);
+            Ok(())
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (file, alias);
+            bail!("descriptor-backed SQLite attachments are unsupported on this platform")
+        }
     }
 
     pub fn detach(&self, alias: &str) -> Result<()> {
+        validate_sql_identifier(alias)?;
         self.conn
             .execute_batch(&format!("DETACH DATABASE {alias}"))?;
+        // SQLite is done with the file only after DETACH succeeds.
+        self.attached_files.lock().unwrap().remove(alias);
         Ok(())
     }
+}
+
+fn validate_schema_tables(conn: &Connection, path: &Path) -> Result<()> {
+    const REQUIRED: &[&str] = &[
+        "meta",
+        "layers",
+        "launches",
+        "metrics",
+        "transfers",
+        "ops",
+        "op_kernel_map",
+        "allocations",
+        "regions",
+        "failures",
+    ];
+    let mut missing = Vec::new();
+    for table in REQUIRED {
+        let present: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+            [table],
+            |row| row.get(0),
+        )?;
+        if present != 1 {
+            missing.push(*table);
+        }
+    }
+    if !missing.is_empty() {
+        bail!(
+            "gdbg session DB {} is missing required table(s): {}",
+            path.display(),
+            missing.join(", ")
+        );
+    }
+    Ok(())
+}
+
+struct OpenedSqlite {
+    conn: Connection,
+    file: std::fs::File,
+    writable: bool,
+}
+
+fn open_sqlite_path(path: &Path, writable: bool, create: bool) -> Result<OpenedSqlite> {
+    #[cfg(unix)]
+    {
+        let file = open_file(path, writable, create)?;
+        let conn = open_sqlite_from_file(&file, writable)?;
+        return Ok(OpenedSqlite {
+            conn,
+            file,
+            writable,
+        });
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (path, writable);
+        bail!("descriptor-backed SQLite access is unsupported on this platform")
+    }
+}
+
+fn open_sqlite_from_file(file: &std::fs::File, writable: bool) -> Result<Connection> {
+    #[cfg(unix)]
+    {
+        let fd_path = sqlite_fd_path(file);
+        let flags = if writable {
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
+        } else {
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+        };
+        return Connection::open_with_flags(fd_path, flags).map_err(Into::into);
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (file, writable);
+        bail!("descriptor-backed SQLite access is unsupported on this platform")
+    }
+}
+
+fn open_existing_file(path: &Path) -> Result<std::fs::File> {
+    open_file(path, false, false)
+}
+
+fn open_file(path: &Path, writable: bool, create: bool) -> Result<std::fs::File> {
+    #[cfg(unix)]
+    {
+        let parent = path.parent().unwrap_or_else(|| Path::new("."));
+        let name = path
+            .file_name()
+            .ok_or_else(|| anyhow::anyhow!("database path has no file name: {}", path.display()))?;
+        let dir = open_directory_anchored(parent)?;
+        return open_file_at_dir(&dir, Path::new(name), writable, create, false);
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (path, writable, create);
+        bail!("descriptor-relative file access is unsupported on this platform")
+    }
+}
+
+#[cfg(unix)]
+fn open_file_at_dir(
+    dir: &std::fs::File,
+    name: &Path,
+    writable: bool,
+    create: bool,
+    exclusive: bool,
+) -> Result<std::fs::File> {
+    use std::ffi::CString;
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::ffi::OsStrExt;
+
+    let name = CString::new(name.as_os_str().as_bytes())?;
+    let mut flags = if writable {
+        nix::libc::O_RDWR
+    } else {
+        nix::libc::O_RDONLY
+    };
+    flags |= nix::libc::O_NOFOLLOW | nix::libc::O_CLOEXEC;
+    if create {
+        flags |= nix::libc::O_CREAT;
+    }
+    if exclusive {
+        flags |= nix::libc::O_EXCL;
+    }
+    let fd = unsafe { nix::libc::openat(dir.as_raw_fd(), name.as_ptr(), flags, 0o600) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    Ok(unsafe { std::fs::File::from_raw_fd(fd) })
+}
+
+fn open_gpu_session_dir(path: &Path) -> Result<(PathBuf, std::fs::File)> {
+    #[cfg(unix)]
+    {
+        let guard = open_directory_anchored(path)?;
+        return Ok((sqlite_fd_path(&guard), guard));
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        bail!("descriptor-relative directory access is unsupported on this platform")
+    }
+}
+
+#[cfg(unix)]
+fn sqlite_fd_path(file: &std::fs::File) -> PathBuf {
+    use std::os::fd::AsRawFd;
+
+    #[cfg(target_os = "linux")]
+    const FD_DIR: &str = "/proc/self/fd";
+    #[cfg(not(target_os = "linux"))]
+    const FD_DIR: &str = "/dev/fd";
+
+    PathBuf::from(format!("{FD_DIR}/{}", file.as_raw_fd()))
+}
+
+/// Open a directory by walking each component from a stable descriptor.
+/// Checking the complete pathname first is not sufficient: an attacker can
+/// replace an ancestor with a symlink between that check and `open`. Every
+/// component is therefore opened with `openat`, `O_DIRECTORY`, and
+/// `O_NOFOLLOW` before the next component is resolved.
+#[cfg(unix)]
+fn open_directory_anchored(path: &Path) -> Result<std::fs::File> {
+    use std::ffi::CString;
+    use std::os::fd::{FromRawFd, OwnedFd};
+    use std::os::unix::ffi::OsStrExt;
+
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    let root = CString::new("/").expect("literal has no NUL");
+    #[cfg(target_os = "linux")]
+    let root_flags = nix::libc::O_PATH;
+    #[cfg(not(target_os = "linux"))]
+    let root_flags = nix::libc::O_RDONLY;
+    let root_fd = unsafe {
+        nix::libc::open(
+            root.as_ptr(),
+            root_flags | nix::libc::O_DIRECTORY | nix::libc::O_CLOEXEC,
+        )
+    };
+    if root_fd < 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    let mut current = unsafe { OwnedFd::from_raw_fd(root_fd) };
+    for component in absolute.components() {
+        let std::path::Component::Normal(name) = component else {
+            if matches!(component, std::path::Component::ParentDir) {
+                bail!(
+                    "refusing parent component in GPU session directory {}",
+                    path.display()
+                );
+            }
+            continue;
+        };
+        let name = CString::new(name.as_bytes())?;
+        #[cfg(target_os = "linux")]
+        let component_flags = nix::libc::O_PATH;
+        #[cfg(not(target_os = "linux"))]
+        let component_flags = nix::libc::O_RDONLY;
+        let fd = unsafe {
+            nix::libc::openat(
+                std::os::fd::AsRawFd::as_raw_fd(&current),
+                name.as_ptr(),
+                component_flags
+                    | nix::libc::O_DIRECTORY
+                    | nix::libc::O_NOFOLLOW
+                    | nix::libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        current = unsafe { OwnedFd::from_raw_fd(fd) };
+    }
+    Ok(std::fs::File::from(current))
 }
 
 // ---------------------------------------------------------------------------
@@ -624,7 +1240,7 @@ fn init_schema(conn: &Connection) -> Result<()> {
         );
 
         CREATE TABLE IF NOT EXISTS metrics (
-            kernel_name              TEXT PRIMARY KEY,
+            kernel_name              TEXT NOT NULL,
             occupancy_pct            REAL,
             compute_throughput_pct   REAL,
             memory_throughput_pct    REAL,
@@ -635,7 +1251,8 @@ fn init_schema(conn: &Connection) -> Result<()> {
             achieved_bandwidth_gb_s  REAL,
             peak_bandwidth_gb_s      REAL,
             boundedness              TEXT,
-            layer_id                 INTEGER REFERENCES layers(id)
+            layer_id                 INTEGER REFERENCES layers(id),
+            PRIMARY KEY (kernel_name, layer_id)
         );
 
         CREATE TABLE IF NOT EXISTS transfers (
@@ -661,7 +1278,8 @@ fn init_schema(conn: &Connection) -> Result<()> {
         CREATE TABLE IF NOT EXISTS op_kernel_map (
             op_id       INTEGER REFERENCES ops(id),
             kernel_name TEXT,
-            PRIMARY KEY (op_id, kernel_name)
+            launch_id   INTEGER REFERENCES launches(id),
+            PRIMARY KEY (op_id, kernel_name, launch_id)
         );
 
         CREATE TABLE IF NOT EXISTS allocations (
@@ -696,6 +1314,162 @@ fn init_schema(conn: &Connection) -> Result<()> {
         CREATE INDEX IF NOT EXISTS idx_transfers_start ON transfers(start_us);
         ",
     )?;
+    Ok(())
+}
+
+fn normalize_kernel_names_in(conn: &Connection) -> Result<()> {
+    let launch_rows: Vec<(i64, String)> = {
+        let mut stmt = conn.prepare("SELECT id, kernel_name FROM launches")?;
+        stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    for (id, raw) in launch_rows {
+        let name = normalize_kernel_name(&raw);
+        if name != raw {
+            conn.execute(
+                "UPDATE launches SET kernel_name = ?1 WHERE id = ?2",
+                params![name, id],
+            )?;
+        }
+    }
+
+    // Metrics have a primary key on (kernel_name, layer_id). If two old
+    // spellings become one key, merge non-null values before removing the
+    // duplicate. A saved database can contain complementary NCU rows.
+    let metric_rows: Vec<(String, Option<i64>)> = {
+        let mut stmt = conn.prepare("SELECT kernel_name, layer_id FROM metrics")?;
+        stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    for (raw, layer_id) in metric_rows {
+        let name = normalize_kernel_name(&raw);
+        if name == raw {
+            continue;
+        }
+        let duplicate = conn.query_row(
+            "SELECT COUNT(*) FROM metrics
+             WHERE kernel_name = ?1 AND layer_id IS ?2",
+            params![name, layer_id],
+            |row| row.get::<_, i64>(0),
+        )? > 0;
+        if duplicate {
+            conn.execute(
+                "UPDATE metrics AS existing SET
+                   occupancy_pct = COALESCE(existing.occupancy_pct, (SELECT incoming.occupancy_pct FROM metrics AS incoming WHERE incoming.kernel_name = ?1 AND incoming.layer_id IS ?2)),
+                   compute_throughput_pct = COALESCE(existing.compute_throughput_pct, (SELECT incoming.compute_throughput_pct FROM metrics AS incoming WHERE incoming.kernel_name = ?1 AND incoming.layer_id IS ?2)),
+                   memory_throughput_pct = COALESCE(existing.memory_throughput_pct, (SELECT incoming.memory_throughput_pct FROM metrics AS incoming WHERE incoming.kernel_name = ?1 AND incoming.layer_id IS ?2)),
+                   registers_per_thread = COALESCE(existing.registers_per_thread, (SELECT incoming.registers_per_thread FROM metrics AS incoming WHERE incoming.kernel_name = ?1 AND incoming.layer_id IS ?2)),
+                   shared_mem_static_bytes = COALESCE(existing.shared_mem_static_bytes, (SELECT incoming.shared_mem_static_bytes FROM metrics AS incoming WHERE incoming.kernel_name = ?1 AND incoming.layer_id IS ?2)),
+                   shared_mem_dynamic_bytes = COALESCE(existing.shared_mem_dynamic_bytes, (SELECT incoming.shared_mem_dynamic_bytes FROM metrics AS incoming WHERE incoming.kernel_name = ?1 AND incoming.layer_id IS ?2)),
+                   l2_hit_rate_pct = COALESCE(existing.l2_hit_rate_pct, (SELECT incoming.l2_hit_rate_pct FROM metrics AS incoming WHERE incoming.kernel_name = ?1 AND incoming.layer_id IS ?2)),
+                   achieved_bandwidth_gb_s = COALESCE(existing.achieved_bandwidth_gb_s, (SELECT incoming.achieved_bandwidth_gb_s FROM metrics AS incoming WHERE incoming.kernel_name = ?1 AND incoming.layer_id IS ?2)),
+                   peak_bandwidth_gb_s = COALESCE(existing.peak_bandwidth_gb_s, (SELECT incoming.peak_bandwidth_gb_s FROM metrics AS incoming WHERE incoming.kernel_name = ?1 AND incoming.layer_id IS ?2)),
+                   boundedness = COALESCE(existing.boundedness, (SELECT incoming.boundedness FROM metrics AS incoming WHERE incoming.kernel_name = ?1 AND incoming.layer_id IS ?2))
+                 WHERE existing.kernel_name = ?3 AND existing.layer_id IS ?4",
+                params![raw, layer_id, name, layer_id],
+            )?;
+            conn.execute(
+                "DELETE FROM metrics WHERE kernel_name = ?1 AND layer_id IS ?2",
+                params![raw, layer_id],
+            )?;
+        } else {
+            conn.execute(
+                "UPDATE metrics SET kernel_name = ?1
+                 WHERE kernel_name = ?2 AND layer_id IS ?3",
+                params![name, raw, layer_id],
+            )?;
+        }
+    }
+
+    let mappings: Vec<(Option<i64>, Option<String>, Option<i64>)> = {
+        let mut stmt = conn.prepare("SELECT op_id, kernel_name, launch_id FROM op_kernel_map")?;
+        stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+    };
+
+    // Normalize the complete key before the table changes. SQLite permits
+    // duplicate composite keys when any key value is NULL.
+    let mut unique_mappings = HashSet::new();
+    let mut normalized_mappings = Vec::with_capacity(mappings.len());
+    for (op_id, name, launch_id) in mappings {
+        let name = name.map(|name| normalize_kernel_name(&name));
+        let mapping = (op_id, name, launch_id);
+        if unique_mappings.insert(mapping.clone()) {
+            normalized_mappings.push(mapping);
+        }
+    }
+
+    conn.execute("DELETE FROM op_kernel_map", [])?;
+    for (op_id, name, launch_id) in normalized_mappings {
+        conn.execute(
+            "INSERT INTO op_kernel_map (op_id, kernel_name, launch_id)
+             VALUES (?1, ?2, ?3)",
+            params![op_id, name, launch_id],
+        )?;
+    }
+    Ok(())
+}
+
+fn normalize_kernel_names_transaction(conn: &Connection) -> Result<()> {
+    conn.execute_batch("BEGIN IMMEDIATE")?;
+    match normalize_kernel_names_in(conn) {
+        Ok(()) => {
+            conn.execute_batch("COMMIT")?;
+            Ok(())
+        }
+        Err(error) => {
+            let _ = conn.execute_batch("ROLLBACK");
+            Err(error)
+        }
+    }
+}
+
+fn validate_saved_session_name(name: &str) -> Result<()> {
+    if name.is_empty()
+        || name == "."
+        || name == ".."
+        || !name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
+    {
+        bail!("invalid GPU saved-session name `{name}`; use only letters, digits, `-`, and `_`");
+    }
+    Ok(())
+}
+
+/// Validate a name interpolated into SQLite's identifier position.
+///
+/// SQLite does not provide a bind-parameter form for database aliases, so
+/// callers must use a deliberately narrow identifier grammar.
+fn validate_sql_identifier(identifier: &str) -> Result<()> {
+    let mut chars = identifier.chars();
+    let first = chars.next();
+    if first.is_none_or(|ch| !(ch == '_' || ch.is_ascii_alphabetic()))
+        || chars.any(|ch| !(ch == '_' || ch.is_ascii_alphanumeric()))
+    {
+        bail!("invalid SQLite identifier `{identifier}`");
+    }
+    Ok(())
+}
+
+fn reject_symlink(path: &Path, description: &str) -> Result<()> {
+    if std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
+        bail!("refusing {description} symlink: {}", path.display());
+    }
+    Ok(())
+}
+
+fn reject_path_symlinks(path: &Path, description: &str) -> Result<()> {
+    for ancestor in path.ancestors() {
+        if std::fs::symlink_metadata(ancestor)
+            .is_ok_and(|metadata| metadata.file_type().is_symlink())
+        {
+            bail!(
+                "refusing {description} path through symlink: {}",
+                ancestor.display()
+            );
+        }
+    }
     Ok(())
 }
 
@@ -771,6 +1545,32 @@ mod tests {
         assert_eq!(db.meta("missing"), "");
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn read_only_legacy_database_is_normalized_in_memory() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("legacy.gpu.db");
+        {
+            let db = GpuDb::create(&path).unwrap();
+            let layer = db.add_layer("nsys", "trace", None, None, None).unwrap();
+            db.conn
+                .execute(
+                    "INSERT INTO launches (kernel_name, duration_us, layer_id)
+                     VALUES ('void legacy::kernel(float)', 1.0, ?1)",
+                    params![layer],
+                )
+                .unwrap();
+        }
+
+        let opened = open_sqlite_path(&path, false, false).unwrap();
+        let db = GpuDb::from_opened(path, opened).unwrap();
+        let name: String = db
+            .conn
+            .query_row("SELECT kernel_name FROM launches", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(name, "legacy::kernel");
+    }
+
     #[test]
     fn add_layer() {
         let db = temp_db();
@@ -787,6 +1587,215 @@ mod tests {
         assert!(db.has_layer("nsys"));
         assert!(!db.has_layer("ncu"));
         assert_eq!(db.layer_names(), vec!["nsys"]);
+    }
+
+    #[test]
+    fn timeline_skips_empty_preferred_layer() {
+        let db = temp_db();
+        let empty = db.add_layer("nsys", "empty.rep", None, None, None).unwrap();
+        let populated = db
+            .add_layer("torch", "trace.json", None, None, None)
+            .unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO launches (kernel_name, duration_us, layer_id) VALUES ('k', 2.0, ?1)",
+                params![populated],
+            )
+            .unwrap();
+        assert_ne!(db.timeline_layer_id(), Some(empty));
+        assert_eq!(db.timeline_layer_id(), Some(populated));
+        assert_eq!(db.total_launch_count(), 1);
+    }
+
+    #[test]
+    fn timeline_uses_the_newest_populated_layer_for_a_source() {
+        let db = temp_db();
+        let old = db.add_layer("nsys", "old.rep", None, None, None).unwrap();
+        let new = db.add_layer("nsys", "new.rep", None, None, None).unwrap();
+        for (layer, name) in [(old, "old"), (new, "new")] {
+            db.conn
+                .execute(
+                    "INSERT INTO launches (kernel_name, duration_us, layer_id)
+                     VALUES (?1, 1.0, ?2)",
+                    params![name, layer],
+                )
+                .unwrap();
+        }
+        assert_eq!(db.timeline_layer_id(), Some(new));
+    }
+
+    #[test]
+    fn allocation_filter_uses_only_the_newest_populated_layer() {
+        let db = temp_db();
+        let old = db.add_layer("nsys", "old.rep", None, None, None).unwrap();
+        let new = db.add_layer("nsys", "new.rep", None, None, None).unwrap();
+        for (layer, bytes) in [(old, 100), (new, 7)] {
+            db.conn
+                .execute(
+                    "INSERT INTO allocations (op, address, bytes, start_us, layer_id)
+                     VALUES ('alloc', ?1, ?1, 0, ?2)",
+                    params![bytes, layer],
+                )
+                .unwrap();
+        }
+        let filter = db.allocation_filter_for("allocations");
+        let bytes: i64 = db
+            .conn
+            .query_row(
+                &format!("SELECT SUM(bytes) FROM allocations WHERE {filter}"),
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(bytes, 7);
+    }
+
+    #[test]
+    fn recompute_deduplicates_repeated_source_mappings() {
+        let db = temp_db();
+        let timeline = db.add_layer("nsys", "trace.rep", None, None, None).unwrap();
+        let source = db
+            .add_layer("torch", "trace.json", None, None, None)
+            .unwrap();
+        for duration in [2.0, 3.0, 5.0] {
+            db.conn
+                .execute(
+                    "INSERT INTO launches (kernel_name, duration_us, layer_id)
+                     VALUES ('same', ?1, ?2)",
+                    params![duration, timeline],
+                )
+                .unwrap();
+        }
+        db.conn
+            .execute(
+                "INSERT INTO ops (name, gpu_time_us, layer_id) VALUES ('op', 0, ?1)",
+                params![source],
+            )
+            .unwrap();
+        for start in [10.0, 20.0] {
+            db.conn
+                .execute(
+                    "INSERT INTO launches (kernel_name, duration_us, start_us, layer_id)
+                     VALUES ('same', 1.0, ?1, ?2)",
+                    params![start, source],
+                )
+                .unwrap();
+            let launch_id = db.conn.last_insert_rowid();
+            db.conn
+                .execute(
+                    "INSERT INTO op_kernel_map (op_id, kernel_name, launch_id)
+                     VALUES (1, 'same', ?1)",
+                    params![launch_id],
+                )
+                .unwrap();
+        }
+
+        db.recompute_op_gpu_times();
+
+        let gpu_time: f64 = db
+            .conn
+            .query_row("SELECT gpu_time_us FROM ops WHERE id=1", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(gpu_time, 5.0);
+    }
+
+    #[test]
+    fn recompute_assigns_same_name_occurrences_to_distinct_ops_once() {
+        let db = temp_db();
+        let timeline = db.add_layer("nsys", "trace.rep", None, None, None).unwrap();
+        let source = db
+            .add_layer("torch", "trace.json", None, None, None)
+            .unwrap();
+        for duration in [2.0, 3.0] {
+            db.conn
+                .execute(
+                    "INSERT INTO launches (kernel_name, duration_us, layer_id)
+                     VALUES ('same', ?1, ?2)",
+                    params![duration, timeline],
+                )
+                .unwrap();
+        }
+        for (op_id, start) in [(1, 10.0), (2, 20.0)] {
+            db.conn
+                .execute(
+                    "INSERT INTO ops (id, name, gpu_time_us, layer_id)
+                     VALUES (?1, 'op', 0, ?2)",
+                    params![op_id, source],
+                )
+                .unwrap();
+            db.conn
+                .execute(
+                    "INSERT INTO launches (kernel_name, duration_us, start_us, layer_id)
+                     VALUES ('same', 1.0, ?1, ?2)",
+                    params![start, source],
+                )
+                .unwrap();
+            db.conn
+                .execute(
+                    "INSERT INTO op_kernel_map (op_id, kernel_name, launch_id)
+                     VALUES (?1, 'same', ?2)",
+                    params![op_id, db.conn.last_insert_rowid()],
+                )
+                .unwrap();
+        }
+
+        db.recompute_op_gpu_times();
+
+        let times: Vec<f64> = db.query_vec("SELECT gpu_time_us FROM ops ORDER BY id", [], |row| {
+            row.get(0)
+        });
+        assert_eq!(times, vec![2.0, 3.0]);
+    }
+
+    #[test]
+    fn import_layer_rolls_back_children_and_layer_together() {
+        let db = temp_db();
+        let result = db.import_layer("ncu", "metrics.csv", None, None, None, |conn, layer_id| {
+            conn.execute(
+                "INSERT INTO launches (kernel_name, duration_us, layer_id) VALUES ('bad', 1.0, ?1)",
+                params![layer_id],
+            )?;
+            bail!("malformed import")
+        });
+        assert!(result.is_err());
+        assert!(!db.has_layer("ncu"));
+        assert_eq!(db.total_launch_count(), 0);
+    }
+
+    #[test]
+    fn save_rejects_names_that_can_escape_gpu_directory() {
+        let db = temp_db();
+        for name in ["../outside", "a/b", "a\\b", "", ".", "..", "a space"] {
+            assert!(db.save(name).is_err(), "accepted unsafe name {name:?}");
+        }
+    }
+
+    #[test]
+    fn save_rejects_symlinked_gpu_directory_or_destination() {
+        let tmp = tempfile::tempdir().unwrap();
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        let link = tmp.path().join("gpu");
+        std::os::unix::fs::symlink(&outside, &link).unwrap();
+        assert!(reject_symlink(&link, "GPU session directory").is_err());
+
+        let destination = tmp.path().join("session.gpu.db");
+        std::fs::write(&outside.join("real.db"), b"database").unwrap();
+        std::os::unix::fs::symlink(outside.join("real.db"), &destination).unwrap();
+        assert!(reject_symlink(&destination, "GPU session destination").is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn anchored_gpu_directory_rejects_a_symlinked_ancestor() {
+        let tmp = tempfile::tempdir().unwrap();
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(outside.join("gpu")).unwrap();
+        let link = tmp.path().join("link");
+        std::os::unix::fs::symlink(&outside, &link).unwrap();
+        assert!(open_gpu_session_dir(&link.join("gpu")).is_err());
     }
 
     /// Regression: when the nsys import failed (nsys 2023 schema
@@ -926,6 +1935,48 @@ mod tests {
     }
 
     #[test]
+    fn gpudb_open_rejects_missing_required_tables() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("incomplete.gpu.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            init_schema(&conn).unwrap();
+            conn.execute("DROP TABLE metrics", []).unwrap();
+            conn.execute(&format!("PRAGMA user_version = {GDBG_SCHEMA_VERSION}"), [])
+                .unwrap();
+        }
+        let error = GpuDb::open(&path).unwrap_err().to_string();
+        assert!(
+            error.contains("missing required table(s): metrics"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn gdbg_comparison_database_validation_and_query_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("comparison.gpu.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            init_schema(&conn).unwrap();
+            conn.execute("DROP TABLE launches", []).unwrap();
+            conn.execute(&format!("PRAGMA user_version = {GDBG_SCHEMA_VERSION}"), [])
+                .unwrap();
+        }
+        let validation = GpuDb::open(&path).unwrap_err();
+        assert!(validation.to_string().contains("missing required table"));
+
+        let current = GpuDb::create(&dir.path().join("current.gpu.db")).unwrap();
+        assert!(
+            current
+                .query_vec_result("SELECT * FROM definitely_missing", [], |row| {
+                    row.get::<_, String>(0)
+                })
+                .is_err()
+        );
+    }
+
+    #[test]
     fn save_preserves_version_through_backup() {
         let db = temp_db();
         db.set_meta("marker", "present").unwrap();
@@ -941,5 +1992,129 @@ mod tests {
         // The backup path must pass the version gate cleanly.
         let loaded = GpuDb::open(&dest).unwrap();
         assert_eq!(loaded.meta("marker"), "present");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn named_load_keeps_database_descriptor_across_ancestor_swap() {
+        let tmp = tempfile::tempdir().unwrap();
+        let selected_dir = tmp.path().join("selected");
+        std::fs::create_dir(&selected_dir).unwrap();
+        let selected_path = selected_dir.join("comparison.gpu.db");
+        let selected = GpuDb::create(&selected_path).unwrap();
+        selected.set_meta("marker", "original").unwrap();
+        drop(selected);
+
+        // This is the named-session open step. Keep the directory descriptor
+        // alive while opening the file, then replace the public ancestor.
+        let (scan_dir, dir_guard) = open_gpu_session_dir(&selected_dir).unwrap();
+        let comparison =
+            GpuDb::load_saved_from_open_dir(&selected_dir, &scan_dir, &dir_guard, "comparison")
+                .unwrap();
+
+        let real_dir = tmp.path().join("selected-real");
+        std::fs::rename(&selected_dir, &real_dir).unwrap();
+        std::fs::create_dir(&selected_dir).unwrap();
+        let replacement_path = selected_dir.join("comparison.gpu.db");
+        let replacement = GpuDb::create(&replacement_path).unwrap();
+        replacement.set_meta("marker", "replacement").unwrap();
+        drop(replacement);
+
+        let current = GpuDb::create(&tmp.path().join("current.gpu.db")).unwrap();
+        current.attach_db(&comparison, "other").unwrap();
+        let marker: String = current
+            .conn
+            .query_row(
+                "SELECT value FROM other.meta WHERE key = 'marker'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(marker, "original");
+        current.detach("other").unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn named_list_reads_from_the_open_directory_after_ancestor_swap() {
+        let tmp = tempfile::tempdir().unwrap();
+        let selected_dir = tmp.path().join("selected");
+        std::fs::create_dir(&selected_dir).unwrap();
+        let selected_path = selected_dir.join("comparison.gpu.db");
+        let selected = GpuDb::create(&selected_path).unwrap();
+        selected.set_meta("device", "original-device").unwrap();
+        selected
+            .set_meta("created", "2026-01-01T00:00:00Z")
+            .unwrap();
+        drop(selected);
+
+        // list_saved opens the directory before it scans entries. The scan
+        // must continue to use that descriptor if the public ancestor moves.
+        let (scan_dir, dir_guard) = open_gpu_session_dir(&selected_dir).unwrap();
+        let real_dir = tmp.path().join("selected-real");
+        std::fs::rename(&selected_dir, &real_dir).unwrap();
+        std::fs::create_dir(&selected_dir).unwrap();
+        let replacement = GpuDb::create(&selected_dir.join("comparison.gpu.db")).unwrap();
+        replacement
+            .set_meta("device", "replacement-device")
+            .unwrap();
+        replacement
+            .set_meta("created", "2026-01-02T00:00:00Z")
+            .unwrap();
+        drop(replacement);
+
+        let sessions = GpuDb::list_saved_from_open_dir(&scan_dir, &dir_guard).unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].device, "original-device");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn named_diff_keeps_explicit_database_descriptor_across_ancestor_swap() {
+        let tmp = tempfile::tempdir().unwrap();
+        let selected_dir = tmp.path().join("selected");
+        std::fs::create_dir(&selected_dir).unwrap();
+        let selected_path = selected_dir.join("comparison.gpu.db");
+        let selected = GpuDb::create(&selected_path).unwrap();
+        selected.set_meta("marker", "original").unwrap();
+        drop(selected);
+
+        // gdbg diff validates and opens an explicit pathname before it
+        // attaches the comparison. The opened database, not the pathname,
+        // must remain the source of truth.
+        let comparison = GpuDb::open(&selected_path).unwrap();
+        let real_dir = tmp.path().join("selected-real");
+        std::fs::rename(&selected_dir, &real_dir).unwrap();
+        std::fs::create_dir(&selected_dir).unwrap();
+        let replacement = GpuDb::create(&selected_dir.join("comparison.gpu.db")).unwrap();
+        replacement.set_meta("marker", "replacement").unwrap();
+        drop(replacement);
+
+        let current = GpuDb::create(&tmp.path().join("current.gpu.db")).unwrap();
+        current.attach_db(&comparison, "other").unwrap();
+        let marker: String = current
+            .conn
+            .query_row(
+                "SELECT value FROM other.meta WHERE key = 'marker'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(marker, "original");
+        current.detach("other").unwrap();
+    }
+
+    #[test]
+    fn attach_and_detach_reject_sql_identifier_injection() {
+        let db = temp_db();
+        assert!(db.detach("other; DROP TABLE meta;--").is_err());
+        assert!(db.attach_db(&db, "other; DROP TABLE meta;--").is_err());
+        assert!(
+            db.conn
+                .query_row("SELECT COUNT(*) FROM meta", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .is_ok()
+        );
     }
 }

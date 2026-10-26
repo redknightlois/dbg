@@ -655,7 +655,8 @@ fn collector_for(id: BackendId) -> Result<Box<dyn Collector>> {
 }
 
 fn persist(db: &SessionDb, req: &Request, plan: &Plan, outcome: &Outcome) -> Result<()> {
-    db.conn().execute(
+    let transaction = db.conn().unchecked_transaction()?;
+    transaction.execute(
         "INSERT INTO insn_hits
             (session_id, target, hit_count, sample_basis, sample_period,
              window_us, backend, collected_at, detail_json)
@@ -671,14 +672,15 @@ fn persist(db: &SessionDb, req: &Request, plan: &Plan, outcome: &Outcome) -> Res
             outcome.detail_summary.as_deref(),
         ],
     )?;
-    let parent_id = db.conn().last_insert_rowid();
+    let parent_id = transaction.last_insert_rowid();
     for d in &outcome.details {
-        db.conn().execute(
+        transaction.execute(
             "INSERT INTO insn_hit_details (insn_hit_id, ts_us, stack_json, regs_json)
              VALUES (?1, ?2, ?3, ?4)",
             params![parent_id, d.ts_us, d.stack_json, d.regs_json],
         )?;
     }
+    transaction.commit()?;
     Ok(())
 }
 
@@ -838,11 +840,16 @@ pub mod uprobe {
         } else {
             target.to_string()
         };
+        let binary = bpftrace_string(binary);
         if with_stack {
             format!("uprobe:{binary}:{probe_target} {{ @[ustack] = count(); }}")
         } else {
             format!("uprobe:{binary}:{probe_target} {{ @ = count(); }}")
         }
+    }
+
+    fn bpftrace_string(value: &str) -> String {
+        format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
     }
 
     fn run_bpftrace(prog: &str, window: Duration) -> Result<String> {
@@ -943,7 +950,7 @@ pub mod uprobe {
         #[test]
         fn build_program_scalar() {
             let p = build_program("CosineDistanceSingles", "/usr/bin/raven", false);
-            assert!(p.contains("uprobe:/usr/bin/raven:CosineDistanceSingles"));
+            assert!(p.contains("uprobe:\"/usr/bin/raven\":CosineDistanceSingles"));
             assert!(p.contains("@ = count();"));
             assert!(!p.contains("ustack"));
         }
@@ -952,6 +959,13 @@ pub mod uprobe {
         fn build_program_with_stack() {
             let p = build_program("foo", "./bin", true);
             assert!(p.contains("@[ustack] = count();"));
+        }
+
+        #[test]
+        fn build_program_quotes_binary_paths_as_dsl_data() {
+            let p = build_program("main", "/tmp/app:evil { @x = 1; }", false);
+            assert!(p.contains("uprobe:\"/tmp/app:evil { @x = 1; }\":main"));
+            assert_eq!(p.matches("{ @ = count(); }").count(), 1);
         }
 
         #[test]
@@ -1320,6 +1334,38 @@ mod tests {
     }
 
     #[test]
+    fn persist_rolls_back_parent_when_a_detail_fails() {
+        let tmp = TempDir::new().unwrap();
+        let db = mk_db(&tmp, "atomic");
+        db.conn()
+            .execute_batch(
+                "CREATE TRIGGER reject_insn_detail BEFORE INSERT ON insn_hit_details
+                 BEGIN SELECT RAISE(ABORT, 'detail rejected'); END;",
+            )
+            .unwrap();
+        let request = req("foo");
+        let plan = plan(&request, &FakeProbe(vec![BackendId::Mock])).unwrap();
+        let outcome = Outcome {
+            hit_count: 1,
+            sample_basis: SampleBasis::Exact,
+            sample_period: None,
+            window_us: Some(1.0),
+            details: vec![HitDetail {
+                ts_us: Some(1.0),
+                stack_json: None,
+                regs_json: None,
+            }],
+            detail_summary: None,
+        };
+        assert!(persist(&db, &request, &plan, &outcome).is_err());
+        let count: i64 = db
+            .conn()
+            .query_row("SELECT COUNT(*) FROM insn_hits", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[test]
     fn run_explain_prints_why_before_summary() {
         let tmp = TempDir::new().unwrap();
         let db = mk_db(&tmp, "s2");
@@ -1473,8 +1519,20 @@ pub mod pt {
         if !out.status.success() {
             return None;
         }
-        let s = String::from_utf8_lossy(&out.stdout);
-        s.lines().next()?.trim().parse().ok()
+        find_matching_pid(
+            binary,
+            &String::from_utf8_lossy(&out.stdout),
+            Path::new("/proc"),
+        )
+    }
+
+    fn find_matching_pid(binary: &str, candidates: &str, proc_root: &Path) -> Option<i32> {
+        let expected = std::fs::canonicalize(binary).ok()?;
+        candidates.lines().find_map(|line| {
+            let pid = line.trim().parse::<i32>().ok()?;
+            let actual = std::fs::read_link(proc_root.join(pid.to_string()).join("exe")).ok()?;
+            (actual == expected).then_some(pid)
+        })
     }
 
     fn capture(pid: i32, window: Duration, out_path: &Path) -> Result<()> {
@@ -1594,6 +1652,28 @@ pub mod pt {
             let trace = "ts: 0xABCD foo+0x0 (bin) nop\nts: 0xabcd foo+0x0 (bin) nop\n";
             assert_eq!(tally_target(trace, "0xabcd"), 2);
             assert_eq!(tally_target(trace, "0xABCD"), 2);
+        }
+
+        #[test]
+        fn pid_selection_verifies_the_full_executable_identity() {
+            let tmp = tempfile::tempdir().unwrap();
+            let expected = tmp.path().join("expected-long-process-name");
+            let other = tmp.path().join("other-long-process-name");
+            std::fs::write(&expected, "expected").unwrap();
+            std::fs::write(&other, "other").unwrap();
+            for (pid, executable) in [(10, &other), (11, &expected)] {
+                let proc_dir = tmp.path().join("proc").join(pid.to_string());
+                std::fs::create_dir_all(&proc_dir).unwrap();
+                std::os::unix::fs::symlink(executable, proc_dir.join("exe")).unwrap();
+            }
+            assert_eq!(
+                find_matching_pid(
+                    &expected.display().to_string(),
+                    "10\n11\n",
+                    &tmp.path().join("proc")
+                ),
+                Some(11)
+            );
         }
     }
 }

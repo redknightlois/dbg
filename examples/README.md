@@ -69,7 +69,7 @@ $ dbg sessions                                        # your saved session
 | Haskell | `haskell/` | `ghc -O0 algos.hs` | ghci | `haskell/algos.hs` |
 | OCaml | `ocaml/` | `ocamlc -g algos.ml -o algos` | ocamldebug | `ocaml/algos.ml` |
 
-The backend column points to the `dbg` backend that drives each language — see `skills/adapters/_canonical-commands.md` for what maps to what.
+The backend column points to the `dbg` backend that drives each language — see `skills/references/adapters/_canonical-commands.md` for what maps to what.
 
 ## Verifying parity
 

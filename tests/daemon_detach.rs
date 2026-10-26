@@ -87,7 +87,8 @@ fn dbg_start_releases_parent_stdout_pipe() {
     let mut buf = [0u8; 64];
     let n = f.read(&mut buf).expect("read");
     assert_eq!(
-        n, 0,
+        n,
+        0,
         "expected EOF, got {n} bytes: {:?}",
         &buf[..n.min(buf.len())]
     );

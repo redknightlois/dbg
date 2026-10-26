@@ -1,5 +1,6 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+use std::sync::OnceLock;
 use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
@@ -121,17 +122,38 @@ pub fn detect_target(target: &str) -> TargetKind {
 // Session temp directory
 // ---------------------------------------------------------------------------
 
-fn session_dir() -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("gdbg-{}", std::process::id()));
-    let _ = std::fs::create_dir_all(&dir);
-    dir
+pub(crate) fn session_dir() -> PathBuf {
+    static DIR: OnceLock<PathBuf> = OnceLock::new();
+    DIR.get_or_init(|| {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        for attempt in 0..100u32 {
+            let dir =
+                std::env::temp_dir().join(format!("gdbg-{}-{stamp}-{attempt}", std::process::id()));
+            if std::fs::create_dir(&dir).is_ok() {
+                return dir;
+            }
+        }
+        // Keep the error at the first file creation instead of silently
+        // opening a stale directory from a previous process.
+        std::env::temp_dir().join(format!("gdbg-unusable-{}-{stamp}", std::process::id()))
+    })
+    .clone()
 }
 
 // ---------------------------------------------------------------------------
 // Full collection pipeline
 // ---------------------------------------------------------------------------
 
-pub fn collect_all(db: &GpuDb, target: &str, args: &[String]) -> Result<()> {
+pub fn collect_all(
+    db: &GpuDb,
+    target: &str,
+    args: &[String],
+    all_kernels: bool,
+    all_launches: bool,
+) -> Result<()> {
     let kind = detect_target(target);
     let session = session_dir();
 
@@ -173,8 +195,8 @@ pub fn collect_all(db: &GpuDb, target: &str, args: &[String]) -> Result<()> {
     // Runs a collection phase, recording failures without aborting.
     let run_phase = |phase: &str, f: &dyn Fn() -> Result<()>| {
         if let Err(e) = f() {
-            eprintln!("{phase} collection failed: {e}");
-            let _ = db.add_failure(phase, &e.to_string());
+            eprintln!("{phase} collection failed: {e:#}");
+            let _ = db.add_failure(phase, &format!("{e:#}"));
         }
     };
 
@@ -184,10 +206,21 @@ pub fn collect_all(db: &GpuDb, target: &str, args: &[String]) -> Result<()> {
         collect_nsys(db, target, args, kind, &session, target_hash.as_deref())
     });
 
-    // Identify top kernels for ncu
-    let top_names = top_kernel_names(db, 5);
+    let top_names = top_kernel_names(db, if all_kernels { 0 } else { 5 });
+    db.set_meta(
+        "ncu_kernel_scope",
+        if all_kernels { "all" } else { "top five" },
+    )?;
+    db.set_meta(
+        "ncu_launch_scope",
+        if all_launches {
+            "all matching"
+        } else {
+            "first per kernel"
+        },
+    )?;
 
-    // Phase 2: ncu deep metrics (on top kernels only)
+    // Phase 2: ncu deep metrics
     if !top_names.is_empty() {
         eprintln!("--- phase 2: deep kernel metrics (ncu) ---");
         eprintln!(
@@ -204,6 +237,8 @@ pub fn collect_all(db: &GpuDb, target: &str, args: &[String]) -> Result<()> {
                 kind,
                 &session,
                 target_hash.as_deref(),
+                all_kernels,
+                all_launches,
             )
         });
     } else {
@@ -221,7 +256,7 @@ pub fn collect_all(db: &GpuDb, target: &str, args: &[String]) -> Result<()> {
         TargetKind::PythonTriton => {
             eprintln!("--- phase 3: op mapping (proton) ---");
             run_phase("proton", &|| {
-                collect_torch(db, target, args, &session, target_hash.as_deref(), "proton")
+                collect_proton(db, target, args, &session, target_hash.as_deref())
             });
         }
         _ => {
@@ -234,6 +269,7 @@ pub fn collect_all(db: &GpuDb, target: &str, args: &[String]) -> Result<()> {
     // layer launches.  If nsys is also present (phase 1), its kernel
     // durations are more complete.  This ensures top-ops, compare-ops, and
     // hotpath stay consistent with breakdown and kernels.
+    db.normalize_kernel_names()?;
     db.recompute_op_gpu_times();
 
     Ok(())
@@ -257,6 +293,7 @@ fn collect_nsys(
 
     let mut cmd = nsys_command(target, args, kind, &trace_base);
 
+    let command = format!("{cmd:?}");
     let profile_output = run_cmd(&mut cmd, "nsys profile failed")?;
     let elapsed = start.elapsed().as_secs_f64();
 
@@ -306,21 +343,14 @@ fn collect_nsys(
         bail!("nsys export did not produce {}", sqlite_path.display());
     }
 
-    let layer_id = db.add_layer(
+    let _layer_id = db.import_layer(
         "nsys",
         &trace_rep.display().to_string(),
-        Some(&format!("nsys profile {target}")),
+        Some(&command),
         Some(elapsed),
         target_hash,
+        |conn, layer_id| parsers::nsys::import_nsys_rep(conn, &sqlite_path, layer_id),
     )?;
-
-    // Roll back the empty layer on import failure, otherwise
-    // `has_layer("nsys")` returns true and the session summary
-    // falsely prints `Layers: nsys + ncu` with zero-everything data.
-    if let Err(e) = parsers::nsys::import_nsys_rep(&db.conn, &sqlite_path, layer_id) {
-        let _ = db.remove_layer(layer_id);
-        return Err(e);
-    }
 
     eprintln!(
         "  nsys done in {elapsed:.1}s ({} kernels, {} launches)",
@@ -338,6 +368,7 @@ fn nsys_command(target: &str, args: &[String], kind: TargetKind, trace: &Path) -
     cmd.arg("--cuda-memory-usage=true");
     // Whole-graph tracing omits the kernel launches inside graph replays.
     cmd.arg("--cuda-graph-trace=node");
+    cmd.arg("--cuda-um-gpu-page-faults=true");
     if matches!(
         kind,
         TargetKind::Python | TargetKind::PythonTorch | TargetKind::PythonTriton
@@ -360,38 +391,44 @@ fn collect_ncu(
     kind: TargetKind,
     session: &Path,
     target_hash: Option<&str>,
+    all_kernels: bool,
+    all_launches: bool,
 ) -> Result<()> {
     let start = Instant::now();
-
-    // nsys stores demangled signatures (for example
-    // `add_one(float *, int)`), while ncu matches `--kernel-name` against
-    // its shorter `function` basis by default (`add_one`). Explicitly select
-    // the demangled basis so the phase-1 names match phase 2. Run each top
-    // kernel separately and capture one representative launch: a combined
-    // regex plus a global launch limit can consume every slot on the first
-    // hot kernel, while omitting the limit can attempt to replay 100k+ tiny
-    // launches under `--set full`.
-    let csv_path = collect_ncu_samples(db, session, kernel_names, |kernel_name| {
-        let mut cmd = ncu_command(target, args, kernel_name, kind);
+    let unfiltered = all_kernels && all_launches;
+    let labels = if unfiltered {
+        vec!["all kernels".to_string()]
+    } else {
+        kernel_names.to_vec()
+    };
+    let csv_path = collect_ncu_samples(db, session, &labels, |label| {
+        let filter = if unfiltered { None } else { Some(label) };
+        let mut cmd = ncu_command(target, args, filter, kind, all_launches);
         cmd.output()
-            .with_context(|| format!("cannot start ncu for kernel `{kernel_name}`"))
+            .with_context(|| format!("cannot start ncu for `{label}`"))
     })?;
     let elapsed = start.elapsed().as_secs_f64();
 
-    let layer_id = db.add_layer(
+    let _layer_id = db.import_layer(
         "ncu",
         &csv_path.display().to_string(),
         Some(&format!(
-            "ncu --set full --launch-count 1 --kernel-name-base demangled ({}) {target}",
-            kernel_names.join("; ")
+            "ncu --set full --kernel-name-base demangled {} {} {target}",
+            if all_kernels {
+                "all kernels"
+            } else {
+                "top five kernels"
+            },
+            if all_launches {
+                "all matching launches"
+            } else {
+                "--launch-count 1 per kernel"
+            }
         )),
         Some(elapsed),
         target_hash,
+        |conn, layer_id| parsers::ncu::import_ncu_csv(conn, &csv_path, layer_id),
     )?;
-    if let Err(error) = parsers::ncu::import_ncu_csv(&db.conn, &csv_path, layer_id) {
-        db.remove_layer(layer_id)?;
-        return Err(error);
-    }
 
     eprintln!(
         "  ncu done in {elapsed:.1}s ({} kernels with metrics)",
@@ -467,10 +504,15 @@ fn collect_ncu_samples(
     Ok(csv_path)
 }
 
-fn ncu_command(target: &str, args: &[String], kernel_name: &str, kind: TargetKind) -> Command {
-    let regex = regex::escape(kernel_name);
+fn ncu_command(
+    target: &str,
+    args: &[String],
+    kernel_name: Option<&str>,
+    kind: TargetKind,
+    all_launches: bool,
+) -> Command {
     let mut cmd = Command::new("ncu");
-    cmd.args(["--set", "full", "--csv"]);
+    cmd.args(["--set", "full", "--csv", "--print-units", "base"]);
     // The importer keys off Nsight Compute's stable metric identifiers (for
     // example `sm__throughput.avg.pct_of_peak_sustained_elapsed`).  CSV output
     // uses localized/display labels such as `Compute (SM) Throughput` unless
@@ -478,8 +520,13 @@ fn ncu_command(target: &str, args: &[String], kernel_name: &str, kind: TargetKin
     // only NULL values and makes the REPL report `[no ncu]`.
     cmd.args(["--print-metric-name", "name"]);
     cmd.args(["--kernel-name-base", "demangled"]);
-    cmd.args(["--kernel-name", &format!("regex:{regex}")]);
-    cmd.args(["--launch-count", "1"]);
+    if let Some(kernel_name) = kernel_name {
+        let regex = regex::escape(kernel_name);
+        cmd.args(["--kernel-name", &format!("regex:{regex}")]);
+    }
+    if !all_launches {
+        cmd.args(["--launch-count", "1"]);
+    }
     if matches!(
         kind,
         TargetKind::Python | TargetKind::PythonTorch | TargetKind::PythonTriton
@@ -490,6 +537,42 @@ fn ncu_command(target: &str, args: &[String], kernel_name: &str, kind: TargetKin
     }
     cmd.args(args);
     cmd
+}
+
+/// Collect Triton's operator mapping with Proton. Triton targets must not
+/// use the torch.profiler wrapper: that records a torch layer even when the
+/// requested collector is Proton and produces misleading cross-track data.
+fn collect_proton(
+    db: &GpuDb,
+    target: &str,
+    args: &[String],
+    session: &Path,
+    target_hash: Option<&str>,
+) -> Result<()> {
+    let trace_json = session.join("proton_trace.json");
+    let start = Instant::now();
+    let mut cmd = Command::new("proton");
+    cmd.args(["profile", "-o"])
+        .arg(&trace_json)
+        .arg("--")
+        .arg("python3")
+        .arg(target)
+        .args(args);
+    run_cmd(&mut cmd, "proton failed")?;
+    if !trace_json.exists() {
+        bail!("proton did not produce {}", trace_json.display());
+    }
+    let elapsed = start.elapsed().as_secs_f64();
+    let _layer_id = db.import_layer(
+        "proton",
+        &trace_json.display().to_string(),
+        Some(&format!("proton profile {target}")),
+        Some(elapsed),
+        target_hash,
+        |conn, layer_id| parsers::chrome_trace::import_chrome_trace(conn, &trace_json, layer_id),
+    )?;
+    eprintln!("  proton done in {elapsed:.1}s");
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -546,15 +629,14 @@ fn collect_torch(
         bail!("torch.profiler did not produce {}", trace_json.display());
     }
 
-    let layer_id = db.add_layer(
+    let _layer_id = db.import_layer(
         layer_name,
         &trace_json.display().to_string(),
         Some(&format!("torch.profiler on {target}")),
         Some(elapsed),
         target_hash,
+        |conn, layer_id| parsers::chrome_trace::import_chrome_trace(conn, &trace_json, layer_id),
     )?;
-
-    parsers::chrome_trace::import_chrome_trace(&db.conn, &trace_json, layer_id)?;
 
     eprintln!("  torch.profiler done in {elapsed:.1}s");
     Ok(())
@@ -565,18 +647,17 @@ fn collect_torch(
 // ---------------------------------------------------------------------------
 
 fn top_kernel_names(db: &GpuDb, n: usize) -> Vec<String> {
-    let mut stmt = db
-        .conn
-        .prepare(
-            "SELECT kernel_name, SUM(duration_us) as total
-             FROM launches GROUP BY kernel_name
-             ORDER BY total DESC LIMIT ?1",
-        )
-        .unwrap();
-    stmt.query_map([n as i64], |row| row.get(0))
-        .unwrap()
-        .filter_map(|r| r.ok())
-        .collect()
+    let mut stmt = db.conn.prepare(&format!(
+        "SELECT kernel_name, SUM(duration_us) as total FROM launches WHERE {} GROUP BY kernel_name ORDER BY total DESC LIMIT ?1",
+        db.timeline_filter(),
+    )).unwrap();
+    stmt.query_map([if n == 0 { -1 } else { n as i64 }], |row| {
+        row.get::<_, String>(0)
+    })
+    .unwrap()
+    .filter_map(|r| r.ok())
+    .map(|name| db.native_kernel_name(&name))
+    .collect()
 }
 
 /// Escape a string for safe use as a Python string literal.
@@ -619,8 +700,8 @@ fn compile_cuda(source: &str) -> Result<String> {
 /// makes nvcc+ptxas print "Conflicting options" warnings on every
 /// build. Keep `-G` — gdbg needs device-side symbols for kernel
 /// attribution — and drop the redundant `-lineinfo`.
-pub(crate) fn cuda_compile_flags<'a>(output: &'a str, source: &'a str) -> [&'a str; 5] {
-    ["-g", "-G", "-o", output, source]
+pub(crate) fn cuda_compile_flags<'a>(output: &'a str, source: &'a str) -> [&'a str; 6] {
+    ["-g", "-G", "-arch=native", "-o", output, source]
 }
 
 /// Which Python module, if any, we should verify importable before
@@ -645,41 +726,6 @@ mod tests {
     /// both `-G` and `-lineinfo` were passed. `-G` already implies
     /// line info, so drop `-lineinfo` to silence the warning without
     /// losing debug information.
-    #[test]
-    fn cuda_compile_flags_does_not_pass_lineinfo_with_capital_g() {
-        let flags = cuda_compile_flags("out", "in.cu");
-        assert!(
-            flags.contains(&"-G"),
-            "-G must stay — gdbg needs device symbols: {flags:?}"
-        );
-        assert!(
-            !flags.contains(&"-lineinfo"),
-            "-lineinfo must be dropped when -G is present: {flags:?}"
-        );
-    }
-
-    /// Regression: when torch/triton weren't installed, gdbg hung in
-    /// nsys waiting on a Python child that crashed immediately with
-    /// ModuleNotFoundError. collect_all now pre-flights the required
-    /// import; python_preflight_module declares what each TargetKind
-    /// needs.
-    #[test]
-    fn python_preflight_module_matches_target_kind() {
-        assert_eq!(
-            python_preflight_module(TargetKind::PythonTorch),
-            Some("torch")
-        );
-        assert_eq!(
-            python_preflight_module(TargetKind::PythonTriton),
-            Some("triton")
-        );
-        // Plain Python and non-Python targets: no pre-flight — the
-        // script either runs under nsys directly or there's no Python
-        // dep to verify.
-        assert_eq!(python_preflight_module(TargetKind::Python), None);
-        assert_eq!(python_preflight_module(TargetKind::Binary), None);
-        assert_eq!(python_preflight_module(TargetKind::CudaSource), None);
-    }
     #[test]
     fn nsys_collects_cuda_graph_kernel_nodes() {
         let command = nsys_command(
@@ -763,12 +809,61 @@ mod tests {
     }
 
     #[test]
+    fn ncu_filter_preserves_typed_template_arguments() {
+        let raw = "void at::native::add<(int)4, std::array<char *, (unsigned long)3>>(int, T2)";
+        let command = ncu_command("train.py", &[], Some(raw), TargetKind::PythonTorch, false);
+        let args: Vec<_> = command
+            .get_args()
+            .map(|s| s.to_string_lossy().into_owned())
+            .collect();
+        assert!(args.contains(&format!("regex:{}", regex::escape(raw))));
+    }
+
+    #[test]
+    fn cuda_compile_flags_does_not_pass_lineinfo_with_capital_g() {
+        let flags = cuda_compile_flags("out", "in.cu");
+        assert!(flags.contains(&"-arch=native"));
+        assert!(
+            flags.contains(&"-G"),
+            "-G must stay — gdbg needs device symbols: {flags:?}"
+        );
+        assert!(
+            !flags.contains(&"-lineinfo"),
+            "-lineinfo must be dropped when -G is present: {flags:?}"
+        );
+    }
+
+    /// Regression: when torch/triton weren't installed, gdbg hung in
+    /// nsys waiting on a Python child that crashed immediately with
+    /// ModuleNotFoundError. collect_all now pre-flights the required
+    /// import; python_preflight_module declares what each TargetKind
+    /// needs.
+    #[test]
+    fn python_preflight_module_matches_target_kind() {
+        assert_eq!(
+            python_preflight_module(TargetKind::PythonTorch),
+            Some("torch")
+        );
+        assert_eq!(
+            python_preflight_module(TargetKind::PythonTriton),
+            Some("triton")
+        );
+        // Plain Python and non-Python targets: no pre-flight — the
+        // script either runs under nsys directly or there's no Python
+        // dep to verify.
+        assert_eq!(python_preflight_module(TargetKind::Python), None);
+        assert_eq!(python_preflight_module(TargetKind::Binary), None);
+        assert_eq!(python_preflight_module(TargetKind::CudaSource), None);
+    }
+
+    #[test]
     fn ncu_command_matches_nsys_demangled_name_and_bounds_launches() {
         let cmd = ncu_command(
             "./app",
             &["--size".into(), "42".into()],
-            "add_one(float *, int)",
+            Some("add_one(float *, int)"),
             TargetKind::Binary,
+            false,
         );
         let args: Vec<String> = cmd
             .get_args()
@@ -778,6 +873,10 @@ mod tests {
             args.windows(2)
                 .any(|w| w == ["--kernel-name-base", "demangled"]),
             "ncu must match the demangled names imported from nsys: {args:?}"
+        );
+        assert!(
+            args.windows(2).any(|w| w == ["--print-units", "base"]),
+            "ncu must emit base units consumed by the parser: {args:?}"
         );
         assert!(
             args.windows(2)
@@ -797,24 +896,89 @@ mod tests {
     }
 
     #[test]
-    fn ncu_filter_preserves_typed_template_arguments() {
-        let raw = "void at::native::add<(int)4, std::array<char *, (unsigned long)3>>(int, T2)";
-        let command = ncu_command(
+    fn ncu_command_wraps_python_targets_after_profiler_flags() {
+        let cmd = ncu_command(
             "train.py",
-            &["--tokens".into(), "256".into()],
-            raw,
+            &["--steps".into(), "2".into()],
+            Some("kernel()"),
             TargetKind::PythonTorch,
+            false,
         );
-        let args: Vec<_> = command
+        let args: Vec<String> = cmd
             .get_args()
-            .map(|s| s.to_string_lossy().into_owned())
+            .map(|arg| arg.to_string_lossy().into_owned())
             .collect();
-        assert!(args.contains(&format!("regex:{}", regex::escape(raw))));
         assert!(args.ends_with(&[
             "python3".into(),
             "train.py".into(),
-            "--tokens".into(),
-            "256".into()
+            "--steps".into(),
+            "2".into(),
         ]));
+    }
+
+    #[test]
+    fn unlimited_counters_keep_all_kernel_instances_in_one_invocation() {
+        let cmd = ncu_command(
+            "driver.py",
+            &["--replays".into(), "1".into()],
+            None,
+            TargetKind::PythonTorch,
+            true,
+        );
+        let args: Vec<_> = cmd
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            !args
+                .iter()
+                .any(|arg| arg == "--launch-count" || arg == "--kernel-name")
+        );
+        assert!(args.ends_with(&[
+            "python3".into(),
+            "driver.py".into(),
+            "--replays".into(),
+            "1".into()
+        ]));
+        let matched = ncu_command("./app", &[], Some("kernel()"), TargetKind::Binary, true);
+        let args: Vec<_> = matched
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert!(args.iter().any(|arg| arg == "--kernel-name"));
+        assert!(!args.iter().any(|arg| arg == "--launch-count"));
+    }
+    #[test]
+    fn counter_collection_uses_native_names_while_queries_keep_canonical_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = GpuDb::create(&dir.path().join("native-names.db")).unwrap();
+        let layer = db
+            .add_layer("nsys", "trace.sqlite", None, None, None)
+            .unwrap();
+        let raw = "void <unnamed>::gemv_kernel<(unsigned int)8192>(float *)";
+        let canonical = crate::kernel::normalize_kernel_name(raw);
+        db.conn
+            .execute(
+                "INSERT INTO launches (kernel_name, duration_us, layer_id) VALUES (?1, 5, ?2)",
+                rusqlite::params![canonical, layer],
+            )
+            .unwrap();
+        db.set_meta(
+            &format!("nsys_kernel_names_{layer}"),
+            &serde_json::json!({canonical: raw}).to_string(),
+        )
+        .unwrap();
+        assert_eq!(top_kernel_names(&db, 1), vec![raw]);
+        assert_eq!(db.unique_kernel_count(), 1);
+        for index in 0..6 {
+            db.conn
+                .execute(
+                    "INSERT INTO launches (kernel_name, duration_us, layer_id) VALUES (?1, 1, ?2)",
+                    rusqlite::params![format!("other{index}"), layer],
+                )
+                .unwrap();
+        }
+        assert_eq!(top_kernel_names(&db, 5).len(), 5);
+        assert_eq!(top_kernel_names(&db, 0).len(), 7);
     }
 }

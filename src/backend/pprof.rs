@@ -14,8 +14,12 @@ fn is_source_extension(lower: &str) -> bool {
 fn is_elf_binary(path: &str) -> bool {
     use std::io::Read;
     let mut buf = [0u8; 4];
-    let Ok(mut f) = std::fs::File::open(path) else { return false };
-    if f.read_exact(&mut buf).is_err() { return false }
+    let Ok(mut f) = std::fs::File::open(path) else {
+        return false;
+    };
+    if f.read_exact(&mut buf).is_err() {
+        return false;
+    }
     buf == [0x7f, b'E', b'L', b'F']
 }
 
@@ -35,22 +39,10 @@ impl Backend for PprofBackend {
     }
 
     fn spawn_config(&self, target: &str, args: &[String]) -> anyhow::Result<SpawnConfig> {
-        // Accept three invocation shapes:
-        //   dbg start pprof cpu.prof                 → [cpu.prof]
-        //   dbg start pprof ./mybin cpu.prof         → [./mybin, cpu.prof]
-        //   dbg start pprof "./mybin cpu.prof"       → [./mybin, cpu.prof]  (legacy)
-        //
-        // The space-joined legacy form is what the CLI used to force
-        // because `spawn_config` ignored `args`; real users and the
-        // adapter doc both expect two separate positional arguments.
-        let mut positional: Vec<String> = Vec::new();
-        let split: Vec<&str> = target.splitn(2, ' ').collect();
-        if split.len() == 2 {
-            positional.push(split[0].into());
-            positional.push(split[1].into());
-        } else {
-            positional.push(target.into());
-        }
+        // `target` is one CLI argument. Never split it on whitespace: a
+        // profile path can contain spaces. Additional pprof positionals are
+        // passed through as separate `args` by the CLI.
+        let mut positional: Vec<String> = vec![target.into()];
         positional.extend(args.iter().cloned());
 
         // pprof only ingests profile files — source files and ELF
@@ -94,7 +86,7 @@ impl Backend for PprofBackend {
         // and silently falls back to an interactive session, yielding
         // a near-empty traces file.
         let shell_cmd = format!(
-            "go tool pprof -traces {} > {} 2>/dev/null || true; exec go tool pprof {}",
+            "go tool pprof -traces {} > {} 2>/dev/null && exec go tool pprof {}",
             quoted_positional,
             shell_escape(&traces_str),
             quoted_positional,
@@ -155,7 +147,10 @@ impl Backend for PprofBackend {
     }
 
     fn adapters(&self) -> Vec<(&'static str, &'static str)> {
-        vec![("pprof.md", include_str!("../../skills/adapters/pprof.md"))]
+        vec![(
+            "pprof.md",
+            include_str!("../../skills/references/adapters/pprof.md"),
+        )]
     }
 }
 
@@ -174,17 +169,33 @@ mod tests {
         let cfg = PprofBackend.spawn_config("cpu.prof", &[]).unwrap();
         let script = shell_script(&cfg);
         assert!(script.contains("go tool pprof cpu.prof"), "{script}");
-        assert!(script.contains("-traces"), "must produce traces file: {script}");
+        assert!(
+            script.contains("-traces"),
+            "must produce traces file: {script}"
+        );
         assert!(script.contains("exec go tool pprof cpu.prof"), "{script}");
     }
 
     #[test]
     fn spawn_config_binary_and_profile() {
         let cfg = PprofBackend
-            .spawn_config("./mybin cpu.prof", &[])
+            .spawn_config("./mybin", &["cpu.prof".into()])
             .unwrap();
         let script = shell_script(&cfg);
-        assert!(script.contains("./mybin") && script.contains("cpu.prof"), "{script}");
+        assert!(
+            script.contains("./mybin") && script.contains("cpu.prof"),
+            "{script}"
+        );
+    }
+
+    #[test]
+    fn spawn_config_preserves_spaces_in_profile_path() {
+        let cfg = PprofBackend
+            .spawn_config("profile with spaces.prof", &[])
+            .unwrap();
+        let script = shell_script(&cfg);
+        assert!(script.contains("'profile with spaces.prof'"), "{script}");
+        assert!(!script.contains("'profile' 'with spaces.prof'"), "{script}");
     }
 
     #[test]
@@ -210,10 +221,16 @@ mod tests {
         let cfg = PprofBackend.spawn_config("cpu.prof", &[]).unwrap();
         let script = shell_script(&cfg);
         // -traces conversion must be in the shell script
-        assert!(script.contains("-traces"), "script missing -traces: {script}");
+        assert!(
+            script.contains("-traces"),
+            "script missing -traces: {script}"
+        );
         // profile_output() must point to the traces file
         let out = PprofBackend.profile_output().unwrap();
-        assert!(out.ends_with("pprof.traces.txt"), "unexpected profile_output: {out}");
+        assert!(
+            out.ends_with("pprof.traces.txt"),
+            "unexpected profile_output: {out}"
+        );
     }
 
     #[test]
@@ -223,14 +240,20 @@ mod tests {
         // immediately with an opaque "debugger did not produce
         // prompt" error. Source files are never valid pprof input —
         // reject them up front and name the expected format.
-        for src in ["broken.go", "main.py", "lib.rs", "app.ts", "foo.js", "Program.cs"] {
+        for src in [
+            "broken.go",
+            "main.py",
+            "lib.rs",
+            "app.ts",
+            "foo.js",
+            "Program.cs",
+        ] {
             let err = match PprofBackend.spawn_config(src, &[]) {
                 Err(e) => e.to_string(),
                 Ok(_) => panic!("pprof accepted source file `{src}`"),
             };
             assert!(
-                err.to_lowercase().contains(".prof")
-                    || err.to_lowercase().contains("profile file"),
+                err.to_lowercase().contains(".prof") || err.to_lowercase().contains("profile file"),
                 "error should name the expected profile-file format, got: {err}"
             );
         }
@@ -257,8 +280,7 @@ mod tests {
             Ok(_) => panic!("pprof accepted ELF binary `{path_str}`"),
         };
         assert!(
-            err.to_lowercase().contains(".prof")
-                || err.to_lowercase().contains("profile"),
+            err.to_lowercase().contains(".prof") || err.to_lowercase().contains("profile"),
             "error should mention profile format, got: {err}"
         );
         assert!(

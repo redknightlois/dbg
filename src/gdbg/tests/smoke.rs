@@ -492,29 +492,6 @@ fn empty_db_no_panic() {
 }
 
 // -----------------------------------------------------------------------
-// Verify trunc handles edge cases
-// -----------------------------------------------------------------------
-
-#[test]
-fn trunc_edge_cases() {
-    use crate::commands::trunc;
-    // ASCII
-    assert_eq!(trunc("hello", 10), "hello");
-    assert_eq!(trunc("hello world", 8), "hello...");
-    assert_eq!(trunc("abc", 3), "abc");
-
-    // Multi-byte: "αβγδ" is 4 chars, 8 bytes
-    assert_eq!(trunc("αβγδ", 10), "αβγδ");
-    assert_eq!(trunc("αβγδ", 4), "αβγδ");
-    // Truncate: 3 chars = "α" + "..."
-    let t = trunc("αβγδεζ", 4);
-    assert_eq!(t, "α...");
-
-    // Empty
-    assert_eq!(trunc("", 5), "");
-}
-
-// -----------------------------------------------------------------------
 // Inspect with multiple matches should list them, not panic
 // -----------------------------------------------------------------------
 

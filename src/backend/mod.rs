@@ -1,9 +1,9 @@
+pub mod callgrind;
 pub mod canonical;
 pub mod debugpy_proto;
 pub mod delve;
 pub mod delve_proto;
 pub mod dotnettrace;
-pub mod callgrind;
 pub mod ghci;
 pub mod ghcprof;
 pub mod import;
@@ -11,15 +11,15 @@ pub mod jdb;
 pub mod jitdasm;
 pub mod lldb;
 pub mod lldb_dap_proto;
-pub mod netcoredbg;
-pub mod netcoredbg_proto;
 pub mod massif;
 pub mod memcheck;
+pub mod netcoredbg;
+pub mod netcoredbg_proto;
 pub mod node_proto;
 pub mod nodeprof;
 pub mod ocamldebug;
-pub mod perf;
 pub mod pdb;
+pub mod perf;
 pub mod phpdbg;
 pub mod pprof;
 pub mod pstats;
@@ -29,7 +29,7 @@ pub mod xdebug;
 use std::collections::HashMap;
 
 // Re-export dependency types from shared crate for backwards compatibility
-pub use dbg_cli::deps::{Dependency, DependencyCheck, DepStatus};
+pub use dbg_cli::deps::{DepStatus, Dependency, DependencyCheck};
 
 pub use canonical::{BreakId, BreakLoc, CanonicalOps, CanonicalReq};
 
@@ -89,6 +89,11 @@ pub trait Backend: Send + Sync {
         "help"
     }
 
+    /// Return true when the transport accepts a native help command.
+    fn supports_help_command(&self) -> bool {
+        !self.uses_inspector() && !self.uses_dap()
+    }
+
     /// Adapter markdown files for AI skill integration.
     fn adapters(&self) -> Vec<(&'static str, &'static str)>;
 
@@ -98,6 +103,17 @@ pub trait Backend: Send + Sync {
     /// Path to a Speedscope JSON file produced after init commands complete.
     fn profile_output(&self) -> Option<String> {
         None
+    }
+
+    /// Whether this backend represents a profiling/analysis session.
+    ///
+    /// Most profilers expose a source that the generic `ProfileData` loader can
+    /// persist and replay, so that remains the default signal. Report-oriented
+    /// profilers such as callgrind, pstats, massif, and memcheck use their own
+    /// REPL/data format and override this independently. Session kind must not
+    /// be inferred solely from generic replay support.
+    fn is_profile_backend(&self) -> bool {
+        self.profile_output().is_some()
     }
 
     /// Wall-clock deadline for each init command (see `SpawnConfig::init_commands`).
@@ -141,7 +157,11 @@ pub trait Backend: Send + Sync {
 
     /// Adapter spawn + launch configuration for DAP backends. Only
     /// invoked when `uses_dap()` returns true.
-    fn dap_launch(&self, _target: &str, _args: &[String]) -> anyhow::Result<crate::dap::DapLaunchConfig> {
+    fn dap_launch(
+        &self,
+        _target: &str,
+        _args: &[String],
+    ) -> anyhow::Result<crate::dap::DapLaunchConfig> {
         anyhow::bail!("dap_launch not implemented for this backend")
     }
 
@@ -158,6 +178,8 @@ pub trait Backend: Send + Sync {
 #[derive(Clone, Debug, Default)]
 pub struct AttachSpec {
     pub pid: Option<u32>,
+    /// An already-running DAP adapter endpoint, in `host:port` form.
+    pub port: Option<String>,
 }
 
 /// Path to the current dbg binary, for exec-ing into sub-REPLs.
@@ -175,7 +197,15 @@ pub fn shell_escape(s: &str) -> String {
         return "''".to_string();
     }
     // If the string is simple (no special chars), return as-is
-    if s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'/' || b == b'-' || b == b'_' || b == b'=' || b == b':') {
+    if s.bytes().all(|b| {
+        b.is_ascii_alphanumeric()
+            || b == b'.'
+            || b == b'/'
+            || b == b'-'
+            || b == b'_'
+            || b == b'='
+            || b == b':'
+    }) {
         return s.to_string();
     }
     // Wrap in single quotes, escaping existing single quotes as '\''
@@ -306,31 +336,63 @@ mod tests {
     fn registry_panics_on_duplicate_type_in_debug() {
         struct A;
         impl Backend for A {
-            fn name(&self) -> &'static str { "a" }
-            fn description(&self) -> &'static str { "" }
-            fn types(&self) -> &'static [&'static str] { &["shared"] }
+            fn name(&self) -> &'static str {
+                "a"
+            }
+            fn description(&self) -> &'static str {
+                ""
+            }
+            fn types(&self) -> &'static [&'static str] {
+                &["shared"]
+            }
             fn spawn_config(&self, _: &str, _: &[String]) -> anyhow::Result<SpawnConfig> {
                 anyhow::bail!("test")
             }
-            fn prompt_pattern(&self) -> &str { "" }
-            fn dependencies(&self) -> Vec<Dependency> { vec![] }
-            fn run_command(&self) -> &'static str { "" }
-            fn adapters(&self) -> Vec<(&'static str, &'static str)> { vec![] }
-            fn parse_help(&self, _: &str) -> String { String::new() }
+            fn prompt_pattern(&self) -> &str {
+                ""
+            }
+            fn dependencies(&self) -> Vec<Dependency> {
+                vec![]
+            }
+            fn run_command(&self) -> &'static str {
+                ""
+            }
+            fn adapters(&self) -> Vec<(&'static str, &'static str)> {
+                vec![]
+            }
+            fn parse_help(&self, _: &str) -> String {
+                String::new()
+            }
         }
         struct B;
         impl Backend for B {
-            fn name(&self) -> &'static str { "b" }
-            fn description(&self) -> &'static str { "" }
-            fn types(&self) -> &'static [&'static str] { &["shared"] }
+            fn name(&self) -> &'static str {
+                "b"
+            }
+            fn description(&self) -> &'static str {
+                ""
+            }
+            fn types(&self) -> &'static [&'static str] {
+                &["shared"]
+            }
             fn spawn_config(&self, _: &str, _: &[String]) -> anyhow::Result<SpawnConfig> {
                 anyhow::bail!("test")
             }
-            fn prompt_pattern(&self) -> &str { "" }
-            fn dependencies(&self) -> Vec<Dependency> { vec![] }
-            fn run_command(&self) -> &'static str { "" }
-            fn adapters(&self) -> Vec<(&'static str, &'static str)> { vec![] }
-            fn parse_help(&self, _: &str) -> String { String::new() }
+            fn prompt_pattern(&self) -> &str {
+                ""
+            }
+            fn dependencies(&self) -> Vec<Dependency> {
+                vec![]
+            }
+            fn run_command(&self) -> &'static str {
+                ""
+            }
+            fn adapters(&self) -> Vec<(&'static str, &'static str)> {
+                vec![]
+            }
+            fn parse_help(&self, _: &str) -> String {
+                String::new()
+            }
         }
         let mut r = Registry::new();
         r.register(Box::new(A));

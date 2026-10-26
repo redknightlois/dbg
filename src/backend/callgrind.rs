@@ -11,9 +11,7 @@ fn is_existing_callgrind_profile(target: &str) -> bool {
         .to_ascii_lowercase();
     // Well-known valgrind output names + the generic ".out" extension
     // agents and CI pipelines produce.
-    name.starts_with("callgrind.out")
-        || name.contains(".callgrind.out")
-        || name.ends_with(".out")
+    name.starts_with("callgrind.out") || name.contains(".callgrind.out") || name.ends_with(".out")
 }
 
 impl Backend for CallgrindBackend {
@@ -42,7 +40,7 @@ impl Backend for CallgrindBackend {
         if path.is_file() && is_existing_callgrind_profile(target) {
             let exec_repl = format!(
                 "exec {} --phpprofile-repl {} --profile-prompt 'callgrind> '",
-                dbg_bin,
+                shell_escape(&dbg_bin),
                 shell_escape(target),
             );
             return Ok(SpawnConfig {
@@ -58,7 +56,8 @@ impl Backend for CallgrindBackend {
 
         let mut valgrind_cmd = format!(
             "valgrind --tool=callgrind --callgrind-out-file={} {}",
-            out_str, shell_escape(target)
+            shell_escape(&out_str),
+            shell_escape(target)
         );
         for a in args {
             valgrind_cmd.push(' ');
@@ -67,19 +66,15 @@ impl Backend for CallgrindBackend {
 
         let exec_repl = format!(
             "exec {} --phpprofile-repl {} --profile-prompt 'callgrind> '",
-            dbg_bin, out_str
+            shell_escape(&dbg_bin),
+            shell_escape(&out_str)
         );
 
         Ok(SpawnConfig {
             bin: "bash".into(),
             args: vec!["--norc".into(), "--noprofile".into()],
-            env: vec![
-                ("PS1".into(), "callgrind> ".into()),
-            ],
-            init_commands: vec![
-                valgrind_cmd,
-                exec_repl,
-            ],
+            env: vec![("PS1".into(), "callgrind> ".into())],
+            init_commands: vec![valgrind_cmd, exec_repl],
         })
     }
 
@@ -88,21 +83,23 @@ impl Backend for CallgrindBackend {
     }
 
     fn dependencies(&self) -> Vec<Dependency> {
-        vec![
-            Dependency {
+        vec![Dependency {
+            name: "valgrind",
+            check: DependencyCheck::Binary {
                 name: "valgrind",
-                check: DependencyCheck::Binary {
-                    name: "valgrind",
-                    alternatives: &["valgrind"],
-                    version_cmd: None,
-                },
-                install: "sudo apt install valgrind  # or: brew install valgrind",
+                alternatives: &["valgrind"],
+                version_cmd: None,
             },
-        ]
+            install: "sudo apt install valgrind  # or: brew install valgrind",
+        }]
     }
 
     fn run_command(&self) -> &'static str {
         "stats"
+    }
+
+    fn is_profile_backend(&self) -> bool {
+        true
     }
 
     fn quit_command(&self) -> &'static str {
@@ -114,7 +111,10 @@ impl Backend for CallgrindBackend {
     }
 
     fn adapters(&self) -> Vec<(&'static str, &'static str)> {
-        vec![("callgrind.md", include_str!("../../skills/adapters/callgrind.md"))]
+        vec![(
+            "callgrind.md",
+            include_str!("../../skills/references/adapters/callgrind.md"),
+        )]
     }
 }
 
@@ -155,11 +155,12 @@ mod tests {
 
     #[test]
     fn spawn_config_escapes_spaces_in_target() {
-        let cfg = CallgrindBackend
-            .spawn_config("./my app", &[])
-            .unwrap();
+        let cfg = CallgrindBackend.spawn_config("./my app", &[]).unwrap();
         let cmd = &cfg.init_commands[0];
-        assert!(cmd.contains("'./my app'"), "target with space not escaped: {cmd}");
+        assert!(
+            cmd.contains("'./my app'"),
+            "target with space not escaped: {cmd}"
+        );
     }
 
     #[test]
@@ -168,7 +169,10 @@ mod tests {
             .spawn_config("./app", &["--dir=/my path".into()])
             .unwrap();
         let cmd = &cfg.init_commands[0];
-        assert!(cmd.contains("'--dir=/my path'"), "arg with space not escaped: {cmd}");
+        assert!(
+            cmd.contains("'--dir=/my path'"),
+            "arg with space not escaped: {cmd}"
+        );
     }
 
     #[test]
@@ -190,7 +194,9 @@ mod tests {
             "existing .out must not be re-profiled:\n{joined}"
         );
         assert!(
-            cfg.init_commands.iter().any(|c| c.contains("--phpprofile-repl")),
+            cfg.init_commands
+                .iter()
+                .any(|c| c.contains("--phpprofile-repl")),
             "REPL must still open on the existing profile:\n{joined}"
         );
         assert!(
@@ -201,10 +207,11 @@ mod tests {
 
     #[test]
     fn spawn_config_escapes_shell_metacharacters() {
-        let cfg = CallgrindBackend
-            .spawn_config("./app$(evil)", &[])
-            .unwrap();
+        let cfg = CallgrindBackend.spawn_config("./app$(evil)", &[]).unwrap();
         let cmd = &cfg.init_commands[0];
-        assert!(cmd.contains("'./app$(evil)'"), "shell metacharacter not escaped: {cmd}");
+        assert!(
+            cmd.contains("'./app$(evil)'"),
+            "shell metacharacter not escaped: {cmd}"
+        );
     }
 }

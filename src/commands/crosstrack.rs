@@ -13,7 +13,7 @@ use std::path::Path;
 use anyhow::Result;
 use dbg_cli::session_db::{
     CollectCtx, CollectTrigger, LiveDebugger, OnDemandCollector, SessionDb, TargetClass,
-    collectors::disasm::{JitDasmCollector, LldbDisassembleCollector},
+    collectors::disasm::{GoDisassCollector, JitDasmCollector, LldbDisassembleCollector},
     persist_disasm,
 };
 use rusqlite::{OptionalExtension, params};
@@ -33,12 +33,30 @@ pub enum Query {
         group_by: Option<String>,
         top: Option<usize>,
     },
-    HitDiff { loc: String, a: u32, b: u32 },
-    HitTrend { loc: String, field: String },
-    Disasm { symbol: Option<String>, refresh: bool },
-    DisasmDiff { a: String, b: String },
-    Source { symbol: String, radius: u32 },
-    Cross { symbol: String },
+    HitDiff {
+        loc: String,
+        a: u32,
+        b: u32,
+    },
+    HitTrend {
+        loc: String,
+        field: String,
+    },
+    Disasm {
+        symbol: Option<String>,
+        refresh: bool,
+    },
+    DisasmDiff {
+        a: String,
+        b: String,
+    },
+    Source {
+        symbol: String,
+        radius: u32,
+    },
+    Cross {
+        symbol: String,
+    },
     AtHitDisasm,
 }
 
@@ -67,167 +85,177 @@ pub fn try_dispatch(input: &str) -> Option<super::Dispatched> {
         Some(i) => (&input[..i], input[i..].trim_start()),
         None => (input, ""),
     };
-    let q = match verb {
-        "hits" => {
-            if rest.is_empty() {
-                return Some(super::Dispatched::Immediate(
-                    "usage: dbg hits <loc> [--group-by FIELD] [--count-by FIELD --top N]\n  \
-                     <loc> is file:line (e.g. broken.py:26), not a function name".into(),
-                ));
-            }
-            let mut loc: Option<String> = None;
-            let mut group_by: Option<String> = None;
-            let mut top: Option<usize> = None;
-            let mut toks = rest.split_whitespace().peekable();
-            while let Some(t) = toks.next() {
-                match t {
-                    "--group-by" | "--count-by" => {
-                        if let Some(v) = toks.next() {
-                            group_by = Some(v.to_string());
-                        } else {
-                            return Some(super::Dispatched::Immediate(
-                                format!("{t} needs a field name").into(),
-                            ));
+    let q =
+        match verb {
+            "hits" => {
+                if rest.is_empty() {
+                    return Some(super::Dispatched::Immediate(
+                        "usage: dbg hits <loc> [--group-by FIELD] [--count-by FIELD --top N]\n  \
+                     <loc> is file:line (e.g. broken.py:26), not a function name"
+                            .into(),
+                    ));
+                }
+                let mut loc: Option<String> = None;
+                let mut group_by: Option<String> = None;
+                let mut top: Option<usize> = None;
+                let mut toks = rest.split_whitespace().peekable();
+                while let Some(t) = toks.next() {
+                    match t {
+                        "--group-by" | "--count-by" => {
+                            if let Some(v) = toks.next() {
+                                group_by = Some(v.to_string());
+                            } else {
+                                return Some(super::Dispatched::Immediate(
+                                    format!("{t} needs a field name").into(),
+                                ));
+                            }
                         }
-                    }
-                    "--top" => {
-                        if let Some(v) = toks.next() {
-                            match v.parse::<usize>() {
-                                Ok(n) => top = Some(n),
-                                Err(_) => {
-                                    return Some(super::Dispatched::Immediate(
-                                        format!("--top needs a number, got `{v}`"),
-                                    ));
+                        "--top" => {
+                            if let Some(v) = toks.next() {
+                                match v.parse::<usize>() {
+                                    Ok(n) => top = Some(n),
+                                    Err(_) => {
+                                        return Some(super::Dispatched::Immediate(format!(
+                                            "--top needs a number, got `{v}`"
+                                        )));
+                                    }
                                 }
                             }
                         }
-                    }
-                    "--help" | "-h" => {
-                        return Some(super::Dispatched::Immediate(
+                        "--help" | "-h" => {
+                            return Some(super::Dispatched::Immediate(
                             "usage: dbg hits <loc> [--group-by FIELD] [--count-by FIELD --top N]\n\
                              see `dbg help hits` for details".into(),
                         ));
-                    }
-                    _ => {
-                        if t.starts_with("--") {
-                            return Some(super::Dispatched::Immediate(
-                                format!("unknown flag `{t}` — supported: --group-by, --count-by, --top"),
-                            ));
                         }
-                        if loc.is_none() {
-                            loc = Some(t.to_string());
+                        _ => {
+                            if t.starts_with("--") {
+                                return Some(super::Dispatched::Immediate(format!(
+                                    "unknown flag `{t}` — supported: --group-by, --count-by, --top"
+                                )));
+                            }
+                            if loc.is_none() {
+                                loc = Some(t.to_string());
+                            }
                         }
                     }
                 }
-            }
-            let loc = match loc {
-                Some(l) => l,
-                None => return Some(super::Dispatched::Immediate(
-                    "usage: dbg hits <loc> [--group-by FIELD] [--count-by FIELD --top N]\n  \
-                     <loc> is file:line (e.g. broken.py:26), not a function name".into(),
-                )),
-            };
-            if top.is_some() && group_by.is_none() {
-                return Some(super::Dispatched::Immediate(
-                    "--top only applies with --group-by / --count-by\n  \
-                     example: dbg hits broken.py:26 --group-by page --top 5".into(),
-                ));
-            }
-            Query::Hits { loc, group_by, top }
-        }
-        "hit-diff" => {
-            let parts: Vec<&str> = rest.split_whitespace().collect();
-            if parts.len() != 3 {
-                return Some(super::Dispatched::Immediate(
-                    "usage: dbg hit-diff <loc> <seq_a> <seq_b>\n  \
-                     <loc> is file:line (e.g. broken.py:26), not a function name\n  \
-                     example: dbg hit-diff broken.py:26 1 3".into(),
-                ));
-            }
-            match (parts[1].parse::<u32>(), parts[2].parse::<u32>()) {
-                (Ok(a), Ok(b)) => Query::HitDiff { loc: parts[0].into(), a, b },
-                _ => {
+                let loc = match loc {
+                    Some(l) => l,
+                    None => return Some(super::Dispatched::Immediate(
+                        "usage: dbg hits <loc> [--group-by FIELD] [--count-by FIELD --top N]\n  \
+                     <loc> is file:line (e.g. broken.py:26), not a function name"
+                            .into(),
+                    )),
+                };
+                if top.is_some() && group_by.is_none() {
                     return Some(super::Dispatched::Immediate(
-                        "hit-diff needs numeric seq_a and seq_b".into(),
+                        "--top only applies with --group-by / --count-by\n  \
+                     example: dbg hits broken.py:26 --group-by page --top 5"
+                            .into(),
                     ));
                 }
+                Query::Hits { loc, group_by, top }
             }
-        }
-        "hit-trend" => {
-            let parts: Vec<&str> = rest.splitn(2, char::is_whitespace).collect();
-            if parts.len() != 2 {
-                return Some(super::Dispatched::Immediate(
-                    "usage: dbg hit-trend <loc> <field>\n  \
+            "hit-diff" => {
+                let parts: Vec<&str> = rest.split_whitespace().collect();
+                if parts.len() != 3 {
+                    return Some(super::Dispatched::Immediate(
+                        "usage: dbg hit-diff <loc> <seq_a> <seq_b>\n  \
+                     <loc> is file:line (e.g. broken.py:26), not a function name\n  \
+                     example: dbg hit-diff broken.py:26 1 3"
+                            .into(),
+                    ));
+                }
+                match (parts[1].parse::<u32>(), parts[2].parse::<u32>()) {
+                    (Ok(a), Ok(b)) => Query::HitDiff {
+                        loc: parts[0].into(),
+                        a,
+                        b,
+                    },
+                    _ => {
+                        return Some(super::Dispatched::Immediate(
+                            "hit-diff needs numeric seq_a and seq_b".into(),
+                        ));
+                    }
+                }
+            }
+            "hit-trend" => {
+                let parts: Vec<&str> = rest.splitn(2, char::is_whitespace).collect();
+                if parts.len() != 2 {
+                    return Some(super::Dispatched::Immediate(
+                        "usage: dbg hit-trend <loc> <field>\n  \
                      <loc> is file:line (e.g. broken.py:26), not a function name\n  \
                      <field> is a locals name, optionally dotted (e.g. self.page)\n  \
-                     example: dbg hit-trend broken.py:26 start".into(),
-                ));
-            }
-            Query::HitTrend {
-                loc: parts[0].into(),
-                field: parts[1].into(),
-            }
-        }
-        "disasm" => {
-            let (symbol, refresh) = parse_disasm_args(rest);
-            Query::Disasm { symbol, refresh }
-        }
-        "disasm-diff" => {
-            let parts: Vec<&str> = rest.split_whitespace().collect();
-            if parts.len() != 2 {
-                return Some(super::Dispatched::Immediate(
-                    "usage: dbg disasm-diff <symbol_a> <symbol_b>".into(),
-                ));
-            }
-            Query::DisasmDiff {
-                a: parts[0].into(),
-                b: parts[1].into(),
-            }
-        }
-        "source" => {
-            if rest.is_empty() {
-                return Some(super::Dispatched::Immediate(
-                    "usage: dbg source <symbol> [radius=5]".into(),
-                ));
-            }
-            let parts: Vec<&str> = rest.split_whitespace().collect();
-            let radius = parts
-                .get(1)
-                .and_then(|s| s.parse::<u32>().ok())
-                .unwrap_or(5);
-            Query::Source {
-                symbol: parts[0].into(),
-                radius,
-            }
-        }
-        "cross" => {
-            if rest.is_empty() {
-                return Some(super::Dispatched::Immediate(
-                    "usage: dbg cross <symbol>".into(),
-                ));
-            }
-            Query::Cross {
-                symbol: rest.to_string(),
-            }
-        }
-        "at-hit" => {
-            let sub = rest.split_whitespace().next().unwrap_or("");
-            match sub {
-                "disasm" => Query::AtHitDisasm,
-                "" => {
-                    return Some(super::Dispatched::Immediate(
-                        "usage: dbg at-hit disasm".into(),
+                     example: dbg hit-trend broken.py:26 start"
+                            .into(),
                     ));
                 }
-                other => {
-                    return Some(super::Dispatched::Immediate(format!(
-                        "unknown at-hit subcommand `{other}` — supported: disasm"
-                    )));
+                Query::HitTrend {
+                    loc: parts[0].into(),
+                    field: parts[1].into(),
                 }
             }
-        }
-        _ => return None,
-    };
+            "disasm" => {
+                let (symbol, refresh) = parse_disasm_args(rest);
+                Query::Disasm { symbol, refresh }
+            }
+            "disasm-diff" => {
+                let parts: Vec<&str> = rest.split_whitespace().collect();
+                if parts.len() != 2 {
+                    return Some(super::Dispatched::Immediate(
+                        "usage: dbg disasm-diff <symbol_a> <symbol_b>".into(),
+                    ));
+                }
+                Query::DisasmDiff {
+                    a: parts[0].into(),
+                    b: parts[1].into(),
+                }
+            }
+            "source" => {
+                if rest.is_empty() {
+                    return Some(super::Dispatched::Immediate(
+                        "usage: dbg source <symbol> [radius=5]".into(),
+                    ));
+                }
+                let parts: Vec<&str> = rest.split_whitespace().collect();
+                let radius = parts
+                    .get(1)
+                    .and_then(|s| s.parse::<u32>().ok())
+                    .unwrap_or(5);
+                Query::Source {
+                    symbol: parts[0].into(),
+                    radius,
+                }
+            }
+            "cross" => {
+                if rest.is_empty() {
+                    return Some(super::Dispatched::Immediate(
+                        "usage: dbg cross <symbol>".into(),
+                    ));
+                }
+                Query::Cross {
+                    symbol: rest.to_string(),
+                }
+            }
+            "at-hit" => {
+                let sub = rest.split_whitespace().next().unwrap_or("");
+                match sub {
+                    "disasm" => Query::AtHitDisasm,
+                    "" => {
+                        return Some(super::Dispatched::Immediate(
+                            "usage: dbg at-hit disasm".into(),
+                        ));
+                    }
+                    other => {
+                        return Some(super::Dispatched::Immediate(format!(
+                            "unknown at-hit subcommand `{other}` — supported: disasm"
+                        )));
+                    }
+                }
+            }
+            _ => return None,
+        };
     Some(super::Dispatched::Query(q))
 }
 
@@ -270,9 +298,7 @@ pub fn run(q: &Query, db: &SessionDb, ctx: &RunCtx<'_>) -> String {
         }
         Query::HitDiff { loc, a, b } => cmd_hit_diff(db, loc, *a, *b),
         Query::HitTrend { loc, field } => cmd_hit_trend(db, loc, field),
-        Query::Disasm { symbol, refresh } => {
-            cmd_disasm(db, ctx, symbol.as_deref(), *refresh)
-        }
+        Query::Disasm { symbol, refresh } => cmd_disasm(db, ctx, symbol.as_deref(), *refresh),
         Query::DisasmDiff { a, b } => cmd_disasm_diff(db, a, b),
         Query::Source { symbol, radius } => cmd_source(db, symbol, *radius),
         Query::Cross { symbol } => cmd_cross(db, symbol),
@@ -281,8 +307,7 @@ pub fn run(q: &Query, db: &SessionDb, ctx: &RunCtx<'_>) -> String {
 }
 
 /// The `<stem>:<line>` prefix — strips directory AND extension so
-/// `/a/b/Algos.java:17` → `Algos:17`. Matches jdb's `Algos.fibonacci:17`
-/// via `LIKE 'Algos:' || '%'` (prefix match).
+/// `/a/b/Algos.java:17` → `Algos:17`.
 fn stem_line_key(loc: &str) -> String {
     let (file, line) = match loc.rsplit_once(':') {
         Some(x) => x,
@@ -297,6 +322,26 @@ fn stem_line_key(loc: &str) -> String {
         None => base,
     };
     format!("{stem}:{line}")
+}
+
+/// SQL LIKE pattern for jdb's `Class.method:line` location shape.
+fn stem_method_pattern(loc: &str) -> String {
+    let stem_line = stem_line_key(loc);
+    let Some((stem, line)) = stem_line.rsplit_once(':') else {
+        return escape_location_like(&stem_line);
+    };
+    format!(
+        "{}.%:{}",
+        escape_location_like(stem),
+        escape_location_like(line)
+    )
+}
+
+fn escape_location_like(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_")
 }
 
 /// The `<basename>:<line>` suffix of a `file:line` key. When the agent
@@ -330,31 +375,38 @@ fn cmd_hits(db: &SessionDb, loc: &str) -> String {
     // `/abs/path/to/main.go:22` matches the `./main.go:22` form delve
     // stores, the `src/main.rs:42` form lldb stores, and so on.
     // Also try stem:line (strip file extension) so `Algos.java:17`
-    // matches jdb's `Algos:17` or `Algos.fibonacci:17`.
+    // matches jdb's `Algos:17`, `Algos.fibonacci:17`, and their
+    // package-qualified forms without treating line 17 as a prefix of 170.
     let exact = loc.to_string();
     let (tail, stem_tail) = loc_keys(loc);
+    let stem_method = stem_method_pattern(loc);
     let mut stmt = match db.conn().prepare(
         "SELECT hit_seq, thread, ts, locals_json
          FROM breakpoint_hits
          WHERE location_key = ?1
             OR location_key LIKE '%' || ?2
-            OR location_key LIKE ?3 || '%'
+            OR location_key = ?3
+            OR location_key LIKE '%.' || ?3
+            OR location_key LIKE ?4 ESCAPE char(92)
+            OR location_key LIKE '%.' || ?4 ESCAPE char(92)
          ORDER BY hit_seq ASC",
     ) {
         Ok(s) => s,
         Err(e) => return format!("[error: {e}]"),
     };
-    let rows = stmt
-        .query_map(params![exact, tail, stem_tail], |r| {
-            Ok((
-                r.get::<_, i64>(0)?,
-                r.get::<_, Option<String>>(1)?,
-                r.get::<_, String>(2)?,
-                r.get::<_, Option<String>>(3)?,
-            ))
-        });
+    let rows = stmt.query_map(params![exact, tail, stem_tail, stem_method], |r| {
+        Ok((
+            r.get::<_, i64>(0)?,
+            r.get::<_, Option<String>>(1)?,
+            r.get::<_, String>(2)?,
+            r.get::<_, Option<String>>(3)?,
+        ))
+    });
     let rows = match rows {
-        Ok(it) => it.collect::<Result<Vec<_>, _>>().unwrap_or_default(),
+        Ok(it) => match it.collect::<Result<Vec<_>, _>>() {
+            Ok(rows) => rows,
+            Err(e) => return format!("[error: {e}]"),
+        },
         Err(e) => return format!("[error: {e}]"),
     };
     if rows.is_empty() {
@@ -381,17 +433,23 @@ fn cmd_hits(db: &SessionDb, loc: &str) -> String {
 /// descending. With `top=Some(n)`, truncates to the n most-frequent.
 fn cmd_hits_grouped(db: &SessionDb, loc: &str, field: &str, top: Option<usize>) -> String {
     let (tail, stem_tail) = loc_keys(loc);
+    let stem_method = stem_method_pattern(loc);
     let mut stmt = match db.conn().prepare(
         "SELECT locals_json FROM breakpoint_hits
          WHERE location_key = ?1
             OR location_key LIKE '%' || ?2
-            OR location_key LIKE ?3 || '%'",
+            OR location_key = ?3
+            OR location_key LIKE '%.' || ?3
+            OR location_key LIKE ?4 ESCAPE char(92)
+            OR location_key LIKE '%.' || ?4 ESCAPE char(92)",
     ) {
         Ok(s) => s,
         Err(e) => return format!("[error: {e}]"),
     };
     let rows: Vec<Option<String>> = stmt
-        .query_map(params![loc, tail, stem_tail], |r| r.get::<_, Option<String>>(0))
+        .query_map(params![loc, tail, stem_tail, stem_method], |r| {
+            r.get::<_, Option<String>>(0)
+        })
         .and_then(|it| it.collect::<Result<Vec<_>, _>>())
         .unwrap_or_default();
     if rows.is_empty() {
@@ -405,7 +463,9 @@ fn cmd_hits_grouped(db: &SessionDb, loc: &str, field: &str, top: Option<usize>) 
     let mut repr_hint: Option<String> = None;
     for locals in rows.into_iter().flatten() {
         with_locals += 1;
-        let Ok(v) = serde_json::from_str::<Value>(&locals) else { continue };
+        let Ok(v) = serde_json::from_str::<Value>(&locals) else {
+            continue;
+        };
         if let Some(val) = lookup_field(&v, field) {
             matched += 1;
             *counts.entry(val).or_insert(0) += 1;
@@ -442,13 +502,14 @@ fn cmd_hits_grouped(db: &SessionDb, loc: &str, field: &str, top: Option<usize>) 
     // key parses as a number (`0, 13, 100, 102` instead of the
     // lexicographic `0, 100, 102, 13`). Fall back to string order
     // for non-numeric fields.
-    let all_numeric = pairs
-        .iter()
-        .all(|(v, _)| v.parse::<f64>().is_ok());
+    let all_numeric = pairs.iter().all(|(v, _)| v.parse::<f64>().is_ok());
     pairs.sort_by(|a, b| {
         b.1.cmp(&a.1).then_with(|| {
             if all_numeric {
-                let (na, nb) = (a.0.parse::<f64>().unwrap_or(0.0), b.0.parse::<f64>().unwrap_or(0.0));
+                let (na, nb) = (
+                    a.0.parse::<f64>().unwrap_or(0.0),
+                    b.0.parse::<f64>().unwrap_or(0.0),
+                );
                 na.partial_cmp(&nb).unwrap_or(std::cmp::Ordering::Equal)
             } else {
                 a.0.cmp(&b.0)
@@ -459,15 +520,14 @@ fn cmd_hits_grouped(db: &SessionDb, loc: &str, field: &str, top: Option<usize>) 
         pairs.truncate(n);
     }
 
-    let mut out = format!(
-        "{loc} — {total} hit(s), grouped by `{field}` ({matched} match)\n"
-    );
-    let max_val_len = pairs.iter().map(|(v, _)| v.chars().count()).max().unwrap_or(5);
+    let mut out = format!("{loc} — {total} hit(s), grouped by `{field}` ({matched} match)\n");
+    let max_val_len = pairs
+        .iter()
+        .map(|(v, _)| v.chars().count())
+        .max()
+        .unwrap_or(5);
     for (val, count) in &pairs {
-        out.push_str(&format!(
-            "  {val:<w$}  {count}\n",
-            w = max_val_len.max(5)
-        ));
+        out.push_str(&format!("  {val:<w$}  {count}\n", w = max_val_len.max(5)));
     }
     out
 }
@@ -562,17 +622,23 @@ fn no_hits_message(db: &SessionDb, loc: &str, verb: &str) -> String {
 /// `loc`. Used to enumerate options in error messages.
 fn collect_captured_names(db: &SessionDb, loc: &str) -> Vec<String> {
     let (tail, stem_tail) = loc_keys(loc);
+    let stem_method = stem_method_pattern(loc);
     let Ok(mut stmt) = db.conn().prepare(
         "SELECT locals_json FROM breakpoint_hits
          WHERE (location_key = ?1
                 OR location_key LIKE '%' || ?2
-                OR location_key LIKE ?3 || '%')
+                OR location_key = ?3
+                OR location_key LIKE '%.' || ?3
+                OR location_key LIKE ?4 ESCAPE char(92)
+                OR location_key LIKE '%.' || ?4 ESCAPE char(92))
            AND locals_json IS NOT NULL",
     ) else {
         return Vec::new();
     };
     let rows: Vec<String> = stmt
-        .query_map(params![loc, tail, stem_tail], |r| r.get::<_, String>(0))
+        .query_map(params![loc, tail, stem_tail, stem_method], |r| {
+            r.get::<_, String>(0)
+        })
         .and_then(|it| it.collect::<Result<Vec<_>, _>>())
         .unwrap_or_default();
     let mut names: std::collections::BTreeSet<String> = Default::default();
@@ -615,15 +681,19 @@ fn locals_summary(locals_json: &str) -> Option<String> {
 
 fn cmd_hit_diff(db: &SessionDb, loc: &str, a: u32, b: u32) -> String {
     let (tail, stem_tail) = loc_keys(loc);
+    let stem_method = stem_method_pattern(loc);
     let fetch = |seq: u32| -> Option<(Option<String>, Option<String>)> {
         db.conn()
             .query_row(
                 "SELECT locals_json, stack_json
                  FROM breakpoint_hits
                  WHERE (location_key = ?1 OR location_key LIKE '%' || ?2
-                        OR location_key LIKE ?3 || '%')
-                   AND hit_seq = ?4",
-                params![loc, tail, stem_tail, seq as i64],
+                        OR location_key = ?3
+                        OR location_key LIKE '%.' || ?3
+                        OR location_key LIKE ?4 ESCAPE char(92)
+                        OR location_key LIKE '%.' || ?4 ESCAPE char(92))
+                   AND hit_seq = ?5",
+                params![loc, tail, stem_tail, stem_method, seq as i64],
                 |r| {
                     Ok((
                         r.get::<_, Option<String>>(0)?,
@@ -676,9 +746,7 @@ fn cmd_hit_diff(db: &SessionDb, loc: &str, a: u32, b: u32) -> String {
             .and_then(|v| v.as_str())
             .unwrap_or("-");
         let mark = if va != vb { "≠" } else { " " };
-        out.push_str(&format!(
-            "  {mark} {k:<14}  {va:<20}  {vb:<20}\n"
-        ));
+        out.push_str(&format!("  {mark} {k:<14}  {va:<20}  {vb:<20}\n"));
     }
     out
 }
@@ -689,18 +757,22 @@ fn cmd_hit_diff(db: &SessionDb, loc: &str, a: u32, b: u32) -> String {
 
 fn cmd_hit_trend(db: &SessionDb, loc: &str, field: &str) -> String {
     let (tail, stem_tail) = loc_keys(loc);
+    let stem_method = stem_method_pattern(loc);
     let mut stmt = match db.conn().prepare(
         "SELECT hit_seq, locals_json FROM breakpoint_hits
          WHERE location_key = ?1
             OR location_key LIKE '%' || ?2
-            OR location_key LIKE ?3 || '%'
+            OR location_key = ?3
+            OR location_key LIKE '%.' || ?3
+            OR location_key LIKE ?4 ESCAPE char(92)
+            OR location_key LIKE '%.' || ?4 ESCAPE char(92)
          ORDER BY hit_seq ASC",
     ) {
         Ok(s) => s,
         Err(e) => return format!("[error: {e}]"),
     };
     let rows: Vec<(i64, Option<String>)> = stmt
-        .query_map(params![loc, tail, stem_tail], |r| {
+        .query_map(params![loc, tail, stem_tail, stem_method], |r| {
             Ok((r.get::<_, i64>(0)?, r.get::<_, Option<String>>(1)?))
         })
         .and_then(|it| it.collect::<Result<Vec<_>, _>>())
@@ -717,7 +789,9 @@ fn cmd_hit_trend(db: &SessionDb, loc: &str, field: &str) -> String {
     for (seq, locals_opt) in rows {
         let Some(locals) = locals_opt else { continue };
         have_any_locals = true;
-        let Ok(v) = serde_json::from_str::<Value>(&locals) else { continue };
+        let Ok(v) = serde_json::from_str::<Value>(&locals) else {
+            continue;
+        };
         if let Some(raw) = lookup_field(&v, field) {
             values.push((seq, raw));
         } else if first_miss.is_none() {
@@ -733,7 +807,10 @@ fn cmd_hit_trend(db: &SessionDb, loc: &str, field: &str) -> String {
         }
         // Bug 3: detect repr-traverse failure before falling back to
         // generic "not captured" message.
-        if let Some(hint) = first_miss.as_ref().and_then(|v| repr_traverse_hint(v, field)) {
+        if let Some(hint) = first_miss
+            .as_ref()
+            .and_then(|v| repr_traverse_hint(v, field))
+        {
             return hint;
         }
         let names = collect_captured_names(db, loc);
@@ -777,7 +854,10 @@ fn sparkline(points: &[(i64, f64)]) -> String {
     }
     let bars = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
     let min = points.iter().map(|(_, v)| *v).fold(f64::INFINITY, f64::min);
-    let max = points.iter().map(|(_, v)| *v).fold(f64::NEG_INFINITY, f64::max);
+    let max = points
+        .iter()
+        .map(|(_, v)| *v)
+        .fold(f64::NEG_INFINITY, f64::max);
     let range = (max - min).max(1e-9);
     points
         .iter()
@@ -792,12 +872,7 @@ fn sparkline(points: &[(i64, f64)]) -> String {
 // dbg disasm [<sym>]
 // ============================================================
 
-fn cmd_disasm(
-    db: &SessionDb,
-    ctx: &RunCtx<'_>,
-    symbol: Option<&str>,
-    refresh: bool,
-) -> String {
+fn cmd_disasm(db: &SessionDb, ctx: &RunCtx<'_>, symbol: Option<&str>, refresh: bool) -> String {
     let sym = match symbol {
         Some(s) => s.to_string(),
         None => match resolve_current_symbol(db) {
@@ -808,14 +883,57 @@ fn cmd_disasm(
         },
     };
 
+    // Replay has no debugger transport. Read the row that belongs to this
+    // session instead of falling through to a shell-out collector. This also
+    // keeps a mixed database from leaking another session's disassembly.
+    if ctx.live.is_none() {
+        if refresh {
+            return "replay is read-only: disassembly refresh requires a live session".into();
+        }
+        let cached: Option<(String, String, Option<String>, Option<i64>)> = db
+            .conn()
+            .query_row(
+                "SELECT d.asm_text, d.source, d.tier, d.code_bytes
+                 FROM disassembly d
+                 JOIN symbols s ON s.id = d.symbol_id
+                 WHERE d.session_id = (SELECT id FROM sessions LIMIT 1)
+                   AND (s.fqn = ?1 OR s.raw = ?1 OR s.demangled = ?1)
+                 ORDER BY d.id DESC LIMIT 1",
+                params![sym],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .optional()
+            .ok()
+            .flatten();
+        return match cached {
+            Some((asm_text, source, tier, code_bytes)) => {
+                let mut header = format!("[via cached {source}] disasm {sym}");
+                if let Some(tier) = tier.as_deref() {
+                    header.push_str(&format!(" ({tier})"));
+                }
+                if let Some(bytes) = code_bytes {
+                    header.push_str(&format!(" — {bytes} bytes"));
+                }
+                format!("{header}\n{asm_text}")
+            }
+            None => "replay is read-only: no cached disassembly exists for that symbol".into(),
+        };
+    }
+
     let collector: Box<dyn OnDemandCollector> = match ctx.target_class {
         TargetClass::ManagedDotnet => Box::new(JitDasmCollector),
         TargetClass::NativeCpu => {
-            // Go vs C/Rust: prefer go-objdump when the target file
-            // claims to be a Go binary (cheap heuristic: extension
-            // unlikely, so rely on user explicitly passing `--tool=go`
-            // in future). Default lldb for now.
-            Box::new(LldbDisassembleCollector)
+            let backend = db
+                .conn()
+                .query_row("SELECT value FROM meta WHERE key='backend'", [], |r| {
+                    r.get::<_, String>(0)
+                })
+                .unwrap_or_default();
+            if backend.contains("delve") || backend.contains("go") {
+                Box::new(GoDisassCollector)
+            } else {
+                Box::new(LldbDisassembleCollector)
+            }
         }
         _ => {
             return format!(
@@ -839,7 +957,7 @@ fn cmd_disasm(
         Err(e) => return format!("[disasm {}: {e}]", collector.kind()),
     };
     if let Err(e) = persist_disasm(db, &collect_ctx, &output) {
-        eprintln!("[dbg] warning: disasm persist failed: {e}");
+        return format!("[disasm persistence failed: {e}]\n{}", output.asm_text);
     }
 
     let mut header = format!(
@@ -911,10 +1029,14 @@ fn cmd_disasm_diff(db: &SessionDb, a: &str, b: &str) -> String {
             out.push_str("neither symbol has cached disassembly — run `dbg disasm` on each first");
         }
         (Some(_), None) => {
-            out.push_str(&format!("only {a} has disassembly; run `dbg disasm {b}` first"));
+            out.push_str(&format!(
+                "only {a} has disassembly; run `dbg disasm {b}` first"
+            ));
         }
         (None, Some(_)) => {
-            out.push_str(&format!("only {b} has disassembly; run `dbg disasm {a}` first"));
+            out.push_str(&format!(
+                "only {b} has disassembly; run `dbg disasm {a}` first"
+            ));
         }
         (Some(a_asm), Some(b_asm)) => {
             out.push_str(&side_by_side(&a_asm, &b_asm));
@@ -984,15 +1106,21 @@ fn cmd_cross(db: &SessionDb, symbol: &str) -> String {
     let mut out = format!("cross {symbol}\n");
 
     // Symbol row
-    if let Ok(Some((lang, file, line))) = db.conn().query_row(
-        "SELECT lang, file, line FROM symbols WHERE fqn = ?1 ORDER BY id DESC LIMIT 1",
-        params![symbol],
-        |r| Ok::<_, rusqlite::Error>((
-            r.get::<_, String>(0)?,
-            r.get::<_, Option<String>>(1)?,
-            r.get::<_, Option<i64>>(2)?,
-        )),
-    ).optional() {
+    if let Ok(Some((lang, file, line))) = db
+        .conn()
+        .query_row(
+            "SELECT lang, file, line FROM symbols WHERE fqn = ?1 ORDER BY id DESC LIMIT 1",
+            params![symbol],
+            |r| {
+                Ok::<_, rusqlite::Error>((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, Option<String>>(1)?,
+                    r.get::<_, Option<i64>>(2)?,
+                ))
+            },
+        )
+        .optional()
+    {
         out.push_str(&format!("  lang={lang}"));
         if let Some(f) = file.as_deref() {
             out.push_str(&format!("  file={f}"));
@@ -1053,16 +1181,16 @@ fn cmd_cross(db: &SessionDb, symbol: &str) -> String {
              ORDER BY d.id DESC",
         )
         .and_then(|mut s| {
-            s.query_map(params![symbol], |r| {
-                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
-            })
-            .and_then(|it| it.collect::<Result<Vec<_>, _>>())
+            s.query_map(params![symbol], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+                .and_then(|it| it.collect::<Result<Vec<_>, _>>())
         })
         .unwrap_or_default();
     out.push_str(&format!("  disassembly:     {} row(s)\n", disasms.len()));
     for (src, tier, bytes) in disasms {
         let tier = tier.as_deref().unwrap_or("-");
-        let bytes = bytes.map(|b| format!("{b} B")).unwrap_or_else(|| "?".into());
+        let bytes = bytes
+            .map(|b| format!("{b} B"))
+            .unwrap_or_else(|| "?".into());
         out.push_str(&format!("    {src}  tier={tier}  size={bytes}\n"));
     }
 
@@ -1193,9 +1321,9 @@ mod tests {
     #[test]
     fn basename_line_key_strips_dir() {
         assert_eq!(basename_line_key("/a/b/main.go:22"), "main.go:22");
-        assert_eq!(basename_line_key("./main.go:22"),     "main.go:22");
-        assert_eq!(basename_line_key("main.go:22"),       "main.go:22");
-        assert_eq!(basename_line_key("foo"),              "foo");
+        assert_eq!(basename_line_key("./main.go:22"), "main.go:22");
+        assert_eq!(basename_line_key("main.go:22"), "main.go:22");
+        assert_eq!(basename_line_key("foo"), "foo");
     }
 
     #[test]
@@ -1203,13 +1331,38 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let (db, _) = db_and_ctx(&tmp);
         // Capture was stored with the debugger's relative form.
-        insert_hit(&db, "./examples/go/main.go:22", 1, r#"{"a":{"value":"0"}}"#, None);
-        insert_hit(&db, "./examples/go/main.go:22", 2, r#"{"a":{"value":"1"}}"#, None);
+        insert_hit(
+            &db,
+            "./examples/go/main.go:22",
+            1,
+            r#"{"a":{"value":"0"}}"#,
+            None,
+        );
+        insert_hit(
+            &db,
+            "./examples/go/main.go:22",
+            2,
+            r#"{"a":{"value":"1"}}"#,
+            None,
+        );
         // Agent queries the absolute form.
         let out = cmd_hits(&db, "/repo/examples/go/main.go:22");
         assert!(out.contains("2 hit(s)"), "{out}");
         assert!(out.contains("a=0"));
         assert!(out.contains("a=1"));
+    }
+
+    #[test]
+    fn java_line_matching_does_not_treat_line_as_a_decimal_prefix() {
+        let tmp = TempDir::new().unwrap();
+        let (db, _) = db_and_ctx(&tmp);
+        insert_hit(&db, "com.example.Algos:17", 1, "{}", None);
+        insert_hit(&db, "Algos.fibonacci:17", 2, "{}", None);
+        insert_hit(&db, "com.example.Algos.sort:17", 3, "{}", None);
+        insert_hit(&db, "com.example.Algos:170", 4, "{}", None);
+        let out = cmd_hits(&db, "/repo/com/example/Algos.java:17");
+        assert!(out.contains("3 hit(s)"), "{out}");
+        assert!(!out.contains("4 hit(s)"), "{out}");
     }
 
     // ---------- hits ----------
@@ -1258,8 +1411,20 @@ mod tests {
     fn hit_diff_highlights_changed_fields() {
         let tmp = TempDir::new().unwrap();
         let (db, _) = db_and_ctx(&tmp);
-        insert_hit(&db, "main.c:42", 1, r#"{"x":{"value":"1"},"y":{"value":"A"}}"#, None);
-        insert_hit(&db, "main.c:42", 2, r#"{"x":{"value":"2"},"y":{"value":"A"}}"#, None);
+        insert_hit(
+            &db,
+            "main.c:42",
+            1,
+            r#"{"x":{"value":"1"},"y":{"value":"A"}}"#,
+            None,
+        );
+        insert_hit(
+            &db,
+            "main.c:42",
+            2,
+            r#"{"x":{"value":"2"},"y":{"value":"A"}}"#,
+            None,
+        );
         let out = cmd_hit_diff(&db, "main.c:42", 1, 2);
         assert!(out.contains("#1 vs #2"));
         // x changed — should have the ≠ marker
@@ -1317,7 +1482,11 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let (db, cwd) = db_and_ctx(&tmp);
         let f = cwd.join("t.c");
-        fs::write(&f, "int a = 1;\nint b = 2;\nint main(){ return 0; }\nint c = 3;\n").unwrap();
+        fs::write(
+            &f,
+            "int a = 1;\nint b = 2;\nint main(){ return 0; }\nint c = 3;\n",
+        )
+        .unwrap();
         db.conn()
             .execute(
                 "INSERT INTO symbols (session_id, lang, fqn, file, line, raw)
@@ -1373,6 +1542,44 @@ mod tests {
             !out.contains("source snapshots:0"),
             "source-snapshots line regressed to the unspaced form:\n{out}"
         );
+    }
+
+    #[test]
+    fn replay_disasm_reads_only_cached_session_rows() {
+        let tmp = TempDir::new().unwrap();
+        let (db, cwd) = db_and_ctx(&tmp);
+        db.conn()
+            .execute(
+                "INSERT INTO symbols (session_id, lang, fqn, raw)
+                 VALUES ((SELECT id FROM sessions LIMIT 1), 'cpp', 'foo', 'foo')",
+                [],
+            )
+            .unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO disassembly
+                    (session_id, symbol_id, source, asm_text, collected_at)
+                 VALUES ((SELECT id FROM sessions LIMIT 1),
+                         (SELECT id FROM symbols LIMIT 1), 'test', 'mov r0, r1', datetime('now'))",
+                [],
+            )
+            .unwrap();
+        let ctx = RunCtx {
+            target: "./app",
+            target_class: TargetClass::NativeCpu,
+            cwd: &cwd,
+            live: None,
+        };
+        let out = run(
+            &Query::Disasm {
+                symbol: Some("foo".into()),
+                refresh: false,
+            },
+            &db,
+            &ctx,
+        );
+        assert!(out.contains("via cached test"), "{out}");
+        assert!(out.contains("mov r0, r1"), "{out}");
     }
 
     // Regression for X1: the indexer may store a fully-qualified name
@@ -1435,11 +1642,20 @@ mod tests {
     #[test]
     fn canonical_op_names_are_stable() {
         assert_eq!(
-            Query::Hits { loc: "x".into(), group_by: None, top: None }.canonical_op(),
+            Query::Hits {
+                loc: "x".into(),
+                group_by: None,
+                top: None
+            }
+            .canonical_op(),
             "hits"
         );
         assert_eq!(
-            Query::Disasm { symbol: None, refresh: false }.canonical_op(),
+            Query::Disasm {
+                symbol: None,
+                refresh: false
+            }
+            .canonical_op(),
             "disasm"
         );
         assert_eq!(Query::Cross { symbol: "x".into() }.canonical_op(), "cross");

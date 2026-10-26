@@ -27,6 +27,7 @@
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::TcpStream;
+use std::path::Path;
 use std::process::{Child, ChildStderr, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
@@ -40,6 +41,151 @@ use serde_json::{Value, json};
 
 use crate::backend::canonical::HitEvent;
 use crate::pty::{DebuggerIo, EventKind, LogHandle};
+
+const MAX_DAP_FRAME_BYTES: usize = 8 * 1024 * 1024;
+const MAX_DAP_HEADER_BYTES: usize = 4096;
+const MAX_DAP_PENDING_REQUESTS: usize = 4096;
+const MAX_DAP_STACK_HELPERS: usize = 64;
+const DAP_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
+
+struct SpawnedChildGuard(Option<Child>);
+
+impl Drop for SpawnedChildGuard {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.0.take() {
+            let descendants = capture_owned_descendants(child.id());
+            let _ = child.kill();
+            let _ = child.wait();
+            kill_captured_processes(descendants);
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ProcessIdentity {
+    start_time: u64,
+    exe_device: u64,
+    exe_inode: u64,
+}
+
+fn process_identity(pid: u32) -> Option<ProcessIdentity> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let fields = stat
+        .rsplit_once(") ")?
+        .1
+        .split_whitespace()
+        .collect::<Vec<_>>();
+    let start_time = fields.get(19)?.parse().ok()?;
+    let metadata = std::fs::metadata(format!("/proc/{pid}/exe")).ok()?;
+    use std::os::unix::fs::MetadataExt;
+    Some(ProcessIdentity {
+        start_time,
+        exe_device: metadata.dev(),
+        exe_inode: metadata.ino(),
+    })
+}
+
+fn process_children(pid: u32) -> Vec<u32> {
+    process_children_from_root(Path::new("/proc"), pid)
+}
+
+fn process_children_from_root(proc_root: &Path, pid: u32) -> Vec<u32> {
+    let task_dir = proc_root.join(format!("{pid}/task"));
+    let mut children = Vec::new();
+    let Ok(tasks) = std::fs::read_dir(task_dir) else {
+        return children;
+    };
+    for task in tasks.flatten() {
+        let path = task.path().join("children");
+        let Ok(content) = std::fs::read_to_string(path) else {
+            continue;
+        };
+        children.extend(
+            content
+                .split_whitespace()
+                .filter_map(|child| child.parse::<u32>().ok()),
+        );
+    }
+    children.sort_unstable();
+    children.dedup();
+    children
+}
+
+fn capture_owned_descendants(pid: u32) -> Vec<(u32, ProcessIdentity)> {
+    let mut tree = Vec::new();
+    let mut pending = process_children(pid);
+    while let Some(current) = pending.pop() {
+        if tree.iter().any(|(seen, _)| *seen == current) {
+            continue;
+        }
+        if let Some(current_identity) = process_identity(current) {
+            tree.push((current, current_identity));
+        }
+        pending.extend(process_children(current));
+    }
+    tree
+}
+
+fn find_new_descendant(
+    before: &[(u32, ProcessIdentity)],
+    after: Vec<(u32, ProcessIdentity)>,
+) -> Option<(u32, ProcessIdentity)> {
+    after
+        .into_iter()
+        .find(|candidate| !before.iter().any(|old| old == candidate))
+}
+
+fn kill_captured_processes(tree: Vec<(u32, ProcessIdentity)>) {
+    for (current, expected_identity) in tree.into_iter().rev() {
+        kill_process_instance(current, expected_identity);
+    }
+}
+
+fn kill_process_instance(pid: u32, expected_identity: ProcessIdentity) {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+        // Bind the signal to this process instance. A check followed by
+        // kill(pid) still has a PID-reuse window.
+        let raw = unsafe { nix::libc::syscall(nix::libc::SYS_pidfd_open, pid, 0) } as i32;
+        if raw < 0 {
+            return;
+        }
+        // SAFETY: pidfd_open returned an owned descriptor.
+        let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+        // Recheck the instance bound by this descriptor. A check before
+        // pidfd_open alone leaves a PID-reuse window.
+        if process_identity(pid) != Some(expected_identity) {
+            return;
+        }
+        let _ = unsafe {
+            nix::libc::syscall(
+                nix::libc::SYS_pidfd_send_signal,
+                fd.as_raw_fd(),
+                nix::libc::SIGKILL,
+                std::ptr::null::<nix::libc::siginfo_t>(),
+                0,
+            )
+        };
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        if process_identity(pid) != Some(expected_identity) {
+            return;
+        }
+        let _ =
+            nix::sys::signal::kill(Pid::from_raw(pid as i32), nix::sys::signal::Signal::SIGKILL);
+    }
+}
+
+fn kill_owned_process_tree(pid: u32, identity: ProcessIdentity) {
+    if process_identity(pid) != Some(identity) {
+        return;
+    }
+    let mut tree = capture_owned_descendants(pid);
+    tree.push((pid, identity));
+    kill_captured_processes(tree);
+}
 
 /// Launch-time configuration supplied by the backend. Everything the
 /// transport needs to spawn the adapter and drive the DAP handshake
@@ -69,6 +215,8 @@ pub struct DapLaunchConfig {
     /// `DapLaunchConfig::pick_free_port` and pass it to the adapter
     /// through `args`.
     pub preassigned_addr: Option<String>,
+    /// Connect to an already-running DAP server instead of spawning `bin`.
+    pub connect_addr: Option<String>,
     /// Debuggee process id when this DAP session attaches to an
     /// already-running process. Used only for diagnostics/fallbacks;
     /// protocol requests still go through adapter-reported thread ids.
@@ -100,20 +248,26 @@ struct State {
     call_frames: Vec<Value>,
     /// Set by the driver when a DAP `stopped` event lands.
     pending_hit: Option<HitEvent>,
+    pending_is_unscoped: bool,
+    pending_action_generation: u64,
     /// Tracked user breakpoints: "file:line" → nothing (DAP
     /// setBreakpoints is path-keyed, not id-keyed).
     breakpoints: HashMap<String, Vec<u32>>,
+    line_breakpoint_ids: HashMap<String, u32>,
     /// Accumulated function-breakpoint names. DAP `setFunctionBreakpoints`
     /// replaces the whole set on each call, so we replay them all.
     function_breakpoints: Vec<String>,
+    function_breakpoint_ids: HashMap<String, u32>,
     /// "absolute-path:line" → condition expression, for replaying
     /// conditional line breakpoints across the full-set setBreakpoints call.
     breakpoint_conditions: HashMap<String, String>,
     /// Function-name → condition expression, same idea for setFunctionBreakpoints.
     function_breakpoint_conditions: HashMap<String, String>,
+    function_breakpoint_log_messages: HashMap<String, String>,
     /// "absolute-path:line" → logMessage template. Logpoints emit
     /// formatted output without stopping the debuggee.
     breakpoint_log_messages: HashMap<String, String>,
+    next_breakpoint_id: u32,
     /// True between `stopped` and the next `continue`/step.
     paused: bool,
     /// Flipped when the adapter disconnects or terminates.
@@ -130,6 +284,16 @@ struct State {
     /// cleanly — netcoredbg leaks the dotnet host to systemd-user
     /// otherwise.
     launched_pid: Option<u32>,
+    launched_identity: Option<ProcessIdentity>,
+    /// Generation of the current execution request. Deferred stack
+    /// helpers carry this value so a late response from an earlier stop
+    /// cannot populate a later continue's state.
+    action_generation: u64,
+    /// Generation which has reached the adapter request queue. Inbound
+    /// stopped frames are dispatched before a new action is armed.
+    armed_action_generation: u64,
+    stop_generation: u64,
+    enriched_stop_generation: u64,
 }
 
 impl State {
@@ -139,16 +303,27 @@ impl State {
             top_frame: None,
             call_frames: Vec::new(),
             pending_hit: None,
+            pending_is_unscoped: false,
+            pending_action_generation: 0,
             breakpoints: HashMap::new(),
+            line_breakpoint_ids: HashMap::new(),
             function_breakpoints: Vec::new(),
+            function_breakpoint_ids: HashMap::new(),
             breakpoint_conditions: HashMap::new(),
             function_breakpoint_conditions: HashMap::new(),
+            function_breakpoint_log_messages: HashMap::new(),
             breakpoint_log_messages: HashMap::new(),
+            next_breakpoint_id: 1,
             paused: false,
             alive: true,
             initialized: false,
             terminated: false,
             launched_pid: None,
+            launched_identity: None,
+            action_generation: 0,
+            armed_action_generation: 0,
+            stop_generation: 0,
+            enriched_stop_generation: 0,
         }
     }
 }
@@ -156,10 +331,23 @@ impl State {
 impl crate::transport_common::StopState for State {
     fn clear_pending(&mut self) {
         self.pending_hit = None;
+        self.pending_is_unscoped = false;
         self.paused = false;
     }
     fn has_pending_hit(&self) -> bool {
         self.pending_hit.is_some()
+    }
+    fn stop_generation(&self) -> u64 {
+        self.stop_generation
+    }
+    fn action_generation(&self) -> u64 {
+        self.action_generation
+    }
+    fn pending_action_generation(&self) -> u64 {
+        self.pending_action_generation
+    }
+    fn pending_is_unscoped(&self) -> bool {
+        self.pending_is_unscoped
     }
     fn alive(&self) -> bool {
         self.alive
@@ -177,6 +365,8 @@ enum DriverCmd {
         command: String,
         arguments: Value,
         resp: Sender<Result<Value, String>>,
+        arm_action: bool,
+        cancelled: Arc<AtomicBool>,
     },
     Shutdown,
 }
@@ -187,6 +377,10 @@ pub struct DapTransport {
     driver_tx: Sender<DriverCmd>,
     log: LogHandle,
     state: Arc<(Mutex<State>, Condvar)>,
+    /// Serializes breakpoint state transactions through the adapter.
+    /// Without this guard, a late rollback can overwrite a concurrent
+    /// breakpoint update that has already committed.
+    breakpoint_transaction: Mutex<()>,
     shutdown: Arc<AtomicBool>,
     driver: Mutex<Option<JoinHandle<()>>>,
     debuggee_pid: Option<u32>,
@@ -213,66 +407,84 @@ impl DapTransport {
             }
         }
 
-        let mut cmd = Command::new(&cfg.bin);
-        cmd.args(&cfg.args)
-            .stdin(Stdio::null())
-            // Adapters differ on where they announce their listen
-            // address: dlv prints to stdout, lldb-dap & debugpy to
-            // stderr. Pipe both and let the scraper search either.
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        let mut child = cmd
-            .spawn()
-            .with_context(|| format!("failed to spawn {}", cfg.bin))?;
-        let child_pid = Pid::from_raw(child.id() as i32);
-        let stderr = child.stderr.take().context("missing adapter stderr")?;
-        let stdout = child.stdout.take().context("missing adapter stdout")?;
-
-        // Race stdout vs stderr for the listen-address announcement.
-        // Whichever stream produces the marker first wins; the other
-        // stays drained by a background forwarder so its buffer
-        // doesn't block the adapter later. `leftover_stdout` carries
-        // the adapter's stdout after scrape so spawn_drain can route
-        // it to EventKind::Stdout (needed for delve, which inherits
-        // stdio to the target and doesn't route program output
-        // through DAP `output` events).
         let log = LogHandle::new();
-        let addr = if let Some(ref a) = cfg.preassigned_addr {
-            // Adapter is silent about its listen port (netcoredbg);
-            // the backend already picked a free port and told the
-            // adapter to bind it. Drain both streams in case the
-            // adapter does chatter later.
-            spawn_drain(stdout, Some(log.clone()));
-            spawn_drain(stderr, None);
-            a.clone()
+        let (child_pid, child, addr) = if let Some(addr) = cfg.connect_addr.clone() {
+            // `--attach-port` owns no adapter process. The endpoint is
+            // already listening, so there is no child stdout/stderr to
+            // scrape or clean up.
+            (Pid::from_raw(-1), None, addr)
         } else {
-            let (addr, leftover_stdout, leftover_stderr) = match scrape_listen_addr_either(
-                stdout,
-                stderr,
-                &cfg.listen_marker,
-                Duration::from_secs(10),
-            ) {
-                Ok(r) => r,
-                Err(e) => {
-                    if let Ok(Some(status)) = child.try_wait() {
-                        bail!("adapter exited before announcing (status={status:?}): {e:#}");
+            let mut cmd = Command::new(&cfg.bin);
+            cmd.args(&cfg.args)
+                .stdin(Stdio::null())
+                // Adapters differ on where they announce their listen
+                // address: dlv prints to stdout, lldb-dap & debugpy to
+                // stderr. Pipe both and let the scraper search either.
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            let mut child_guard = SpawnedChildGuard(Some(
+                cmd.spawn()
+                    .with_context(|| format!("failed to spawn {}", cfg.bin))?,
+            ));
+            let child = child_guard.0.as_mut().expect("child guard is populated");
+            let child_pid = Pid::from_raw(child.id() as i32);
+            let stderr = child.stderr.take().context("missing adapter stderr")?;
+            let stdout = child.stdout.take().context("missing adapter stdout")?;
+
+            // Race stdout vs stderr for the listen-address announcement.
+            // Whichever stream produces the marker first wins; the other
+            // stays drained by a background forwarder so its buffer
+            // doesn't block the adapter later.
+            let addr = if let Some(ref a) = cfg.preassigned_addr {
+                // Adapter is silent about its listen port (netcoredbg);
+                // the backend already picked a free port and told the
+                // adapter to bind it. Drain both streams in case the
+                // adapter does chatter later.
+                spawn_drain(stdout, Some(log.clone()));
+                spawn_drain(stderr, None);
+                a.clone()
+            } else {
+                let (addr, leftover_stdout, leftover_stderr) = match scrape_listen_addr_either(
+                    stdout,
+                    stderr,
+                    &cfg.listen_marker,
+                    Duration::from_secs(10),
+                ) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        if let Ok(Some(status)) = child.try_wait() {
+                            bail!("adapter exited before announcing (status={status:?}): {e:#}");
+                        }
+                        return Err(e).context("failed to read listen address");
                     }
-                    return Err(e).context("failed to read listen address");
+                };
+                if let Some(so) = leftover_stdout {
+                    spawn_drain(so, Some(log.clone()));
                 }
+                if let Some(se) = leftover_stderr {
+                    spawn_drain(se, None);
+                }
+                addr
             };
-            if let Some(so) = leftover_stdout {
-                spawn_drain(so, Some(log.clone()));
-            }
-            if let Some(se) = leftover_stderr {
-                spawn_drain(se, None);
-            }
-            addr
+            (child_pid, child_guard.0.take(), addr)
         };
 
         // Retry TCP connect a few times — some adapters announce the
         // listen port just before bind() completes.
-        let stream = connect_with_retry(&addr, Duration::from_secs(5))
-            .with_context(|| format!("failed to connect to adapter at {addr}"))?;
+        let require_listener_owner =
+            cfg.preassigned_addr.is_some() && cfg.bin.to_ascii_lowercase().contains("netcoredbg");
+        // Keep ownership of the adapter until the transport is fully
+        // constructed. `Child` does not kill a process when it is dropped,
+        // so an error while connecting or starting the driver would leak
+        // the adapter (and often its debuggee) without this guard.
+        let mut child_guard = SpawnedChildGuard(child);
+        let stream = connect_with_retry_owned(
+            &addr,
+            Duration::from_secs(5),
+            require_listener_owner,
+            child_pid.as_raw() as u32,
+        )
+        .with_context(|| format!("failed to connect to adapter at {addr}"))?;
         stream.set_nonblocking(true)?;
 
         let state = Arc::new((Mutex::new(State::new()), Condvar::new()));
@@ -292,10 +504,11 @@ impl DapTransport {
         let is_attach = cfg.launch_verb == "attach";
         let transport = Self {
             child_pid,
-            child: Mutex::new(Some(child)),
+            child: Mutex::new(child_guard.0.take()),
             driver_tx,
             log,
             state,
+            breakpoint_transaction: Mutex::new(()),
             shutdown,
             driver: Mutex::new(Some(driver)),
             debuggee_pid: cfg.debuggee_pid,
@@ -363,6 +576,9 @@ impl DapTransport {
         if guard.terminated && !guard.initialized {
             bail!("adapter terminated before initialized event");
         }
+        if !guard.alive && !guard.initialized {
+            bail!("DAP adapter connection closed before initialized event");
+        }
         Ok(())
     }
 
@@ -377,24 +593,51 @@ impl DapTransport {
                 command: command.to_string(),
                 arguments,
                 resp: tx,
+                arm_action: false,
+                cancelled: Arc::new(AtomicBool::new(false)),
             })
             .map_err(|_| anyhow!("DAP driver thread gone"))?;
         Ok(rx)
     }
 
     fn call_blocking(&self, command: &str, arguments: Value, timeout: Duration) -> Result<Value> {
+        self.call_blocking_inner(command, arguments, timeout, false)
+    }
+
+    fn call_blocking_action(
+        &self,
+        command: &str,
+        arguments: Value,
+        timeout: Duration,
+    ) -> Result<Value> {
+        self.call_blocking_inner(command, arguments, timeout, true)
+    }
+
+    fn call_blocking_inner(
+        &self,
+        command: &str,
+        arguments: Value,
+        timeout: Duration,
+        arm_action: bool,
+    ) -> Result<Value> {
         let (tx, rx) = mpsc::channel();
+        let cancelled = Arc::new(AtomicBool::new(false));
         self.driver_tx
             .send(DriverCmd::Call {
                 command: command.to_string(),
                 arguments,
                 resp: tx,
+                arm_action,
+                cancelled: cancelled.clone(),
             })
             .map_err(|_| anyhow!("DAP driver thread gone"))?;
         match rx.recv_timeout(timeout) {
             Ok(Ok(v)) => Ok(v),
             Ok(Err(e)) => Err(anyhow!("DAP {command}: {e}")),
-            Err(_) => Err(anyhow!("DAP {command}: timeout")),
+            Err(_) => {
+                cancelled.store(true, Ordering::Release);
+                Err(anyhow!("DAP {command}: timeout"))
+            }
         }
     }
 
@@ -403,28 +646,28 @@ impl DapTransport {
         if matches!(trimmed, "cont" | "c" | "continue") {
             let tid = self.current_thread().unwrap_or(1);
             return self.exec(
-                |s| s.call_blocking("continue", json!({"threadId": tid}), timeout),
+                |s| s.call_blocking_action("continue", json!({"threadId": tid}), timeout),
                 timeout,
             );
         }
         if matches!(trimmed, "step" | "s" | "stepi") {
             let tid = self.current_thread().unwrap_or(1);
             return self.exec(
-                |s| s.call_blocking("stepIn", json!({"threadId": tid}), timeout),
+                |s| s.call_blocking_action("stepIn", json!({"threadId": tid}), timeout),
                 timeout,
             );
         }
         if matches!(trimmed, "next" | "n") {
             let tid = self.current_thread().unwrap_or(1);
             return self.exec(
-                |s| s.call_blocking("next", json!({"threadId": tid}), timeout),
+                |s| s.call_blocking_action("next", json!({"threadId": tid}), timeout),
                 timeout,
             );
         }
         if matches!(trimmed, "out" | "finish") {
             let tid = self.current_thread().unwrap_or(1);
             return self.exec(
-                |s| s.call_blocking("stepOut", json!({"threadId": tid}), timeout),
+                |s| s.call_blocking_action("stepOut", json!({"threadId": tid}), timeout),
                 timeout,
             );
         }
@@ -443,15 +686,25 @@ impl DapTransport {
             // post-restart `stopped` event (if any) repopulates from
             // scratch instead of returning stale frameIds to
             // `locals`/`print`.
+            let descendants_before = capture_owned_descendants(self.child_pid.as_raw() as u32);
             {
                 let (lock, _) = &*self.state;
                 let mut s = lock.lock().unwrap();
+                s.action_generation = s.action_generation.wrapping_add(1);
                 s.paused = false;
                 s.top_frame = None;
                 s.call_frames.clear();
                 s.pending_hit = None;
+                s.pending_action_generation = s.action_generation;
+                s.armed_action_generation = s.action_generation;
+                // A restart replaces the launched process. Do not retain
+                // the old PID as a shutdown fallback while the replacement
+                // process event is still in flight.
+                s.launched_pid = None;
+                s.launched_identity = None;
             }
             self.call_blocking("restart", json!({}), timeout)?;
+            self.track_restarted_debuggee(&descendants_before, timeout);
             return Ok("restart requested".into());
         }
         if trimmed == "catch" || trimmed == "catch off" {
@@ -508,11 +761,17 @@ impl DapTransport {
             return self.list_source(Some(loc.trim()));
         }
         if let Some(rest) = trimmed.strip_prefix("bfn ") {
-            let (name, cond) = match rest.find(" if ") {
-                Some(i) => (rest[..i].trim(), Some(rest[i + 4..].trim())),
+            let (name, cond) = match find_keyword_outside_quotes(rest, " if ") {
+                Some(i) if !rest[i + 4..].trim().is_empty() => {
+                    (rest[..i].trim(), Some(rest[i + 4..].trim()))
+                }
+                Some(_) => return Err(anyhow!("invalid function breakpoint expression")),
+                None if rest.trim_end().ends_with(" if") => {
+                    return Err(anyhow!("invalid function breakpoint expression"));
+                }
                 None => (rest.trim(), None),
             };
-            return self.set_function_breakpoint(name, cond, timeout);
+            return self.set_function_breakpoint(name, cond, None, timeout);
         }
         if let Some(spec) = parse_break(trimmed) {
             return self.set_breakpoint(&spec, timeout);
@@ -535,12 +794,49 @@ impl DapTransport {
     }
 
     fn exec<F: FnOnce(&Self) -> Result<Value>>(&self, f: F, timeout: Duration) -> Result<String> {
+        {
+            let (lock, _) = &*self.state;
+            let mut s = lock.lock().unwrap();
+            s.action_generation = s.action_generation.wrapping_add(1);
+        }
         crate::transport_common::wait_for_stop(&self.state, || f(self).map(|_| ()), timeout)
     }
 
     fn current_thread(&self) -> Option<i64> {
         let (lock, _) = &*self.state;
         lock.lock().unwrap().current_thread
+    }
+
+    /// Some adapters restart the inferior without sending a DAP `process`
+    /// event. Keep quit cleanup correct by finding a new adapter descendant
+    /// after the restart request. The search is bounded because a restart
+    /// request must not turn into an unbounded process wait.
+    fn track_restarted_debuggee(
+        &self,
+        descendants_before: &[(u32, ProcessIdentity)],
+        timeout: Duration,
+    ) {
+        if self.is_attach {
+            return;
+        }
+        let deadline = Instant::now() + timeout.min(Duration::from_secs(2));
+        loop {
+            let candidate = find_new_descendant(
+                descendants_before,
+                capture_owned_descendants(self.child_pid.as_raw() as u32),
+            );
+            if let Some((pid, identity)) = candidate {
+                let (lock, _) = &*self.state;
+                let mut s = lock.lock().unwrap();
+                s.launched_pid = Some(pid);
+                s.launched_identity = Some(identity);
+                return;
+            }
+            if Instant::now() >= deadline {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 
     fn list_threads(&self, timeout: Duration) -> Result<String> {
@@ -622,12 +918,19 @@ impl DapTransport {
         if tids.is_empty() {
             bail!("pause: adapter reported no DAP threads to pause");
         }
+        {
+            let (lock, _) = &*self.state;
+            let mut s = lock.lock().unwrap();
+            s.action_generation = s.action_generation.wrapping_add(1);
+        }
         match crate::transport_common::wait_for_stop(
             &self.state,
             || {
                 let mut last_err = None;
                 for tid in &tids {
-                    if let Err(e) = self.call_blocking("pause", json!({"threadId": tid}), timeout) {
+                    if let Err(e) =
+                        self.call_blocking_action("pause", json!({"threadId": tid}), timeout)
+                    {
                         last_err = Some(e);
                     }
                 }
@@ -733,22 +1036,57 @@ impl DapTransport {
         &self,
         name: &str,
         cond: Option<&str>,
+        log_message: Option<&str>,
         timeout: Duration,
     ) -> Result<String> {
+        validate_breakpoint_text(name, "function name")?;
+        if let Some(condition) = cond {
+            validate_breakpoint_text(condition, "condition")?;
+        }
+        if let Some(message) = log_message {
+            validate_breakpoint_text(message, "log message")?;
+        }
+        let _transaction = self.breakpoint_transaction.lock().unwrap();
         // DAP `setFunctionBreakpoints` replaces the whole set per call,
         // same semantics as `setBreakpoints`. Accumulate in state so
         // adding a second fn bp doesn't remove the first.
+        let snapshot = {
+            let (lock, _) = &*self.state;
+            let s = lock.lock().unwrap();
+            (
+                s.function_breakpoints.clone(),
+                s.function_breakpoint_ids.clone(),
+                s.function_breakpoint_conditions.clone(),
+                s.function_breakpoint_log_messages.clone(),
+                s.next_breakpoint_id,
+            )
+        };
         let all: Vec<String> = {
             let (lock, _) = &*self.state;
             let mut s = lock.lock().unwrap();
-            if !s.function_breakpoints.contains(&name.to_string()) {
+            let already_present = s
+                .function_breakpoints
+                .iter()
+                .any(|candidate| candidate == name);
+            if !already_present {
+                // Reserve the public id before changing any function
+                // breakpoint state. In particular, an exhausted allocator
+                // must not leave a condition or log message behind.
+                let id = allocate_breakpoint_id(&mut s)?;
                 s.function_breakpoints.push(name.to_string());
+                s.function_breakpoint_ids.insert(name.to_string(), id);
             }
             if let Some(c) = cond {
                 s.function_breakpoint_conditions
                     .insert(name.to_string(), c.to_string());
             } else {
                 s.function_breakpoint_conditions.remove(name);
+            }
+            if let Some(message) = log_message {
+                s.function_breakpoint_log_messages
+                    .insert(name.to_string(), message.to_string());
+            } else {
+                s.function_breakpoint_log_messages.remove(name);
             }
             s.function_breakpoints.clone()
         };
@@ -757,33 +1095,89 @@ impl DapTransport {
             let s = lock.lock().unwrap();
             all.iter()
                 .map(|n| {
-                    let mut b = serde_json::Map::new();
-                    b.insert("name".into(), Value::String(n.clone()));
-                    if let Some(c) = s.function_breakpoint_conditions.get(n) {
-                        b.insert("condition".into(), Value::String(c.clone()));
-                    }
-                    Value::Object(b)
+                    function_breakpoint_value(
+                        n,
+                        s.function_breakpoint_conditions.get(n).map(String::as_str),
+                        s.function_breakpoint_log_messages
+                            .get(n)
+                            .map(String::as_str),
+                    )
                 })
                 .collect()
         };
-        self.call_blocking(
+        let response = match self.call_blocking(
             "setFunctionBreakpoints",
             json!({ "breakpoints": fns }),
             timeout,
-        )?;
-        match cond {
-            Some(c) => Ok(format!("Function breakpoint set: {name} if {c}")),
-            None => Ok(format!("Function breakpoint set: {name}")),
+        ) {
+            Ok(response) => response,
+            Err(error) => {
+                self.restore_function_breakpoint_state(snapshot);
+                return Err(error);
+            }
+        };
+        if !function_breakpoints_verified(&response, fns.len()) {
+            self.restore_function_breakpoint_state(snapshot);
+            bail!("function breakpoint `{name}` was not verified by the adapter");
+        }
+        match (cond, log_message) {
+            (Some(c), Some(message)) => {
+                Ok(format!("Function logpoint set: {name} if {c}: {message}"))
+            }
+            (None, Some(message)) => Ok(format!("Function logpoint set: {name}: {message}")),
+            (Some(c), None) => Ok(format!("Function breakpoint set: {name} if {c}")),
+            (None, None) => Ok(format!("Function breakpoint set: {name}")),
         }
     }
 
+    fn restore_function_breakpoint_state(
+        &self,
+        snapshot: (
+            Vec<String>,
+            HashMap<String, u32>,
+            HashMap<String, String>,
+            HashMap<String, String>,
+            u32,
+        ),
+    ) {
+        let (lock, _) = &*self.state;
+        let mut s = lock.lock().unwrap();
+        s.function_breakpoints = snapshot.0;
+        s.function_breakpoint_ids = snapshot.1;
+        s.function_breakpoint_conditions = snapshot.2;
+        s.function_breakpoint_log_messages = snapshot.3;
+        s.next_breakpoint_id = snapshot.4;
+    }
+
     fn set_breakpoint(&self, spec: &BreakSpec, timeout: Duration) -> Result<String> {
+        validate_breakpoint_text(&spec.file, "file")?;
+        if spec.line == 0 {
+            bail!("breakpoint line must be greater than zero");
+        }
+        if let Some(condition) = spec.condition.as_deref() {
+            validate_breakpoint_text(condition, "condition")?;
+        }
+        if let Some(message) = spec.log_message.as_deref() {
+            validate_breakpoint_text(message, "log message")?;
+        }
+        let _transaction = self.breakpoint_transaction.lock().unwrap();
         let BreakSpec {
             file,
             line,
             condition,
             log_message,
         } = spec;
+        let snapshot = {
+            let (lock, _) = &*self.state;
+            let s = lock.lock().unwrap();
+            (
+                s.breakpoints.clone(),
+                s.line_breakpoint_ids.clone(),
+                s.breakpoint_conditions.clone(),
+                s.breakpoint_log_messages.clone(),
+                s.next_breakpoint_id,
+            )
+        };
         // DAP requires the full set of breakpoints for a source each
         // call — it doesn't merge. Accumulate in state.breakpoints
         // and replay the full list per source on each add.
@@ -791,13 +1185,23 @@ impl DapTransport {
         let lines: Vec<u32> = {
             let (lock, _) = &*self.state;
             let mut s = lock.lock().unwrap();
-            let lines_snapshot = {
-                let entry = s.breakpoints.entry(resolved_path.clone()).or_default();
-                if !entry.contains(line) {
-                    entry.push(*line);
-                }
-                entry.clone()
-            };
+            let already_present = s
+                .breakpoints
+                .get(&resolved_path)
+                .is_some_and(|lines| lines.contains(line));
+            if !already_present {
+                // Reserve the public id before changing any line
+                // breakpoint state. This keeps exhaustion a true
+                // transaction boundary.
+                let id = allocate_breakpoint_id(&mut s)?;
+                s.breakpoints
+                    .entry(resolved_path.clone())
+                    .or_default()
+                    .push(*line);
+                let key = format!("{resolved_path}:{line}");
+                s.line_breakpoint_ids.insert(key, id);
+            }
+            let lines_snapshot = s.breakpoints[&resolved_path].clone();
             let key = format!("{resolved_path}:{line}");
             if let Some(c) = condition {
                 s.breakpoint_conditions.insert(key.clone(), c.clone());
@@ -830,7 +1234,7 @@ impl DapTransport {
                 })
                 .collect()
         };
-        self.call_blocking(
+        let response = match self.call_blocking(
             "setBreakpoints",
             json!({
                 "source": { "path": resolved_path },
@@ -838,7 +1242,32 @@ impl DapTransport {
                 "sourceModified": false,
             }),
             timeout,
-        )?;
+        ) {
+            Ok(response) => response,
+            Err(e) => {
+                let (lock, _) = &*self.state;
+                let mut s = lock.lock().unwrap();
+                s.breakpoints = snapshot.0;
+                s.line_breakpoint_ids = snapshot.1;
+                s.breakpoint_conditions = snapshot.2;
+                s.breakpoint_log_messages = snapshot.3;
+                s.next_breakpoint_id = snapshot.4;
+                return Err(e);
+            }
+        };
+        let requested_index = lines.iter().position(|candidate| candidate == line);
+        let verified =
+            breakpoint_response_verified(&response, lines.len()) && requested_index.is_some();
+        if !verified {
+            let (lock, _) = &*self.state;
+            let mut s = lock.lock().unwrap();
+            s.breakpoints = snapshot.0;
+            s.line_breakpoint_ids = snapshot.1;
+            s.breakpoint_conditions = snapshot.2;
+            s.breakpoint_log_messages = snapshot.3;
+            s.next_breakpoint_id = snapshot.4;
+            bail!("breakpoint at {file}:{line} was not verified by the adapter")
+        }
         match (condition, log_message) {
             (Some(c), Some(m)) => Ok(format!("Logpoint set at {file}:{line} if {c}: {m}")),
             (None, Some(m)) => Ok(format!("Logpoint set at {file}:{line}: {m}")),
@@ -1065,41 +1494,130 @@ impl DapTransport {
     fn format_breakpoints(&self) -> String {
         let (lock, _) = &*self.state;
         let s = lock.lock().unwrap();
-        if s.breakpoints.is_empty() {
-            return "(no breakpoints set)".into();
-        }
-        let mut out = String::new();
-        let mut id = 0u32;
+        let mut entries = Vec::new();
         for (file, lines) in &s.breakpoints {
             for line in lines {
-                id += 1;
-                out.push_str(&format!("{id}: {file}:{line}\n"));
+                let key = format!("{file}:{line}");
+                if let Some(id) = s.line_breakpoint_ids.get(&key) {
+                    entries.push((*id, format!("{file}:{line}")));
+                }
             }
         }
+        for name in &s.function_breakpoints {
+            if let Some(id) = s.function_breakpoint_ids.get(name) {
+                entries.push((*id, format!("function {name}")));
+            }
+        }
+        if entries.is_empty() {
+            return "(no breakpoints set)".into();
+        }
+        entries.sort_by_key(|(id, _)| *id);
+        let out = entries
+            .into_iter()
+            .map(|(id, location)| format!("{id}: {location}"))
+            .collect::<Vec<_>>()
+            .join("\n");
         out.trim_end().to_string()
     }
 
     fn delete_breakpoint(&self, id: u32, timeout: Duration) -> Result<String> {
+        let _transaction = self.breakpoint_transaction.lock().unwrap();
         if id == 0 {
             bail!("delete: breakpoint ids start at 1");
         }
-        let mut target: Option<(String, u32)> = None;
+        enum Target {
+            Line(String, u32),
+            Function(String),
+        }
+        let mut target = None;
         {
             let (lock, _) = &*self.state;
             let s = lock.lock().unwrap();
-            let mut cur = 0u32;
-            'outer: for (file, lines) in &s.breakpoints {
+            for (file, lines) in &s.breakpoints {
                 for line in lines {
-                    cur += 1;
-                    if cur == id {
-                        target = Some((file.clone(), *line));
-                        break 'outer;
+                    if s.line_breakpoint_ids.get(&format!("{file}:{line}")) == Some(&id) {
+                        target = Some(Target::Line(file.clone(), *line));
                     }
                 }
             }
+            for name in &s.function_breakpoints {
+                if s.function_breakpoint_ids.get(name) == Some(&id) {
+                    target = Some(Target::Function(name.clone()));
+                }
+            }
         }
-        let Some((file, line)) = target else {
+        let Some(target) = target else {
             bail!("delete: no breakpoint id {id}; run `dbg breaks` to list ids");
+        };
+        let snapshot = {
+            let (lock, _) = &*self.state;
+            let s = lock.lock().unwrap();
+            (
+                s.breakpoints.clone(),
+                s.line_breakpoint_ids.clone(),
+                s.function_breakpoints.clone(),
+                s.function_breakpoint_ids.clone(),
+                s.breakpoint_conditions.clone(),
+                s.function_breakpoint_conditions.clone(),
+                s.function_breakpoint_log_messages.clone(),
+                s.breakpoint_log_messages.clone(),
+                s.next_breakpoint_id,
+            )
+        };
+        if let Target::Function(ref name) = target {
+            let fns = {
+                let (lock, _) = &*self.state;
+                let mut s = lock.lock().unwrap();
+                s.function_breakpoints.retain(|candidate| candidate != name);
+                s.function_breakpoint_ids.remove(name);
+                s.function_breakpoint_conditions.remove(name);
+                s.function_breakpoint_log_messages.remove(name);
+                s.function_breakpoints
+                    .iter()
+                    .map(|candidate| {
+                        function_breakpoint_value(
+                            candidate,
+                            s.function_breakpoint_conditions
+                                .get(candidate)
+                                .map(String::as_str),
+                            s.function_breakpoint_log_messages
+                                .get(candidate)
+                                .map(String::as_str),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            };
+            let response = self.call_blocking(
+                "setFunctionBreakpoints",
+                json!({"breakpoints": fns}),
+                timeout,
+            );
+            if response.as_ref().is_err()
+                || !response
+                    .as_ref()
+                    .ok()
+                    .is_some_and(|body| function_breakpoints_verified(body, fns.len()))
+            {
+                let (lock, _) = &*self.state;
+                let mut s = lock.lock().unwrap();
+                s.breakpoints = snapshot.0;
+                s.line_breakpoint_ids = snapshot.1;
+                s.function_breakpoints = snapshot.2;
+                s.function_breakpoint_ids = snapshot.3;
+                s.breakpoint_conditions = snapshot.4;
+                s.function_breakpoint_conditions = snapshot.5;
+                s.function_breakpoint_log_messages = snapshot.6;
+                s.breakpoint_log_messages = snapshot.7;
+                s.next_breakpoint_id = snapshot.8;
+                if let Err(error) = response {
+                    return Err(error);
+                }
+                bail!("function breakpoint `{name}` was not verified by the adapter");
+            }
+            return Ok(format!("Breakpoint {id} cleared (function {name})"));
+        }
+        let Target::Line(file, line) = target else {
+            unreachable!()
         };
         let source_path = file.clone();
         let remaining: Vec<u32> = {
@@ -1137,7 +1655,7 @@ impl DapTransport {
                 })
                 .collect()
         };
-        self.call_blocking(
+        let response = match self.call_blocking(
             "setBreakpoints",
             json!({
                 "source": { "path": source_path },
@@ -1145,7 +1663,42 @@ impl DapTransport {
                 "sourceModified": false,
             }),
             timeout,
-        )?;
+        ) {
+            Ok(response) => response,
+            Err(error) => {
+                let (lock, _) = &*self.state;
+                let mut s = lock.lock().unwrap();
+                s.breakpoints = snapshot.0;
+                s.line_breakpoint_ids = snapshot.1;
+                s.function_breakpoints = snapshot.2;
+                s.function_breakpoint_ids = snapshot.3;
+                s.breakpoint_conditions = snapshot.4;
+                s.function_breakpoint_conditions = snapshot.5;
+                s.function_breakpoint_log_messages = snapshot.6;
+                s.breakpoint_log_messages = snapshot.7;
+                s.next_breakpoint_id = snapshot.8;
+                return Err(error);
+            }
+        };
+        if !breakpoint_response_verified(&response, remaining.len()) {
+            let (lock, _) = &*self.state;
+            let mut s = lock.lock().unwrap();
+            s.breakpoints = snapshot.0;
+            s.line_breakpoint_ids = snapshot.1;
+            s.function_breakpoints = snapshot.2;
+            s.function_breakpoint_ids = snapshot.3;
+            s.breakpoint_conditions = snapshot.4;
+            s.function_breakpoint_conditions = snapshot.5;
+            s.function_breakpoint_log_messages = snapshot.6;
+            s.breakpoint_log_messages = snapshot.7;
+            s.next_breakpoint_id = snapshot.8;
+            bail!("breakpoint {id} was not verified by the adapter")
+        }
+        let (lock, _) = &*self.state;
+        lock.lock()
+            .unwrap()
+            .line_breakpoint_ids
+            .remove(&format!("{file}:{line}"));
         Ok(format!("Breakpoint {id} cleared ({line})"))
     }
 }
@@ -1165,21 +1718,30 @@ impl DebuggerIo for DapTransport {
         let deadline = Instant::now() + timeout;
         let (lock, cvar) = &*self.state;
         let mut guard = lock.lock().unwrap();
-        while guard.alive && !guard.paused && !guard.terminated {
+        // A stopped event is the startup boundary. Stack enrichment runs on
+        // a helper thread and may arrive after the event, so startup must not
+        // wait for that optional response. Waiting for pending_hit here can
+        // time out a healthy Delve session when the adapter sends entry and
+        // stackTrace frames in separate packets.
+        while guard.alive && !guard.terminated && !guard.paused {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
-                // Not-stopped yet: programs without stopOnEntry are
-                // already running — that's fine, caller will drive.
-                return Ok(String::new());
+                if self.is_attach {
+                    return Ok(String::new());
+                }
+                bail!("timeout waiting for DAP startup state");
             }
             let r = cvar
                 .wait_timeout(guard, Duration::from_millis(250))
                 .unwrap();
             guard = r.0;
-            if r.1.timed_out() && guard.call_frames.is_empty() {
-                // No stop yet; treat "running without stopOnEntry" as
-                // an acceptable state and return.
-                return Ok(String::new());
+        }
+        if !self.is_attach && !guard.paused {
+            if guard.terminated {
+                bail!("debuggee terminated before the required entry stop");
+            }
+            if !guard.alive {
+                bail!("DAP adapter closed before the required entry stop");
             }
         }
         Ok(String::new())
@@ -1195,6 +1757,15 @@ impl DebuggerIo for DapTransport {
         lock.lock().unwrap().alive
     }
     fn quit(&self, _quit_cmd: &str) {
+        // Capture descendants before disconnecting or killing the adapter.
+        // This is the fallback for adapters which launch the debuggee but
+        // never send a DAP `process` event, and it also covers a replacement
+        // debuggee created by `restart` before its event is dispatched.
+        let adapter_descendants = if self.child_pid.as_raw() > 0 {
+            capture_owned_descendants(self.child_pid.as_raw() as u32)
+        } else {
+            Vec::new()
+        };
         // 1. Politely ask the adapter to disconnect. Spec-compliant
         //    adapters (delve, lldb-dap, debugpy) honour
         //    `terminateDebuggee=true` by killing the inferior here.
@@ -1229,12 +1800,15 @@ impl DebuggerIo for DapTransport {
             s.terminated = true;
             cvar.notify_all();
         }
-        let _ = nix::sys::signal::kill(self.child_pid, nix::sys::signal::Signal::SIGTERM);
+        if self.child_pid.as_raw() > 0 {
+            let _ = nix::sys::signal::kill(self.child_pid, nix::sys::signal::Signal::SIGTERM);
+        }
         std::thread::sleep(Duration::from_millis(500));
         if let Some(mut child) = self.child.lock().unwrap().take() {
             let _ = child.kill();
             let _ = child.wait();
         }
+        kill_captured_processes(adapter_descendants);
         if let Some(h) = self.driver.lock().unwrap().take() {
             let _ = h.join();
         }
@@ -1248,11 +1822,12 @@ impl DebuggerIo for DapTransport {
         //    follow through. Skip in attach mode — the user explicitly
         //    opted into not owning the lifecycle.
         if !self.is_attach {
-            if let Some(pid) = launched_pid {
-                let p = nix::unistd::Pid::from_raw(pid as i32);
-                if nix::sys::signal::kill(p, None).is_ok() {
-                    let _ = nix::sys::signal::kill(p, nix::sys::signal::Signal::SIGKILL);
-                }
+            let identity = {
+                let (lock, _) = &*self.state;
+                lock.lock().unwrap().launched_identity
+            };
+            if let (Some(pid), Some(identity)) = (launched_pid, identity) {
+                kill_owned_process_tree(pid, identity);
             }
         }
     }
@@ -1277,16 +1852,12 @@ impl DebuggerIo for DapTransport {
                     };
                     Some(self.set_breakpoint(&spec, timeout))
                 }
-                BreakLoc::Fqn(name) => {
-                    // Function breakpoints don't carry a log template
-                    // in the current DAP path; logpoints on a symbol
-                    // fall back to the native string (`bfn` has no
-                    // log field) so PTY-style callers still work.
-                    if log.is_some() {
-                        return None;
-                    }
-                    Some(self.set_function_breakpoint(name, cond.as_deref(), timeout))
-                }
+                BreakLoc::Fqn(name) => Some(self.set_function_breakpoint(
+                    name,
+                    cond.as_deref(),
+                    log.as_deref(),
+                    timeout,
+                )),
                 BreakLoc::ModuleMethod { .. } => None,
             },
         }
@@ -1297,9 +1868,28 @@ impl Drop for DapTransport {
     fn drop(&mut self) {
         self.shutdown.store(true, Ordering::Relaxed);
         let _ = self.driver_tx.send(DriverCmd::Shutdown);
+        // Capture adapter descendants before killing the adapter. A launch
+        // can have started its debuggee while the handshake is still in
+        // progress, before the DAP `process` event has been dispatched.
+        let adapter_descendants = if self.child_pid.as_raw() > 0 {
+            capture_owned_descendants(self.child_pid.as_raw() as u32)
+        } else {
+            Vec::new()
+        };
         if let Some(mut child) = self.child.lock().unwrap().take() {
             let _ = child.kill();
             let _ = child.wait();
+        }
+        kill_captured_processes(adapter_descendants);
+        if !self.is_attach {
+            let launched = {
+                let (lock, _) = &*self.state;
+                let state = lock.lock().unwrap();
+                state.launched_pid.zip(state.launched_identity)
+            };
+            if let Some((pid, identity)) = launched {
+                kill_owned_process_tree(pid, identity);
+            }
         }
     }
 }
@@ -1475,8 +2065,24 @@ fn extract_host_port(line: &str) -> Option<String> {
 }
 
 fn connect_with_retry(addr: &str, timeout: Duration) -> Result<TcpStream> {
+    connect_with_retry_owned(addr, timeout, false, 0)
+}
+
+fn connect_with_retry_owned(
+    addr: &str,
+    timeout: Duration,
+    require_owner: bool,
+    adapter_pid: u32,
+) -> Result<TcpStream> {
     let deadline = Instant::now() + timeout;
     loop {
+        if require_owner && !listener_owned_by(addr, adapter_pid) {
+            if Instant::now() >= deadline {
+                bail!("listener at {addr} is not owned by spawned adapter PID {adapter_pid}");
+            }
+            std::thread::sleep(Duration::from_millis(25));
+            continue;
+        }
         match TcpStream::connect(addr) {
             Ok(s) => return Ok(s),
             Err(_) if Instant::now() < deadline => {
@@ -1485,6 +2091,40 @@ fn connect_with_retry(addr: &str, timeout: Duration) -> Result<TcpStream> {
             Err(e) => return Err(e.into()),
         }
     }
+}
+
+#[cfg(target_os = "linux")]
+fn listener_owned_by(addr: &str, adapter_pid: u32) -> bool {
+    let Some(port) = addr
+        .rsplit_once(':')
+        .and_then(|(_, p)| p.parse::<u16>().ok())
+    else {
+        return false;
+    };
+    let wanted = format!("{port:04X}");
+    let Some(inode) = ["/proc/net/tcp", "/proc/net/tcp6"].iter().find_map(|path| {
+        let text = std::fs::read_to_string(path).ok()?;
+        text.lines().skip(1).find_map(|line| {
+            let fields: Vec<_> = line.split_whitespace().collect();
+            (fields.get(1)?.rsplit_once(':')?.1 == wanted && *fields.get(3)? == "0A")
+                .then(|| fields.get(9)?.parse::<u64>().ok())
+                .flatten()
+        })
+    }) else {
+        return false;
+    };
+    let Ok(entries) = std::fs::read_dir(format!("/proc/{adapter_pid}/fd")) else {
+        return false;
+    };
+    entries.flatten().any(|entry| {
+        std::fs::read_link(entry.path())
+            .is_ok_and(|link| link.to_string_lossy() == format!("socket:[{inode}]"))
+    })
+}
+
+#[cfg(not(target_os = "linux"))]
+fn listener_owned_by(_addr: &str, _adapter_pid: u32) -> bool {
+    false
 }
 
 /// Driver: reads DAP frames from the TCP stream, writes outbound
@@ -1498,9 +2138,9 @@ fn driver_loop(
 ) {
     // Inbound buffer holds bytes that arrived but didn't yet form a
     // complete Content-Length-framed message.
-    let mut inbox: Vec<u8> = Vec::with_capacity(16 * 1024);
+    let mut decoder = DapFrameDecoder::new();
     let mut next_seq: i64 = 1;
-    let mut pending: HashMap<i64, (String, Sender<Result<Value, String>>)> = HashMap::new();
+    let mut pending: HashMap<i64, PendingRequest> = HashMap::new();
     loop {
         if shutdown.load(Ordering::Relaxed) {
             break;
@@ -1515,7 +2155,30 @@ fn driver_loop(
                     mark_dead(&state);
                     return;
                 }
-                Ok(n) => inbox.extend_from_slice(&buf[..n]),
+                Ok(n) => {
+                    decoder.inbox.extend_from_slice(&buf[..n]);
+                    // Parse while reading rather than waiting for the socket
+                    // to become idle. A peer that continuously keeps the
+                    // socket readable must not bypass the frame-size bound.
+                    loop {
+                        match decoder.next_frame() {
+                            Ok(Some(bytes)) => {
+                                if let Ok(v) = serde_json::from_slice::<Value>(&bytes) {
+                                    dispatch_incoming(
+                                        v,
+                                        &mut pending,
+                                        &state,
+                                        &log,
+                                        &mut stream,
+                                        &mut next_seq,
+                                    );
+                                }
+                            }
+                            Ok(None) => break,
+                            Err(_) => continue,
+                        }
+                    }
+                }
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
                 Err(_) => {
                     drain_pending(&mut pending);
@@ -1525,24 +2188,7 @@ fn driver_loop(
             }
         }
 
-        // Parse as many complete messages as are in the inbox.
-        loop {
-            match take_frame(&mut inbox) {
-                Some(bytes) => {
-                    if let Ok(v) = serde_json::from_slice::<Value>(&bytes) {
-                        dispatch_incoming(
-                            v,
-                            &mut pending,
-                            &state,
-                            &log,
-                            &mut stream,
-                            &mut next_seq,
-                        );
-                    }
-                }
-                None => break,
-            }
-        }
+        prune_cancelled(&mut pending);
 
         // Drain outbound command channel.
         loop {
@@ -1556,7 +2202,21 @@ fn driver_loop(
                     command,
                     arguments,
                     resp,
+                    arm_action,
+                    cancelled,
                 }) => {
+                    if cancelled.load(Ordering::Acquire) {
+                        continue;
+                    }
+                    if pending.len() >= MAX_DAP_PENDING_REQUESTS {
+                        let _ = resp.send(Err("DAP request queue is full".into()));
+                        continue;
+                    }
+                    if arm_action {
+                        let (lock, _) = &*state;
+                        let mut s = lock.lock().unwrap();
+                        s.armed_action_generation = s.action_generation;
+                    }
                     let seq = next_seq;
                     next_seq += 1;
                     let frame = json!({
@@ -1569,7 +2229,14 @@ fn driver_loop(
                         let _ = resp.send(Err(format!("write failed: {e}")));
                         continue;
                     }
-                    pending.insert(seq, (command, resp));
+                    pending.insert(
+                        seq,
+                        PendingRequest {
+                            command,
+                            resp,
+                            cancelled,
+                        },
+                    );
                 }
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
@@ -1588,9 +2255,31 @@ fn driver_loop(
 /// parked in `pending` would time out with the generic "timeout" error.
 /// Drain them with a clearer "driver dead" message so callers can
 /// distinguish a dead adapter from a slow one.
-fn drain_pending(pending: &mut HashMap<i64, (String, Sender<Result<Value, String>>)>) {
-    for (_seq, (_cmd, tx)) in pending.drain() {
-        let _ = tx.send(Err("DAP driver thread exited".into()));
+struct PendingRequest {
+    command: String,
+    resp: Sender<Result<Value, String>>,
+    cancelled: Arc<AtomicBool>,
+}
+
+fn prune_cancelled(pending: &mut HashMap<i64, PendingRequest>) {
+    pending.retain(|_, request| !request.cancelled.load(Ordering::Acquire));
+}
+
+fn can_schedule_stack_helper(pending: &HashMap<i64, PendingRequest>) -> bool {
+    pending.len() < MAX_DAP_PENDING_REQUESTS
+        && pending
+            .values()
+            .filter(|request| request.command == "stackTrace")
+            .count()
+            < MAX_DAP_STACK_HELPERS
+}
+
+fn drain_pending(pending: &mut HashMap<i64, PendingRequest>) {
+    for (_seq, request) in pending.drain() {
+        let _ = request.resp.send(Err(format!(
+            "DAP driver thread exited while waiting for {}",
+            request.command
+        )));
     }
 }
 
@@ -1601,23 +2290,114 @@ fn mark_dead(state: &Arc<(Mutex<State>, Condvar)>) {
     cvar.notify_all();
 }
 
-fn take_frame(inbox: &mut Vec<u8>) -> Option<Vec<u8>> {
-    // Find header/body boundary.
-    let hdr_end = inbox.windows(4).position(|w| w == b"\r\n\r\n")?;
-    let header_s = std::str::from_utf8(&inbox[..hdr_end]).ok()?;
-    let mut content_length = 0usize;
-    for line in header_s.split("\r\n") {
-        if let Some(rest) = line.strip_prefix("Content-Length:") {
-            content_length = rest.trim().parse().ok()?;
+struct DapFrameDecoder {
+    inbox: Vec<u8>,
+    /// An oversized frame has no safe, bounded body buffer. Once its
+    /// header is rejected, scan for the next header marker instead of
+    /// trusting its declared length, which could be `usize::MAX`.
+    resync_oversized: bool,
+}
+
+impl DapFrameDecoder {
+    fn new() -> Self {
+        Self {
+            inbox: Vec::with_capacity(16 * 1024),
+            resync_oversized: false,
         }
     }
-    let total = hdr_end + 4 + content_length;
-    if inbox.len() < total {
-        return None;
+
+    fn next_frame(&mut self) -> Result<Option<Vec<u8>>, &'static str> {
+        // Do not discard an attacker-controlled number of bytes. A hostile
+        // oversized length can be usize::MAX, and waiting for that declared
+        // boundary would consume every later valid frame. Resynchronize at
+        // the next plausible DAP header while retaining only a bounded
+        // suffix when the marker has not arrived yet.
+        if self.resync_oversized {
+            const CONTENT_LENGTH: &[u8] = b"Content-Length:";
+            if let Some(pos) = self
+                .inbox
+                .windows(CONTENT_LENGTH.len())
+                .position(|window| window == CONTENT_LENGTH)
+            {
+                self.inbox.drain(..pos);
+                self.resync_oversized = false;
+            } else {
+                let keep = CONTENT_LENGTH.len().saturating_sub(1);
+                let discard = self.inbox.len().saturating_sub(keep);
+                if discard > 0 {
+                    self.inbox.drain(..discard);
+                }
+                return Ok(None);
+            }
+        }
+
+        let Some(hdr_end) = self.inbox.windows(4).position(|w| w == b"\r\n\r\n") else {
+            if self.inbox.len() > MAX_DAP_HEADER_BYTES {
+                let keep = self
+                    .inbox
+                    .windows(b"Content-Length:".len())
+                    .rposition(|w| w == b"Content-Length:")
+                    .unwrap_or(self.inbox.len().saturating_sub(b"Content-Length:".len()));
+                self.inbox.drain(..keep);
+                return Err("DAP header exceeded maximum size");
+            }
+            return Ok(None);
+        };
+        if hdr_end > MAX_DAP_HEADER_BYTES {
+            self.inbox.drain(..hdr_end + 4);
+            return Err("DAP header exceeded maximum size");
+        }
+        let header_s = match std::str::from_utf8(&self.inbox[..hdr_end]) {
+            Ok(s) => s,
+            Err(_) => {
+                self.inbox.drain(..hdr_end + 4);
+                return Err("DAP header is not valid UTF-8");
+            }
+        };
+        let mut content_length = None;
+        for line in header_s.split("\r\n") {
+            if let Some(rest) = line.strip_prefix("Content-Length:") {
+                if content_length.is_some() {
+                    self.inbox.drain(..hdr_end + 4);
+                    return Err("duplicate DAP Content-Length header");
+                }
+                let parsed = match rest.trim().parse::<usize>() {
+                    Ok(length) => length,
+                    Err(_) => {
+                        self.inbox.drain(..hdr_end + 4);
+                        return Err("invalid DAP Content-Length");
+                    }
+                };
+                content_length = Some(parsed);
+            }
+        }
+        let Some(content_length) = content_length else {
+            self.inbox.drain(..hdr_end + 4);
+            return Err("missing DAP Content-Length header");
+        };
+        if content_length > MAX_DAP_FRAME_BYTES {
+            self.inbox.drain(..hdr_end + 4);
+            self.resync_oversized = true;
+            return Err("DAP frame exceeds maximum size");
+        }
+        let total = hdr_end + 4 + content_length;
+        if self.inbox.len() < total {
+            return Ok(None);
+        }
+        let body = self.inbox[hdr_end + 4..total].to_vec();
+        self.inbox.drain(..total);
+        Ok(Some(body))
     }
-    let body = inbox[hdr_end + 4..total].to_vec();
-    inbox.drain(..total);
-    Some(body)
+}
+
+fn take_frame(inbox: &mut Vec<u8>) -> Option<Vec<u8>> {
+    let mut decoder = DapFrameDecoder {
+        inbox: std::mem::take(inbox),
+        resync_oversized: false,
+    };
+    let frame = decoder.next_frame().ok().flatten();
+    *inbox = decoder.inbox;
+    frame
 }
 
 fn write_frame(stream: &mut TcpStream, frame: &Value) -> std::io::Result<()> {
@@ -1629,6 +2409,7 @@ fn write_frame(stream: &mut TcpStream, frame: &Value) -> std::io::Result<()> {
     to_write.extend_from_slice(header.as_bytes());
     to_write.extend_from_slice(bytes);
     let mut written = 0;
+    let deadline = Instant::now() + DAP_WRITE_TIMEOUT;
     while written < to_write.len() {
         match stream.write(&to_write[written..]) {
             Ok(0) => {
@@ -1639,6 +2420,12 @@ fn write_frame(stream: &mut TcpStream, frame: &Value) -> std::io::Result<()> {
             }
             Ok(n) => written += n,
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                if Instant::now() >= deadline {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "DAP write remained blocked past its deadline",
+                    ));
+                }
                 std::thread::sleep(Duration::from_millis(2));
             }
             Err(e) => return Err(e),
@@ -1649,7 +2436,7 @@ fn write_frame(stream: &mut TcpStream, frame: &Value) -> std::io::Result<()> {
 
 fn dispatch_incoming(
     v: Value,
-    pending: &mut HashMap<i64, (String, Sender<Result<Value, String>>)>,
+    pending: &mut HashMap<i64, PendingRequest>,
     state: &Arc<(Mutex<State>, Condvar)>,
     log: &LogHandle,
     stream: &mut TcpStream,
@@ -1659,17 +2446,17 @@ fn dispatch_incoming(
     match ty {
         "response" => {
             let req_seq = v.get("request_seq").and_then(|v| v.as_i64()).unwrap_or(0);
-            if let Some((_cmd, tx)) = pending.remove(&req_seq) {
+            if let Some(request) = pending.remove(&req_seq) {
                 if v.get("success").and_then(|s| s.as_bool()) == Some(true) {
                     let body = v.get("body").cloned().unwrap_or(Value::Null);
-                    let _ = tx.send(Ok(body));
+                    let _ = request.resp.send(Ok(body));
                 } else {
                     let msg = v
                         .get("message")
                         .and_then(|m| m.as_str())
                         .unwrap_or("request failed")
                         .to_string();
-                    let _ = tx.send(Err(msg));
+                    let _ = request.resp.send(Err(msg));
                 }
             }
         }
@@ -1684,18 +2471,45 @@ fn dispatch_incoming(
                     cvar.notify_all();
                 }
                 "stopped" => {
+                    // A typed, positive thread id is required when an
+                    // adapter supplies one. A missing id is allowed by DAP
+                    // and is represented as an unscoped stop below; a
+                    // malformed id must not manufacture a hit.
+                    if let Some(raw_thread) = body.get("threadId").filter(|v| !v.is_null()) {
+                        let Some(thread_id) = raw_thread.as_i64().filter(|id| *id > 0) else {
+                            return;
+                        };
+                        let _ = thread_id;
+                    }
                     let thread_id = body.get("threadId").and_then(|v| v.as_i64());
-                    {
+                    let stop_generation = {
                         let (lock, _) = &**state;
                         let mut s = lock.lock().unwrap();
                         s.paused = true;
                         s.current_thread = thread_id;
-                    }
+                        s.stop_generation = s.stop_generation.wrapping_add(1);
+                        // Publish ownership of the stop before the
+                        // asynchronous stackTrace helper returns. A late
+                        // stop must remain available to the next action,
+                        // but its delayed helper must not create a hit for
+                        // a later continue.
+                        s.pending_hit = None;
+                        s.stop_generation
+                    };
                     if let Some(tid) = thread_id {
+                        {
+                            let (lock, _) = &**state;
+                            let mut s = lock.lock().unwrap();
+                            s.pending_action_generation = s.armed_action_generation;
+                            s.pending_is_unscoped = false;
+                        }
                         // Fire an out-of-band stackTrace request so the
                         // handler can build a structured HitEvent. We
                         // bypass the call_blocking path (driver can't
                         // block on itself) and write directly.
+                        if !can_schedule_stack_helper(pending) {
+                            return;
+                        }
                         let seq = *next_seq;
                         *next_seq += 1;
                         let frame = json!({
@@ -1705,16 +2519,30 @@ fn dispatch_incoming(
                             "arguments": { "threadId": tid, "startFrame": 0, "levels": 20 },
                         });
                         let (tx, rx) = mpsc::channel::<Result<Value, String>>();
-                        pending.insert(seq, ("stackTrace".into(), tx));
+                        let cancelled = Arc::new(AtomicBool::new(false));
+                        pending.insert(
+                            seq,
+                            PendingRequest {
+                                command: "stackTrace".into(),
+                                resp: tx,
+                                cancelled: cancelled.clone(),
+                            },
+                        );
                         let _ = write_frame(stream, &frame);
                         // Defer the response-waiting onto a short-lived
                         // helper thread so we don't block the driver.
                         let state2 = state.clone();
-                        std::thread::spawn(move || {
-                            if let Ok(Ok(body)) = rx.recv_timeout(Duration::from_secs(5)) {
-                                handle_stack_response(body, &state2);
-                            }
+                        std::thread::spawn(move || match rx.recv_timeout(Duration::from_secs(5)) {
+                            Ok(Ok(body)) => handle_stack_response(body, &state2, stop_generation),
+                            _ => cancelled.store(true, Ordering::Release),
                         });
+                    } else {
+                        let (lock, cvar) = &**state;
+                        let mut s = lock.lock().unwrap();
+                        s.pending_hit = Some(HitEvent::default());
+                        s.pending_is_unscoped = true;
+                        s.pending_action_generation = s.armed_action_generation;
+                        cvar.notify_all();
                     }
                 }
                 "continued" => {
@@ -1764,6 +2592,7 @@ fn dispatch_incoming(
                         let (lock, _) = &**state;
                         let mut s = lock.lock().unwrap();
                         s.launched_pid = Some(spid);
+                        s.launched_identity = process_identity(spid);
                     }
                 }
                 _ => {}
@@ -1773,7 +2602,7 @@ fn dispatch_incoming(
     }
 }
 
-fn handle_stack_response(body: Value, state: &Arc<(Mutex<State>, Condvar)>) {
+fn handle_stack_response(body: Value, state: &Arc<(Mutex<State>, Condvar)>, stop_generation: u64) {
     let frames = body
         .get("stackFrames")
         .and_then(|v| v.as_array())
@@ -1807,9 +2636,28 @@ fn handle_stack_response(body: Value, state: &Arc<(Mutex<State>, Condvar)>) {
     });
     let (lock, cvar) = &**state;
     let mut s = lock.lock().unwrap();
+    // A stack helper owns exactly the stop event which created it. If the
+    // daemon already consumed that stop, or another stop arrived, this
+    // delayed response must not create a hit for a later continue.
+    if s.stop_generation != stop_generation
+        || s.pending_action_generation != s.action_generation
+        || s.enriched_stop_generation == stop_generation
+    {
+        return;
+    }
     s.call_frames = frames;
     s.top_frame = top;
-    s.pending_hit = hit;
+    if let Some(hit) = hit {
+        s.pending_hit = Some(hit);
+    } else {
+        // The adapter answered the enrichment request but supplied no
+        // frames. Publish a structured placeholder only after that answer;
+        // this keeps the wait ordering deterministic without inventing a
+        // hit before enrichment completes.
+        s.pending_hit = Some(HitEvent::default());
+    }
+    s.pending_action_generation = s.action_generation;
+    s.enriched_stop_generation = stop_generation;
     cvar.notify_all();
 }
 
@@ -1821,6 +2669,73 @@ struct BreakSpec {
     log_message: Option<String>,
 }
 
+fn function_breakpoints_verified(response: &Value, expected: usize) -> bool {
+    let Some(items) = response.get("breakpoints").and_then(Value::as_array) else {
+        return expected == 0;
+    };
+    items.len() == expected
+        && items
+            .iter()
+            .all(|bp| bp.get("verified").and_then(Value::as_bool) == Some(true))
+}
+
+fn breakpoint_response_verified(response: &Value, expected: usize) -> bool {
+    let Some(items) = response.get("breakpoints").and_then(Value::as_array) else {
+        return expected == 0;
+    };
+    items.len() == expected
+        && items
+            .iter()
+            .all(|bp| bp.get("verified").and_then(Value::as_bool) == Some(true))
+}
+
+fn function_breakpoint_value(
+    name: &str,
+    condition: Option<&str>,
+    log_message: Option<&str>,
+) -> Value {
+    let mut breakpoint = serde_json::Map::new();
+    breakpoint.insert("name".into(), Value::String(name.to_string()));
+    if let Some(condition) = condition {
+        breakpoint.insert("condition".into(), Value::String(condition.to_string()));
+    }
+    if let Some(log_message) = log_message {
+        breakpoint.insert("logMessage".into(), Value::String(log_message.to_string()));
+    }
+    Value::Object(breakpoint)
+}
+
+fn allocate_breakpoint_id(state: &mut State) -> Result<u32> {
+    // Zero is reserved as the post-u32::MAX exhausted sentinel. Keep this
+    // sentinel separate from the maps so deleting the maximum ID cannot
+    // make it available for reuse.
+    if state.next_breakpoint_id == 0 {
+        bail!("breakpoint id space exhausted");
+    }
+
+    let mut candidate = state.next_breakpoint_id;
+    loop {
+        let already_used = state
+            .line_breakpoint_ids
+            .values()
+            .any(|id| *id == candidate)
+            || state
+                .function_breakpoint_ids
+                .values()
+                .any(|id| *id == candidate);
+        if !already_used {
+            state.next_breakpoint_id = candidate.checked_add(1).unwrap_or(0);
+            return Ok(candidate);
+        }
+        if candidate == u32::MAX {
+            // Do not change the cursor on failure. The caller can therefore
+            // retry without changing committed allocation state.
+            bail!("breakpoint id space exhausted");
+        }
+        candidate += 1;
+    }
+}
+
 fn parse_break(cmd: &str) -> Option<BreakSpec> {
     // Accepts `break file:line` or `b file:line`, optionally followed by
     // ` if <expr>` and/or ` log <template>`. Peel the log suffix first
@@ -1830,22 +2745,80 @@ fn parse_break(cmd: &str) -> Option<BreakSpec> {
     let rest = cmd
         .strip_prefix("break ")
         .or_else(|| cmd.strip_prefix("b "))?;
-    let (head, log_message) = match rest.find(" log ") {
-        Some(i) => (&rest[..i], Some(rest[i + 5..].trim().to_string())),
+    let (head, log_message) = match find_keyword_outside_quotes(rest, " log ") {
+        Some(i) if !rest[i + 5..].trim().is_empty() => {
+            (&rest[..i], Some(rest[i + 5..].trim().to_string()))
+        }
+        Some(_) => return None,
+        None if rest.trim_end().ends_with(" log") => return None,
         None => (rest, None),
     };
-    let (locspec, condition) = match head.find(" if ") {
-        Some(i) => (&head[..i], Some(head[i + 4..].trim().to_string())),
+    let (locspec, condition) = match find_keyword_outside_quotes(head, " if ") {
+        Some(i) if !head[i + 4..].trim().is_empty() => {
+            (&head[..i], Some(head[i + 4..].trim().to_string()))
+        }
+        Some(_) => return None,
+        None if head.trim_end().ends_with(" if") => return None,
         None => (head, None),
     };
     let (file, line_s) = locspec.rsplit_once(':')?;
     let line: u32 = line_s.trim().parse().ok()?;
+    let file = file.trim();
+    if file.is_empty() || line == 0 {
+        return None;
+    }
+    if condition.as_deref().is_some_and(|s| s.trim().is_empty())
+        || log_message.as_deref().is_some_and(|s| s.trim().is_empty())
+    {
+        return None;
+    }
     Some(BreakSpec {
-        file: file.trim().to_string(),
+        file: file.to_string(),
         line,
         condition,
         log_message,
     })
+}
+
+fn find_keyword_outside_quotes(input: &str, keyword: &str) -> Option<usize> {
+    let bytes = input.as_bytes();
+    let needle = keyword.as_bytes();
+    let mut quote = None;
+    let mut escaped = false;
+    for i in 0..=bytes.len().saturating_sub(needle.len()) {
+        let ch = bytes[i] as char;
+        if escaped {
+            escaped = false;
+        } else if ch == '\\' && quote.is_some() {
+            escaped = true;
+        } else if ch == '\'' || ch == '"' {
+            quote = if quote == Some(ch) {
+                None
+            } else if quote.is_none() {
+                Some(ch)
+            } else {
+                quote
+            };
+        }
+        if quote.is_none() && bytes.get(i..i + needle.len()) == Some(needle) {
+            return Some(i);
+        }
+    }
+    None
+}
+
+fn validate_breakpoint_text(value: &str, label: &str) -> Result<()> {
+    const MAX_BREAKPOINT_TEXT: usize = 256 * 1024;
+    if value.trim().is_empty() {
+        bail!("breakpoint {label} must not be empty");
+    }
+    if value.len() > MAX_BREAKPOINT_TEXT {
+        bail!("breakpoint {label} exceeds {MAX_BREAKPOINT_TEXT} bytes");
+    }
+    if value.chars().any(|c| c.is_control() && c != '\t') {
+        bail!("breakpoint {label} contains a control character");
+    }
+    Ok(())
 }
 
 fn resolve_breakpoint_path(file: &str) -> String {
@@ -1883,7 +2856,21 @@ fn preflight_attach(pid: u32) -> Result<()> {
         .ok()
         .and_then(|s| s.trim().parse().ok())
         .unwrap_or(0);
-    preflight_attach_decide(pid, pid_alive, scope)
+    let target_parent = std::fs::read_to_string(format!("/proc/{pid}/status"))
+        .ok()
+        .and_then(|status| {
+            status
+                .lines()
+                .find_map(|line| line.strip_prefix("PPid:")?.trim().parse().ok())
+        });
+    preflight_attach_authorized(
+        pid,
+        pid_alive,
+        scope,
+        target_parent,
+        std::process::id(),
+        has_cap_sys_ptrace(),
+    )
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -1909,12 +2896,30 @@ fn extract_system_process_id(body: &Value) -> Option<u32> {
 /// Pure decision logic for [`preflight_attach`]. Split out so the
 /// regression tests don't need to mutate /proc.
 fn preflight_attach_decide(pid: u32, pid_alive: bool, ptrace_scope: i32) -> Result<()> {
+    preflight_attach_authorized(pid, pid_alive, ptrace_scope, None, 0, false)
+}
+
+fn preflight_attach_authorized(
+    pid: u32,
+    pid_alive: bool,
+    ptrace_scope: i32,
+    _target_parent: Option<u32>,
+    _tracer_pid: u32,
+    has_capability: bool,
+) -> Result<()> {
+    if pid == 0 {
+        bail!("cannot attach to pid 0; provide a specific target process PID");
+    }
     if !pid_alive {
         bail!(
             "no process with pid {pid} (or /proc not mounted). Verify the PID is correct and still running."
         );
     }
-    if ptrace_scope == 0 {
+    // At scope 1 an unrelated target may have granted this daemon access
+    // with PR_SET_PTRACER. Linux exposes no procfs query for that grant, so
+    // rejecting here produces a false negative. Let the adapter/kernel be
+    // authoritative. Scope 2 requires CAP_SYS_PTRACE; scope 3 forbids attach.
+    if ptrace_scope == 0 || ptrace_scope == 1 || (ptrace_scope == 2 && has_capability) {
         return Ok(());
     }
     bail!(
@@ -1926,15 +2931,706 @@ Fix one of:\n  \
     );
 }
 
+#[cfg(target_os = "linux")]
+fn has_cap_sys_ptrace() -> bool {
+    // CAP_SYS_PTRACE is capability 19. This avoids rejecting valid attach
+    // sessions when the process has the capability even though Yama is
+    // configured above the unrestricted mode.
+    let Some(raw) = std::fs::read_to_string("/proc/self/status").ok() else {
+        return false;
+    };
+    let Some(effective) = raw.lines().find_map(|line| {
+        Some(
+            line.strip_prefix("CapEff:")?
+                .trim()
+                .trim_start_matches("0x"),
+        )
+    }) else {
+        return false;
+    };
+    u128::from_str_radix(effective, 16)
+        .map(|caps| (caps & (1u128 << 19)) != 0)
+        .unwrap_or(false)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn has_cap_sys_ptrace() -> bool {
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_transport(
+        responses: Vec<std::result::Result<Value, String>>,
+    ) -> (DapTransport, Arc<std::sync::atomic::AtomicUsize>) {
+        use std::sync::atomic::AtomicUsize;
+
+        let state = Arc::new((Mutex::new(State::new()), Condvar::new()));
+        let (driver_tx, driver_rx) = mpsc::channel();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_for_driver = calls.clone();
+        let driver = std::thread::spawn(move || {
+            let mut responses = responses.into_iter();
+            while let Ok(command) = driver_rx.recv() {
+                match command {
+                    DriverCmd::Call { resp, .. } => {
+                        calls_for_driver.fetch_add(1, Ordering::Relaxed);
+                        let response = responses
+                            .next()
+                            .unwrap_or_else(|| Ok(json!({ "breakpoints": [] })));
+                        let _ = resp.send(response);
+                    }
+                    DriverCmd::Shutdown => break,
+                }
+            }
+        });
+        let transport = DapTransport {
+            child_pid: Pid::from_raw(-1),
+            child: Mutex::new(None),
+            driver_tx,
+            log: LogHandle::new(),
+            state,
+            breakpoint_transaction: Mutex::new(()),
+            shutdown: Arc::new(AtomicBool::new(false)),
+            driver: Mutex::new(Some(driver)),
+            debuggee_pid: None,
+            is_attach: true,
+        };
+        (transport, calls)
+    }
+
+    fn verified_breakpoint_response(count: usize) -> Value {
+        json!({
+            "breakpoints": (0..count)
+                .map(|_| json!({ "verified": true }))
+                .collect::<Vec<_>>()
+        })
+    }
+
+    #[test]
+    fn timed_out_requests_are_removed_from_the_pending_bound() {
+        let (tx, _rx) = mpsc::channel();
+        let cancelled = Arc::new(AtomicBool::new(true));
+        let mut pending = HashMap::from([(
+            1,
+            PendingRequest {
+                command: "threads".into(),
+                resp: tx,
+                cancelled,
+            },
+        )]);
+        prune_cancelled(&mut pending);
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn stopped_event_helpers_have_a_small_independent_bound() {
+        let mut pending = HashMap::new();
+        for seq in 0..MAX_DAP_STACK_HELPERS {
+            let (tx, _rx) = mpsc::channel();
+            pending.insert(
+                seq as i64,
+                PendingRequest {
+                    command: "stackTrace".into(),
+                    resp: tx,
+                    cancelled: Arc::new(AtomicBool::new(false)),
+                },
+            );
+        }
+        assert!(!can_schedule_stack_helper(&pending));
+    }
+
+    fn assert_no_breakpoint_state(transport: &DapTransport, next_id: u32) {
+        let (lock, _) = &*transport.state;
+        let state = lock.lock().unwrap();
+        assert!(state.breakpoints.is_empty());
+        assert!(state.line_breakpoint_ids.is_empty());
+        assert!(state.function_breakpoints.is_empty());
+        assert!(state.function_breakpoint_ids.is_empty());
+        assert!(state.breakpoint_conditions.is_empty());
+        assert!(state.function_breakpoint_conditions.is_empty());
+        assert!(state.breakpoint_log_messages.is_empty());
+        assert!(state.function_breakpoint_log_messages.is_empty());
+        assert_eq!(state.next_breakpoint_id, next_id);
+    }
+
+    #[test]
+    fn line_breakpoint_id_exhaustion() {
+        let (transport, calls) = test_transport(Vec::new());
+        {
+            let (lock, _) = &*transport.state;
+            // Zero is the exhausted sentinel reached after u32::MAX was
+            // already allocated.
+            lock.lock().unwrap().next_breakpoint_id = 0;
+        }
+        let error = transport
+            .set_breakpoint(
+                &BreakSpec {
+                    file: "main.rs".into(),
+                    line: 10,
+                    condition: Some("ready".into()),
+                    log_message: Some("hit".into()),
+                },
+                Duration::from_millis(100),
+            )
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("id space exhausted"),
+            "unexpected error: {error:#}"
+        );
+        assert_eq!(calls.load(Ordering::Relaxed), 0);
+        assert_no_breakpoint_state(&transport, 0);
+    }
+
+    #[test]
+    fn function_breakpoint_id_exhaustion() {
+        let (transport, calls) = test_transport(Vec::new());
+        {
+            let (lock, _) = &*transport.state;
+            lock.lock().unwrap().next_breakpoint_id = 0;
+        }
+        let error = transport
+            .set_function_breakpoint(
+                "worker",
+                Some("ready"),
+                Some("hit"),
+                Duration::from_millis(100),
+            )
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("id space exhausted"),
+            "unexpected error: {error:#}"
+        );
+        assert_eq!(calls.load(Ordering::Relaxed), 0);
+        assert_no_breakpoint_state(&transport, 0);
+    }
+
+    #[test]
+    fn breakpoint_id_exhaustion_does_not_reuse_ids() {
+        let mut occupied = State::new();
+        occupied.next_breakpoint_id = 42;
+        occupied
+            .line_breakpoint_ids
+            .insert("occupied.rs:1".into(), 42);
+        occupied
+            .function_breakpoint_ids
+            .insert("occupied".into(), 43);
+        assert_eq!(allocate_breakpoint_id(&mut occupied).unwrap(), 44);
+        assert_eq!(occupied.line_breakpoint_ids["occupied.rs:1"], 42);
+        assert_eq!(occupied.function_breakpoint_ids["occupied"], 43);
+
+        occupied.next_breakpoint_id = u32::MAX;
+        occupied
+            .function_breakpoint_ids
+            .insert("maximum".into(), u32::MAX);
+        assert!(allocate_breakpoint_id(&mut occupied).is_err());
+        assert_eq!(occupied.next_breakpoint_id, u32::MAX);
+        assert_eq!(occupied.function_breakpoint_ids["maximum"], u32::MAX);
+
+        let (transport, calls) = test_transport(vec![Ok(verified_breakpoint_response(1))]);
+        {
+            let (lock, _) = &*transport.state;
+            lock.lock().unwrap().next_breakpoint_id = u32::MAX;
+        }
+        transport
+            .set_breakpoint(
+                &BreakSpec {
+                    file: "first.rs".into(),
+                    line: 1,
+                    condition: None,
+                    log_message: None,
+                },
+                Duration::from_millis(100),
+            )
+            .unwrap();
+        let error = transport
+            .set_breakpoint(
+                &BreakSpec {
+                    file: "second.rs".into(),
+                    line: 2,
+                    condition: Some("retry".into()),
+                    log_message: Some("retry".into()),
+                },
+                Duration::from_millis(100),
+            )
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("id space exhausted"),
+            "unexpected error: {error:#}"
+        );
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        let listing = transport
+            .run_command("breakpoints", Duration::from_millis(100))
+            .unwrap();
+        assert!(listing.contains(&u32::MAX.to_string()));
+        assert!(!listing.contains("second.rs"));
+        let (lock, _) = &*transport.state;
+        let state = lock.lock().unwrap();
+        assert_eq!(state.next_breakpoint_id, 0);
+        assert_eq!(state.line_breakpoint_ids.len(), 1);
+    }
+
+    #[test]
+    fn breakpoint_adapter_rejection_rolls_back_and_retry_succeeds() {
+        let (transport, calls) = test_transport(vec![
+            Err("adapter rejected breakpoint".into()),
+            Ok(verified_breakpoint_response(1)),
+            Ok(verified_breakpoint_response(0)),
+            Ok(verified_breakpoint_response(1)),
+        ]);
+        let spec = BreakSpec {
+            file: "retry.rs".into(),
+            line: 7,
+            condition: Some("ready".into()),
+            log_message: Some("hit".into()),
+        };
+        assert!(
+            transport
+                .set_breakpoint(&spec, Duration::from_millis(100))
+                .is_err()
+        );
+        assert_no_breakpoint_state(&transport, 1);
+
+        transport
+            .set_breakpoint(&spec, Duration::from_millis(100))
+            .unwrap();
+        let listing = transport
+            .run_command("breakpoints", Duration::from_millis(100))
+            .unwrap();
+        assert!(listing.contains("retry.rs:7"));
+        assert!(listing.starts_with("1:"));
+
+        transport
+            .run_command("breakpoint delete 1", Duration::from_millis(100))
+            .unwrap();
+        assert_eq!(
+            transport
+                .run_command("breakpoints", Duration::from_millis(100))
+                .unwrap(),
+            "(no breakpoints set)"
+        );
+
+        transport
+            .set_breakpoint(
+                &BreakSpec {
+                    file: "after.rs".into(),
+                    line: 3,
+                    condition: None,
+                    log_message: None,
+                },
+                Duration::from_millis(100),
+            )
+            .unwrap();
+        let listing = transport
+            .run_command("breakpoints", Duration::from_millis(100))
+            .unwrap();
+        assert!(listing.starts_with("2:"));
+        assert!(listing.contains("after.rs:3"));
+        assert_eq!(calls.load(Ordering::Relaxed), 4);
+    }
+
+    #[test]
+    fn function_breakpoint_adapter_rejection_rolls_back_and_retry_succeeds() {
+        let (transport, calls) = test_transport(vec![
+            Ok(json!({"breakpoints": [{"verified": false}]})),
+            Ok(verified_breakpoint_response(1)),
+        ]);
+
+        assert!(
+            transport
+                .set_function_breakpoint(
+                    "worker",
+                    Some("ready"),
+                    Some("hit"),
+                    Duration::from_millis(100),
+                )
+                .is_err()
+        );
+        assert_no_breakpoint_state(&transport, 1);
+
+        transport
+            .set_function_breakpoint(
+                "worker",
+                Some("ready"),
+                Some("hit"),
+                Duration::from_millis(100),
+            )
+            .unwrap();
+        assert_eq!(
+            transport
+                .run_command("breakpoints", Duration::from_millis(100))
+                .unwrap(),
+            "1: function worker"
+        );
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn line_breakpoint_partial_adapter_rejection_rolls_back_and_retry_succeeds() {
+        let (transport, calls) = test_transport(vec![
+            Ok(verified_breakpoint_response(1)),
+            Ok(json!({
+                "breakpoints": [
+                    {"verified": false},
+                    {"verified": true}
+                ]
+            })),
+            Ok(verified_breakpoint_response(2)),
+        ]);
+        let first = BreakSpec {
+            file: "partial.rs".into(),
+            line: 3,
+            condition: None,
+            log_message: None,
+        };
+        let second = BreakSpec {
+            file: "partial.rs".into(),
+            line: 7,
+            condition: Some("ready".into()),
+            log_message: Some("hit".into()),
+        };
+
+        transport
+            .set_breakpoint(&first, Duration::from_millis(100))
+            .unwrap();
+        assert!(
+            transport
+                .set_breakpoint(&second, Duration::from_millis(100))
+                .is_err()
+        );
+        let listing = transport
+            .run_command("breakpoints", Duration::from_millis(100))
+            .unwrap();
+        assert!(listing.starts_with("1: "));
+        assert!(listing.ends_with("partial.rs:3"));
+        {
+            let (lock, _) = &*transport.state;
+            let state = lock.lock().unwrap();
+            assert_eq!(state.next_breakpoint_id, 2);
+            assert!(!state.breakpoint_conditions.contains_key("partial.rs:7"));
+            assert!(!state.breakpoint_log_messages.contains_key("partial.rs:7"));
+        }
+
+        transport
+            .set_breakpoint(&second, Duration::from_millis(100))
+            .unwrap();
+        let listing = transport
+            .run_command("breakpoints", Duration::from_millis(100))
+            .unwrap();
+        let mut entries = listing.lines();
+        assert!(entries.next().unwrap().ends_with("partial.rs:3"));
+        assert!(entries.next().unwrap().ends_with("partial.rs:7"));
+        assert!(entries.next().is_none());
+        assert_eq!(calls.load(Ordering::Relaxed), 3);
+    }
+
+    #[test]
+    fn breakpoint_transactions_do_not_overlap_adapter_requests() {
+        let state = Arc::new((Mutex::new(State::new()), Condvar::new()));
+        let (driver_tx, driver_rx) = mpsc::channel();
+        let (first_seen_tx, first_seen_rx) = mpsc::channel();
+        let (probe_tx, probe_rx) = mpsc::channel();
+        let (overlap_tx, overlap_rx) = mpsc::channel();
+        let driver = std::thread::spawn(move || {
+            let DriverCmd::Call {
+                resp: first_resp, ..
+            } = driver_rx.recv().unwrap()
+            else {
+                panic!("expected first breakpoint request")
+            };
+            first_seen_tx.send(()).unwrap();
+            probe_rx.recv().unwrap();
+            let overlapping = driver_rx.recv_timeout(Duration::from_millis(200)).ok();
+            overlap_tx.send(overlapping.is_some()).unwrap();
+            first_resp
+                .send(Err("adapter rejected first request".into()))
+                .unwrap();
+
+            let second = overlapping.unwrap_or_else(|| driver_rx.recv().unwrap());
+            let DriverCmd::Call {
+                resp: second_resp, ..
+            } = second
+            else {
+                panic!("expected second breakpoint request")
+            };
+            second_resp
+                .send(Ok(verified_breakpoint_response(1)))
+                .unwrap();
+            while let Ok(command) = driver_rx.recv() {
+                if matches!(command, DriverCmd::Shutdown) {
+                    break;
+                }
+            }
+        });
+        let transport = Arc::new(DapTransport {
+            child_pid: Pid::from_raw(-1),
+            child: Mutex::new(None),
+            driver_tx,
+            log: LogHandle::new(),
+            state,
+            breakpoint_transaction: Mutex::new(()),
+            shutdown: Arc::new(AtomicBool::new(false)),
+            driver: Mutex::new(Some(driver)),
+            debuggee_pid: None,
+            is_attach: true,
+        });
+
+        let first_transport = transport.clone();
+        let first = std::thread::spawn(move || {
+            first_transport.set_breakpoint(
+                &BreakSpec {
+                    file: "first.rs".into(),
+                    line: 1,
+                    condition: None,
+                    log_message: None,
+                },
+                Duration::from_secs(1),
+            )
+        });
+        first_seen_rx.recv().unwrap();
+
+        let (second_started_tx, second_started_rx) = mpsc::channel();
+        let second_transport = transport.clone();
+        let second = std::thread::spawn(move || {
+            second_started_tx.send(()).unwrap();
+            second_transport.set_breakpoint(
+                &BreakSpec {
+                    file: "second.rs".into(),
+                    line: 2,
+                    condition: None,
+                    log_message: None,
+                },
+                Duration::from_secs(1),
+            )
+        });
+        second_started_rx.recv().unwrap();
+        probe_tx.send(()).unwrap();
+
+        assert!(!overlap_rx.recv().unwrap());
+        assert!(first.join().unwrap().is_err());
+        second.join().unwrap().unwrap();
+        let listing = transport
+            .run_command("breakpoints", Duration::from_millis(100))
+            .unwrap();
+        assert!(listing.starts_with("1: "));
+        assert!(listing.ends_with("second.rs:2"));
+    }
+
+    #[test]
+    fn breakpoint_failure_keeps_break_unbreak_listing_consistent() {
+        let (transport, _) = test_transport(vec![
+            Ok(verified_breakpoint_response(1)),
+            Ok(json!({"breakpoints": [{"verified": false}]})),
+            Ok(verified_breakpoint_response(0)),
+        ]);
+        transport
+            .set_breakpoint(
+                &BreakSpec {
+                    file: "consistent.rs".into(),
+                    line: 4,
+                    condition: None,
+                    log_message: None,
+                },
+                Duration::from_millis(100),
+            )
+            .unwrap();
+        assert!(
+            transport
+                .run_command("breakpoint delete 1", Duration::from_millis(100))
+                .is_err()
+        );
+        assert!(
+            transport
+                .run_command("breakpoints", Duration::from_millis(100))
+                .unwrap()
+                .contains("consistent.rs:4")
+        );
+
+        transport
+            .run_command("breakpoint delete 1", Duration::from_millis(100))
+            .unwrap();
+        assert_eq!(
+            transport
+                .run_command("breakpoints", Duration::from_millis(100))
+                .unwrap(),
+            "(no breakpoints set)"
+        );
+        assert!(
+            transport
+                .run_command("breakpoint delete 1", Duration::from_millis(100))
+                .is_err()
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn netcoredbg_listener_ownership() {
+        use std::io::BufRead;
+        use std::process::Command;
+
+        // A different process owns the selected port. A connect-only check
+        // would accept this listener; netcoredbg launch must reject it
+        // unless the spawned adapter (or one of its descendants) owns it.
+        let mut unrelated = Command::new("python3")
+            .args([
+                "-c",
+                "import socket,time; s=socket.socket(); s.bind(('127.0.0.1',0)); s.listen(1); print(s.getsockname()[1], flush=True); time.sleep(30)",
+            ])
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .expect("python3 is required for the listener ownership regression");
+        let mut line = String::new();
+        std::io::BufReader::new(unrelated.stdout.take().unwrap())
+            .read_line(&mut line)
+            .unwrap();
+        let addr = format!("127.0.0.1:{}", line.trim());
+        let error =
+            connect_with_retry_owned(&addr, Duration::from_millis(100), true, std::process::id())
+                .unwrap_err();
+        assert!(error.to_string().contains("not owned by spawned adapter"));
+        let _ = unrelated.kill();
+        let _ = unrelated.wait();
+    }
 
     #[test]
     fn parse_break_file_line() {
         let b = parse_break("break app.go:10").unwrap();
         assert_eq!(b.file, "app.go");
         assert_eq!(b.line, 10);
+    }
+
+    #[test]
+    fn parse_break_rejects_empty_suffixes_and_zero_lines() {
+        for input in [
+            "break app.go:0",
+            "break app.go:10 if",
+            "break app.go:10 log",
+            "break :10",
+        ] {
+            assert!(parse_break(input).is_none(), "accepted malformed {input:?}");
+        }
+    }
+
+    #[test]
+    fn parse_break_keeps_quoted_log_keyword_in_condition() {
+        let b = parse_break(r#"break app.go:10 if message == " log ""#).unwrap();
+        assert_eq!(b.condition.as_deref(), Some(r#"message == " log ""#));
+        assert!(b.log_message.is_none());
+    }
+
+    #[test]
+    fn dap_capture_includes_thread_descendants() {
+        let tmp = tempfile::tempdir().unwrap();
+        let task_dir = tmp.path().join("42/task");
+        std::fs::create_dir_all(task_dir.join("42")).unwrap();
+        std::fs::create_dir(task_dir.join("43")).unwrap();
+        std::fs::write(task_dir.join("42/children"), "100 101\n").unwrap();
+        std::fs::write(task_dir.join("43/children"), "101 102\n").unwrap();
+
+        assert_eq!(
+            process_children_from_root(tmp.path(), 42),
+            vec![100, 101, 102]
+        );
+    }
+
+    #[test]
+    fn dap_stopped_without_thread_id_wakes_waiters() {
+        let state = Arc::new((Mutex::new(State::new()), Condvar::new()));
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let peer = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut pending = HashMap::new();
+        let log = LogHandle::new();
+        let mut next_seq = 1;
+        {
+            let (lock, _) = &*state;
+            let mut guard = lock.lock().unwrap();
+            // Model the race where exec advances its generation before the
+            // driver has armed the request which will follow.
+            guard.action_generation = 1;
+            guard.armed_action_generation = 0;
+        }
+        dispatch_incoming(
+            json!({"type":"event", "event":"stopped", "body":{"reason":"pause"}}),
+            &mut pending,
+            &state,
+            &log,
+            &mut stream,
+            &mut next_seq,
+        );
+        drop(peer);
+        crate::transport_common::wait_for_stop(&state, || Ok(()), Duration::from_millis(20))
+            .unwrap();
+        let (lock, _) = &*state;
+        assert!(lock.lock().unwrap().pending_is_unscoped);
+    }
+
+    #[test]
+    fn dap_stopped_with_null_thread_id_is_unscoped() {
+        let state = Arc::new((Mutex::new(State::new()), Condvar::new()));
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let peer = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut pending = HashMap::new();
+        let log = LogHandle::new();
+        let mut next_seq = 1;
+        dispatch_incoming(
+            json!({"type":"event", "event":"stopped", "body":{"threadId":null}}),
+            &mut pending,
+            &state,
+            &log,
+            &mut stream,
+            &mut next_seq,
+        );
+        drop(peer);
+        let (lock, _) = &*state;
+        let guard = lock.lock().unwrap();
+        assert!(guard.pending_is_unscoped);
+        assert!(guard.pending_hit.is_some());
+    }
+
+    #[test]
+    fn dap_function_logpoint_uses_log_message() {
+        let value = function_breakpoint_value("worker", None, Some("hit {x}"));
+        assert_eq!(value.get("name").and_then(Value::as_str), Some("worker"));
+        assert_eq!(
+            value.get("logMessage").and_then(Value::as_str),
+            Some("hit {x}")
+        );
+        assert!(value.get("name").unwrap().as_str().unwrap() != "hit {x}");
+    }
+
+    #[test]
+    fn dap_rejects_unverified_function_breakpoints() {
+        assert!(!function_breakpoints_verified(
+            &json!({"breakpoints":[{"verified":false}]}),
+            1
+        ));
+        assert!(function_breakpoints_verified(
+            &json!({"breakpoints":[{"verified":true}]}),
+            1
+        ));
+    }
+
+    #[test]
+    fn dap_breakpoint_ids_cover_line_and_function_breakpoints() {
+        let mut state = State::new();
+        state
+            .line_breakpoint_ids
+            .insert("/tmp/main.rs:10".into(), 1);
+        state.function_breakpoint_ids.insert("worker".into(), 2);
+        state.breakpoints.insert("/tmp/main.rs".into(), vec![10]);
+        state.function_breakpoints.push("worker".into());
+        let ids: Vec<u32> = state
+            .line_breakpoint_ids
+            .values()
+            .chain(state.function_breakpoint_ids.values())
+            .copied()
+            .collect();
+        assert_eq!(ids, vec![1, 2]);
+        assert_ne!(ids[0], ids[1]);
     }
 
     #[test]
@@ -1987,6 +3683,177 @@ mod tests {
     }
 
     #[test]
+    fn framing_rejects_bad_headers_and_keeps_the_next_frame() {
+        let valid = b"Content-Length: 2\r\n\r\n{}";
+        for bad in [
+            b"Content-Length: nope\r\n\r\n".as_slice(),
+            b"Content-Length: 2\r\nX: \xff\r\n\r\n".as_slice(),
+        ] {
+            let mut decoder = DapFrameDecoder::new();
+            decoder.inbox.extend_from_slice(bad);
+            decoder.inbox.extend_from_slice(valid);
+            assert!(decoder.next_frame().is_err());
+            assert_eq!(decoder.next_frame().unwrap().as_deref(), Some(&b"{}"[..]));
+        }
+    }
+
+    #[test]
+    fn framing_discards_oversized_body_before_resynchronizing() {
+        let mut decoder = DapFrameDecoder::new();
+        let header = format!("Content-Length: {}\r\n\r\n", MAX_DAP_FRAME_BYTES + 1);
+        decoder.inbox.extend_from_slice(header.as_bytes());
+        decoder
+            .inbox
+            .extend(std::iter::repeat(b'x').take(MAX_DAP_FRAME_BYTES + 1));
+        decoder
+            .inbox
+            .extend_from_slice(b"Content-Length: 2\r\n\r\n{}");
+        assert!(decoder.next_frame().is_err());
+        assert_eq!(decoder.next_frame().unwrap().as_deref(), Some(&b"{}"[..]));
+    }
+
+    #[test]
+    fn framing_resynchronizes_after_an_oversized_length_without_waiting_for_it() {
+        let mut decoder = DapFrameDecoder::new();
+        decoder
+            .inbox
+            .extend_from_slice(b"Content-Length: 18446744073709551615\r\n\r\n");
+        decoder
+            .inbox
+            .extend_from_slice(b"Content-Length: 2\r\n\r\n{}");
+
+        assert!(decoder.next_frame().is_err());
+        assert_eq!(decoder.next_frame().unwrap().as_deref(), Some(&b"{}"[..]));
+    }
+
+    #[test]
+    fn oversized_resynchronization_keeps_memory_bounded_between_chunks() {
+        let mut decoder = DapFrameDecoder::new();
+        decoder
+            .inbox
+            .extend_from_slice(b"Content-Length: 999999999999999999\r\n\r\n");
+        assert!(decoder.next_frame().is_err());
+
+        decoder
+            .inbox
+            .extend(std::iter::repeat(b'x').take(1_000_000));
+        assert!(decoder.next_frame().unwrap().is_none());
+        assert!(decoder.inbox.len() < b"Content-Length:".len());
+
+        decoder
+            .inbox
+            .extend_from_slice(b"Content-Length: 2\r\n\r\n{}");
+        assert_eq!(decoder.next_frame().unwrap().as_deref(), Some(&b"{}"[..]));
+    }
+
+    #[test]
+    fn a_consumed_stop_cannot_be_recreated_by_a_late_stack_helper() {
+        let state = Arc::new((Mutex::new(State::new()), Condvar::new()));
+        {
+            let (lock, _) = &*state;
+            let mut guard = lock.lock().unwrap();
+            guard.stop_generation = 7;
+            guard.pending_hit = Some(HitEvent::default());
+        }
+        let body = json!({
+            "stackFrames": [{
+                "name": "old_stop",
+                "line": 10,
+                "source": { "path": "old.rs" }
+            }]
+        });
+        handle_stack_response(body.clone(), &state, 7);
+        {
+            let (lock, _) = &*state;
+            assert_eq!(
+                lock.lock()
+                    .unwrap()
+                    .pending_hit
+                    .take()
+                    .unwrap()
+                    .file
+                    .as_deref(),
+                Some("old.rs")
+            );
+        }
+
+        // The daemon consumed the stop and began a later action. A delayed
+        // helper from the earlier stop must not repopulate pending state.
+        handle_stack_response(body, &state, 7);
+        let (lock, _) = &*state;
+        assert!(lock.lock().unwrap().pending_hit.is_none());
+    }
+
+    #[test]
+    fn stopped_frame_queued_before_action_keeps_the_previous_generation() {
+        let state = Arc::new((Mutex::new(State::new()), Condvar::new()));
+        {
+            let (lock, _) = &*state;
+            let mut guard = lock.lock().unwrap();
+            guard.action_generation = 1;
+            guard.armed_action_generation = 0;
+        }
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let peer = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (mut stream, _) = listener.accept().unwrap();
+        let _peer = peer;
+        let mut pending = HashMap::new();
+        let log = LogHandle::new();
+        let mut next_seq = 1;
+        dispatch_incoming(
+            json!({
+                "type": "event",
+                "event": "stopped",
+                "body": { "reason": "breakpoint" }
+            }),
+            &mut pending,
+            &state,
+            &log,
+            &mut stream,
+            &mut next_seq,
+        );
+        let (lock, _) = &*state;
+        assert_eq!(lock.lock().unwrap().pending_action_generation, 0);
+
+        {
+            let mut guard = lock.lock().unwrap();
+            guard.armed_action_generation = 1;
+        }
+        dispatch_incoming(
+            json!({
+                "type": "event",
+                "event": "stopped",
+                "body": { "reason": "breakpoint" }
+            }),
+            &mut pending,
+            &state,
+            &log,
+            &mut stream,
+            &mut next_seq,
+        );
+        assert_eq!(lock.lock().unwrap().pending_action_generation, 1);
+    }
+
+    #[test]
+    fn restart_tracking_accepts_a_reused_pid_only_with_new_identity() {
+        let old = ProcessIdentity {
+            start_time: 1,
+            exe_device: 2,
+            exe_inode: 3,
+        };
+        let replacement = ProcessIdentity {
+            start_time: 4,
+            exe_device: 2,
+            exe_inode: 3,
+        };
+        assert_eq!(find_new_descendant(&[(10, old)], vec![(10, old)]), None);
+        assert_eq!(
+            find_new_descendant(&[(10, old)], vec![(10, replacement)]),
+            Some((10, replacement))
+        );
+    }
+
+    #[test]
     fn preflight_attach_passes_when_ptrace_unrestricted() {
         // ptrace_scope=0 → kernel allows any user to ptrace own
         // processes regardless of parentage; preflight has nothing to
@@ -1995,12 +3862,21 @@ mod tests {
     }
 
     #[test]
+    fn preflight_attach_allows_authorized_parent_or_capability() {
+        assert!(preflight_attach_authorized(1234, true, 1, Some(77), 77, false).is_ok());
+        assert!(preflight_attach_authorized(1234, true, 2, None, 77, true).is_ok());
+        // PR_SET_PTRACER grants are intentionally not observable through
+        // procfs, so scope 1 must be attempted rather than pre-rejected.
+        assert!(preflight_attach_authorized(1234, true, 1, None, 77, false).is_ok());
+    }
+
+    #[test]
     fn preflight_attach_blocks_when_ptrace_restricted() {
         // Regression for the netcoredbg "DAP configurationDone: timeout"
         // we used to surface 10s after attach. With ptrace_scope >= 1
         // and dbg's daemon not the parent of the target, we now bail
         // up front with the actionable message.
-        for scope in [1, 2, 3] {
+        for scope in [2, 3] {
             let err = preflight_attach_decide(1234, true, scope).unwrap_err();
             let msg = format!("{err:#}");
             assert!(

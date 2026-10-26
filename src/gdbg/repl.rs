@@ -1,4 +1,4 @@
-use std::io::{self, BufRead, Write};
+use std::io::{self, BufRead, IsTerminal, Write};
 
 use anyhow::Result;
 
@@ -13,8 +13,10 @@ pub fn run(db: &mut GpuDb) -> Result<()> {
     println!();
 
     loop {
-        print!("gpu> ");
-        stdout.flush()?;
+        if stdin.is_terminal() {
+            print!("gpu> ");
+            stdout.flush()?;
+        }
 
         let mut line = String::new();
         if stdin.lock().read_line(&mut line)? == 0 {
@@ -22,7 +24,9 @@ pub fn run(db: &mut GpuDb) -> Result<()> {
         }
 
         let line = line.trim();
-        if line.is_empty() { continue; }
+        if line.is_empty() {
+            continue;
+        }
 
         let parts: Vec<&str> = line.split_whitespace().collect();
         let cmd = parts[0];
@@ -97,8 +101,12 @@ fn cmd_help(args: &[&str]) {
         println!("    occupancy [N]           SM occupancy ranking");
         println!("    variance <kernel>       Launch-to-launch timing variance");
         println!("    outliers <kernel>       Slowest launches, timeline position, clustering");
-        println!("    source <kernel>         Op/file that launched this kernel (needs torch/proton)");
-        println!("    memory [N]              GPU allocations: peak, leaks, largest, churn");
+        println!(
+            "    source <kernel>         Op/file that launched this kernel (needs torch/proton)"
+        );
+        println!(
+            "    memory [N]              Recorded allocations: peak, unmatched allocations, largest, churn"
+        );
         println!("    bandwidth [N] [pat]     Per-kernel achieved memory bandwidth (needs ncu)");
         println!("    critical-path [gap_us]  Longest same-stream kernel chain");
         println!("    stream-graph [width]    ASCII timeline with streams as rows");
@@ -107,11 +115,11 @@ fn cmd_help(args: &[&str]) {
         println!("    compare <ka> <kb>       Side-by-side stats for two kernels");
         println!("    regressions <s> [%] [us] Diff filtered by % and absolute thresholds");
         println!("    warmup                  Detect warmup launches before steady state");
-        println!("    small [N]               Kernels where launch overhead > compute");
-        println!("    fuse [N]                Sequential kernels that could be fused");
+        println!("    small [N]               Short kernels and observed scheduling gaps");
+        println!("    fuse [N]                Adjacent kernel sequences and observed gaps");
         println!("    concurrency             Stream utilization and parallelism gaps");
-        println!("    hotpath                 Critical path through ops (CPU vs GPU bound)");
-        println!("    compare-ops [N]         CPU vs GPU time ratio per operator");
+        println!("    hotpath                 Inclusive CPU operator totals and GPU attribution");
+        println!("    compare-ops [N]         CPU / attributed GPU time per operator");
         println!("    top-ops [N] [pattern]   Ops ranked by GPU time (not CPU)");
         println!("    breakdown <op>          Which kernels an op expands into");
         println!("    idle-between <a> <b>    GPU idle gap between two ops\n");

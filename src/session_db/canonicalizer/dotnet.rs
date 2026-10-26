@@ -103,11 +103,14 @@ fn strip_param_list(s: &str) -> String {
 fn unwrap_async_state_machine(s: &str) -> Option<String> {
     static RE: OnceLock<Regex> = OnceLock::new();
     let re = RE.get_or_init(|| {
-        Regex::new(r"(?x)
+        Regex::new(
+            r"(?x)
             ^(?P<prefix>.*?)               # namespace / class prefix (non-greedy)
             <(?P<method>[A-Za-z_][A-Za-z0-9_]*)>   # <Method>
             d__\d+                         # d__N  (state machine discriminator)
-            \.MoveNext$").unwrap()
+            \.MoveNext$",
+        )
+        .unwrap()
     });
     re.captures(s).map(|c| {
         let prefix = c.name("prefix").unwrap().as_str();
@@ -127,14 +130,16 @@ fn looks_synthetic(s: &str) -> bool {
         || s.contains("<>c<>")
         || s.contains("__AnonymousType")
         || (s.contains(".<") && s.contains(">b__"))    // local func / lambda
-        || (s.contains(".<") && s.contains(">g__"))    // local static func
+        || (s.contains(".<") && s.contains(">g__")) // local static func
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn n() -> DotnetCanonicalizer { DotnetCanonicalizer }
+    fn n() -> DotnetCanonicalizer {
+        DotnetCanonicalizer
+    }
 
     #[test]
     fn simple_fqn_preserved() {

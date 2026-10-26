@@ -126,9 +126,7 @@ impl Backend for JitDasmBackend {
         // lands in the capture file and the REPL happily loads the
         // host runtime's JIT noise instead. Catch the misuse up front.
         let lower = target.to_ascii_lowercase();
-        if !(lower.ends_with(".csproj")
-            || lower.ends_with(".fsproj")
-            || lower.ends_with(".vbproj"))
+        if !(lower.ends_with(".csproj") || lower.ends_with(".fsproj") || lower.ends_with(".vbproj"))
         {
             anyhow::bail!(
                 "jitdasm needs a project file (.csproj/.fsproj/.vbproj), got `{target}` — \
@@ -154,7 +152,7 @@ impl Backend for JitDasmBackend {
         // hang forever waiting for the child to produce EOF. When the
         // flag is set we wrap the child with `timeout --preserve-status`
         // so a graceful time-kill still looks like success. See
-        // skills/adapters/jitdasm.md "Long-running targets".
+        // skills/references/adapters/jitdasm.md "Long-running targets".
         let (capture_duration, rest_args) = extract_capture_duration(args);
 
         let raw_pattern = if rest_args.is_empty() {
@@ -179,10 +177,14 @@ impl Backend for JitDasmBackend {
 
         let dbg_bin = super::self_exe();
 
-        let mkdir_cmd = format!("mkdir -p {}", out_dir_str);
+        let mkdir_cmd = format!(
+            "mkdir -p {} && rm -f {}",
+            shell_escape(&out_dir_str),
+            shell_escape(&out_file_str)
+        );
 
         let build_cmd = format!(
-            "echo 'Building...' && dotnet build {} -c Release --nologo -v q 2>&1 | tail -1",
+            "echo 'Building...' && dotnet build {} -c Release --nologo -v q 2>&1",
             shell_escape(&project)
         );
 
@@ -204,20 +206,23 @@ impl Backend for JitDasmBackend {
         // emit one, so it reliably names the entry-point dll.
         // Capture dirname into a shell variable so paths with spaces
         // survive expansion inside the ls glob.
-        let locate_dll = format!(
-            "proj_dir=$(dirname {project_arg}); \
+        let run_cmd = format!(
+            "echo Disassembling: {pattern_arg}; \
+             proj_dir=$(dirname {project_arg}); \
              dll=$(ls -t \"$proj_dir\"/bin/Release/net*/*.runtimeconfig.json 2>/dev/null | \
              head -1 | sed 's/\\.runtimeconfig\\.json$/.dll/'); \
              if [ -z \"$dll\" ] || [ ! -f \"$dll\" ]; then \
                echo 'jitdasm: could not locate built dll under bin/Release/net*/; did build succeed?' >&2; \
-               exit 1; \
-             fi",
+               status=1; \
+             else \
+             DOTNET_TieredCompilation=0 DOTNET_JitDisasm={pattern_arg} DOTNET_JitDiffableDasm=1 \
+             {timeout_prefix}dotnet exec \"$dll\"{extra} > {out_file} 2>&1; \
+             status=$?; \
+             fi; \
+             if ([ \"$status\" -eq 124 ] || [ \"$status\" -eq 143 ]) && [ -f {out_file} ]; then status=0; fi; \
+             bash -c 'exit \"$1\"' _ \"$status\"",
             project_arg = shell_escape(&project),
-        );
-        let run_cmd = format!(
-            "echo 'Disassembling: {pattern}' && {locate_dll} && \
-             DOTNET_TieredCompilation=0 DOTNET_JitDisasm='{pattern}' DOTNET_JitDiffableDasm=1 \
-             {timeout_prefix}dotnet exec \"$dll\"{extra} > {out_file} 2>&1",
+            pattern_arg = shell_escape(&pattern),
             out_file = shell_escape(&out_file_str),
         );
 
@@ -231,12 +236,16 @@ impl Backend for JitDasmBackend {
         // — strip any leading `Namespace.Type:` prefix and wildcards.
         let repl_default = repl_default_pattern(&raw_pattern);
         let exec_repl = if repl_default.is_empty() {
-            format!("exec {} --jitdasm-repl {}", dbg_bin, out_file_str)
+            format!(
+                "exec {} --jitdasm-repl {}",
+                shell_escape(&dbg_bin),
+                shell_escape(&out_file_str)
+            )
         } else {
             format!(
                 "exec {} --jitdasm-repl {} --jitdasm-pattern {}",
-                dbg_bin,
-                out_file_str,
+                shell_escape(&dbg_bin),
+                shell_escape(&out_file_str),
                 shell_escape(&repl_default),
             )
         };
@@ -274,11 +283,15 @@ impl Backend for JitDasmBackend {
     }
 
     fn parse_help(&self, _raw: &str) -> String {
-        "jitdasm: methods, disasm <pattern>, search <instr>, stats, hotspots [N], simd, help".to_string()
+        "jitdasm: methods, disasm <pattern>, search <instr>, stats, hotspots [N], simd, help"
+            .to_string()
     }
 
     fn adapters(&self) -> Vec<(&'static str, &'static str)> {
-        vec![("jitdasm.md", include_str!("../../skills/adapters/jitdasm.md"))]
+        vec![(
+            "jitdasm.md",
+            include_str!("../../skills/references/adapters/jitdasm.md"),
+        )]
     }
 }
 
@@ -289,7 +302,10 @@ mod tests {
     #[test]
     fn spawn_config_with_pattern() {
         let cfg = JitDasmBackend
-            .spawn_config("bench/tq-quick/tq-quick.csproj", &["SimdOps:DotProduct".into()])
+            .spawn_config(
+                "bench/tq-quick/tq-quick.csproj",
+                &["SimdOps:DotProduct".into()],
+            )
             .unwrap();
         assert_eq!(cfg.bin, "bash");
         assert!(cfg.init_commands[0].contains("mkdir"));
@@ -300,9 +316,7 @@ mod tests {
 
     #[test]
     fn spawn_config_default_captures_all() {
-        let cfg = JitDasmBackend
-            .spawn_config("myapp.csproj", &[])
-            .unwrap();
+        let cfg = JitDasmBackend.spawn_config("myapp.csproj", &[]).unwrap();
         assert!(cfg.init_commands[2].contains("DOTNET_JitDisasm='*'"));
     }
 
@@ -393,10 +407,7 @@ mod tests {
 
     #[test]
     fn qualify_pattern_leaves_already_qualified() {
-        assert_eq!(
-            qualify_pattern("Foo.Bar:Baz", "Foo.csproj"),
-            "Foo.Bar:Baz"
-        );
+        assert_eq!(qualify_pattern("Foo.Bar:Baz", "Foo.csproj"), "Foo.Bar:Baz");
     }
 
     #[test]
@@ -435,7 +446,10 @@ mod tests {
             exec_cmd.contains("--jitdasm-pattern"),
             "missing --jitdasm-pattern:\n{exec_cmd}"
         );
-        assert!(exec_cmd.contains(":SumFast"), "missing :SumFast:\n{exec_cmd}");
+        assert!(
+            exec_cmd.contains(":SumFast"),
+            "missing :SumFast:\n{exec_cmd}"
+        );
     }
 
     #[test]
@@ -482,6 +496,49 @@ mod tests {
         JitDasmBackend
             .spawn_config("app.fsproj", &[])
             .expect("fsproj must be accepted");
+    }
+
+    #[test]
+    fn jitdasm_build_failure_cannot_be_masked_by_tail() {
+        let cfg = JitDasmBackend.spawn_config("app.csproj", &[]).unwrap();
+        let build = &cfg.init_commands[1];
+        assert!(build.contains("dotnet build"));
+        assert!(!build.contains("| tail"));
+        assert!(build.contains("&&"));
+    }
+
+    #[test]
+    fn jitdasm_capture_timeout_allows_repl_handoff() {
+        let cfg = JitDasmBackend
+            .spawn_config("app.csproj", &["--capture-duration".into(), "1s".into()])
+            .unwrap();
+        let capture = &cfg.init_commands[2];
+        assert!(capture.contains("-eq 124") || capture.contains("-eq 143"));
+        assert!(cfg.init_commands[3].starts_with("exec "));
+    }
+
+    #[test]
+    fn capture_status_keeps_shell_alive_for_daemon_marker() {
+        let cfg = JitDasmBackend.spawn_config("app.csproj", &[]).unwrap();
+        let run = &cfg.init_commands[2];
+        assert!(run.contains("bash -c 'exit \"$1\"'"));
+        assert!(!run.contains("exit \"$status\""));
+    }
+
+    #[test]
+    fn capture_status_preserves_the_exact_nonzero_code() {
+        let output = std::process::Command::new("bash")
+            .args([
+                "-c",
+                "status=42; bash -c 'exit \"$1\"' _ \"$status\"; printf '__DBG_INIT_STATUS__%s\n' \"$?\"",
+            ])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        assert_eq!(
+            String::from_utf8(output.stdout).unwrap(),
+            "__DBG_INIT_STATUS__42\n"
+        );
     }
 
     #[test]
@@ -551,5 +608,18 @@ mod tests {
             first_char == '\'' || first_char == '"',
             "redirect target with spaces must be quoted: {run}"
         );
+    }
+
+    #[test]
+    fn run_command_shell_escapes_the_user_pattern() {
+        let cfg = JitDasmBackend
+            .spawn_config("app.csproj", &["$(touch /tmp/pwned);'".into()])
+            .unwrap();
+        let run = &cfg.init_commands[2];
+        assert!(
+            run.contains("DOTNET_JitDisasm='app.$(touch /tmp/pwned);'\\''"),
+            "{run}"
+        );
+        assert!(!run.contains("DOTNET_JitDisasm='app.$(touch /tmp/pwned);' &&"));
     }
 }

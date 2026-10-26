@@ -1,12 +1,15 @@
 use std::collections::HashMap;
+use std::collections::hash_map::Entry;
+use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
+use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
-use std::sync::atomic::{AtomicI32, Ordering};
-use std::time::Duration;
+use std::sync::atomic::{AtomicI32, AtomicUsize, Ordering};
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use dbg_cli::session_db::{self, CreateOptions, SessionDb, SessionKind, TargetClass};
 use rusqlite::params;
 
@@ -19,22 +22,53 @@ use crate::pty::{DebuggerIo, DebuggerProcess};
 use dbg_cli::session_db::LiveDebugger;
 
 const CMD_TIMEOUT: Duration = Duration::from_secs(60);
+const MAX_IPC_CONNECTIONS: usize = 32;
+const MAX_IPC_REQUEST_BYTES: u64 = 64 * 1024;
+const IPC_IDLE_TIMEOUT: Duration = Duration::from_secs(5);
 
-fn cleanup_and_exit() -> ! {
+fn should_wake_accept_after_release(previous: usize) -> bool {
+    previous == MAX_IPC_CONNECTIONS
+}
+
+fn cleanup_and_exit(keep_session_tmp: bool) -> ! {
+    cleanup_runtime_state(keep_session_tmp);
+    std::process::exit(0);
+}
+
+fn cleanup_runtime_state(keep_session_tmp: bool) {
     let me = session_slug();
     let _ = std::fs::remove_file(socket_path());
     let _ = std::fs::remove_file(pid_path());
+    // Keep the reservation inode. Its flock is released when this process
+    // exits, so a later starter can safely reuse the same inode. Unlinking
+    // it here would let a new starter create a replacement inode while this
+    // process was still shutting down.
     // Clear the "latest" pointer only if it still names us — another
     // daemon may have become the newest since we started, and we
     // mustn't blow away its pointer.
-    if let Ok(contents) = std::fs::read_to_string(latest_pointer_path()) {
-        if contents.trim() == me {
-            let _ = std::fs::remove_file(latest_pointer_path());
-        }
+    clear_latest_pointer_if_owner(&me);
+    cleanup_session_tmp(keep_session_tmp);
+}
+
+/// Remove state published before backend initialization completed.
+/// Called by the forked child when `run_daemon` returns an error.
+pub fn cleanup_after_startup_error() {
+    cleanup_runtime_state(false);
+}
+
+fn cleanup_session_tmp(keep_session_tmp: bool) {
+    cleanup_session_tmp_at(&session_tmp_dir(), keep_session_tmp);
+}
+
+fn cleanup_session_tmp_at(session_dir: &Path, keep_session_tmp: bool) {
+    if keep_session_tmp {
+        eprintln!(
+            "[dbg] warning: raw session evidence was not removed; recover it from {}",
+            session_dir.display()
+        );
+    } else {
+        let _ = std::fs::remove_dir_all(&session_dir);
     }
-    let session_dir = session_tmp_dir();
-    let _ = std::fs::remove_dir_all(&session_dir);
-    std::process::exit(0);
 }
 
 /// Return the session-scoped temp directory (without appending a filename).
@@ -45,21 +79,18 @@ fn session_tmp_dir() -> PathBuf {
 }
 
 fn users_uid() -> u32 {
-    // Read from /proc/self/status; the value only needs to be stable
-    // per-user within the host, not authoritative.
-    std::env::var("UID")
+    // Do not trust the conventional `$UID` environment variable. A caller
+    // can set it to another user's value and otherwise redirect the IPC
+    // pathname into a directory that is not theirs. `/proc` reports the
+    // effective UID assigned by the kernel.
+    std::fs::read_to_string("/proc/self/status")
         .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or_else(|| {
-            std::fs::read_to_string("/proc/self/status")
-                .ok()
-                .and_then(|s| {
-                    s.lines()
-                        .find(|l| l.starts_with("Uid:"))
-                        .and_then(|l| l.split_ascii_whitespace().nth(1)?.parse().ok())
-                })
-                .unwrap_or(0)
+        .and_then(|s| {
+            s.lines()
+                .find(|l| l.starts_with("Uid:"))
+                .and_then(|l| l.split_ascii_whitespace().nth(1)?.parse().ok())
         })
+        .unwrap_or(0)
 }
 
 /// Per-user IPC directory. Prefers `$XDG_RUNTIME_DIR/dbg-<uid>` (tmpfs,
@@ -78,11 +109,33 @@ fn runtime_dir() -> PathBuf {
         .unwrap_or_else(|_| PathBuf::from("/tmp"));
     let dir = base.join(format!("dbg-{uid}"));
     if let Err(e) = std::fs::create_dir_all(&dir) {
-        // Fall back — we can't abort here (callers treat this as
-        // infallible). The bind() will fail with a clearer error.
-        eprintln!("dbg: cannot create {}: {e}", dir.display());
-    } else {
-        let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+        panic!(
+            "dbg: cannot create secure runtime directory {}: {e}",
+            dir.display()
+        );
+    }
+    let metadata = std::fs::symlink_metadata(&dir).unwrap_or_else(|e| {
+        panic!(
+            "dbg: cannot inspect runtime directory {}: {e}",
+            dir.display()
+        )
+    });
+    use std::os::unix::fs::MetadataExt;
+    if !metadata.is_dir() || metadata.uid() != uid {
+        panic!("dbg: refusing insecure runtime directory {}", dir.display());
+    }
+    if let Err(e) = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)) {
+        panic!(
+            "dbg: cannot secure runtime directory {}: {e}",
+            dir.display()
+        );
+    }
+    let mode = std::fs::symlink_metadata(&dir).unwrap().mode();
+    if mode & 0o077 != 0 {
+        panic!(
+            "dbg: runtime directory {} is writable by another user",
+            dir.display()
+        );
     }
     dir
 }
@@ -118,23 +171,59 @@ pub fn latest_pointer_path() -> PathBuf {
     runtime_dir().join(format!("dbg-{}.latest", cwd_base_slug()))
 }
 
+fn latest_pointer_lock_path() -> PathBuf {
+    runtime_dir().join(format!("dbg-{}.latest.lock", cwd_base_slug()))
+}
+
+fn with_latest_pointer_lock<T>(f: impl FnOnce() -> T) -> T {
+    let path = latest_pointer_lock_path();
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .open(path)
+        .expect("cannot open latest-session pointer lock");
+    let lock = nix::fcntl::Flock::lock(file, nix::fcntl::FlockArg::LockExclusive)
+        .expect("cannot lock latest-session pointer");
+    let result = f();
+    drop(lock);
+    result
+}
+
 /// Update the pointer to name `slug` as the newest daemon for this cwd.
 pub fn write_latest_pointer(slug: &str) {
-    let _ = std::fs::write(latest_pointer_path(), slug);
+    with_latest_pointer_lock(|| {
+        let path = latest_pointer_path();
+        let tmp = path.with_extension(format!("latest.{}", std::process::id()));
+        if std::fs::write(&tmp, format!("{slug}\n")).is_ok() {
+            let _ = std::fs::rename(tmp, path);
+        }
+    });
+}
+
+fn clear_latest_pointer_if_owner(slug: &str) {
+    with_latest_pointer_lock(|| {
+        let path = latest_pointer_path();
+        if std::fs::read_to_string(&path)
+            .ok()
+            .is_some_and(|contents| contents.trim() == slug)
+        {
+            let _ = std::fs::remove_file(path);
+        }
+    });
 }
 
 /// Read the pointer. Returns `None` if missing, empty, or pointing at
 /// a daemon that is no longer alive.
 fn read_live_pointer() -> Option<String> {
-    let raw = std::fs::read_to_string(latest_pointer_path()).ok()?;
-    let slug = raw.trim();
-    if slug.is_empty() {
-        return None;
-    }
-    if !is_slug_live(slug) {
-        return None;
-    }
-    Some(slug.to_string())
+    with_latest_pointer_lock(|| {
+        let raw = std::fs::read_to_string(latest_pointer_path()).ok()?;
+        let slug = raw.trim();
+        if slug.is_empty() || !is_slug_live(slug) {
+            return None;
+        }
+        Some(slug.to_string())
+    })
 }
 
 /// Slug the current process should act on. Priority:
@@ -163,6 +252,10 @@ pub fn pid_path_for(slug: &str) -> PathBuf {
     runtime_dir().join(format!("dbg-{slug}.pid"))
 }
 
+fn reservation_path_for(slug: &str) -> PathBuf {
+    runtime_dir().join(format!("dbg-{slug}.lock"))
+}
+
 fn socket_path() -> PathBuf {
     socket_path_for(&session_slug())
 }
@@ -176,13 +269,17 @@ pub fn is_slug_live(slug: &str) -> bool {
     let Ok(pid_str) = std::fs::read_to_string(pid_path_for(slug)) else {
         return false;
     };
-    let Ok(pid) = pid_str.trim().parse::<i32>() else {
+    let Some(pid) = pid_str
+        .lines()
+        .next()
+        .and_then(|s| s.trim().parse::<i32>().ok())
+    else {
         return false;
     };
     if nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None).is_err() {
         return false;
     }
-    proc_comm_is_dbg(pid)
+    daemon_identity_matches(&pid_str, pid) && proc_comm_is_dbg(pid)
 }
 
 /// Pick a slug for a new daemon. With `DBG_SESSION` set we honor the
@@ -202,13 +299,111 @@ pub fn allocate_slug() -> Result<String> {
                  `DBG_SESSION={name} dbg kill` first"
             );
         }
+        claim_slug(&name)?;
         return Ok(name);
     }
     let base = cwd_base_slug();
-    if is_slug_live(&base) {
-        Ok(format!("{base}-{}", std::process::id()))
-    } else {
-        Ok(base)
+    if !is_slug_live(&base) && claim_slug(&base).is_ok() {
+        return Ok(base);
+    }
+    for suffix in 0..1000u32 {
+        let name = if suffix == 0 {
+            format!("{base}-{}", std::process::id())
+        } else {
+            format!("{base}-{}-{suffix}", std::process::id())
+        };
+        if !is_slug_live(&name) && claim_slug(&name).is_ok() {
+            return Ok(name);
+        }
+    }
+    anyhow::bail!("cannot allocate a free debugger session slot")
+}
+
+type SlugReservation = nix::fcntl::Flock<File>;
+
+/// The reservation file is deliberately never removed. Ownership is the
+/// kernel's exclusive flock on this stable inode, not a PID written into a
+/// pathname. This makes stale recovery safe: after an owner dies, the next
+/// starter acquires the same inode; it can never remove a path that another
+/// starter acquired in the meantime.
+static SLUG_RESERVATIONS: OnceLock<Mutex<HashMap<PathBuf, SlugReservation>>> = OnceLock::new();
+
+fn slug_reservations() -> &'static Mutex<HashMap<PathBuf, SlugReservation>> {
+    SLUG_RESERVATIONS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Atomically reserve a slug before the caller forks. This closes the
+/// check-then-create window between `allocate_slug` and daemon startup.
+fn claim_slug(slug: &str) -> Result<()> {
+    let path = reservation_path_for(slug);
+    let mut reservations = slug_reservations()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if let Entry::Occupied(_) = reservations.entry(path.clone()) {
+        anyhow::bail!("session slot `{slug}` is already reserved")
+    }
+
+    // O_NOFOLLOW prevents a malicious or damaged runtime entry from
+    // redirecting this open outside the per-user runtime directory.
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .custom_flags(nix::libc::O_NOFOLLOW)
+        .open(&path)
+        .with_context(|| format!("cannot open slug reservation {}", path.display()))?;
+    #[cfg(test)]
+    test_reservation_contender_ready();
+    let lock = match nix::fcntl::Flock::lock(file, nix::fcntl::FlockArg::LockExclusiveNonblock) {
+        Ok(lock) => lock,
+        Err((_file, _err)) => {
+            anyhow::bail!("session slot `{slug}` is already reserved")
+        }
+    };
+    #[cfg(test)]
+    test_reservation_lock_acquired();
+
+    // A daemon started by an older binary may have a live PID marker but no
+    // flock. Check it only while we own the stable reservation inode. No
+    // pathname can be removed and replaced between this check and claim.
+    if is_slug_live(slug) {
+        anyhow::bail!("session slot `{slug}` is already live")
+    }
+
+    reservations.insert(path, lock);
+    Ok(())
+}
+
+#[cfg(test)]
+fn test_reservation_contender_ready() {
+    let Ok(raw) = std::env::var("DBG_TEST_RESERVATION_BARRIER") else {
+        return;
+    };
+    let barrier = PathBuf::from(raw);
+    std::fs::create_dir_all(&barrier).expect("create reservation test barrier");
+    std::fs::write(
+        barrier.join(format!("contender-{}", std::process::id())),
+        b"ready",
+    )
+    .expect("publish reservation contender");
+    while !barrier.join("begin").exists() {
+        std::thread::sleep(Duration::from_millis(2));
+    }
+}
+
+#[cfg(test)]
+fn test_reservation_lock_acquired() {
+    let Ok(raw) = std::env::var("DBG_TEST_RESERVATION_BARRIER") else {
+        return;
+    };
+    let barrier = PathBuf::from(raw);
+    std::fs::write(
+        barrier.join(format!("locked-{}", std::process::id())),
+        b"locked",
+    )
+    .expect("publish reservation lock");
+    while !barrier.join("release").exists() {
+        std::thread::sleep(Duration::from_millis(2));
     }
 }
 
@@ -263,11 +458,12 @@ pub fn startup_log_path() -> PathBuf {
 /// Must be called from the forked daemon child, after `setsid()`.
 pub fn detach_stdio(log_path: &std::path::Path) {
     use std::os::unix::io::AsRawFd;
-    if let Ok(dn) = std::fs::OpenOptions::new()
+    let devnull = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
         .open("/dev/null")
-    {
+        .ok();
+    if let Some(dn) = &devnull {
         let _ = nix::unistd::dup2(dn.as_raw_fd(), 0);
         let _ = nix::unistd::dup2(dn.as_raw_fd(), 1);
     }
@@ -278,6 +474,10 @@ pub fn detach_stdio(log_path: &std::path::Path) {
         .open(log_path)
     {
         let _ = nix::unistd::dup2(f.as_raw_fd(), 2);
+    } else if let Some(dn) = &devnull {
+        // Never retain the parent's capture pipe merely because the
+        // preferred startup log could not be opened.
+        let _ = nix::unistd::dup2(dn.as_raw_fd(), 2);
     }
 }
 
@@ -313,6 +513,8 @@ struct Session {
     /// Where to back the DB up on graceful shutdown (if the session
     /// accumulated any captured data and is still marked auto).
     save_to: Option<PathBuf>,
+    /// Private raw-evidence directory for this session.
+    tmp_dir: PathBuf,
     /// Target path — used by crosstrack collectors (dbg disasm, etc.).
     target: String,
     /// Working directory at session start — used to resolve
@@ -346,8 +548,10 @@ impl LiveDebugger for ProcLive<'_> {
 /// for those, not driving any per-class domain tables.
 fn backend_target_class(name: &str) -> TargetClass {
     match name {
-        "pdb" => TargetClass::Python,
-        "netcoredbg" | "dotnet-trace" | "jitdasm" => TargetClass::ManagedDotnet,
+        "pdb" | "debugpy-proto" => TargetClass::Python,
+        "netcoredbg" | "netcoredbg-proto" | "dotnet-trace" | "jitdasm" => {
+            TargetClass::ManagedDotnet
+        }
         "jdb" => TargetClass::Jvm,
         "node-inspect" | "nodeprof" | "node-proto" => TargetClass::JsNode,
         "rdbg" | "stackprof" => TargetClass::Ruby,
@@ -355,6 +559,14 @@ fn backend_target_class(name: &str) -> TargetClass {
         // lldb, delve, perf, callgrind, massif, memcheck,
         // ghci, ocamldebug, etc. — all native-style by default.
         _ => TargetClass::NativeCpu,
+    }
+}
+
+fn backend_session_kind(backend: &dyn Backend) -> SessionKind {
+    if backend.is_profile_backend() {
+        SessionKind::Profile
+    } else {
+        SessionKind::Debug
     }
 }
 
@@ -410,30 +622,30 @@ pub fn is_profile_repl_verb(cmd: &str) -> bool {
 
 /// Read the profile source file at `src` and copy it into the session
 /// DB's meta table so a subsequent `dbg replay` can rebuild a
-/// `ProfileData` from it. Best-effort — failures are logged, never
-/// fatal: a profile session without persisted source is still useful
-/// live, it just can't be queried after replay. The format hint comes
+/// `ProfileData` from it. Errors are returned so the caller can record
+/// them in the same durable session. The format hint comes
 /// from the file extension so V8 cpuprofile vs speedscope JSON
 /// disambiguation matches what `ProfileData::load` would have used on
 /// the original path.
-fn persist_profile_source(db: &SessionDb, src: &Path) {
-    let content = match std::fs::read_to_string(src) {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!(
-                "[dbg] warning: profile replay disabled — could not read {} ({e})",
-                src.display()
-            );
-            return;
-        }
-    };
-    if let Err(e) = db.set_meta("profile_raw", &content) {
-        eprintln!("[dbg] warning: profile replay disabled — meta write failed ({e})");
-        return;
+fn persist_profile_source(db: &SessionDb, src: &Path) -> Result<()> {
+    const MAX_PROFILE_SOURCE_BYTES: u64 = 256 * 1024 * 1024;
+    let metadata =
+        std::fs::metadata(src).with_context(|| format!("stat profile source {}", src.display()))?;
+    if metadata.len() > MAX_PROFILE_SOURCE_BYTES {
+        anyhow::bail!(
+            "profile source {} is too large ({} bytes; maximum is {} bytes)",
+            src.display(),
+            metadata.len(),
+            MAX_PROFILE_SOURCE_BYTES
+        );
     }
+    let content = crate::profile::read_bounded_text(src, MAX_PROFILE_SOURCE_BYTES)
+        .with_context(|| format!("reading profile source {}", src.display()))?;
+    db.set_meta("profile_raw", &content)?;
     if let Some(ext) = src.extension().and_then(|e| e.to_str()) {
-        let _ = db.set_meta("profile_raw_ext", ext);
+        db.set_meta("profile_raw_ext", ext)?;
     }
+    Ok(())
 }
 
 /// Start the daemon: spawn the debugger, listen on socket.
@@ -450,17 +662,19 @@ pub fn run_daemon(
     // use the Debug Adapter Protocol over TCP. All paths produce a
     // `Box<dyn DebuggerIo>`. Protocol backends have no post-spawn
     // init commands — their handshake happens inside the transport.
-    let (proc, init_commands): (Box<dyn DebuggerIo>, Vec<String>) = if backend.uses_inspector() {
+    let (proc, init_commands, fail_fast_init): (Box<dyn DebuggerIo>, Vec<String>, bool) = if backend
+        .uses_inspector()
+    {
         let t = crate::inspector::InspectorTransport::spawn(target, args)
             .context("failed to spawn inspector transport")?;
-        (Box::new(t), Vec::new())
+        (Box::new(t), Vec::new(), false)
     } else if backend.uses_dap() {
         let cfg = match attach {
             Some(spec) => backend.dap_attach(spec)?,
             None => backend.dap_launch(target, args)?,
         };
         let t = crate::dap::DapTransport::spawn(cfg).context("failed to spawn DAP transport")?;
-        (Box::new(t), Vec::new())
+        (Box::new(t), Vec::new(), false)
     } else {
         let config = backend.spawn_config(target, args)?;
         let p = DebuggerProcess::spawn(
@@ -470,7 +684,8 @@ pub fn run_daemon(
             backend.prompt_pattern(),
         )
         .context("failed to spawn debugger")?;
-        (Box::new(p), config.init_commands)
+        let fail_fast = config.bin == "bash" || config.bin.ends_with("/bash");
+        (Box::new(p), config.init_commands, fail_fast)
     };
 
     // Publish the jitdasm capture path so on-demand collectors (which
@@ -493,6 +708,7 @@ pub fn run_daemon(
     // can SIGINT the child to interrupt a blocked `send_and_wait` (e.g.
     // jdb waiting on a `continue` that hasn't hit a breakpoint yet).
     let child_pid = AtomicI32::new(proc.child_pid().as_raw());
+    let child_identity = process_identity(proc.child_pid().as_raw());
 
     // Pre-clone the event-log handle outside the session mutex. `dbg
     // events --wait` blocks on the log's condvar without touching the
@@ -501,7 +717,8 @@ pub fn run_daemon(
     let log_handle = proc.log();
 
     // Wait for initial prompt
-    proc.wait_for_prompt(Duration::from_secs(120))
+    let startup_output = proc
+        .wait_for_prompt(Duration::from_secs(120))
         .context("debugger did not produce prompt")?;
 
     // Publish pid + socket BEFORE running init commands. Backends
@@ -512,7 +729,7 @@ pub fn run_daemon(
     // written and socket bound up-front, connections queue into the
     // listener backlog and are served as soon as the accept loop
     // below picks them up — which happens right after init finishes.
-    std::fs::write(&pid_path(), std::process::id().to_string())?;
+    std::fs::write(&pid_path(), daemon_pid_record(std::process::id() as i32))?;
     let _ = std::fs::remove_file(&socket_path());
     let listener = UnixListener::bind(&socket_path()).context("failed to bind socket")?;
     // Point the cwd's "latest" pointer at ourselves so env-less clients
@@ -521,8 +738,17 @@ pub fn run_daemon(
     // case where the parent's write was lost/raced.
     write_latest_pointer(&session_slug());
 
+    let shutdown_requested = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let active_connections = std::sync::Arc::new(AtomicUsize::new(0));
+    let shutdown_flag = shutdown_requested.clone();
+    let wake_path = socket_path();
+    let signal_wake_path = wake_path.clone();
+    let signal_pid = child_pid.load(Ordering::Relaxed);
+    let signal_identity = child_identity.clone();
     ctrlc::set_handler(move || {
-        cleanup_and_exit();
+        shutdown_flag.store(true, Ordering::Release);
+        let _ = signal_child_identity(signal_pid, signal_identity.as_deref(), nix::libc::SIGINT);
+        let _ = std::os::unix::net::UnixStream::connect(&signal_wake_path);
     })
     .ok();
 
@@ -531,35 +757,58 @@ pub fn run_daemon(
     // takes minutes to finish, so the backend's `init_timeout()`
     // overrides the default CMD_TIMEOUT here.
     let init_deadline = backend.init_timeout();
+    // Shell-backed profilers must stop at the first failed preparation
+    // command. `send_and_wait` only waits for the prompt, so it does not
+    // report a shell command's exit status. Append a private status marker
+    // and inspect it after every command. This also covers interactive bash
+    // contexts where `set -e` can be suppressed or changed by a command.
     for cmd in &init_commands {
-        proc.send_and_wait(cmd, init_deadline)?;
+        let is_exec = cmd.trim_start().starts_with("exec ");
+        let response = if fail_fast_init && !is_exec {
+            proc.send_and_wait(
+                &format!("{cmd}; printf '\\n__DBG_INIT_STATUS__%s\\n' \"$?\""),
+                init_deadline,
+            )?
+        } else {
+            proc.send_and_wait(cmd, init_deadline)?
+        };
+        if fail_fast_init && !is_exec {
+            let status = parse_init_status(&response);
+            if status != Some(0) {
+                bail!("init command failed (exit status {status:?}): {cmd}");
+            }
+        }
     }
 
     // Cache help output now while the debugger is idle and responsive.
     // Stored outside the session mutex so it can be served even when
     // the debugger is busy running a command.
-    let cached_help = proc
-        .send_and_wait(backend.help_command(), CMD_TIMEOUT)
-        .map(|raw| backend.parse_help(&raw))
-        .unwrap_or_default();
+    // Protocol transports expose their command surface through structured
+    // requests. They do not accept the native PTY help command, so use the
+    // backend's static description without sending an unsupported request.
+    // PTY transports keep the native help query and its parsed output.
+    let cached_help = cache_help(backend, || {
+        proc.send_and_wait(backend.help_command(), CMD_TIMEOUT)
+            .map(|raw| backend.parse_help(&raw))
+            .context("failed to initialize debugger help")
+    })?;
 
     let profile_output_path = backend.profile_output();
-    let profile = profile_output_path
-        .as_ref()
-        .and_then(|path| ProfileData::load(Path::new(path)).ok());
+    let (profile, profile_error) = match profile_output_path.as_ref() {
+        Some(path) => match ProfileData::load(Path::new(path)) {
+            Ok(profile) => (Some(profile), None),
+            Err(error) => (None, Some(format!("{}: {error:#}", path))),
+        },
+        None => (None, None),
+    };
 
     // Build a per-run SessionDb alongside the debugger session. Create
-    // failure is non-fatal — we proceed without persistence rather than
-    // refusing to start the debugger.
+    // A live session must always have a durable owner and failure record.
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let target_class = backend_target_class(backend.name());
     let tmp_db = session_tmp("session.db");
     let _ = std::fs::remove_file(&tmp_db); // fresh DB on every start
-    let session_kind = if profile.is_some() {
-        SessionKind::Profile
-    } else {
-        SessionKind::Debug
-    };
+    let session_kind = backend_session_kind(backend);
     // Honour a user-chosen session label (e.g. `dbg import --label foo`).
     // The cmd_* layer sets DBG_LABEL before forking the daemon; we
     // pass it through to the session DB so `dbg sessions` and
@@ -576,23 +825,24 @@ pub fn run_daemon(
         target_hash: None,
     }) {
         Ok(db) => {
+            db.set_meta("backend", backend.name())?;
             // Profile sessions need their source content stashed in the
             // DB so `dbg replay` can rehydrate top/callers/callees from
             // a saved session. The raw file is on a tmp path that won't
             // survive the daemon — copy it into the SessionDb's meta
             // table now while we still know where it is.
-            if profile.is_some() {
-                if let Some(ref src) = profile_output_path {
-                    persist_profile_source(&db, Path::new(src));
+            if let Some(ref src) = profile_output_path {
+                if let Err(error) = persist_profile_source(&db, Path::new(src)) {
+                    db.add_failure("profile_source", &format!("{error:#}"))?;
                 }
             }
-            let final_path = session_db::sessions_dir(&cwd).join(format!("{}.db", db.label()));
-            (Some(db), Some(final_path))
+            if let Some(error) = profile_error {
+                db.add_failure("profile_parse", &error)?;
+            }
+            let final_path = session_save_path(&cwd, db.label());
+            (Some(db), final_path)
         }
-        Err(e) => {
-            eprintln!("[dbg] warning: session DB unavailable ({e}); proceeding without capture");
-            (None, None)
-        }
+        Err(e) => bail!("session DB initialization failed: {e:#}"),
     };
 
     let session = Mutex::new(Session {
@@ -601,10 +851,27 @@ pub fn run_daemon(
         db,
         hit_seq: HashMap::new(),
         save_to,
+        tmp_dir: tmp_db
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(session_tmp_dir),
         target: target.to_string(),
         cwd: cwd.clone(),
         target_class,
     });
+
+    // Consume a protocol entry stop (or a PTY stop banner) at startup. This
+    // makes the entry stop observable exactly once and prevents the first
+    // user execution command from treating it as its own result.
+    if let Ok(mut session_guard) = session.lock() {
+        capture_hit_if_stopped(&mut session_guard, backend, &startup_output);
+    }
+
+    if shutdown_requested.load(Ordering::Acquire) {
+        let (_, keep_session_tmp) =
+            handle_quit(backend, &session, &child_pid, child_identity.as_deref());
+        cleanup_and_exit(keep_session_tmp);
+    }
 
     // Blocking accept — the daemon does nothing useful between
     // connections, and ctrl-c is delivered to the signal handler
@@ -617,17 +884,74 @@ pub fn run_daemon(
                 Err(_) => continue,
             };
 
+            // The signal-handler wake must be processed even when all
+            // request slots are occupied. Otherwise the wake connection is
+            // rejected at the limit and shutdown waits for a blocked worker.
+            if shutdown_requested.load(Ordering::Acquire) {
+                let (_, keep_session_tmp) =
+                    handle_quit(backend, &session, &child_pid, child_identity.as_deref());
+                cleanup_and_exit(keep_session_tmp);
+            }
+
+            let previous =
+                active_connections.fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+                    (n < MAX_IPC_CONNECTIONS).then_some(n + 1)
+                });
+            if previous.is_err() {
+                // Refuse excess clients without allocating a handler
+                // thread. The client can retry after an active request
+                // completes.
+                drop(stream);
+                continue;
+            }
+
+            if shutdown_requested.load(Ordering::Acquire) {
+                let (_, keep_session_tmp) =
+                    handle_quit(backend, &session, &child_pid, child_identity.as_deref());
+                cleanup_and_exit(keep_session_tmp);
+            }
+
             let session = &session;
             let cached_help = &cached_help;
             let child_pid = &child_pid;
             let log_handle = &log_handle;
+            let active_connections = active_connections.clone();
+            let connection_wake_path = wake_path.clone();
+            let connection_child_identity = child_identity.clone();
 
             scope.spawn(move || {
+                struct ConnectionGuard {
+                    active: std::sync::Arc<AtomicUsize>,
+                    wake_path: PathBuf,
+                }
+                impl Drop for ConnectionGuard {
+                    fn drop(&mut self) {
+                        let previous = self.active.fetch_sub(1, Ordering::AcqRel);
+                        // A queued client may be waiting in accept while all
+                        // request slots are occupied. Wake accept only when
+                        // this drop frees one of those full-limit slots.
+                        // Empty wake clients must not wake themselves again.
+                        if should_wake_accept_after_release(previous) {
+                            let _ = std::os::unix::net::UnixStream::connect(&self.wake_path);
+                        }
+                    }
+                }
+                let _connection_guard = ConnectionGuard {
+                    active: active_connections,
+                    wake_path: connection_wake_path,
+                };
                 let mut stream = stream;
-                // Accepted sockets inherit non-blocking from the listener; reset to blocking
-                let _ = stream.set_nonblocking(false);
-                let mut data = String::new();
-                let _ = stream.read_to_string(&mut data);
+                let _ = stream.set_read_timeout(Some(IPC_IDLE_TIMEOUT));
+                let _ = stream.set_write_timeout(Some(IPC_IDLE_TIMEOUT));
+                let (read_result, bytes) = read_ipc_request(&mut stream);
+                if read_result.is_err() || bytes.len() > MAX_IPC_REQUEST_BYTES as usize {
+                    let _ = stream.write_all(b"[error: IPC request exceeds size or idle limit]");
+                    return;
+                }
+                let Ok(data) = String::from_utf8(bytes) else {
+                    let _ = stream.write_all(b"[error: IPC request is not valid UTF-8]");
+                    return;
+                };
                 let cmd = data.trim().to_string();
 
                 if cmd.is_empty() {
@@ -635,7 +959,12 @@ pub fn run_daemon(
                 }
 
                 if cmd == "quit" {
-                    let response = handle_quit(backend, session, child_pid);
+                    let (response, keep_session_tmp) = handle_quit(
+                        backend,
+                        session,
+                        child_pid,
+                        connection_child_identity.as_deref(),
+                    );
                     let _ = stream.write_all(response.as_bytes());
                     let _ = stream.flush();
                     // Close the write half so the client's read_to_string
@@ -648,11 +977,11 @@ pub fn run_daemon(
                     std::thread::sleep(Duration::from_millis(20));
                     // Exit immediately — scoped threads would otherwise wait
                     // for any blocked command (e.g. `continue`) to finish.
-                    cleanup_and_exit();
+                    cleanup_and_exit(keep_session_tmp);
                 }
 
                 if cmd == "cancel" {
-                    let response = handle_cancel(child_pid);
+                    let response = handle_cancel(child_pid, connection_child_identity.as_deref());
                     let _ = stream.write_all(response.as_bytes());
                     return;
                 }
@@ -663,7 +992,92 @@ pub fn run_daemon(
         }
     });
 
-    cleanup_and_exit();
+    cleanup_and_exit(false);
+}
+
+fn read_ipc_request(stream: &mut std::os::unix::net::UnixStream) -> (std::io::Result<()>, Vec<u8>) {
+    read_ipc_request_with_timeout(stream, IPC_IDLE_TIMEOUT)
+}
+
+fn parse_init_status(response: &str) -> Option<i32> {
+    response
+        .lines()
+        .rev()
+        .find_map(|line| line.strip_prefix("__DBG_INIT_STATUS__"))
+        .and_then(|value| value.trim().parse::<i32>().ok())
+}
+
+fn cache_help(
+    backend: &dyn Backend,
+    native_help: impl FnOnce() -> Result<String>,
+) -> Result<String> {
+    if !backend.supports_help_command() {
+        Ok(backend.parse_help(""))
+    } else {
+        native_help()
+    }
+}
+
+fn native_help_topic_command(backend: &dyn Backend, topic: &str) -> Option<String> {
+    backend
+        .supports_help_command()
+        .then(|| format!("{} {topic}", backend.help_command()))
+}
+
+fn jdb_run_needs_vm_prompt(backend: &dyn Backend, canonical_op: &str, output: &str) -> bool {
+    backend.name() == "jdb"
+        && canonical_op == "run"
+        && !output.contains("VM Started:")
+        && !output.contains("The application exited")
+        && !output.contains("The application has been disconnected")
+}
+
+fn read_ipc_request_with_timeout(
+    stream: &mut std::os::unix::net::UnixStream,
+    idle_timeout: Duration,
+) -> (std::io::Result<()>, Vec<u8>) {
+    let deadline = Instant::now() + idle_timeout;
+    let _ = stream.set_read_timeout(Some(idle_timeout));
+    let mut bytes = Vec::new();
+    let mut chunk = [0u8; 8192];
+    let result = loop {
+        if Instant::now() >= deadline {
+            break Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "IPC request exceeded idle limit",
+            ));
+        }
+        match stream.read(&mut chunk) {
+            Ok(0) => break Ok(()),
+            Ok(n) => {
+                bytes.extend_from_slice(&chunk[..n]);
+                if bytes.len() > MAX_IPC_REQUEST_BYTES as usize {
+                    break Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "IPC request is too large",
+                    ));
+                }
+                // Successful reads must not refresh the deadline. A
+                // slow-drip client must not retain a handler forever.
+                if Instant::now() >= deadline {
+                    break Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "IPC request exceeded idle limit",
+                    ));
+                }
+            }
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) && Instant::now() < deadline =>
+            {
+                continue;
+            }
+            Err(e) => break Err(e),
+        }
+    };
+    (result, bytes)
 }
 
 /// Lock the session mutex, recovering from poisoning so the daemon
@@ -676,30 +1090,52 @@ fn lock_session(session: &Mutex<Session>) -> std::sync::MutexGuard<'_, Session> 
 /// returns, acquire the session lock, persist the DB, then quit the
 /// debugger. This fixes the jdb timing issue where the 2s lock timeout
 /// wasn't enough for a slow `continue` to finish.
-fn handle_quit(backend: &dyn Backend, session: &Mutex<Session>, child_pid: &AtomicI32) -> String {
+fn handle_quit(
+    backend: &dyn Backend,
+    session: &Mutex<Session>,
+    child_pid: &AtomicI32,
+    child_identity: Option<&str>,
+) -> (String, bool) {
+    handle_quit_with(backend, session, child_pid, child_identity, &|path| {
+        Ok(Box::new(std::fs::read_dir(path)?)
+            as Box<
+                dyn Iterator<Item = std::io::Result<std::fs::DirEntry>>,
+            >)
+    })
+}
+
+fn handle_quit_with(
+    backend: &dyn Backend,
+    session: &Mutex<Session>,
+    child_pid: &AtomicI32,
+    child_identity: Option<&str>,
+    read_dir: &dyn Fn(
+        &Path,
+    ) -> std::io::Result<
+        Box<dyn Iterator<Item = std::io::Result<std::fs::DirEntry>>>,
+    >,
+) -> (String, bool) {
     // SIGINT the child to interrupt any blocked PTY read (e.g. jdb
     // waiting for a breakpoint during `continue`). This causes the
     // `send_and_wait` in the command thread to return promptly,
     // releasing the session lock so we can acquire it.
-    let pid = nix::unistd::Pid::from_raw(child_pid.load(Ordering::Relaxed));
-    let _ = nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGINT);
+    let pid = child_pid.load(Ordering::Relaxed);
+    let _ = signal_child_identity(pid, child_identity, nix::libc::SIGINT);
 
-    // Give the interrupted command thread time to release the lock.
-    // 5s is generous — after the SIGINT the prompt usually appears
-    // within 100-200ms, so the lock drops well before the deadline.
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    // Give the interrupted command thread time to release the lock. Do not
+    // report success and remove the temp directory while it is still held:
+    // the database is the only durable copy of captured evidence.
     loop {
         if let Ok(mut guard) = session.try_lock() {
-            persist_session_on_exit(&mut guard);
+            let keep_session_tmp = !persist_session_on_exit_with(&mut guard, read_dir);
+            // Preserve raw evidence after a failed durable copy, but always
+            // stop the owned debugger before the daemon exits. Once the
+            // socket is removed there is no way to recover a live child.
             guard.proc.quit(backend.quit_command());
-            break;
-        }
-        if std::time::Instant::now() >= deadline {
-            break;
+            break ("stopped".to_string(), keep_session_tmp);
         }
         std::thread::sleep(Duration::from_millis(50));
     }
-    "stopped".to_string()
 }
 
 /// Interrupt the running command by SIGINT'ing the child without
@@ -708,9 +1144,12 @@ fn handle_quit(backend: &dyn Backend, session: &Mutex<Session>, child_pid: &Atom
 /// the interrupt), the session lock drops, and subsequent commands
 /// proceed normally. Used to break out of a `continue` that hasn't
 /// hit a breakpoint, an infinite loop in the target, etc.
-fn handle_cancel(child_pid: &AtomicI32) -> String {
-    let pid = nix::unistd::Pid::from_raw(child_pid.load(Ordering::Relaxed));
-    match nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGINT) {
+fn handle_cancel(child_pid: &AtomicI32, child_identity: Option<&str>) -> String {
+    match signal_child_identity(
+        child_pid.load(Ordering::Relaxed),
+        child_identity,
+        nix::libc::SIGINT,
+    ) {
         Ok(()) => "interrupted".to_string(),
         Err(e) => format!("[error: {e}]"),
     }
@@ -755,14 +1194,16 @@ fn handle_command(
         if let Some(text) = dbg_verb_help(topic) {
             return text.to_string();
         }
-        let help_cmd = backend.help_command();
+        let Some(help_command) = native_help_topic_command(backend, topic) else {
+            return cached_help.to_string();
+        };
         let guard = match session.try_lock() {
             Ok(g) => g,
             Err(_) => return "[busy] debugger is running a command — try again".to_string(),
         };
         return guard
             .proc
-            .send_and_wait(&format!("{help_cmd} {topic}"), CMD_TIMEOUT)
+            .send_and_wait(&help_command, CMD_TIMEOUT)
             .unwrap_or_else(|e| format!("[error: {e}]"));
     }
 
@@ -814,9 +1255,27 @@ fn handle_command(
                 },
                 None => guard.proc.send_and_wait(&native_cmd, CMD_TIMEOUT),
             };
+            let send_result = match send_result {
+                Ok(mut raw) if jdb_run_needs_vm_prompt(backend, canonical_op, &raw) => {
+                    // JDB emits one transient prompt while it starts the VM.
+                    // Wait for the next prompt so the run command returns at
+                    // the breakpoint or exit boundary.
+                    guard.proc.wait_for_prompt(CMD_TIMEOUT).map(|late| {
+                        raw.push_str(&late);
+                        raw
+                    })
+                }
+                result => result,
+            };
             match send_result {
                 Ok(raw) => {
-                    if op_may_stop(canonical_op) {
+                    // A stop banner can arrive after the command that
+                    // caused it has already acknowledged its prompt. It
+                    // can therefore be consumed by an inspection request
+                    // that was queued next. Parse every response so that
+                    // such a stop is not discarded just because the
+                    // inspection verb itself is non-executing.
+                    if op_may_stop(canonical_op) || !raw.trim().is_empty() {
                         capture_hit_if_stopped(&mut guard, backend, &raw);
                     }
                     // When the agent explicitly runs `dbg locals`,
@@ -928,7 +1387,7 @@ fn handle_command(
 
             match guard.proc.send_and_wait(&effective_cmd, CMD_TIMEOUT) {
                 Ok(raw) => {
-                    if command_may_stop(cmd) {
+                    if command_may_stop(cmd) || !raw.trim().is_empty() {
                         capture_hit_if_stopped(&mut guard, backend, &raw);
                     }
                     let cleaned = backend.clean(cmd, &raw);
@@ -1594,23 +2053,576 @@ fn backfill_locals(session: &mut Session, backend: &dyn Backend, raw_output: &st
 /// session is still marked auto and has captured any data. If the
 /// session is empty we leave nothing behind — the tmpdir is wiped by
 /// `cleanup_and_exit`.
-fn persist_session_on_exit(session: &mut Session) {
+/// Persist all session evidence before the daemon removes its private temp
+/// directory. Returns false when any durable write failed; callers must then
+/// keep that directory so the only remaining evidence is recoverable.
+fn persist_session_on_exit(session: &mut Session) -> bool {
+    persist_session_on_exit_with(session, &|path| {
+        Ok(Box::new(std::fs::read_dir(path)?)
+            as Box<
+                dyn Iterator<Item = std::io::Result<std::fs::DirEntry>>,
+            >)
+    })
+}
+
+fn persist_session_on_exit_with(
+    session: &mut Session,
+    read_dir: &dyn Fn(
+        &Path,
+    ) -> std::io::Result<
+        Box<dyn Iterator<Item = std::io::Result<std::fs::DirEntry>>>,
+    >,
+) -> bool {
     let db = match session.db.as_ref() {
         Some(d) => d,
-        None => return,
+        None => return false,
     };
-    let has_data = db.has_captured_data().unwrap_or(false);
-    if !has_data {
-        return;
+    let has_data = match db.has_captured_data() {
+        Ok(has_data) => has_data,
+        Err(e) => {
+            // An inspection failure is not evidence that the session is
+            // empty. Keep the private directory because it may contain the
+            // only copy of a native capture.
+            eprintln!("[dbg] warning: failed to inspect captured session data: {e}");
+            return false;
+        }
+    };
+    let has_raw_evidence = match raw_evidence_present_with(&session.tmp_dir, read_dir) {
+        Ok(present) => present,
+        Err(e) => {
+            // An inspection failure is not evidence that the session is
+            // empty. Keep the private directory and the live debugger.
+            eprintln!("[dbg] warning: failed to inspect raw session evidence: {e}");
+            return false;
+        }
+    };
+    if !has_data && !has_raw_evidence {
+        return true;
     }
-    if let Some(path) = session.save_to.as_ref() {
-        if let Err(e) = db.save_to(path) {
-            eprintln!(
-                "[dbg] warning: failed to save session DB to {}: {e}",
-                path.display()
-            );
+    let Some(path) = session.save_to.as_ref() else {
+        eprintln!("[dbg] warning: session has captured data but no safe save destination");
+        return false;
+    };
+    if let Err(e) = persist_raw_evidence(db, &session.cwd, db.label(), &session.tmp_dir) {
+        eprintln!("[dbg] warning: failed to preserve raw session evidence: {e}");
+        return false;
+    }
+    if let Err(e) = db.save_to(path) {
+        eprintln!(
+            "[dbg] warning: failed to save session DB to {}: {e}",
+            path.display()
+        );
+        return false;
+    }
+    true
+}
+
+#[cfg(test)]
+fn raw_evidence_present(root: &Path) -> std::io::Result<bool> {
+    raw_evidence_present_with(root, &|path| {
+        Ok(Box::new(std::fs::read_dir(path)?)
+            as Box<
+                dyn Iterator<Item = std::io::Result<std::fs::DirEntry>>,
+            >)
+    })
+}
+
+fn raw_evidence_present_with(
+    root: &Path,
+    read_dir: &dyn Fn(
+        &Path,
+    ) -> std::io::Result<
+        Box<dyn Iterator<Item = std::io::Result<std::fs::DirEntry>>>,
+    >,
+) -> std::io::Result<bool> {
+    raw_evidence_present_inner(root, read_dir, true)
+}
+
+fn raw_evidence_present_inner(
+    root: &Path,
+    read_dir: &dyn Fn(
+        &Path,
+    ) -> std::io::Result<
+        Box<dyn Iterator<Item = std::io::Result<std::fs::DirEntry>>>,
+    >,
+    skip_session_db: bool,
+) -> std::io::Result<bool> {
+    let metadata = match std::fs::symlink_metadata(root) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Ok(true);
+    }
+    let entries = read_dir(root)?;
+    let mut present = false;
+    for entry in entries {
+        let entry = entry?;
+        let path = entry.path();
+        let metadata = std::fs::symlink_metadata(&path)?;
+        let is_session_db = entry.file_name() == "session.db";
+        match metadata {
+            // A rejected symlink is still evidence. Treating it as empty
+            // would let shutdown delete the only copy after persistence
+            // correctly refused to follow the link.
+            meta if meta.file_type().is_symlink() => present = true,
+            meta if skip_session_db && is_session_db && meta.is_file() => {}
+            meta if meta.is_dir() => {
+                present |= raw_evidence_present_inner(&path, read_dir, false)?;
+            }
+            _ => present = true,
         }
     }
+    Ok(present)
+}
+
+fn session_save_path(cwd: &Path, label: &str) -> Option<PathBuf> {
+    if label.is_empty()
+        || label == "."
+        || label == ".."
+        || label.contains('/')
+        || label.contains('\\')
+    {
+        eprintln!("[dbg] warning: refusing unsafe session label `{label}`");
+        return None;
+    }
+    let dir = session_db::sessions_dir(cwd);
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        eprintln!("[dbg] warning: cannot create {}: {e}", dir.display());
+        return None;
+    }
+    let root = match std::fs::canonicalize(&dir) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("[dbg] warning: cannot resolve {}: {e}", dir.display());
+            return None;
+        }
+    };
+    let path = root.join(format!("{label}.db"));
+    if std::fs::symlink_metadata(&path).is_ok_and(|m| m.file_type().is_symlink()) {
+        eprintln!(
+            "[dbg] warning: refusing symbolic-link session destination {}",
+            path.display()
+        );
+        return None;
+    }
+    Some(path)
+}
+
+/// Copy raw profiler/debugger artifacts beside the durable SQLite session.
+/// SQLite metadata alone cannot regenerate native captures such as perf.data
+/// or .nettrace files, so cleanup must happen only after this copy succeeds.
+fn persist_raw_evidence(db: &SessionDb, cwd: &Path, label: &str, source: &Path) -> Result<()> {
+    if label.is_empty()
+        || label.contains('/')
+        || label.contains('\\')
+        || label == "."
+        || label == ".."
+    {
+        anyhow::bail!("unsafe session label {label:?}");
+    }
+    let destination = session_db::raw_dir(cwd, label);
+    copy_raw_tree(&source, &destination)?;
+
+    // Saved databases must refer to the durable copy, not the daemon's
+    // private directory that cleanup removes after shutdown.
+    let mut stmt = db
+        .conn()
+        .prepare("SELECT id, file FROM layers WHERE file IS NOT NULL")?;
+    let rows: Vec<(i64, String)> = stmt
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    for (id, file) in rows {
+        if let Ok(relative) = Path::new(&file).strip_prefix(&source) {
+            let durable = destination.join(relative);
+            db.conn().execute(
+                "UPDATE layers SET file = ?1 WHERE id = ?2",
+                rusqlite::params![durable.display().to_string(), id],
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn copy_raw_tree(src: &Path, dst: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        return copy_raw_tree_unix(src, dst);
+    }
+
+    #[cfg(not(unix))]
+    copy_raw_tree_portable(src, dst)
+}
+
+#[cfg(not(unix))]
+fn copy_raw_tree_portable(src: &Path, dst: &Path) -> std::io::Result<()> {
+    copy_raw_tree_portable_inner(src, dst, true)
+}
+
+#[cfg(not(unix))]
+fn copy_raw_tree_portable_inner(
+    src: &Path,
+    dst: &Path,
+    skip_session_db: bool,
+) -> std::io::Result<()> {
+    let src_meta = std::fs::symlink_metadata(src)?;
+    if src_meta.file_type().is_symlink() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("raw evidence source is a symbolic link: {}", src.display()),
+        ));
+    }
+    if !src_meta.is_dir() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotADirectory,
+            format!("raw evidence source is not a directory: {}", src.display()),
+        ));
+    }
+
+    match std::fs::symlink_metadata(dst) {
+        Ok(meta) if meta.file_type().is_symlink() => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "raw evidence destination is a symbolic link: {}",
+                    dst.display()
+                ),
+            ));
+        }
+        Ok(meta) if !meta.is_dir() => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                format!(
+                    "raw evidence destination is not a directory: {}",
+                    dst.display()
+                ),
+            ));
+        }
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => std::fs::create_dir_all(dst)?,
+        Err(e) => return Err(e),
+    }
+
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let from = entry.path();
+        let to = dst.join(entry.file_name());
+        let meta = std::fs::symlink_metadata(&from)?;
+        if meta.file_type().is_symlink() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("raw evidence contains a symbolic link: {}", from.display()),
+            ));
+        }
+        if skip_session_db
+            && from.file_name().and_then(|n| n.to_str()) == Some("session.db")
+            && meta.is_file()
+        {
+            continue;
+        }
+        if meta.is_dir() {
+            copy_raw_tree_portable_inner(&from, &to, false)?;
+        } else if meta.is_file() {
+            if std::fs::symlink_metadata(&to)
+                .is_ok_and(|existing| existing.file_type().is_symlink())
+            {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!(
+                        "raw evidence destination is a symbolic link: {}",
+                        to.display()
+                    ),
+                ));
+            }
+            std::fs::copy(&from, &to)?;
+        } else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "raw evidence contains an unsupported file: {}",
+                    from.display()
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn copy_raw_tree_unix(src: &Path, dst: &Path) -> std::io::Result<()> {
+    use std::ffi::CStr;
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::ffi::OsStrExt;
+
+    let source = open_source_directory(src, None)?;
+    let destination = open_destination_directory(dst)?;
+    copy_raw_directory_fd(source.as_raw_fd(), src, destination.as_raw_fd(), dst, true)?;
+    // Keep the source directory fd alive until all children have been
+    // opened. This makes each child lookup relative to the directory inode,
+    // not to a pathname which an attacker can replace.
+    drop(source);
+
+    fn open_source_directory(path: &Path, parent_fd: Option<i32>) -> std::io::Result<File> {
+        let raw_path = path.as_os_str().as_bytes();
+        let c_path = std::ffi::CString::new(raw_path).map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "source path contains NUL")
+        })?;
+        let fd = unsafe {
+            match parent_fd {
+                Some(parent) => nix::libc::openat(
+                    parent,
+                    c_path.as_ptr(),
+                    nix::libc::O_RDONLY
+                        | nix::libc::O_DIRECTORY
+                        | nix::libc::O_NOFOLLOW
+                        | nix::libc::O_CLOEXEC,
+                    0,
+                ),
+                None => nix::libc::open(
+                    c_path.as_ptr(),
+                    nix::libc::O_RDONLY
+                        | nix::libc::O_DIRECTORY
+                        | nix::libc::O_NOFOLLOW
+                        | nix::libc::O_CLOEXEC,
+                ),
+            }
+        };
+        if fd < 0 {
+            let error = std::io::Error::last_os_error();
+            let source_is_symlink = std::fs::symlink_metadata(path)
+                .is_ok_and(|metadata| metadata.file_type().is_symlink());
+            if error.raw_os_error() == Some(nix::libc::ELOOP) || source_is_symlink {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("raw evidence source is a symbolic link: {}", path.display()),
+                ));
+            }
+            return Err(error);
+        }
+        // SAFETY: open/openat returned a unique owned descriptor.
+        Ok(unsafe { File::from_raw_fd(fd) })
+    }
+
+    fn open_source_entry(parent_fd: i32, name: &std::ffi::OsStr) -> std::io::Result<File> {
+        let c_name = std::ffi::CString::new(name.as_bytes()).map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "source name contains NUL")
+        })?;
+        let fd = unsafe {
+            nix::libc::openat(
+                parent_fd,
+                c_name.as_ptr(),
+                nix::libc::O_RDONLY
+                    | nix::libc::O_NONBLOCK
+                    | nix::libc::O_NOFOLLOW
+                    | nix::libc::O_CLOEXEC,
+                0,
+            )
+        };
+        if fd < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() == Some(nix::libc::ELOOP) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("raw evidence contains a symbolic link: {}", name.display()),
+                ));
+            }
+            return Err(error);
+        }
+        // SAFETY: openat returned a unique owned descriptor.
+        Ok(unsafe { File::from_raw_fd(fd) })
+    }
+
+    fn open_directory_at(parent_fd: i32, name: &std::ffi::OsStr) -> std::io::Result<File> {
+        let c_name = std::ffi::CString::new(name.as_bytes()).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "destination name contains NUL",
+            )
+        })?;
+        let fd = unsafe {
+            nix::libc::openat(
+                parent_fd,
+                c_name.as_ptr(),
+                nix::libc::O_RDONLY
+                    | nix::libc::O_DIRECTORY
+                    | nix::libc::O_NOFOLLOW
+                    | nix::libc::O_CLOEXEC,
+                0,
+            )
+        };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        // SAFETY: openat returned a unique owned descriptor.
+        Ok(unsafe { File::from_raw_fd(fd) })
+    }
+
+    fn open_or_create_directory_at(
+        parent_fd: i32,
+        name: &std::ffi::OsStr,
+    ) -> std::io::Result<File> {
+        match open_directory_at(parent_fd, name) {
+            Ok(directory) => Ok(directory),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let c_name = std::ffi::CString::new(name.as_bytes()).map_err(|_| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "destination name contains NUL",
+                    )
+                })?;
+                let mkdir_result = unsafe { nix::libc::mkdirat(parent_fd, c_name.as_ptr(), 0o700) };
+                if mkdir_result < 0 {
+                    let mkdir_error = std::io::Error::last_os_error();
+                    if mkdir_error.kind() != std::io::ErrorKind::AlreadyExists {
+                        return Err(mkdir_error);
+                    }
+                }
+                // Reopen with O_NOFOLLOW after mkdir. If a race installed a
+                // symlink or a non-directory, this fails without following
+                // it. The returned descriptor pins the directory inode.
+                open_directory_at(parent_fd, name)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn open_destination_directory(path: &Path) -> std::io::Result<File> {
+        let mut current = if path.is_absolute() {
+            open_directory_at(nix::libc::AT_FDCWD, std::ffi::OsStr::new("/"))?
+        } else {
+            open_directory_at(nix::libc::AT_FDCWD, std::ffi::OsStr::new("."))?
+        };
+        for component in path.components() {
+            use std::path::Component;
+            let name = match component {
+                Component::RootDir | Component::CurDir => continue,
+                Component::Normal(name) => name,
+                Component::ParentDir => std::ffi::OsStr::new(".."),
+                Component::Prefix(_) => continue,
+            };
+            current = open_or_create_directory_at(current.as_raw_fd(), name)?;
+        }
+        Ok(current)
+    }
+
+    fn open_destination_file(parent_fd: i32, name: &std::ffi::OsStr) -> std::io::Result<File> {
+        let c_name = std::ffi::CString::new(name.as_bytes()).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "destination name contains NUL",
+            )
+        })?;
+        let fd = unsafe {
+            nix::libc::openat(
+                parent_fd,
+                c_name.as_ptr(),
+                nix::libc::O_WRONLY
+                    | nix::libc::O_CREAT
+                    | nix::libc::O_TRUNC
+                    | nix::libc::O_NOFOLLOW
+                    | nix::libc::O_CLOEXEC,
+                0o600,
+            )
+        };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        // SAFETY: openat returned a unique owned descriptor.
+        Ok(unsafe { File::from_raw_fd(fd) })
+    }
+
+    fn visit_source_entries(
+        parent_fd: i32,
+        mut visit: impl FnMut(std::ffi::OsString) -> std::io::Result<()>,
+    ) -> std::io::Result<()> {
+        // Duplicate the descriptor because fdopendir takes ownership. This
+        // enumerates the held source directory directly and does not require
+        // /proc/self/fd to be mounted.
+        let duplicate = unsafe { nix::libc::dup(parent_fd) };
+        if duplicate < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let directory = unsafe { nix::libc::fdopendir(duplicate) };
+        if directory.is_null() {
+            let error = std::io::Error::last_os_error();
+            unsafe { nix::libc::close(duplicate) };
+            return Err(error);
+        }
+        struct Directory(*mut nix::libc::DIR);
+
+        impl Drop for Directory {
+            fn drop(&mut self) {
+                if !self.0.is_null() {
+                    unsafe { nix::libc::closedir(self.0) };
+                }
+            }
+        }
+
+        let directory = Directory(directory);
+        loop {
+            nix::errno::Errno::clear();
+            let entry = unsafe { nix::libc::readdir(directory.0) };
+            if entry.is_null() {
+                let error = nix::errno::Errno::last_raw();
+                if error != 0 {
+                    return Err(std::io::Error::from_raw_os_error(error));
+                }
+                break;
+            }
+            let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) }.to_bytes();
+            if name == b"." || name == b".." {
+                continue;
+            }
+            visit(std::ffi::OsStr::from_bytes(name).to_os_string())?;
+        }
+        Ok(())
+    }
+
+    fn copy_raw_directory_fd(
+        parent_fd: i32,
+        source_path: &Path,
+        destination_fd: i32,
+        destination_path: &Path,
+        skip_session_db: bool,
+    ) -> std::io::Result<()> {
+        visit_source_entries(parent_fd, |name| {
+            let source_entry = open_source_entry(parent_fd, &name)?;
+            let metadata = source_entry.metadata()?;
+            if skip_session_db && name.to_str() == Some("session.db") && metadata.is_file() {
+                // A regular session.db is the SQLite metadata already saved
+                // separately. Inspect it through the no-follow descriptor,
+                // but do not copy it as raw evidence.
+                return Ok(());
+            }
+            let target = destination_path.join(&name);
+            if metadata.is_dir() {
+                let destination_entry = open_or_create_directory_at(destination_fd, &name)?;
+                copy_raw_directory_fd(
+                    source_entry.as_raw_fd(),
+                    &source_path.join(&name),
+                    destination_entry.as_raw_fd(),
+                    &target,
+                    false,
+                )?;
+            } else if metadata.is_file() {
+                let mut output = open_destination_file(destination_fd, &name)?;
+                let mut input = source_entry;
+                std::io::copy(&mut input, &mut output)?;
+            } else {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!(
+                        "raw evidence contains an unsupported file: {}",
+                        source_path.join(&name).display()
+                    ),
+                ));
+            }
+            Ok(())
+        })
+    }
+
+    Ok(())
 }
 
 /// Send a command to a running daemon. Returns the response.
@@ -1624,7 +2636,11 @@ fn persist_session_on_exit(session: &mut Session) {
 /// with our accept loop). Without retry the second call surfaces as
 /// a misleading "no session running".
 pub fn send_command(cmd: &str) -> Result<String> {
-    let mut stream = connect_with_retry()?;
+    send_command_for_slug(&session_slug(), cmd)
+}
+
+fn send_command_for_slug(slug: &str, cmd: &str) -> Result<String> {
+    let mut stream = connect_with_retry_for_slug(slug)?;
     stream.set_read_timeout(Some(CMD_TIMEOUT))?;
 
     stream.write_all(format!("{cmd}\n").as_bytes())?;
@@ -1636,10 +2652,14 @@ pub fn send_command(cmd: &str) -> Result<String> {
 }
 
 fn connect_with_retry() -> Result<std::os::unix::net::UnixStream> {
+    connect_with_retry_for_slug(&session_slug())
+}
+
+fn connect_with_retry_for_slug(slug: &str) -> Result<std::os::unix::net::UnixStream> {
     use std::os::unix::net::UnixStream;
     let mut attempts = 0;
     loop {
-        match UnixStream::connect(&socket_path()) {
+        match UnixStream::connect(socket_path_for(slug)) {
             Ok(s) => return Ok(s),
             Err(e) => {
                 // Two failure modes to distinguish:
@@ -1652,9 +2672,9 @@ fn connect_with_retry() -> Result<std::os::unix::net::UnixStream> {
                 //      no in-process recovery — `dbg kill` + restart
                 //      is the only path back to a connectable
                 //      socket.
-                if !is_running() || attempts >= 5 {
-                    if is_running() && !Path::new(&socket_path()).exists() {
-                        let path = socket_path();
+                if !is_slug_live(slug) || attempts >= 5 {
+                    if is_slug_live(slug) && !socket_path_for(slug).exists() {
+                        let path = socket_path_for(slug);
                         return Err(e).context(format!(
                             "daemon is running but its socket file is gone \
                              ({}). Something unlinked the path while the \
@@ -1704,35 +2724,78 @@ fn foreign_daemon_hint() -> String {
     }
 }
 
-/// Check if a daemon is running.
-/// Read the current cwd's daemon PID file. Returns `None` when no
-/// daemon is registered for this slug — does NOT verify the process
-/// is alive (callers that need liveness should also check `is_running`
-/// or `is_slug_live`). Public so client-side commands like `dbg
-/// finalize` can locate the daemon's child process tree even before
-/// the accept loop is serving requests.
-pub fn current_daemon_pid() -> Option<i32> {
-    let s = std::fs::read_to_string(pid_path()).ok()?;
-    s.trim().parse().ok()
+/// Return a process identity that remains stable while a PID is alive.
+/// The kernel start time is the important part: a recycled PID has a
+/// different value even when the replacement executable has the same name.
+fn process_identity(pid: i32) -> Option<String> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let after_comm = stat.rsplit_once(") ")?.1;
+    let fields: Vec<&str> = after_comm.split_whitespace().collect();
+    let start_time = fields.get(19)?; // field 22, after pid + comm
+    let exe = std::fs::read_link(format!("/proc/{pid}/exe"))
+        .ok()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    Some(format!("{start_time}\n{exe}"))
 }
 
-/// List the direct child PIDs of `pid` via `/proc/<pid>/task/<pid>/children`.
+fn daemon_pid_record(pid: i32) -> String {
+    match process_identity(pid) {
+        Some(identity) => format!("{pid}\n{identity}\n"),
+        None => format!("{pid}\n"),
+    }
+}
+
+fn recorded_process_identity(pid_file: &str) -> Option<String> {
+    let mut lines = pid_file.lines();
+    let _pid = lines.next()?;
+    let start = lines.next()?.trim();
+    let exe = lines.next().unwrap_or("").trim();
+    if start.is_empty() {
+        None
+    } else {
+        Some(format!("{start}\n{exe}"))
+    }
+}
+
+fn daemon_identity_matches(pid_file: &str, pid: i32) -> bool {
+    daemon_identity_matches_with_procfs(pid_file, pid, procfs_available())
+}
+
+fn daemon_identity_matches_with_procfs(pid_file: &str, pid: i32, procfs_available: bool) -> bool {
+    match recorded_process_identity(pid_file) {
+        Some(recorded) => process_identity(pid).is_some_and(|current| current == recorded),
+        // A PID-only marker is unsafe against PID reuse when procfs is
+        // available. If procfs is unavailable, it is the only identity
+        // published by older daemons and must still identify a live daemon.
+        None => !procfs_available || pid == std::process::id() as i32,
+    }
+}
+
+fn procfs_available() -> bool {
+    std::fs::read_to_string("/proc/self/stat").is_ok()
+}
+
+/// List the direct child PIDs of `pid` via `/proc/<pid>/task/*/children`.
 /// Linux-only — returns an empty vec on other platforms or when the
 /// procfs entry is missing. Used by `dbg finalize` to walk from the
 /// daemon down to the profile collector (daemon → bash → collector).
 fn proc_children(pid: i32) -> Vec<i32> {
-    proc_children_from_reader(pid, |path| std::fs::read_to_string(path))
-}
-
-fn proc_children_from_reader<F>(pid: i32, read_to_string: F) -> Vec<i32>
-where
-    F: FnOnce(&str) -> std::io::Result<String>,
-{
-    let path = format!("/proc/{pid}/task/{pid}/children");
-    let Ok(content) = read_to_string(&path) else {
+    let task_dir = format!("/proc/{pid}/task");
+    let Ok(tasks) = std::fs::read_dir(&task_dir) else {
         return Vec::new();
     };
-    parse_proc_children(&content)
+    let mut children = Vec::new();
+    for task in tasks.flatten() {
+        let path = task.path().join("children");
+        let Ok(content) = std::fs::read_to_string(path) else {
+            continue;
+        };
+        children.extend(parse_proc_children(&content));
+    }
+    children.sort_unstable();
+    children.dedup();
+    children
 }
 
 fn parse_proc_children(content: &str) -> Vec<i32> {
@@ -1742,6 +2805,214 @@ fn parse_proc_children(content: &str) -> Vec<i32> {
         .collect()
 }
 
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+struct IdentitySafePidFd {
+    pid: i32,
+    identity: String,
+    fd: std::os::fd::OwnedFd,
+}
+
+/// Open a handle to one process instance and verify the instance after the
+/// open. If the PID changes after this function returns, the pidfd still
+/// refers to the original process and cannot address the replacement.
+#[cfg(target_os = "linux")]
+fn open_identity_safe_pidfd(pid: i32, expected_identity: &str) -> Result<IdentitySafePidFd> {
+    use std::os::fd::{FromRawFd, OwnedFd};
+
+    if expected_identity.is_empty() {
+        bail!("process {pid} has no verified start identity")
+    }
+
+    // SAFETY: this is the Linux pidfd_open(2) syscall. On kernels without
+    // pidfd support it returns an error; never fall back to kill(pid, ...).
+    let raw_fd = unsafe { nix::libc::syscall(nix::libc::SYS_pidfd_open, pid, 0) } as i32;
+    if raw_fd < 0 {
+        return Err(std::io::Error::last_os_error())
+            .with_context(|| format!("cannot obtain identity-safe handle for PID {pid}"));
+    }
+    // SAFETY: a successful pidfd_open returns a new owned file descriptor.
+    let fd = unsafe { OwnedFd::from_raw_fd(raw_fd) };
+    let Some(identity) = process_identity(pid) else {
+        bail!("cannot verify start identity for PID {pid} after opening its pidfd")
+    };
+    if identity != expected_identity {
+        bail!("PID {pid} changed process instance while opening its pidfd; refusing to signal it")
+    }
+    Ok(IdentitySafePidFd { pid, identity, fd })
+}
+
+#[cfg(target_os = "linux")]
+fn open_current_identity_safe_pidfd(pid: i32) -> Result<IdentitySafePidFd> {
+    let expected = process_identity(pid)
+        .ok_or_else(|| anyhow::anyhow!("cannot obtain start identity for PID {pid}"))?;
+    open_identity_safe_pidfd(pid, &expected)
+}
+
+#[cfg(target_os = "linux")]
+fn pidfd_send_sigint(handle: &IdentitySafePidFd) -> std::io::Result<()> {
+    pidfd_send_signal(handle, nix::libc::SIGINT)
+}
+
+#[cfg(target_os = "linux")]
+fn pidfd_send_signal(handle: &IdentitySafePidFd, signal: i32) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+
+    // SAFETY: pidfd_send_signal addresses the process instance bound to the
+    // fd, never a later occupant of handle.pid.
+    let rc = unsafe {
+        nix::libc::syscall(
+            nix::libc::SYS_pidfd_send_signal,
+            handle.fd.as_raw_fd(),
+            signal,
+            std::ptr::null::<nix::libc::siginfo_t>(),
+            0,
+        )
+    };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+fn signal_child_identity(
+    pid: i32,
+    expected_identity: Option<&str>,
+    signal: i32,
+) -> anyhow::Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        let identity = expected_identity
+            .ok_or_else(|| anyhow::anyhow!("child PID {pid} has no verified identity"))?;
+        let handle = open_identity_safe_pidfd(pid, identity)?;
+        pidfd_send_signal(&handle, signal)?;
+        return Ok(());
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        if let Some(identity) = expected_identity {
+            if process_identity(pid).as_deref() != Some(identity) {
+                anyhow::bail!("child PID {pid} no longer names the original process");
+            }
+        }
+        nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(pid),
+            nix::sys::signal::Signal::try_from(signal)
+                .map_err(|_| anyhow::anyhow!("invalid signal {signal}"))?,
+        )?;
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn process_parent_pid(pid: i32) -> Option<i32> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let after_comm = stat.rsplit_once(") ")?.1;
+    let fields: Vec<&str> = after_comm.split_whitespace().collect();
+    fields.get(1)?.parse().ok() // field 4: state, then parent PID
+}
+
+#[cfg(target_os = "linux")]
+fn process_is_child_of(pid: i32, parent: i32) -> bool {
+    let Some(actual_parent) = process_parent_pid(pid) else {
+        return false;
+    };
+    if actual_parent == parent {
+        return true;
+    }
+    // A child forked by a non-leader thread has that thread's TID as its
+    // parent in /proc. It is still a child of the daemon process here.
+    std::fs::read_dir(format!("/proc/{parent}/task"))
+        .ok()
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| entry.ok()?.file_name().to_str()?.parse::<i32>().ok())
+        .any(|tid| tid == actual_parent)
+}
+
+#[cfg(target_os = "linux")]
+fn open_verified_child(parent: &IdentitySafePidFd, pid: i32) -> Result<IdentitySafePidFd> {
+    let child = open_current_identity_safe_pidfd(pid)
+        .with_context(|| format!("cannot bind child PID {pid} to an identity-safe handle"))?;
+    // Check the process-tree boundary while both instance-bound handles are
+    // held. A replacement or a reparented process is not a descendant.
+    if !process_is_child_of(pid, parent.pid)
+        || process_identity(parent.pid).as_deref() != Some(parent.identity.as_str())
+    {
+        anyhow::bail!(
+            "PID {pid} is no longer a verified child of process instance {}",
+            parent.pid
+        );
+    }
+    Ok(child)
+}
+
+#[cfg(target_os = "linux")]
+fn open_verified_children_from_pids(
+    parent: &IdentitySafePidFd,
+    pids: Vec<i32>,
+) -> Result<(Vec<IdentitySafePidFd>, bool)> {
+    let had_children = !pids.is_empty();
+    let children = pids
+        .into_iter()
+        .map(|pid| open_verified_child(parent, pid))
+        .collect::<Result<Vec<_>>>()?;
+    Ok((children, had_children))
+}
+
+#[cfg(target_os = "linux")]
+fn open_verified_children(parent: &IdentitySafePidFd) -> Result<(Vec<IdentitySafePidFd>, bool)> {
+    open_verified_children_from_pids(parent, proc_children(parent.pid))
+}
+
+#[cfg(target_os = "linux")]
+fn append_verified_descendants(
+    root: IdentitySafePidFd,
+    output: &mut Vec<IdentitySafePidFd>,
+) -> Result<()> {
+    let (children, _) = open_verified_children(&root)?;
+    output.push(root);
+    for child in children {
+        append_verified_descendants(child, output)?;
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn collector_identity_safe_targets(daemon: &IdentitySafePidFd) -> Result<Vec<IdentitySafePidFd>> {
+    let (direct, had_direct) = open_verified_children(daemon)?;
+    if !had_direct {
+        anyhow::bail!(
+            "daemon {} has no child processes — has the collector already exited? Try `dbg status` to see the current state.",
+            daemon.pid
+        );
+    }
+    // The normal tree is daemon → shell → collector. Preserve the old
+    // direct-child fallback for backends that do not use a shell, but only
+    // with handles verified as this daemon's children.
+    let mut collectors = Vec::new();
+    let mut had_grandchildren = false;
+    for child in &direct {
+        let (grandchildren, had) = open_verified_children(child)?;
+        had_grandchildren |= had;
+        collectors.extend(grandchildren);
+    }
+    if !had_grandchildren {
+        collectors = direct;
+    }
+
+    let mut targets = Vec::new();
+    for collector in collectors {
+        append_verified_descendants(collector, &mut targets)?;
+    }
+    if targets.is_empty() {
+        anyhow::bail!("finalize: collector tree has no identity-safe signal targets");
+    }
+    Ok(targets)
+}
+
+#[cfg(test)]
 fn collector_signal_targets<F>(daemon_pid: i32, mut children_of: F) -> Result<Vec<i32>>
 where
     F: FnMut(i32) -> Vec<i32>,
@@ -1767,6 +3038,7 @@ where
     Ok(targets)
 }
 
+#[derive(Debug)]
 pub struct FinalizeReport {
     pub signalled: Vec<i32>,
     pub failed: Vec<i32>,
@@ -1775,44 +3047,57 @@ pub struct FinalizeReport {
 /// Signal the profile/sample collector process tree for the active daemon so
 /// blocking collectors can flush their trace and let daemon init complete.
 pub fn finalize_collector() -> Result<FinalizeReport> {
-    use nix::sys::signal::{Signal, kill};
-    use nix::unistd::{Pid, getpgid};
+    #[cfg(not(target_os = "linux"))]
+    {
+        // There is no portable process-instance-bound signal primitive here.
+        // A bare PID or process-group fallback would make stale runtime data
+        // dangerous, so unsupported platforms fail closed.
+        anyhow::bail!("finalize: identity-safe process handles are unavailable on this platform");
+    }
 
-    let daemon_pid = current_daemon_pid().ok_or_else(|| {
-        anyhow::anyhow!(
-            "no daemon registered for this cwd — `dbg start` must be running. \
-             If `dbg start` is mid-init the pid file should exist; check \
-             $XDG_RUNTIME_DIR/dbg-$UID/ for stale state."
-        )
-    })?;
+    #[cfg(target_os = "linux")]
+    {
+        let pid_file =
+            std::fs::read_to_string(pid_path()).context("cannot read daemon identity marker")?;
+        // Parse PID and identity from one marker snapshot. Reading the path
+        // twice could combine an old identity with a replacement marker's PID.
+        let daemon_pid = pid_file
+            .lines()
+            .next()
+            .and_then(|line| line.trim().parse::<i32>().ok())
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "no daemon registered for this cwd — `dbg start` must be running. \
+                     If `dbg start` is mid-init the pid file should exist; check \
+                     $XDG_RUNTIME_DIR/dbg-$UID/ for stale state."
+                )
+            })?;
+        let daemon_identity = recorded_process_identity(&pid_file).ok_or_else(|| {
+            anyhow::anyhow!(
+                "finalize: daemon identity marker has no verified process start identity; refusing to signal PID {daemon_pid}"
+            )
+        })?;
 
-    let targets = collector_signal_targets(daemon_pid, proc_children)?;
+        // Open the daemon handle before inspecting descendants. This binds
+        // the operation to this daemon instance if its PID is recycled.
+        let daemon = open_identity_safe_pidfd(daemon_pid, &daemon_identity)?;
+        let targets = collector_identity_safe_targets(&daemon)?;
 
-    let mut signalled = Vec::new();
-    let mut failed = Vec::new();
-    for pid in &targets {
-        // Send to the process group, not the bare PID: collectors that
-        // fork helper processes (perf record's session manager, etc.)
-        // need every member to see the signal for a clean shutdown.
-        let pgid = getpgid(Some(Pid::from_raw(*pid)))
-            .map(|p| p.as_raw())
-            .unwrap_or(*pid);
-        match kill(Pid::from_raw(-pgid), Signal::SIGINT) {
-            Ok(()) => signalled.push(*pid),
-            // EPERM is rare here (same-uid) but include the bare PID as
-            // a fallback so we still try the direct kill.
-            Err(_) => match kill(Pid::from_raw(*pid), Signal::SIGINT) {
-                Ok(()) => signalled.push(*pid),
-                Err(_) => failed.push(*pid),
-            },
+        let mut signalled = Vec::new();
+        let mut failed = Vec::new();
+        for target in &targets {
+            match pidfd_send_sigint(target) {
+                Ok(()) => signalled.push(target.pid),
+                Err(_) => failed.push(target.pid),
+            }
         }
-    }
 
-    if signalled.is_empty() {
-        anyhow::bail!("finalize: failed to signal any collector ({failed:?})");
-    }
+        if signalled.is_empty() {
+            anyhow::bail!("finalize: failed to signal any identity-safe collector ({failed:?})");
+        }
 
-    Ok(FinalizeReport { signalled, failed })
+        return Ok(FinalizeReport { signalled, failed });
+    }
 }
 
 pub fn is_running() -> bool {
@@ -1826,7 +3111,11 @@ pub fn is_running() -> bool {
     let Ok(pid_str) = std::fs::read_to_string(&pid_path()) else {
         return false;
     };
-    let Ok(pid) = pid_str.trim().parse::<i32>() else {
+    let Some(pid) = pid_str
+        .lines()
+        .next()
+        .and_then(|s| s.trim().parse::<i32>().ok())
+    else {
         return false;
     };
     let alive = nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None).is_ok();
@@ -1845,7 +3134,7 @@ pub fn is_running() -> bool {
     // proof the daemon is gone — only that something removed the
     // path. Diagnosing that case (alive daemon, dead socket path)
     // is `connect_with_retry`'s job, not ours.
-    proc_comm_is_dbg(pid)
+    daemon_identity_matches(&pid_str, pid) && proc_comm_is_dbg(pid)
 }
 
 fn proc_comm_is_dbg(pid: i32) -> bool {
@@ -1875,17 +3164,44 @@ fn proc_comm_is_dbg(pid: i32) -> bool {
 /// process. A recycled pid owned by an unrelated program is stale state and
 /// should not pin this runtime slot forever.
 pub fn clean_stale_runtime_files() {
-    if let Ok(pid_str) = std::fs::read_to_string(&pid_path()) {
-        if let Ok(pid) = pid_str.trim().parse::<i32>() {
+    let slug = session_slug();
+    let Some(reservation) = try_reserve_for_cleanup(&slug) else {
+        // A starter owns this slug. It may publish the PID/socket between
+        // any two pathname observations, so leave its files alone.
+        return;
+    };
+    let pid_path = pid_path_for(&slug);
+    let socket_path = socket_path_for(&slug);
+    if let Ok(pid_str) = std::fs::read_to_string(&pid_path) {
+        if let Some(pid) = pid_str
+            .lines()
+            .next()
+            .and_then(|s| s.trim().parse::<i32>().ok())
+        {
             if nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None).is_ok()
+                && daemon_identity_matches(&pid_str, pid)
                 && proc_comm_is_dbg(pid)
             {
+                drop(reservation);
                 return;
             }
         }
     }
-    let _ = std::fs::remove_file(pid_path());
-    let _ = std::fs::remove_file(socket_path());
+    let _ = std::fs::remove_file(pid_path);
+    let _ = std::fs::remove_file(socket_path);
+    drop(reservation);
+}
+
+fn try_reserve_for_cleanup(slug: &str) -> Option<nix::fcntl::Flock<File>> {
+    let path = reservation_path_for(slug);
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .custom_flags(nix::libc::O_NOFOLLOW)
+        .open(path)
+        .ok()?;
+    nix::fcntl::Flock::lock(file, nix::fcntl::FlockArg::LockExclusiveNonblock).ok()
 }
 
 /// Kill the running daemon. Blocks until the process is gone and
@@ -1899,11 +3215,14 @@ pub fn kill_daemon() -> Result<String> {
     // peer daemon coexisting in the same cwd.
     let slug = session_slug();
     if !is_slug_live(&slug) {
-        let _ = std::fs::remove_file(socket_path_for(&slug));
-        let _ = std::fs::remove_file(pid_path_for(&slug));
+        if let Some(lock) = try_reserve_for_cleanup(&slug) {
+            let _ = std::fs::remove_file(socket_path_for(&slug));
+            let _ = std::fs::remove_file(pid_path_for(&slug));
+            drop(lock);
+        }
         return Ok("stopped".into());
     }
-    let response = send_command("quit").unwrap_or_else(|_| "stopped".into());
+    let response = send_command_for_slug(&slug, "quit").unwrap_or_else(|_| "stopped".into());
     // Wait for the daemon to actually exit before reaping its runtime
     // files. The previous 5s window was too tight for backends with
     // long finalize phases — dotnet-trace flushing a multi-GB
@@ -1929,6 +3248,9 @@ pub fn kill_daemon() -> Result<String> {
     if is_slug_live(&slug) {
         let pid = std::fs::read_to_string(pid_path_for(&slug))
             .unwrap_or_default()
+            .lines()
+            .next()
+            .unwrap_or("")
             .trim()
             .to_string();
         return Ok(format!(
@@ -1937,8 +3259,11 @@ pub fn kill_daemon() -> Result<String> {
              `dbg kill`, raise DBG_KILL_TIMEOUT_SECS, or send SIGKILL manually)"
         ));
     }
-    let _ = std::fs::remove_file(socket_path_for(&slug));
-    let _ = std::fs::remove_file(pid_path_for(&slug));
+    if let Some(lock) = try_reserve_for_cleanup(&slug) {
+        let _ = std::fs::remove_file(socket_path_for(&slug));
+        let _ = std::fs::remove_file(pid_path_for(&slug));
+        drop(lock);
+    }
     Ok(response)
 }
 
@@ -1957,7 +3282,237 @@ pub fn wait_for_socket(timeout: Duration) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backend::delve_proto::DelveProtoBackend;
+    use crate::backend::jdb::JdbBackend;
+    use crate::backend::node_proto::NodeProtoBackend;
+    use crate::dap::{DapLaunchConfig, DapTransport};
+    use crate::pty::LogHandle;
     use tempfile::TempDir;
+
+    #[test]
+    fn import_profile_parse_init_errors_fail_closed() {
+        let tmp = TempDir::new().unwrap();
+        let source = tmp.path().join("profile.json");
+        std::fs::write(&source, "not valid profile data").unwrap();
+        let db = SessionDb::create(CreateOptions {
+            kind: SessionKind::Profile,
+            target: source.to_str().unwrap(),
+            target_class: TargetClass::NativeCpu,
+            cwd: tmp.path(),
+            db_path: None,
+            label: Some("profile-error".into()),
+            target_hash: Some("test".into()),
+        })
+        .unwrap();
+
+        let parse_error = match ProfileData::load(&source) {
+            Ok(_) => panic!("invalid profile input unexpectedly parsed"),
+            Err(error) => error.to_string(),
+        };
+        db.add_failure("profile_parse", &parse_error).unwrap();
+        persist_profile_source(&db, &source).unwrap();
+
+        let failure: String = db
+            .conn()
+            .query_row(
+                "SELECT error FROM failures WHERE phase = 'profile_parse'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!failure.is_empty());
+        assert_eq!(
+            db.meta("profile_raw").unwrap().as_deref(),
+            Some("not valid profile data")
+        );
+    }
+
+    #[test]
+    fn dap_adapter_child() {
+        if std::env::var_os("DBG_DAP_ADAPTER_CHILD").is_none() {
+            return;
+        }
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        println!("LISTENING {address}");
+        std::io::stdout().flush().unwrap();
+        let (mut stream, _) = listener.accept().unwrap();
+
+        let read_message = |stream: &mut std::net::TcpStream| {
+            let mut header = Vec::new();
+            while !header.windows(4).any(|window| window == b"\r\n\r\n") {
+                let mut byte = [0u8; 1];
+                stream.read_exact(&mut byte)?;
+                header.push(byte[0]);
+            }
+            let header = String::from_utf8_lossy(&header);
+            let length = header
+                .lines()
+                .find_map(|line| line.strip_prefix("Content-Length:"))
+                .unwrap()
+                .trim()
+                .parse::<usize>()
+                .unwrap();
+            let mut body = vec![0u8; length];
+            stream.read_exact(&mut body)?;
+            Ok::<_, std::io::Error>(serde_json::from_slice::<serde_json::Value>(&body).unwrap())
+        };
+        let send_message =
+            |stream: &mut std::net::TcpStream, message: serde_json::Value| -> std::io::Result<()> {
+                let body = message.to_string();
+                write!(stream, "Content-Length: {}\r\n\r\n{body}", body.len())?;
+                stream.flush()
+            };
+        let response = |stream: &mut std::net::TcpStream,
+                        request: &serde_json::Value,
+                        body: serde_json::Value| {
+            send_message(
+                stream,
+                serde_json::json!({
+                    "seq": 1000 + request["seq"].as_i64().unwrap(),
+                    "type": "response",
+                    "request_seq": request["seq"],
+                    "success": true,
+                    "command": request["command"],
+                    "body": body,
+                }),
+            )
+            .unwrap();
+        };
+        let event = |stream: &mut std::net::TcpStream, name: &str, body: serde_json::Value| {
+            send_message(
+                stream,
+                serde_json::json!({
+                    "seq": 2000,
+                    "type": "event",
+                    "event": name,
+                    "body": body,
+                }),
+            )
+            .unwrap();
+        };
+
+        loop {
+            let request = read_message(&mut stream).unwrap();
+            match request["command"].as_str().unwrap_or_default() {
+                "initialize" => response(
+                    &mut stream,
+                    &request,
+                    serde_json::json!({"supportsConfigurationDoneRequest": true}),
+                ),
+                "launch" => {
+                    event(&mut stream, "initialized", serde_json::json!({}));
+                    response(&mut stream, &request, serde_json::json!({}));
+                }
+                "configurationDone" => {
+                    response(&mut stream, &request, serde_json::json!({}));
+                    event(
+                        &mut stream,
+                        "stopped",
+                        serde_json::json!({"reason": "entry", "threadId": 1}),
+                    );
+                }
+                "continue" => {
+                    response(&mut stream, &request, serde_json::json!({}));
+                    event(&mut stream, "continued", serde_json::json!({"threadId": 1}));
+                    event(
+                        &mut stream,
+                        "stopped",
+                        serde_json::json!({"reason": "breakpoint", "threadId": 1}),
+                    );
+                }
+                "stackTrace" => response(
+                    &mut stream,
+                    &request,
+                    serde_json::json!({"stackFrames": [{
+                        "id": 7,
+                        "name": "main.main",
+                        "line": 7,
+                        "column": 1,
+                        "source": {"path": "/virtual/e2e.go"}
+                    }]}),
+                ),
+                "scopes" => response(
+                    &mut stream,
+                    &request,
+                    serde_json::json!({"scopes": [{
+                        "name": "Locals",
+                        "variablesReference": 1
+                    }]}),
+                ),
+                "variables" => {
+                    response(
+                        &mut stream,
+                        &request,
+                        serde_json::json!({"variables": [{
+                            "name": "answer",
+                            "value": "42",
+                            "variablesReference": 0
+                        }]}),
+                    );
+                    event(&mut stream, "terminated", serde_json::json!({}));
+                }
+                "disconnect" => {
+                    response(&mut stream, &request, serde_json::json!({}));
+                    break;
+                }
+                _ => response(&mut stream, &request, serde_json::json!({})),
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    fn real_dap_session(tmp: &TempDir) -> Session {
+        let tmp_dir = tmp.path().join("session-tmp");
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+        // This is a small wire-level adapter. It is a child process with a
+        // real TCP socket and DAP framing, so these tests exercise
+        // DapTransport, the daemon dispatcher, and SessionDb together.
+        // It does not provide prepared JSON to the daemon.
+        let adapter = std::env::current_exe().unwrap();
+        let transport = DapTransport::spawn(DapLaunchConfig {
+            // Run the adapter in the background so it is reparented before
+            // the other daemon-process tests inspect this test process's
+            // children for signalling. The adapter exits after the
+            // terminated event, so this does not leave a child behind.
+            bin: "sh".into(),
+            args: vec![
+                "-c".into(),
+                "env DBG_DAP_ADAPTER_CHILD=1 \"$1\" --exact daemon::tests::dap_adapter_child --nocapture &".into(),
+                "dbg-dap-adapter".into(),
+                adapter.display().to_string(),
+            ],
+            listen_marker: "LISTENING".into(),
+            launch_verb: "launch".into(),
+            launch_args: serde_json::json!({"request": "launch"}),
+            preassigned_addr: None,
+            connect_addr: None,
+            debuggee_pid: None,
+        })
+        .unwrap();
+        let db = SessionDb::create(CreateOptions {
+            kind: SessionKind::Debug,
+            target: "/virtual/e2e.go",
+            target_class: TargetClass::NativeCpu,
+            cwd: tmp.path(),
+            db_path: None,
+            label: Some("dap-e2e".into()),
+            target_hash: Some("dap-e2e".into()),
+        })
+        .unwrap();
+        Session {
+            proc: Box::new(transport),
+            profile: None,
+            db: Some(db),
+            hit_seq: HashMap::new(),
+            save_to: None,
+            tmp_dir,
+            target: "/virtual/e2e.go".into(),
+            cwd: tmp.path().to_path_buf(),
+            target_class: TargetClass::NativeCpu,
+        }
+    }
 
     /// Regression: the accept loop used non-blocking accept + a
     /// 10ms sleep, which burned ~100 wakeups/sec on an idle daemon
@@ -1972,7 +3527,7 @@ mod tests {
         // the listener bind, before std::thread::scope's closing.
         let bind_pos = src.find("UnixListener::bind").expect("bind site");
         let scope_end = src[bind_pos..]
-            .find("cleanup_and_exit();\n}")
+            .find("cleanup_and_exit(false);\n}")
             .map(|p| bind_pos + p)
             .unwrap_or(src.len());
         let region = &src[bind_pos..scope_end];
@@ -1984,6 +3539,13 @@ mod tests {
             !region.contains("WouldBlock"),
             "WouldBlock retry loop signals the polling defect has returned"
         );
+    }
+
+    #[test]
+    fn releasing_a_full_ipc_slot_wakes_accept_once() {
+        assert!(should_wake_accept_after_release(MAX_IPC_CONNECTIONS));
+        assert!(!should_wake_accept_after_release(MAX_IPC_CONNECTIONS - 1));
+        assert!(!should_wake_accept_after_release(0));
     }
 
     #[test]
@@ -2010,6 +3572,61 @@ mod tests {
             bind < init_loop,
             "socket bind must precede init_commands loop"
         );
+    }
+
+    #[test]
+    fn ipc_slow_drip_has_an_absolute_deadline() {
+        use std::os::unix::net::UnixStream;
+
+        let (mut writer, mut reader) = UnixStream::pair().unwrap();
+        let producer = std::thread::spawn(move || {
+            writer.write_all(b"x").unwrap();
+            std::thread::sleep(Duration::from_millis(40));
+            let _ = writer.write_all(b"y");
+        });
+
+        let started = Instant::now();
+        let (result, bytes) = read_ipc_request_with_timeout(&mut reader, Duration::from_millis(10));
+        assert!(result.is_err(), "slow-drip request must be rejected");
+        assert_eq!(bytes, b"x");
+        assert!(started.elapsed() < Duration::from_millis(100));
+        producer.join().unwrap();
+    }
+
+    #[test]
+    fn init_command_status_marker_surfaces_nonzero_exit() {
+        assert_eq!(parse_init_status("output\n__DBG_INIT_STATUS__0\n"), Some(0));
+        assert_eq!(parse_init_status("output\n__DBG_INIT_STATUS__7\n"), Some(7));
+        assert_eq!(parse_init_status("output without marker"), None);
+    }
+
+    #[test]
+    fn protocol_help_uses_static_surface_without_native_command() {
+        let help = cache_help(&NodeProtoBackend, || {
+            panic!("node-proto must not receive the native help command")
+        })
+        .unwrap();
+        assert!(help.contains("node-proto"));
+        assert_eq!(
+            native_help_topic_command(&NodeProtoBackend, "unknown-topic"),
+            None
+        );
+    }
+
+    #[test]
+    fn jdb_run_waits_past_the_transient_startup_prompt() {
+        let backend = JdbBackend;
+        assert!(jdb_run_needs_vm_prompt(
+            &backend,
+            "run",
+            "run Broken\nSet deferred uncaught java.lang.Throwable\n"
+        ));
+        assert!(!jdb_run_needs_vm_prompt(
+            &backend,
+            "run",
+            "VM Started:\nBreakpoint hit: Broken$Sku.equals"
+        ));
+        assert!(!jdb_run_needs_vm_prompt(&backend, "stack", "where\n"));
     }
 
     // These tests mutate process-global env vars (XDG_RUNTIME_DIR +
@@ -2141,6 +3758,178 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_starters_cannot_share_a_slug_reservation() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = TempDir::new().unwrap();
+        unsafe {
+            std::env::set_var("XDG_RUNTIME_DIR", tmp.path());
+            std::env::remove_var("DBG_SESSION");
+        }
+
+        // Both contenders start at the same synchronization point. One
+        // owns the bare slot; the other must receive a different slot. A
+        // stale-marker check followed by unlink would allow both to report
+        // the same slot in this interleaving.
+        let gate = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let results = std::thread::scope(|scope| {
+            let mut workers = Vec::new();
+            for _ in 0..2 {
+                let gate = std::sync::Arc::clone(&gate);
+                workers.push(scope.spawn(move || {
+                    gate.wait();
+                    allocate_slug().unwrap()
+                }));
+            }
+            workers
+                .into_iter()
+                .map(|worker| worker.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        assert_ne!(results[0], results[1], "starters must own distinct slugs");
+        unsafe {
+            std::env::remove_var("DBG_SESSION");
+        }
+    }
+
+    #[test]
+    fn stale_reservation_recovery_is_atomic_across_processes() {
+        use std::process::Command;
+
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = TempDir::new().unwrap();
+        let barrier = tmp.path().join("reservation-barrier");
+        unsafe {
+            std::env::set_var("XDG_RUNTIME_DIR", tmp.path());
+            std::env::set_var("DBG_SESSION", "stale-race");
+        }
+
+        // This is a stale reservation left by a crashed starter. Both new
+        // starters must contend for this same inode. The test helper pauses
+        // one owner while the other reaches flock, so the interleaving is
+        // deterministic and uses independent processes.
+        let reservation = reservation_path_for("stale-race");
+        std::fs::write(&reservation, b"2147483000\n").unwrap();
+
+        let executable = std::env::current_exe().unwrap();
+        let mut children = Vec::new();
+        for n in 0..2 {
+            let result = tmp.path().join(format!("result-{n}"));
+            children.push(
+                Command::new(&executable)
+                    .arg("--exact")
+                    .arg("daemon::tests::claim_slug_helper")
+                    .arg("--nocapture")
+                    .env("XDG_RUNTIME_DIR", tmp.path())
+                    .env("DBG_SESSION", "stale-race")
+                    .env("DBG_CLAIM_HELPER", "1")
+                    .env("DBG_CLAIM_RESULT", &result)
+                    .env("DBG_TEST_RESERVATION_BARRIER", &barrier)
+                    .spawn()
+                    .unwrap(),
+            );
+        }
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while std::fs::read_dir(&barrier)
+            .ok()
+            .map(|entries| {
+                entries
+                    .flatten()
+                    .filter(|e| e.file_name().to_string_lossy().starts_with("contender-"))
+                    .count()
+            })
+            .unwrap_or(0)
+            < 2
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        std::fs::create_dir_all(&barrier).unwrap();
+        std::fs::write(barrier.join("begin"), b"begin").unwrap();
+
+        let locked = loop {
+            let count = std::fs::read_dir(&barrier)
+                .ok()
+                .map(|entries| {
+                    entries
+                        .flatten()
+                        .filter(|e| e.file_name().to_string_lossy().starts_with("locked-"))
+                        .count()
+                })
+                .unwrap_or(0);
+            if count > 0 || std::time::Instant::now() >= deadline {
+                break count;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        };
+
+        // The losing process must already have observed the held lock before
+        // the winner is allowed to release it. Otherwise a sequential stale
+        // recovery could look like two simultaneous owners.
+        let loser_reported = loop {
+            let reported = (0..2).any(|n| {
+                std::fs::read_to_string(tmp.path().join(format!("result-{n}")))
+                    .is_ok_and(|result| result.starts_with("err:"))
+            });
+            if reported || std::time::Instant::now() >= deadline {
+                break reported;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        };
+        std::fs::write(barrier.join("release"), b"release").unwrap();
+
+        let mut statuses = Vec::new();
+        for child in children {
+            let output = child.wait_with_output().unwrap();
+            statuses.push((output.status, output.stdout, output.stderr));
+        }
+        assert_eq!(locked, 1, "exactly one process must acquire the stale lock");
+        assert!(
+            loser_reported,
+            "the second process must lose while the lock is held"
+        );
+        let outcomes: Vec<_> = (0..2)
+            .map(|n| std::fs::read_to_string(tmp.path().join(format!("result-{n}"))).unwrap())
+            .collect();
+        assert!(statuses.iter().all(|(status, _, _)| status.success()));
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|result| result.as_str() == "ok")
+                .count(),
+            1
+        );
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|result| result.starts_with("err:"))
+                .count(),
+            1
+        );
+        assert!(
+            reservation.exists(),
+            "stale recovery must retain the stable inode"
+        );
+
+        unsafe {
+            std::env::remove_var("DBG_SESSION");
+        }
+    }
+
+    #[test]
+    fn claim_slug_helper() {
+        if std::env::var_os("DBG_CLAIM_HELPER").is_none() {
+            return;
+        }
+        let result = std::env::var("DBG_CLAIM_RESULT").unwrap();
+        let outcome = match allocate_slug() {
+            Ok(_) => "ok".to_string(),
+            Err(error) => format!("err:{error}"),
+        };
+        std::fs::write(result, outcome).unwrap();
+    }
+
+    #[test]
     fn pointer_file_is_honored_when_live() {
         let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let tmp = TempDir::new().unwrap();
@@ -2158,6 +3947,34 @@ mod tests {
             pid_slug,
             "pointer should win over bare fallback"
         );
+    }
+
+    #[test]
+    fn startup_error_cleanup_removes_published_runtime_state() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = TempDir::new().unwrap();
+        unsafe {
+            std::env::set_var("XDG_RUNTIME_DIR", tmp.path());
+            std::env::set_var("DBG_SESSION", "failed-startup");
+        }
+
+        let slug = session_slug();
+        std::fs::write(socket_path(), "socket").unwrap();
+        std::fs::write(pid_path(), "123").unwrap();
+        write_latest_pointer(&slug);
+        let evidence = session_tmp("partial.data");
+        std::fs::write(&evidence, "partial").unwrap();
+
+        cleanup_after_startup_error();
+
+        assert!(!socket_path().exists());
+        assert!(!pid_path().exists());
+        assert!(!latest_pointer_path().exists());
+        assert!(!evidence.parent().unwrap().exists());
+        unsafe {
+            std::env::remove_var("DBG_SESSION");
+            std::env::remove_var("XDG_RUNTIME_DIR");
+        }
     }
 
     #[test]
@@ -2276,6 +4093,158 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn finalize_signals_a_live_collector_with_an_identity_safe_handle() {
+        use std::process::Command;
+
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = TempDir::new().unwrap();
+        unsafe {
+            std::env::set_var("XDG_RUNTIME_DIR", tmp.path());
+            std::env::set_var("DBG_SESSION", "finalize-live");
+        }
+        let mut collector = Command::new("sleep").arg("30").spawn().unwrap();
+        let collector_pid = collector.id() as i32;
+        std::fs::write(pid_path(), daemon_pid_record(std::process::id() as i32)).unwrap();
+
+        let report = finalize_collector().expect("live collector must be signalled");
+        assert!(report.signalled.contains(&collector_pid));
+        let status = collector.wait().unwrap();
+        assert!(!status.success(), "SIGINT must stop the collector");
+
+        let _ = std::fs::remove_file(pid_path());
+        unsafe {
+            std::env::remove_var("DBG_SESSION");
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn finalize_does_not_signal_an_unrelated_process_in_the_collector_group() {
+        use std::process::Command;
+
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = TempDir::new().unwrap();
+        unsafe {
+            std::env::set_var("XDG_RUNTIME_DIR", tmp.path());
+            std::env::set_var("DBG_SESSION", "finalize-group");
+        }
+
+        let mut collector = Command::new("sleep").arg("30").spawn().unwrap();
+        let collector_pid = collector.id() as i32;
+        // Both children inherit this test process's process group. The orphan
+        // below is reparented to init, so it is not a collector-tree
+        // descendant even though a negative-PGID kill would reach it.
+        let orphan_pid_file = tmp.path().join("orphan.pid");
+        let command = format!("sleep 30 & echo $! > {}; exit 0", orphan_pid_file.display());
+        let mut helper = Command::new("sh").arg("-c").arg(command).spawn().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !orphan_pid_file.exists() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let orphan_pid: i32 = std::fs::read_to_string(&orphan_pid_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        helper.wait().unwrap();
+
+        std::fs::write(pid_path(), daemon_pid_record(std::process::id() as i32)).unwrap();
+        let report = finalize_collector().expect("collector must be signalled");
+        assert!(report.signalled.contains(&collector_pid));
+        assert!(
+            nix::sys::signal::kill(nix::unistd::Pid::from_raw(orphan_pid), None).is_ok(),
+            "an unrelated same-group orphan must survive finalize"
+        );
+
+        let _ = collector.wait();
+        let _ = nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(orphan_pid),
+            nix::sys::signal::Signal::SIGKILL,
+        );
+        let _ = std::fs::remove_file(pid_path());
+        unsafe {
+            std::env::remove_var("DBG_SESSION");
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn finalize_rejects_a_replaced_daemon_identity() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = TempDir::new().unwrap();
+        unsafe {
+            std::env::set_var("XDG_RUNTIME_DIR", tmp.path());
+            std::env::set_var("DBG_SESSION", "finalize-daemon-replaced");
+        }
+        std::fs::write(
+            pid_path(),
+            format!("{}\nnot-the-current-instance\n", std::process::id()),
+        )
+        .unwrap();
+
+        let error = finalize_collector().unwrap_err().to_string();
+        assert!(
+            error.contains("changed process instance") || error.contains("refusing to signal"),
+            "unexpected replacement error: {error}"
+        );
+
+        let _ = std::fs::remove_file(pid_path());
+        unsafe {
+            std::env::remove_var("DBG_SESSION");
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn identity_safe_handle_rejects_a_replaced_descendant_identity() {
+        let pid = std::process::id() as i32;
+        let current = process_identity(pid).unwrap();
+        let replacement = format!("{current}\nreplacement-executable");
+        assert!(
+            open_identity_safe_pidfd(pid, &replacement).is_err(),
+            "a PID with a different start identity must not be signalled"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn descendant_handle_failure_aborts_capture_before_any_signal() {
+        use std::process::Command;
+
+        let parent = open_current_identity_safe_pidfd(std::process::id() as i32).unwrap();
+        let mut child = Command::new("sleep").arg("30").spawn().unwrap();
+        let child_pid = child.id() as i32;
+
+        let error = open_verified_children_from_pids(&parent, vec![child_pid, i32::MAX])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("identity-safe handle"),
+            "unexpected handle failure: {error}"
+        );
+        assert!(
+            nix::sys::signal::kill(nix::unistd::Pid::from_raw(child_pid), None).is_ok(),
+            "capture failure must happen before a verified sibling is signalled"
+        );
+
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn finalize_fails_closed_when_identity_safe_handle_cannot_be_verified() {
+        let pid = std::process::id() as i32;
+        assert!(
+            open_identity_safe_pidfd(pid, "").is_err(),
+            "missing identity must never fall back to a bare PID signal"
+        );
+        let src = include_str!("daemon.rs");
+        assert!(src.contains("SYS_pidfd_send_signal"));
+    }
+
     #[test]
     fn clean_stale_runtime_files_preserves_live_daemon_mid_startup() {
         let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -2295,6 +4264,15 @@ mod tests {
         unsafe {
             std::env::remove_var("DBG_SESSION");
         }
+    }
+
+    #[test]
+    fn pid_only_marker_is_accepted_when_procfs_is_unavailable() {
+        assert!(daemon_identity_matches_with_procfs(
+            &format!("{}\n", std::process::id()),
+            std::process::id() as i32 + 1,
+            false,
+        ));
     }
 
     /// Regression: `kill_daemon` used to unlink socket+pid files
@@ -2369,8 +4347,13 @@ mod tests {
         assert_eq!(backend_target_class("lldb"), TargetClass::NativeCpu);
         assert_eq!(backend_target_class("delve"), TargetClass::NativeCpu);
         assert_eq!(backend_target_class("pdb"), TargetClass::Python);
+        assert_eq!(backend_target_class("debugpy-proto"), TargetClass::Python);
         assert_eq!(
             backend_target_class("netcoredbg"),
+            TargetClass::ManagedDotnet
+        );
+        assert_eq!(
+            backend_target_class("netcoredbg-proto"),
             TargetClass::ManagedDotnet
         );
         assert_eq!(backend_target_class("jdb"), TargetClass::Jvm);
@@ -2380,6 +4363,34 @@ mod tests {
         assert_eq!(backend_target_class("phpdbg"), TargetClass::Php);
         // Unknown backends fall through to native-cpu — informational only.
         assert_eq!(backend_target_class("perf"), TargetClass::NativeCpu);
+    }
+
+    #[test]
+    fn report_oriented_profilers_are_profile_sessions() {
+        let profilers: Vec<Box<dyn Backend>> = vec![
+            Box::new(crate::backend::callgrind::CallgrindBackend),
+            Box::new(crate::backend::pstats::PstatsBackend),
+            Box::new(crate::backend::massif::MassifBackend),
+            Box::new(crate::backend::memcheck::MemcheckBackend),
+            Box::new(crate::backend::ghcprof::GhcProfBackend),
+            Box::new(crate::backend::stackprof::StackprofBackend),
+            Box::new(crate::backend::xdebug::XdebugProfileBackend),
+        ];
+        for backend in profilers {
+            assert_eq!(
+                backend_session_kind(backend.as_ref()),
+                SessionKind::Profile,
+                "{} must create a profile-kind session",
+                backend.name()
+            );
+        }
+
+        let debugger = crate::backend::lldb::LldbBackend;
+        assert_eq!(
+            backend_session_kind(&debugger),
+            SessionKind::Debug,
+            "debuggers must retain debug-kind sessions"
+        );
     }
 
     #[test]
@@ -2404,6 +4415,271 @@ mod tests {
         assert!(!command_may_stop("breakpoint list"));
         assert!(!command_may_stop("frame variable"));
         assert!(!command_may_stop("help"));
+    }
+
+    #[test]
+    fn raw_copy_failure_is_reported_without_removing_source() {
+        let tmp = TempDir::new().unwrap();
+        let source = tmp.path().join("source");
+        std::fs::create_dir(&source).unwrap();
+        let artifact = source.join("perf.data");
+        std::fs::write(&artifact, b"capture").unwrap();
+
+        // A file at the destination makes the copy fail. The source must
+        // remain available because cleanup is allowed only after a full
+        // durable copy succeeds.
+        let destination = tmp.path().join("destination");
+        std::fs::write(&destination, b"not a directory").unwrap();
+        assert!(copy_raw_tree(&source, &destination).is_err());
+        assert!(artifact.exists());
+    }
+
+    #[test]
+    fn daemon_cleanup_after_raw_persist() {
+        let tmp = TempDir::new().unwrap();
+        let source = tmp.path().join("session-tmp");
+        std::fs::create_dir_all(&source).unwrap();
+        let artifact = source.join("cleanup-capture.data");
+        std::fs::write(&artifact, b"capture").unwrap();
+        let save_path = session_db::sessions_dir(tmp.path()).join("dap-e2e.db");
+        let session = Mutex::new(real_dap_session(&tmp));
+        session.lock().unwrap().save_to = Some(save_path.clone());
+        let backend = DelveProtoBackend;
+
+        assert!(raw_evidence_present(&source).unwrap());
+        let (_, keep_session_tmp) = handle_quit(&backend, &session, &AtomicI32::new(0), None);
+        assert!(!keep_session_tmp);
+        assert!(save_path.exists());
+
+        // This is the same cleanup operation used by the daemon after the
+        // persistence-dependent decision in handle_quit.
+        cleanup_session_tmp_at(&source, keep_session_tmp);
+        assert!(!source.exists());
+        let durable = session_db::raw_dir(tmp.path(), "dap-e2e");
+        assert_eq!(
+            std::fs::read(durable.join("cleanup-capture.data")).unwrap(),
+            b"capture"
+        );
+        assert!(SessionDb::open(&save_path).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn daemon_cleanup_persists_nested_session_db_evidence() {
+        let tmp = TempDir::new().unwrap();
+        let source = tmp.path().join("session-tmp");
+        let nested = source.join("capture").join("session.db");
+        std::fs::create_dir_all(nested.parent().unwrap()).unwrap();
+        std::fs::write(&nested, b"nested raw evidence").unwrap();
+        let save_path = session_db::sessions_dir(tmp.path()).join("nested-db-evidence.db");
+        let session = Mutex::new(real_dap_session(&tmp));
+        session.lock().unwrap().save_to = Some(save_path.clone());
+        let backend = DelveProtoBackend;
+
+        let (_, keep_session_tmp) = handle_quit(&backend, &session, &AtomicI32::new(0), None);
+        assert!(
+            !keep_session_tmp,
+            "nested raw evidence was treated as empty"
+        );
+        cleanup_session_tmp_at(&source, keep_session_tmp);
+
+        assert!(!source.exists());
+        assert_eq!(
+            std::fs::read(session_db::raw_dir(tmp.path(), "dap-e2e").join("capture/session.db"))
+                .unwrap(),
+            b"nested raw evidence"
+        );
+        assert!(SessionDb::open(&save_path).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn daemon_cleanup_preserves_evidence_on_failure() {
+        let tmp = TempDir::new().unwrap();
+        let source = tmp.path().join("session-tmp");
+        std::fs::create_dir_all(&source).unwrap();
+        let outside = tmp.path().join("live-evidence");
+        std::fs::write(&outside, b"live evidence").unwrap();
+        std::os::unix::fs::symlink(&outside, source.join("cleanup-capture.data")).unwrap();
+        let save_path = session_db::sessions_dir(tmp.path()).join("dap-e2e.db");
+        let raw_destination = session_db::raw_dir(tmp.path(), "dap-e2e");
+        let _ = std::fs::remove_dir_all(&raw_destination);
+        let session = Mutex::new(real_dap_session(&tmp));
+        session.lock().unwrap().save_to = Some(save_path.clone());
+        let backend = DelveProtoBackend;
+
+        // Rejected raw input is still evidence. A failed persistence attempt
+        // must leave both the source entry and its target available.
+        assert!(raw_evidence_present(&source).unwrap());
+        let (_, keep_session_tmp) = handle_quit(&backend, &session, &AtomicI32::new(0), None);
+        assert!(
+            keep_session_tmp,
+            "cleanup was allowed after raw-copy failure"
+        );
+        cleanup_session_tmp_at(&source, keep_session_tmp);
+        assert!(source.join("cleanup-capture.data").exists());
+        assert!(outside.exists());
+        assert!(!session.lock().unwrap().proc.is_alive());
+        assert!(!save_path.exists());
+        assert!(!raw_destination.join("cleanup-capture.data").exists());
+
+        // Keep the test process from leaving the intentionally preserved raw
+        // source behind after proving the failure behavior.
+        std::fs::remove_dir_all(source).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn raw_evidence_presence_fails_closed_for_invalid_root() {
+        let tmp = TempDir::new().unwrap();
+        let target = tmp.path().join("outside");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::write(target.join("capture.data"), b"evidence").unwrap();
+        let link = tmp.path().join("raw-link");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        assert!(raw_evidence_present(&link).unwrap());
+        assert!(!raw_evidence_present(&tmp.path().join("missing")).unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn raw_evidence_does_not_ignore_session_db_symlink() {
+        let tmp = TempDir::new().unwrap();
+        let source = tmp.path().join("session-tmp");
+        std::fs::create_dir(&source).unwrap();
+        let outside = tmp.path().join("outside.db");
+        std::fs::write(&outside, b"not the session database").unwrap();
+        std::os::unix::fs::symlink(&outside, source.join("session.db")).unwrap();
+
+        assert!(raw_evidence_present(&source).unwrap());
+    }
+
+    #[test]
+    fn raw_evidence_reports_directory_and_iterator_errors() {
+        let tmp = TempDir::new().unwrap();
+        let source = tmp.path().join("session-tmp");
+        std::fs::create_dir(&source).unwrap();
+        let artifact = source.join("capture.data");
+        std::fs::write(&artifact, b"capture").unwrap();
+
+        let open_error = |_path: &Path| -> std::io::Result<
+            Box<dyn Iterator<Item = std::io::Result<std::fs::DirEntry>>>,
+        > { Err(std::io::Error::other("directory inspection failed")) };
+        assert!(raw_evidence_present_with(&source, &open_error).is_err());
+
+        let source_for_reader = source.clone();
+        let iterator_error = move |path: &Path| -> std::io::Result<
+            Box<dyn Iterator<Item = std::io::Result<std::fs::DirEntry>>>,
+        > {
+            if path == source_for_reader {
+                let entry = std::fs::read_dir(path)?.next().unwrap()?;
+                Ok(Box::new(
+                    vec![
+                        Ok(entry),
+                        Err(std::io::Error::other("directory iterator failed")),
+                    ]
+                    .into_iter(),
+                ))
+            } else {
+                Ok(Box::new(std::fs::read_dir(path)?))
+            }
+        };
+        let error = raw_evidence_present_with(&source, &iterator_error).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::Other);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn daemon_cleanup_preserves_evidence_on_inspection_failure() {
+        let tmp = TempDir::new().unwrap();
+        let source = tmp.path().join("session-tmp");
+        std::fs::create_dir_all(&source).unwrap();
+        let artifact = source.join("capture.data");
+        std::fs::write(&artifact, b"capture").unwrap();
+        let save_path = session_db::sessions_dir(tmp.path()).join("inspection-failure.db");
+        let session = Mutex::new(real_dap_session(&tmp));
+        session.lock().unwrap().save_to = Some(save_path.clone());
+        let backend = DelveProtoBackend;
+        let reader = |_path: &Path| -> std::io::Result<
+            Box<dyn Iterator<Item = std::io::Result<std::fs::DirEntry>>>,
+        > { Err(std::io::Error::other("raw evidence inspection failed")) };
+
+        let (_, keep_session_tmp) =
+            handle_quit_with(&backend, &session, &AtomicI32::new(0), None, &reader);
+        assert!(
+            keep_session_tmp,
+            "inspection uncertainty must keep the raw source"
+        );
+        cleanup_session_tmp_at(&source, keep_session_tmp);
+        assert!(artifact.exists());
+        assert!(!session.lock().unwrap().proc.is_alive());
+        assert!(!save_path.exists());
+    }
+
+    #[test]
+    fn raw_copy_rejects_file_symlinks_without_following_them() {
+        let tmp = TempDir::new().unwrap();
+        let source = tmp.path().join("source");
+        let destination = tmp.path().join("destination");
+        std::fs::create_dir(&source).unwrap();
+        let outside = tmp.path().join("outside-secret");
+        std::fs::write(&outside, b"must not be copied").unwrap();
+        std::os::unix::fs::symlink(&outside, source.join("capture.data")).unwrap();
+
+        let error = copy_raw_tree(&source, &destination).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(!destination.join("capture.data").exists());
+        assert!(outside.exists(), "the symlink target must remain untouched");
+    }
+
+    #[test]
+    fn raw_copy_rejects_directory_symlinks_without_traversing_them() {
+        let tmp = TempDir::new().unwrap();
+        let source = tmp.path().join("source");
+        let destination = tmp.path().join("destination");
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir(&source).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::write(outside.join("secret.nettrace"), b"must not be copied").unwrap();
+        std::os::unix::fs::symlink(&outside, source.join("nested")).unwrap();
+
+        let error = copy_raw_tree(&source, &destination).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(!destination.join("nested").exists());
+        assert!(outside.join("secret.nettrace").exists());
+    }
+
+    #[test]
+    fn raw_copy_rejects_source_root_symlinks_without_traversing_them() {
+        let tmp = TempDir::new().unwrap();
+        let real_source = tmp.path().join("real-source");
+        let source = tmp.path().join("source-link");
+        let destination = tmp.path().join("destination");
+        std::fs::create_dir(&real_source).unwrap();
+        std::fs::write(real_source.join("capture.data"), b"must not be copied").unwrap();
+        std::os::unix::fs::symlink(&real_source, &source).unwrap();
+
+        let error = copy_raw_tree(&source, &destination).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(!destination.exists());
+        assert!(real_source.join("capture.data").exists());
+    }
+
+    #[test]
+    fn raw_copy_rejects_destination_directory_symlinks_without_writing_outside() {
+        let tmp = TempDir::new().unwrap();
+        let source = tmp.path().join("source");
+        let destination = tmp.path().join("destination");
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(source.join("nested")).unwrap();
+        std::fs::write(source.join("nested/capture.data"), b"must stay inside").unwrap();
+        std::fs::create_dir(&destination).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, destination.join("nested")).unwrap();
+
+        assert!(copy_raw_tree(&source, &destination).is_err());
+        assert!(!outside.join("capture.data").exists());
     }
 
     /// End-to-end of the SessionDb capture path without spawning a real
@@ -2461,5 +4737,73 @@ mod tests {
             .unwrap();
         assert_eq!(cmds, 1);
         assert_eq!(hits, 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dap_automatic_capture_persist_e2e() {
+        let tmp = TempDir::new().unwrap();
+        let session = Mutex::new(real_dap_session(&tmp));
+        let backend = DelveProtoBackend;
+        let log = LogHandle::new();
+        let save_path = session_db::sessions_dir(tmp.path()).join("dap-e2e.db");
+        session.lock().unwrap().save_to = Some(save_path.clone());
+
+        let response = handle_command("continue", &backend, &session, "", &log);
+        assert!(!response.starts_with("[error:"), "{response}");
+        let (_, keep_session_tmp) = handle_quit(&backend, &session, &AtomicI32::new(0), None);
+        assert!(!keep_session_tmp, "captured DAP data was not persisted");
+
+        let saved = SessionDb::open(&save_path).unwrap();
+        let (location, locals, stack): (String, Option<String>, Option<String>) = saved
+            .conn()
+            .query_row(
+                "SELECT location_key, locals_json, stack_json
+                 FROM breakpoint_hits LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(location, "/virtual/e2e.go:7");
+        assert_eq!(locals.as_deref(), Some(r#"{"answer":"42"}"#));
+        assert!(stack.unwrap().contains("main.main"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dap_post_exit_stack_locals_e2e() {
+        let tmp = TempDir::new().unwrap();
+        let session = Mutex::new(real_dap_session(&tmp));
+        let backend = DelveProtoBackend;
+        let log = LogHandle::new();
+        let save_path = session_db::sessions_dir(tmp.path()).join("dap-post-mortem.db");
+        session.lock().unwrap().save_to = Some(save_path.clone());
+
+        let _ = handle_command("continue", &backend, &session, "", &log);
+        for _ in 0..100 {
+            if !session.lock().unwrap().proc.is_alive() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let stack = handle_command("stack", &backend, &session, "", &log);
+        let locals = handle_command("locals", &backend, &session, "", &log);
+        assert!(stack.contains("[post-mortem]"), "{stack}");
+        assert!(stack.contains("main.main"), "{stack}");
+        assert!(locals.contains("[post-mortem]"), "{locals}");
+        assert!(locals.contains("42"), "{locals}");
+
+        let saved = SessionDb::open(&save_path).unwrap();
+        let (stack, locals): (String, String) = saved
+            .conn()
+            .query_row(
+                "SELECT stack_json, locals_json
+                 FROM breakpoint_hits LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert!(stack.contains("main.main"));
+        assert!(locals.contains("42"));
     }
 }

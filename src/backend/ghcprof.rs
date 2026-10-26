@@ -32,43 +32,59 @@ impl Backend for GhcProfBackend {
             let ghc_bin = find_bin("ghc");
             let cmd = format!(
                 "mkdir -p {} && {} -prof -fprof-late -rtsopts -o {} {}",
-                out_dir_str, shell_escape(&ghc_bin), bin_str, shell_escape(target)
+                shell_escape(&out_dir_str),
+                shell_escape(&ghc_bin),
+                shell_escape(&bin_str),
+                shell_escape(target)
             );
             (bin_str, Some(cmd))
         } else {
             // Already compiled with -prof -rtsopts
-            (target.to_string(), None)
+            let path = std::path::Path::new(target);
+            let absolute = if path.is_absolute() {
+                path.to_path_buf()
+            } else {
+                std::env::current_dir()?.join(path)
+            };
+            (absolute.display().to_string(), None)
         };
 
         // Step 2: Run with profiling RTS flags
         let mut run_cmd = format!(
             "cd {} && {} +RTS -p -RTS",
-            out_dir_str, shell_escape(&binary)
+            shell_escape(&out_dir_str),
+            shell_escape(&binary)
         );
         if !args.is_empty() {
             let escaped_args: Vec<String> = args.iter().map(|a| shell_escape(a)).collect();
             run_cmd = format!(
                 "cd {} && {} {} +RTS -p -RTS",
-                out_dir_str, shell_escape(&binary), escaped_args.join(" ")
+                shell_escape(&out_dir_str),
+                shell_escape(&binary),
+                escaped_args.join(" ")
             );
         }
         // GHC writes .prof next to the binary or in cwd — rename to known location
         let rename_cmd = format!(
             "mv {}/*.prof {}",
-            out_dir_str, prof_str
+            shell_escape(&out_dir_str),
+            shell_escape(&prof_str)
         );
 
         let dbg_bin = super::self_exe();
 
         let convert_cmd = format!(
             "{} --ghcprof-convert {} {}",
-            dbg_bin, prof_str, cg_str
+            shell_escape(&dbg_bin),
+            shell_escape(&prof_str),
+            shell_escape(&cg_str)
         );
 
         // Step 4: Exec into the profile REPL
         let exec_repl = format!(
             "exec {} --phpprofile-repl {} --profile-prompt 'haskell-profile> '",
-            dbg_bin, cg_str
+            shell_escape(&dbg_bin),
+            shell_escape(&cg_str)
         );
 
         let mut init_commands = Vec::new();
@@ -108,6 +124,10 @@ impl Backend for GhcProfBackend {
         "hotspots"
     }
 
+    fn is_profile_backend(&self) -> bool {
+        true
+    }
+
     fn quit_command(&self) -> &'static str {
         "exit"
     }
@@ -117,9 +137,11 @@ impl Backend for GhcProfBackend {
     }
 
     fn adapters(&self) -> Vec<(&'static str, &'static str)> {
-        vec![("haskell-profile.md", include_str!("../../skills/adapters/haskell-profile.md"))]
+        vec![(
+            "haskell-profile.md",
+            include_str!("../../skills/references/adapters/haskell-profile.md"),
+        )]
     }
-
 }
 
 #[cfg(test)]
@@ -134,16 +156,28 @@ mod tests {
         assert!(cfg.init_commands[0].contains("ghc -prof"));
         assert!(cfg.init_commands[0].contains("test.hs"));
         // Should have convert step
-        assert!(cfg.init_commands.iter().any(|c| c.contains("--ghcprof-convert")));
+        assert!(
+            cfg.init_commands
+                .iter()
+                .any(|c| c.contains("--ghcprof-convert"))
+        );
         // Should exec into REPL
-        assert!(cfg.init_commands.last().unwrap().contains("--phpprofile-repl"));
+        assert!(
+            cfg.init_commands
+                .last()
+                .unwrap()
+                .contains("--phpprofile-repl")
+        );
     }
 
     #[test]
     fn spawn_config_precompiled_binary() {
         let cfg = GhcProfBackend.spawn_config("./myapp", &[]).unwrap();
         // No compile step — first command runs the binary
-        assert!(cfg.init_commands[0].contains("./myapp"));
+        assert!(cfg.init_commands[0].contains("/myapp"));
+        assert!(
+            cfg.init_commands[0].contains(&std::env::current_dir().unwrap().display().to_string())
+        );
         assert!(cfg.init_commands[0].contains("+RTS -p -RTS"));
         // Should NOT contain ghc -prof
         assert!(!cfg.init_commands[0].contains("ghc -prof"));
@@ -154,7 +188,11 @@ mod tests {
         let cfg = GhcProfBackend
             .spawn_config("test.hs", &["--input".into(), "data.txt".into()])
             .unwrap();
-        let run_cmd = cfg.init_commands.iter().find(|c| c.contains("+RTS")).unwrap();
+        let run_cmd = cfg
+            .init_commands
+            .iter()
+            .find(|c| c.contains("+RTS"))
+            .unwrap();
         assert!(run_cmd.contains("--input"));
         assert!(run_cmd.contains("data.txt"));
     }

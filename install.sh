@@ -27,11 +27,12 @@ main() {
 
     # Install dbg-cli
     echo "Installing dbg-cli from crates.io..."
-    cargo install dbg-cli
+    INSTALL_ROOT="${CARGO_INSTALL_ROOT:-${CARGO_HOME:-$HOME/.cargo}}"
+    cargo install --root "$INSTALL_ROOT" dbg-cli
     echo ""
 
     # Verify the binary exists
-    DBG_BIN="$HOME/.cargo/bin/dbg"
+    DBG_BIN="$INSTALL_ROOT/bin/dbg"
     if [ ! -f "$DBG_BIN" ]; then
         echo "Error: dbg binary not found at $DBG_BIN"
         exit 1
@@ -42,14 +43,14 @@ main() {
 
     # If not in PATH, show how to activate
     case ":$PATH:" in
-        *":$HOME/.cargo/bin:"*)
+        *":$INSTALL_ROOT/bin:"*)
             ;;
         *)
             echo "To use dbg in this shell, run:"
-            echo "  export PATH=\"\$HOME/.cargo/bin:\$PATH\""
+            echo "  export PATH=\"$INSTALL_ROOT/bin:\$PATH\""
             echo ""
             echo "To make it permanent (optional):"
-            echo "  echo 'export PATH=\"\$HOME/.cargo/bin:\$PATH\"' >> ~/.bashrc"
+            echo "  echo 'export PATH=\"$INSTALL_ROOT/bin:\$PATH\"' >> ~/.bashrc"
             echo ""
             ;;
     esac

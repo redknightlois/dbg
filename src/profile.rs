@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::io::Read;
 use std::path::Path;
 
 /// Named ignore presets — expand to a concrete substring pattern.
@@ -52,6 +53,47 @@ pub struct ProfileData {
     /// Named windows so a user can define insert/query/truth once and
     /// switch between them with `phase use <name>`.
     phases: HashMap<String, (f64, f64)>,
+}
+
+/// Keep profile imports and replay bounded. The limit applies before JSON
+/// deserialization, because serde must not receive an attacker-controlled
+/// unbounded string from an imported file or persisted session.
+pub const MAX_PROFILE_BYTES: u64 = 256 * 1024 * 1024;
+const MAX_PROFILE_FRAMES: usize = 1_000_000;
+const MAX_PROFILE_THREADS: usize = 100_000;
+const MAX_PROFILE_EVENTS: usize = 5_000_000;
+const MAX_V8_NODES: usize = 1_000_000;
+const MAX_V8_SAMPLES: usize = 5_000_000;
+
+/// Read at most `limit` bytes and probe one extra byte. The probe closes the
+/// metadata/read race where a file grows after its size was checked.
+pub(crate) fn read_bounded_text(path: &Path, limit: u64) -> Result<String> {
+    let mut file = std::fs::File::open(path)
+        .with_context(|| format!("failed to read profile file {}", path.display()))?;
+    let mut bytes = Vec::new();
+    let mut chunk = [0_u8; 8192];
+    loop {
+        let remaining = limit.saturating_sub(bytes.len() as u64);
+        if remaining == 0 {
+            let mut probe = [0_u8; 1];
+            if file.read(&mut probe)? != 0 {
+                anyhow::bail!(
+                    "profile file {} exceeds the maximum input size of {} bytes",
+                    path.display(),
+                    limit
+                );
+            }
+            break;
+        }
+        let chunk_len = chunk.len();
+        let count = file.read(&mut chunk[..(remaining as usize).min(chunk_len)])?;
+        if count == 0 {
+            break;
+        }
+        bytes.extend_from_slice(&chunk[..count]);
+    }
+    String::from_utf8(bytes)
+        .with_context(|| format!("profile file {} is not valid UTF-8", path.display()))
 }
 
 #[derive(Clone)]
@@ -132,7 +174,7 @@ struct V8CallFrame {
 
 impl ProfileData {
     pub fn load(path: &Path) -> Result<Self> {
-        let content = std::fs::read_to_string(path).context("failed to read profile file")?;
+        let content = read_bounded_text(path, MAX_PROFILE_BYTES)?;
         let ext = path.extension().and_then(|e| e.to_str());
         Self::load_str(&content, ext)
     }
@@ -144,6 +186,12 @@ impl ProfileData {
     /// stash and replay profile content from the SessionDb without
     /// touching the original file.
     pub fn load_str(content: &str, ext_hint: Option<&str>) -> Result<Self> {
+        if content.len() > MAX_PROFILE_BYTES as usize {
+            anyhow::bail!(
+                "profile input exceeds the maximum size of {} bytes",
+                MAX_PROFILE_BYTES
+            );
+        }
         // Auto-detect: V8 cpuprofile has "nodes" + "samples" at top level
         if ext_hint == Some("cpuprofile")
             || (content.contains("\"nodes\"") && content.contains("\"timeDeltas\""))
@@ -180,6 +228,30 @@ impl ProfileData {
         let file: SpeedscopeFile =
             serde_json::from_str(content).context("failed to parse speedscope JSON")?;
 
+        if file.shared.frames.len() > MAX_PROFILE_FRAMES {
+            anyhow::bail!(
+                "profile contains {} frames; maximum is {}",
+                file.shared.frames.len(),
+                MAX_PROFILE_FRAMES
+            );
+        }
+        if file.profiles.len() > MAX_PROFILE_THREADS {
+            anyhow::bail!(
+                "profile contains {} threads; maximum is {}",
+                file.profiles.len(),
+                MAX_PROFILE_THREADS
+            );
+        }
+        let event_count: usize = file
+            .profiles
+            .iter()
+            .map(|profile| profile.events.len())
+            .try_fold(0usize, |total, count| total.checked_add(count))
+            .ok_or_else(|| anyhow::anyhow!("profile event count overflowed"))?;
+        if event_count > MAX_PROFILE_EVENTS {
+            anyhow::bail!("profile contains {event_count} events; maximum is {MAX_PROFILE_EVENTS}");
+        }
+
         let frames: Vec<Frame> = file
             .shared
             .frames
@@ -213,6 +285,9 @@ impl ProfileData {
                 if idx >= n {
                     continue;
                 }
+                if !event.at.is_finite() || event.at < 0.0 {
+                    anyhow::bail!("profile contains an invalid event timestamp");
+                }
 
                 match event.event_type.as_str() {
                     "O" => {
@@ -227,6 +302,14 @@ impl ProfileData {
                         }
                     }
                     "C" => {
+                        if !stack
+                            .last()
+                            .is_some_and(|(opened_idx, _)| *opened_idx == idx)
+                        {
+                            anyhow::bail!(
+                                "profile close event for frame {idx} does not match the open frame"
+                            );
+                        }
                         if let Some((opened_idx, opened_at)) = stack.pop() {
                             let duration = event.at - opened_at;
                             if duration > 0.0 {
@@ -307,6 +390,35 @@ impl ProfileData {
         let profile: V8CpuProfile =
             serde_json::from_str(content).context("failed to parse V8 cpuprofile JSON")?;
 
+        if profile.nodes.len() > MAX_V8_NODES {
+            anyhow::bail!(
+                "V8 profile contains {} nodes; maximum is {}",
+                profile.nodes.len(),
+                MAX_V8_NODES
+            );
+        }
+        if profile.samples.len() > MAX_V8_SAMPLES {
+            anyhow::bail!(
+                "V8 profile contains {} samples; maximum is {}",
+                profile.samples.len(),
+                MAX_V8_SAMPLES
+            );
+        }
+        if profile.time_deltas.len() > MAX_V8_SAMPLES {
+            anyhow::bail!(
+                "V8 profile contains {} timeDeltas; maximum is {}",
+                profile.time_deltas.len(),
+                MAX_V8_SAMPLES
+            );
+        }
+        if profile.samples.len() != profile.time_deltas.len() {
+            anyhow::bail!(
+                "V8 profile has {} samples but {} timeDeltas",
+                profile.samples.len(),
+                profile.time_deltas.len()
+            );
+        }
+
         // Build node-id → index map and parent map
         let id_to_idx: HashMap<u64, usize> = profile
             .nodes
@@ -360,10 +472,14 @@ impl ProfileData {
         // Collapse consecutive recursive calls to the same frame so that
         // e.g. ackermann→ackermann→ackermann appears as a single frame
         // in the stack rather than inflating inclusive time.
-        let build_stack = |node_id: u64| -> Vec<usize> {
+        let build_stack = |node_id: u64| -> Result<Vec<usize>> {
             let mut stack = Vec::new();
             let mut id = node_id;
+            let mut visited = HashSet::new();
             loop {
+                if !visited.insert(id) {
+                    anyhow::bail!("V8 profile node graph contains a cycle at node {id}");
+                }
                 if let Some(&node_idx) = id_to_idx.get(&id) {
                     let frame_idx = node_to_frame[node_idx];
                     // Skip if same frame as the previous entry (recursion)
@@ -377,7 +493,7 @@ impl ProfileData {
                 }
             }
             stack.reverse();
-            stack
+            Ok(stack)
         };
 
         // Convert samples + timeDeltas into Speedscope evented format
@@ -386,8 +502,11 @@ impl ProfileData {
         let mut prev_stack: Vec<usize> = Vec::new();
 
         for (i, &sample_id) in profile.samples.iter().enumerate() {
-            let stack = build_stack(sample_id);
+            let stack = build_stack(sample_id)?;
             let delta = profile.time_deltas[i] / 1000.0; // microseconds → ms
+            if !delta.is_finite() || delta < 0.0 {
+                anyhow::bail!("V8 profile contains an invalid time delta");
+            }
 
             // Find common prefix length
             let common = prev_stack
@@ -2448,6 +2567,42 @@ Duration: 1s
     }
 
     #[test]
+    fn load_v8_cpuprofile_rejects_parent_cycles() {
+        let cyclic = r#"{
+            "nodes": [
+                {"id":1,"callFrame":{"functionName":"a","scriptId":"1","url":"a.js","lineNumber":0,"columnNumber":0},"children":[2]},
+                {"id":2,"callFrame":{"functionName":"b","scriptId":"1","url":"a.js","lineNumber":1,"columnNumber":0},"children":[1]}
+            ],
+            "startTime":0,"endTime":1,"samples":[1],"timeDeltas":[1]
+        }"#;
+        let error = match ProfileData::load_v8_cpuprofile(cyclic) {
+            Ok(_) => panic!("cyclic parent graph was accepted"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("cycle"));
+    }
+
+    #[test]
+    fn speedscope_rejects_a_close_for_the_wrong_open_frame() {
+        let malformed = r#"{
+            "shared":{"frames":[{"name":"a"},{"name":"b"}]},
+            "profiles":[{"events":[
+                {"type":"O","at":0.0,"frame":0},
+                {"type":"O","at":1.0,"frame":1},
+                {"type":"C","at":2.0,"frame":0}
+            ]}]
+        }"#;
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("bad.json");
+        std::fs::write(&path, malformed).unwrap();
+        let error = match ProfileData::load(&path) {
+            Ok(_) => panic!("mismatched close event was accepted"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("does not match"));
+    }
+
+    #[test]
     fn load_v8_cpuprofile_has_time() {
         let p = ProfileData::load_v8_cpuprofile(&sample_v8_cpuprofile()).unwrap();
         assert!(p.total_time > 0.0);
@@ -2612,5 +2767,17 @@ Duration: 1s
         let p = ProfileData::load(&path).unwrap();
         assert_eq!(p.frames.len(), 4);
         assert!(p.frames[2].name.contains("compute"));
+    }
+
+    #[test]
+    fn v8_sample_and_delta_lengths_must_match() {
+        let input = r#"{
+            "nodes": [], "samples": [1], "timeDeltas": []
+        }"#;
+        let error = match ProfileData::load_str(input, Some("cpuprofile")) {
+            Ok(_) => panic!("mismatched V8 sample lengths were accepted"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("samples but"), "{error:#}");
     }
 }

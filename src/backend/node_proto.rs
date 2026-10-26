@@ -26,7 +26,15 @@ impl Backend for NodeProtoBackend {
     }
 
     fn types(&self) -> &'static [&'static str] {
-        &["node-proto", "node", "nodejs", "js", "javascript", "ts", "typescript"]
+        &[
+            "node-proto",
+            "node",
+            "nodejs",
+            "js",
+            "javascript",
+            "ts",
+            "typescript",
+        ]
     }
 
     fn spawn_config(&self, target: &str, _args: &[String]) -> anyhow::Result<SpawnConfig> {
@@ -83,6 +91,10 @@ impl Backend for NodeProtoBackend {
         "help"
     }
 
+    fn supports_help_command(&self) -> bool {
+        false
+    }
+
     fn parse_help(&self, _raw: &str) -> String {
         "node-proto: cont, step, next, out, backtrace, breakpoints, \
          sb(file, line), print <expr>, .exit"
@@ -90,7 +102,10 @@ impl Backend for NodeProtoBackend {
     }
 
     fn adapters(&self) -> Vec<(&'static str, &'static str)> {
-        vec![("javascript.md", include_str!("../../skills/adapters/javascript.md"))]
+        vec![(
+            "javascript.md",
+            include_str!("../../skills/references/adapters/javascript.md"),
+        )]
     }
 
     fn canonical_ops(&self) -> Option<&dyn CanonicalOps> {
@@ -202,5 +217,15 @@ impl CanonicalOps for NodeProtoBackend {
         // The inspector transport already emits a JSON object as the
         // `locals` response — just round-trip it.
         serde_json::from_str(output.trim()).ok()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn inspector_transport_rejects_native_help() {
+        assert!(!NodeProtoBackend.supports_help_command());
     }
 }

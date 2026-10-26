@@ -6,6 +6,8 @@
 use super::fixtures::*;
 use crate::commands;
 use crate::db::GpuDb;
+use crate::parsers::chrome_trace::import_chrome_trace;
+use crate::parsers::ncu::import_ncu_csv;
 use rusqlite::params;
 
 // -----------------------------------------------------------------------
@@ -97,7 +99,7 @@ fn ncu_csv_edge_cases() {
     // Second kernel with memory metric
     writeln!(
         tmp,
-        r#""2","other_kernel","dram__throughput.avg.pct_of_peak_sustained_elapsed","%","65.2""#
+        r#""2","other_kernel","gpu__compute_memory_throughput.avg.pct_of_peak_sustained_elapsed","%","65.2""#
     )
     .unwrap();
     writeln!(
@@ -148,6 +150,120 @@ fn ncu_csv_edge_cases() {
     assert_eq!(
         bound, "memory",
         "65.2% mem vs 12.0% compute should be memory-bound"
+    );
+
+    // The roofline command must be able to read nullable hardware metrics.
+    let pat = "%".to_string();
+    let rows: Vec<_> = db.query_vec(
+        "SELECT kernel_name, boundedness, compute_throughput_pct,
+                memory_throughput_pct, occupancy_pct
+         FROM metrics m WHERE kernel_name LIKE ?1 ESCAPE '\\' AND
+              (m.layer_id = ?2 OR m.layer_id IS NULL)",
+        rusqlite::params![pat, lid],
+        |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, Option<f64>>(2)?,
+                row.get::<_, Option<f64>>(3)?,
+                row.get::<_, Option<f64>>(4)?,
+            ))
+        },
+    );
+    assert_eq!(rows.len(), 2, "roofline query should return both kernels");
+
+    let sql = format!(
+        "SELECT kernel_name, boundedness, compute_throughput_pct,
+                memory_throughput_pct, occupancy_pct
+         FROM metrics m WHERE kernel_name LIKE ?1 ESCAPE '\\' AND {}",
+        db.metric_filter_for("m")
+    );
+    let command_rows: Vec<_> = db.query_vec(&sql, [&pat], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, Option<String>>(1)?,
+            row.get::<_, Option<f64>>(2)?,
+            row.get::<_, Option<f64>>(3)?,
+            row.get::<_, Option<f64>>(4)?,
+        ))
+    });
+    assert_eq!(
+        command_rows.len(),
+        2,
+        "the exact roofline command query should return both kernels"
+    );
+}
+
+#[test]
+fn ncu_oversized_input_fails_closed() {
+    const MAX: u64 = 256 * 1024 * 1024;
+    let dir = tempfile::tempdir().unwrap();
+    let ncu = dir.path().join("oversized.csv");
+    std::fs::File::create(&ncu)
+        .unwrap()
+        .set_len(MAX + 1)
+        .unwrap();
+    let db = GpuDb::create(&dir.path().join("session.gpu.db")).unwrap();
+    let ncu_layer = db
+        .add_layer("ncu", "oversized.csv", None, None, None)
+        .unwrap();
+
+    assert!(
+        import_ncu_csv(&db.conn, &ncu, ncu_layer)
+            .unwrap_err()
+            .to_string()
+            .contains("too large")
+    );
+}
+
+#[test]
+fn chrome_trace_rejects_oversized_integer_fields() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("bad-grid.json");
+    std::fs::write(
+        &path,
+        r#"{"traceEvents":[{"name":"k","cat":"kernel","ph":"X","args":{"grid":[4294967296,1,1],"block":[1,1,1]}}]}"#,
+    )
+    .unwrap();
+    let db = GpuDb::create(&dir.path().join("session.gpu.db")).unwrap();
+    let layer = db
+        .add_layer("torch", "bad-grid.json", None, None, None)
+        .unwrap();
+    let error = import_chrome_trace(&db.conn, &path, layer)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("grid[0]") || error.contains("u32"),
+        "{error}"
+    );
+}
+
+#[test]
+fn ncu_requires_candidate_header_and_required_columns() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = GpuDb::create(&dir.path().join("session.gpu.db")).unwrap();
+    let no_header = dir.path().join("no-header.csv");
+    std::fs::write(&no_header, "hello\nworld\n").unwrap();
+    let layer = db
+        .add_layer("ncu", "no-header.csv", None, None, None)
+        .unwrap();
+    assert!(
+        import_ncu_csv(&db.conn, &no_header, layer)
+            .unwrap_err()
+            .to_string()
+            .contains("no candidate header")
+    );
+
+    let missing = dir.path().join("missing.csv");
+    std::fs::write(&missing, "Kernel Name,Metric Name\nk,m\n").unwrap();
+    let layer = db
+        .add_layer("ncu", "missing.csv", None, None, None)
+        .unwrap();
+    assert!(
+        import_ncu_csv(&db.conn, &missing, layer)
+            .unwrap_err()
+            .to_string()
+            .contains("missing one or more required columns")
     );
 }
 
@@ -534,7 +650,7 @@ fn suggest_ncu_regex_is_valid() {
 }
 
 // -----------------------------------------------------------------------
-// Chrome trace parser: op aggregation sums CPU time correctly
+// Chrome trace parser: repeated op invocations keep launch identity
 // -----------------------------------------------------------------------
 
 #[test]
@@ -552,9 +668,10 @@ fn chrome_trace_op_cpu_time_aggregation() {
         "traceEvents": [
             // Kernel launch
             {"ph": "X", "cat": "kernel", "name": "gemm_kernel", "ts": 100.0, "dur": 50.0, "args": {}},
-            // Two invocations of the same op (should sum CPU time)
+            // Two invocations of the same op must remain separate rows.
             {"ph": "X", "cat": "cpu_op", "name": "aten::mm", "ts": 90.0, "dur": 80.0, "args": {}},
             {"ph": "X", "cat": "cpu_op", "name": "aten::mm", "ts": 200.0, "dur": 30.0, "args": {}},
+            {"ph": "X", "cat": "kernel", "name": "gemm_kernel", "ts": 220.0, "dur": 20.0, "args": {}},
             // A different op
             {"ph": "X", "cat": "cpu_op", "name": "aten::add", "ts": 300.0, "dur": 10.0, "args": {}},
         ]
@@ -565,19 +682,28 @@ fn chrome_trace_op_cpu_time_aggregation() {
 
     import_chrome_trace(&db.conn, tmp.path(), lid).unwrap();
 
-    // aten::mm should have cpu_time = 80 + 30 = 110
+    // The two invocations have separate rows, with their own CPU durations.
     let mm_cpu: f64 = db
         .conn
         .query_row(
-            "SELECT cpu_time_us FROM ops WHERE name = 'aten::mm'",
+            "SELECT SUM(cpu_time_us) FROM ops WHERE name = 'aten::mm'",
             [],
             |row| row.get(0),
         )
         .unwrap();
     assert!(
         (mm_cpu - 110.0).abs() < 0.01,
-        "aten::mm CPU time should be 110 (80+30), got {mm_cpu}"
+        "aten::mm CPU time should sum to 110 (80+30), got {mm_cpu}"
     );
+    let mm_count: i64 = db
+        .conn
+        .query_row(
+            "SELECT COUNT(*) FROM ops WHERE name = 'aten::mm'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(mm_count, 2, "repeated operations must not be merged");
 
     // aten::add should have cpu_time = 10
     let add_cpu: f64 = db
@@ -593,30 +719,36 @@ fn chrome_trace_op_cpu_time_aggregation() {
         "aten::add CPU should be 10, got {add_cpu}"
     );
 
-    // gemm_kernel should be mapped to aten::mm (first containing op)
-    let mapped_op: String = db
+    // Each launch maps to the invocation that contains its timestamp.
+    let mapped_ops: Vec<(f64, f64)> = db
         .conn
-        .query_row(
-            "SELECT o.name FROM op_kernel_map okm JOIN ops o ON o.id = okm.op_id
-         WHERE okm.kernel_name = 'gemm_kernel'",
-            [],
-            |row| row.get(0),
+        .prepare(
+            "SELECT o.cpu_time_us, o.gpu_time_us
+             FROM op_kernel_map okm JOIN ops o ON o.id = okm.op_id
+             WHERE okm.kernel_name = 'gemm_kernel' ORDER BY o.cpu_time_us",
         )
+        .unwrap()
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
         .unwrap();
-    assert_eq!(mapped_op, "aten::mm", "kernel should map to containing op");
+    assert_eq!(mapped_ops.len(), 2, "both launches must be mapped");
+    assert_eq!(mapped_ops[0].0, 30.0);
+    assert_eq!(mapped_ops[1].0, 80.0);
 
-    // aten::mm gpu_time should reflect the kernel (50us)
+    // GPU time is attributed to each invocation, not all launches with the
+    // same kernel name.
     let mm_gpu: f64 = db
         .conn
         .query_row(
-            "SELECT gpu_time_us FROM ops WHERE name = 'aten::mm'",
+            "SELECT SUM(gpu_time_us) FROM ops WHERE name = 'aten::mm'",
             [],
             |row| row.get(0),
         )
         .unwrap();
     assert!(
-        (mm_gpu - 50.0).abs() < 0.01,
-        "aten::mm GPU should be 50, got {mm_gpu}"
+        (mm_gpu - 70.0).abs() < 0.01,
+        "aten::mm GPU should be 70 (50+20), got {mm_gpu}"
     );
 }
 
@@ -681,5 +813,169 @@ fn chrome_trace_innermost_op_wins() {
     assert_eq!(
         ew_op, "aten::linear",
         "elementwise should map to outer op aten::linear"
+    );
+}
+
+#[test]
+fn chrome_trace_correlation_respects_process_and_thread_identity() {
+    use crate::db::GpuDb;
+    use crate::parsers::chrome_trace::import_chrome_trace;
+
+    let db = GpuDb::create(&tempfile::tempdir().unwrap().keep().join("contexts.db")).unwrap();
+    let layer = db
+        .add_layer("torch", "trace.json", None, None, None)
+        .unwrap();
+    let trace = serde_json::json!({
+        "traceEvents": [
+            {"ph":"X", "cat":"cpu_op", "name":"wrong-shorter", "pid":1, "tid":1,
+             "ts":100.0, "dur":20.0, "args":{}},
+            {"ph":"X", "cat":"cpu_op", "name":"right-context", "pid":2, "tid":7,
+             "ts":0.0, "dur":200.0, "args":{}},
+            {"ph":"X", "cat":"kernel", "name":"kernel", "pid":2, "tid":7,
+             "ts":110.0, "dur":5.0, "args":{}}
+        ]
+    });
+    let file = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(file.path(), serde_json::to_vec(&trace).unwrap()).unwrap();
+
+    import_chrome_trace(&db.conn, file.path(), layer).unwrap();
+
+    let mapped: String = db
+        .conn
+        .query_row(
+            "SELECT ops.name FROM op_kernel_map
+             JOIN ops ON ops.id = op_kernel_map.op_id",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(mapped, "right-context");
+}
+
+#[test]
+fn nsys_copy_kinds_and_unified_memory_faults_preserve_their_contract() {
+    use crate::parsers::nsys::import_nsys_rep;
+    use rusqlite::Connection;
+
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("nsys.sqlite");
+    let src = Connection::open(&source).unwrap();
+    src.execute_batch(
+        "CREATE TABLE CUPTI_ACTIVITY_KIND_MEMCPY (
+            copyKind INTEGER, start INTEGER, end INTEGER, bytes INTEGER, streamId INTEGER);
+         CREATE TABLE CUDA_UM_GPU_PAGE_FAULT_EVENTS (numberOfPageFaults INTEGER);
+         INSERT INTO CUDA_UM_GPU_PAGE_FAULT_EVENTS VALUES (4), (7);
+         CREATE TABLE NVTX_EVENTS (text TEXT, start INTEGER, end INTEGER);
+         INSERT INTO NVTX_EVENTS VALUES ('CCCL', -1000, NULL), ('candidate', 1000, 2000);",
+    )
+    .unwrap();
+    let kinds = [
+        (1, "H2D"),
+        (2, "D2H"),
+        (3, "H2Array"),
+        (8, "D2D"),
+        (10, "Peer"),
+        (11, "Unified H2D"),
+        (12, "Unified D2H"),
+        (13, "Unified D2D"),
+        (99, "Unknown"),
+    ];
+    for (kind, _) in kinds {
+        src.execute(
+            "INSERT INTO CUPTI_ACTIVITY_KIND_MEMCPY VALUES (?1, 1000, 2000, 8, 7)",
+            [kind],
+        )
+        .unwrap();
+    }
+    let db = GpuDb::create(&dir.path().join("session.db")).unwrap();
+    let layer = db
+        .import_layer(
+            "nsys",
+            source.to_str().unwrap(),
+            None,
+            None,
+            None,
+            |conn, id| import_nsys_rep(conn, &source, id),
+        )
+        .unwrap();
+    let imported: Vec<String> =
+        db.query_vec("SELECT kind FROM transfers ORDER BY id", [], |r| r.get(0));
+    assert_eq!(imported, kinds.map(|(_, kind)| kind.to_string()));
+    let summary: serde_json::Value =
+        serde_json::from_str(&db.meta(&format!("nsys_um_gpu_faults_{layer}"))).unwrap();
+    assert_eq!(summary, serde_json::json!({"events": 2, "page_faults": 11}));
+    assert_eq!(db.scalar_f64("SELECT COUNT(*) FROM regions"), 1.0);
+    assert_eq!(
+        db.scalar_f64("SELECT duration_us FROM regions WHERE name='candidate'"),
+        1.0
+    );
+    commands::cmd_transfers(&db, &[]);
+
+    src.execute("INSERT INTO CUDA_UM_GPU_PAGE_FAULT_EVENTS VALUES (-1)", [])
+        .unwrap();
+    assert!(
+        db.import_layer(
+            "nsys",
+            source.to_str().unwrap(),
+            None,
+            None,
+            None,
+            |conn, id| import_nsys_rep(conn, &source, id)
+        )
+        .is_err()
+    );
+    assert_eq!(db.scalar_f64("SELECT COUNT(*) FROM layers"), 1.0);
+    assert_eq!(db.transfer_count(), kinds.len());
+    src.execute_batch("DELETE FROM CUPTI_ACTIVITY_KIND_MEMCPY; DELETE FROM NVTX_EVENTS; DELETE FROM CUDA_UM_GPU_PAGE_FAULT_EVENTS WHERE numberOfPageFaults < 0;").unwrap();
+    let faults_only = db
+        .import_layer(
+            "nsys",
+            source.to_str().unwrap(),
+            None,
+            None,
+            None,
+            |conn, id| import_nsys_rep(conn, &source, id),
+        )
+        .unwrap();
+    db.remove_layer(faults_only).unwrap();
+    assert!(
+        db.meta(&format!("nsys_um_gpu_faults_{faults_only}"))
+            .is_empty()
+    );
+}
+
+#[test]
+fn chrome_trace_string_tracks_and_async_external_ids_preserve_identity() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = GpuDb::create(&dir.path().join("tracks.db")).unwrap();
+    let trace = serde_json::json!({"traceEvents": [
+        {"ph":"M", "name":"process_name", "pid":"Spans", "tid":"Profiler"},
+        {"ph":"X", "cat":"cpu_op", "name":"launch", "pid":123, "tid":11, "ts":0, "dur":1, "args":{"External id":42}},
+        {"ph":"X", "cat":"kernel", "name":"async", "pid":0, "tid":7, "ts":10, "dur":3, "args":{"External id":42}},
+        {"ph":"X", "cat":"cpu_op", "name":"text_track", "pid":"123", "tid":"11", "ts":50, "dur":10},
+        {"ph":"X", "cat":"kernel", "name":"same_text_track", "pid":"123", "tid":"11", "ts":52, "dur":2},
+        {"ph":"X", "cat":"kernel", "name":"different_numeric_track", "pid":123, "tid":11, "ts":52, "dur":2},
+        {"ph":"X", "cat":"cpu_op", "name":"duplicate_one", "ts":100, "dur":10, "args":{"External id":99}},
+        {"ph":"X", "cat":"cpu_op", "name":"duplicate_two", "ts":100, "dur":10, "args":{"External id":99}},
+        {"ph":"X", "cat":"kernel", "name":"ambiguous", "ts":101, "dur":1, "args":{"External id":99}}
+    ]});
+    let path = dir.path().join("trace.json");
+    std::fs::write(&path, trace.to_string()).unwrap();
+    db.import_layer(
+        "torch",
+        path.to_str().unwrap(),
+        None,
+        None,
+        None,
+        |conn, id| import_chrome_trace(conn, &path, id),
+    )
+    .unwrap();
+    let links: Vec<(String,String)> = db.query_vec("SELECT m.kernel_name,o.name FROM op_kernel_map m JOIN ops o ON o.id=m.op_id ORDER BY m.kernel_name", [], |r| Ok((r.get(0)?,r.get(1)?)));
+    assert_eq!(
+        links,
+        vec![
+            ("async".into(), "launch".into()),
+            ("same_text_track".into(), "text_track".into())
+        ]
     );
 }

@@ -26,51 +26,42 @@ impl Backend for StackprofBackend {
 
         // Use environment variables to pass target/args safely into Ruby,
         // avoiding multi-layer shell+Ruby escaping issues.
+        // Environment variables cannot carry NUL bytes. Encode the argument
+        // vector as JSON and let Ruby parse it, which also preserves spaces,
+        // quotes, and empty arguments exactly.
+        let args_json = serde_json::to_string(args)?;
         let ruby_script = format!(
-            "require 'stackprof'; StackProf.run(mode: :cpu, out: '{}', raw: true) {{ load ENV['DBG_TARGET'] }}",
+            "require 'json'; ARGV.replace(JSON.parse(ENV['DBG_ARGS_JSON'])); require 'stackprof'; StackProf.run(mode: :cpu, out: '{}', raw: true) {{ load ENV['DBG_TARGET'] }}",
             dump_str
         );
-        let ruby_script_with_args = format!(
-            "ARGV.replace(ENV['DBG_ARGS'].split('\\x00')); require 'stackprof'; StackProf.run(mode: :cpu, out: '{}', raw: true) {{ load ENV['DBG_TARGET'] }}",
-            dump_str
+        let ruby_cmd = format!(
+            "mkdir -p {} && DBG_TARGET={} DBG_ARGS_JSON={} ruby -e {}",
+            shell_escape(&out_dir_str),
+            shell_escape(target),
+            shell_escape(&args_json),
+            shell_escape(&ruby_script)
         );
-
-        let ruby_cmd = if args.is_empty() {
-            format!(
-                "mkdir -p {} && DBG_TARGET={} ruby -e {}",
-                shell_escape(&out_dir_str), shell_escape(target), shell_escape(&ruby_script)
-            )
-        } else {
-            let joined_args = args.join("\x00");
-            format!(
-                "mkdir -p {} && DBG_TARGET={} DBG_ARGS={} ruby -e {}",
-                shell_escape(&out_dir_str), shell_escape(target), shell_escape(&joined_args), shell_escape(&ruby_script_with_args)
-            )
-        };
 
         // Convert stackprof dump to callgrind format, fail if output is empty
         let convert_cmd = format!(
             "stackprof {} --callgrind > {} && test -s {}",
-            shell_escape(&dump_str), shell_escape(&cg_str), shell_escape(&cg_str)
+            shell_escape(&dump_str),
+            shell_escape(&cg_str),
+            shell_escape(&cg_str)
         );
 
         let dbg_bin = super::self_exe();
         let exec_repl = format!(
             "exec {} --phpprofile-repl {} --profile-prompt 'ruby-profile> '",
-            dbg_bin, cg_str
+            shell_escape(&dbg_bin),
+            shell_escape(&cg_str)
         );
 
         Ok(SpawnConfig {
             bin: "bash".into(),
             args: vec!["--norc".into(), "--noprofile".into()],
-            env: vec![
-                ("PS1".into(), "ruby-profile> ".into()),
-            ],
-            init_commands: vec![
-                ruby_cmd,
-                convert_cmd,
-                exec_repl,
-            ],
+            env: vec![("PS1".into(), "ruby-profile> ".into())],
+            init_commands: vec![ruby_cmd, convert_cmd, exec_repl],
         })
     }
 
@@ -104,6 +95,10 @@ impl Backend for StackprofBackend {
         "hotspots"
     }
 
+    fn is_profile_backend(&self) -> bool {
+        true
+    }
+
     fn quit_command(&self) -> &'static str {
         "exit"
     }
@@ -113,9 +108,11 @@ impl Backend for StackprofBackend {
     }
 
     fn adapters(&self) -> Vec<(&'static str, &'static str)> {
-        vec![("ruby-profile.md", include_str!("../../skills/adapters/ruby-profile.md"))]
+        vec![(
+            "ruby-profile.md",
+            include_str!("../../skills/references/adapters/ruby-profile.md"),
+        )]
     }
-
 }
 
 #[cfg(test)]
@@ -145,7 +142,7 @@ mod tests {
             .unwrap();
         let cmd = &cfg.init_commands[0];
         assert!(cmd.contains("DBG_TARGET=test.rb"));
-        assert!(cmd.contains("DBG_ARGS=--flag"));
+        assert!(cmd.contains("DBG_ARGS_JSON='[\"--flag\"]'"), "{cmd}");
     }
 
     #[test]
@@ -166,17 +163,21 @@ mod tests {
             .unwrap();
         let cmd = &cfg.init_commands[0];
         // Target with single quote is shell-escaped via env var
-        assert!(cmd.contains("DBG_TARGET="), "target not passed via env: {cmd}");
+        assert!(
+            cmd.contains("DBG_TARGET="),
+            "target not passed via env: {cmd}"
+        );
         assert!(cmd.contains("it"), "target not present: {cmd}");
     }
 
     #[test]
     fn spawn_config_escapes_shell_metacharacters() {
-        let cfg = StackprofBackend
-            .spawn_config("$(evil).rb", &[])
-            .unwrap();
+        let cfg = StackprofBackend.spawn_config("$(evil).rb", &[]).unwrap();
         let cmd = &cfg.init_commands[0];
         // Shell metacharacters must be escaped in the DBG_TARGET value
-        assert!(cmd.contains("'$(evil).rb'"), "shell metacharacter not escaped: {cmd}");
+        assert!(
+            cmd.contains("'$(evil).rb'"),
+            "shell metacharacter not escaped: {cmd}"
+        );
     }
 }

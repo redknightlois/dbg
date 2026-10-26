@@ -7,8 +7,8 @@
 //!     `disasm`, `source`, ...) that operate on the SessionDb and
 //!     optionally reach back to the live debugger for `at-hit`.
 //!
-//! The top-level `dispatch` tries `debug` first, then `crosstrack`,
-//! and hands back a unified `Dispatched` verdict.
+//! The top-level dispatcher first routes lifecycle, instruction-hit, and
+//! cross-track commands. It then routes commands that require a live backend.
 
 pub mod crosstrack;
 pub mod debug;
@@ -53,30 +53,74 @@ pub enum Dispatched {
 ///   3. canonical debug verbs (break / step / continue / …)
 ///   4. Fallthrough → daemon runs the legacy passthrough path.
 pub fn dispatch(input: &str, backend: &dyn Backend) -> Dispatched {
-    if let Some(d) = lifecycle::try_dispatch(input) {
-        return d;
-    }
-    if let Some(d) = insnhits::try_dispatch(input) {
-        return d;
-    }
-    if let Some(d) = crosstrack::try_dispatch(input) {
-        return d;
-    }
-    debug::dispatch_to(input, backend)
+    dispatch_no_backend(input).unwrap_or_else(|| debug::dispatch_to(input, backend))
 }
 
-/// Dispatch variant for contexts without a live backend (e.g.
-/// `dbg replay`). Returns `None` for debug verbs (step/continue/…)
-/// since those require a live debugger.
+/// Dispatch commands that do not require a live backend. This is also the
+/// common first stage for live dispatch, so live and replay sessions use the
+/// same command precedence.
 pub fn dispatch_no_backend(input: &str) -> Option<Dispatched> {
-    if let Some(d) = lifecycle::try_dispatch(input) {
-        return Some(d);
+    lifecycle::try_dispatch(input)
+        .or_else(|| insnhits::try_dispatch(input))
+        .or_else(|| crosstrack::try_dispatch(input))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::backend::lldb::LldbBackend;
+
+    #[test]
+    fn live_dispatch_routes_each_command_family() {
+        let backend = LldbBackend;
+
+        assert!(matches!(
+            dispatch("sessions", &backend),
+            Dispatched::Lifecycle(_)
+        ));
+        assert!(matches!(
+            dispatch("insn-hits main", &backend),
+            Dispatched::InsnHits(_)
+        ));
+        assert!(matches!(
+            dispatch("hits main.rs:1", &backend),
+            Dispatched::Query(_)
+        ));
+        assert!(matches!(
+            dispatch("continue", &backend),
+            Dispatched::Native {
+                canonical_op: "continue",
+                ..
+            }
+        ));
+        assert!(matches!(
+            dispatch("an-unknown-command", &backend),
+            Dispatched::Fallthrough
+        ));
     }
-    if let Some(d) = insnhits::try_dispatch(input) {
-        return Some(d);
+
+    #[test]
+    fn backend_free_dispatch_matches_live_precedence() {
+        let backend = LldbBackend;
+        let inputs = ["sessions", "insn-hits main", "hits main.rs:1"];
+
+        for input in inputs {
+            let live = dispatch(input, &backend);
+            let replay = dispatch_no_backend(input).expect("backend-free command");
+            assert_eq!(variant_name(&live), variant_name(&replay), "input: {input}");
+        }
+        assert!(dispatch_no_backend("continue").is_none());
+        assert!(dispatch_no_backend("an-unknown-command").is_none());
     }
-    if let Some(d) = crosstrack::try_dispatch(input) {
-        return Some(d);
+
+    fn variant_name(dispatched: &Dispatched) -> &'static str {
+        match dispatched {
+            Dispatched::Native { .. } => "native",
+            Dispatched::Immediate(_) => "immediate",
+            Dispatched::Query(_) => "query",
+            Dispatched::Lifecycle(_) => "lifecycle",
+            Dispatched::InsnHits(_) => "insn-hits",
+            Dispatched::Fallthrough => "fallthrough",
+        }
     }
-    None
 }

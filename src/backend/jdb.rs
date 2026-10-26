@@ -3,7 +3,7 @@ use std::sync::OnceLock;
 use regex::Regex;
 use serde_json::{Map, Value};
 
-use super::canonical::{BreakLoc, CanonicalOps, HitEvent};
+use super::canonical::{BreakLoc, CanonicalOps, HitEvent, unsupported};
 use super::{Backend, Dependency, DependencyCheck, SpawnConfig};
 
 pub struct JdbBackend;
@@ -72,7 +72,8 @@ impl Backend for JdbBackend {
         let mut saw_exit = false;
         for line in output.lines() {
             let trimmed = line.trim();
-            if trimmed.starts_with("Set breakpoint") || trimmed.starts_with("Deferring breakpoint") {
+            if trimmed.starts_with("Set breakpoint") || trimmed.starts_with("Deferring breakpoint")
+            {
                 saw_deferred_bp = true;
                 continue;
             }
@@ -84,7 +85,9 @@ impl Backend for JdbBackend {
             {
                 saw_exit = true;
             }
-            if trimmed.contains("thread") && (trimmed.contains("started") || trimmed.contains("died")) {
+            if trimmed.contains("thread")
+                && (trimmed.contains("started") || trimmed.contains("died"))
+            {
                 continue;
             }
             lines.push(line);
@@ -109,43 +112,75 @@ impl Backend for JdbBackend {
     }
 
     fn adapters(&self) -> Vec<(&'static str, &'static str)> {
-        vec![("java.md", include_str!("../../skills/adapters/java.md"))]
+        vec![(
+            "java.md",
+            include_str!("../../skills/references/adapters/java.md"),
+        )]
     }
 
-    fn canonical_ops(&self) -> Option<&dyn CanonicalOps> { Some(self) }
+    fn canonical_ops(&self) -> Option<&dyn CanonicalOps> {
+        Some(self)
+    }
 }
 
 impl CanonicalOps for JdbBackend {
-    fn tool_name(&self) -> &'static str { "jdb" }
-    fn auto_capture_locals(&self) -> bool { false }
+    fn tool_name(&self) -> &'static str {
+        "jdb"
+    }
+    fn auto_capture_locals(&self) -> bool {
+        false
+    }
 
     fn op_break(&self, loc: &BreakLoc) -> anyhow::Result<String> {
         Ok(match loc {
             BreakLoc::FileLine { file, line } => {
-                // jdb expects `stop at <ClassName>:<line>`, not a file path.
-                // Strip the directory and `.java` extension to get the class name.
-                let class = std::path::Path::new(file)
-                    .file_stem()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or(file);
+                // Preserve package qualifiers. jdb resolves `a.b.Main:10`
+                // differently from an unqualified `Main:10` when classes
+                // with the same simple name are loaded.
+                let class = jdb_location_class(file, *line);
                 format!("stop at {class}:{line}")
             }
             BreakLoc::Fqn(name) => format!("stop at {name}"),
             BreakLoc::ModuleMethod { module, method } => format!("stop at {module}.{method}"),
         })
     }
-    fn op_run(&self, _args: &[String]) -> anyhow::Result<String> { Ok("run".into()) }
-    fn op_continue(&self) -> anyhow::Result<String> { Ok("cont".into()) }
-    fn op_step(&self) -> anyhow::Result<String> { Ok("step".into()) }
-    fn op_next(&self) -> anyhow::Result<String> { Ok("next".into()) }
-    fn op_finish(&self) -> anyhow::Result<String> { Ok("step up".into()) }
-    fn op_stack(&self, _n: Option<u32>) -> anyhow::Result<String> { Ok("where".into()) }
-    fn op_frame(&self, n: u32) -> anyhow::Result<String> { Ok(format!("up {n}")) }
-    fn op_locals(&self) -> anyhow::Result<String> { Ok("locals".into()) }
-    fn op_print(&self, expr: &str) -> anyhow::Result<String> { Ok(format!("print {expr}")) }
-    fn op_threads(&self) -> anyhow::Result<String> { Ok("threads".into()) }
-    fn op_thread(&self, n: u32) -> anyhow::Result<String> { Ok(format!("thread {n}")) }
-    fn op_list(&self, _loc: Option<&str>) -> anyhow::Result<String> { Ok("list".into()) }
+    fn op_run(&self, _args: &[String]) -> anyhow::Result<String> {
+        Ok("run".into())
+    }
+    fn op_continue(&self) -> anyhow::Result<String> {
+        Ok("cont".into())
+    }
+    fn op_step(&self) -> anyhow::Result<String> {
+        Ok("step".into())
+    }
+    fn op_next(&self) -> anyhow::Result<String> {
+        Ok("next".into())
+    }
+    fn op_finish(&self) -> anyhow::Result<String> {
+        Ok("step up".into())
+    }
+    fn op_stack(&self, _n: Option<u32>) -> anyhow::Result<String> {
+        Ok("where".into())
+    }
+    fn op_frame(&self, n: u32) -> anyhow::Result<String> {
+        let _ = n;
+        Err(unsupported("jdb", "absolute frame selection"))
+    }
+    fn op_locals(&self) -> anyhow::Result<String> {
+        Ok("locals".into())
+    }
+    fn op_print(&self, expr: &str) -> anyhow::Result<String> {
+        Ok(format!("print {expr}"))
+    }
+    fn op_threads(&self) -> anyhow::Result<String> {
+        Ok("threads".into())
+    }
+    fn op_thread(&self, n: u32) -> anyhow::Result<String> {
+        Ok(format!("thread {n}"))
+    }
+    fn op_list(&self, _loc: Option<&str>) -> anyhow::Result<String> {
+        Ok("list".into())
+    }
     fn op_breaks(&self) -> anyhow::Result<String> {
         // jdb has no dedicated "breakpoint list" verb; the default
         // `breakpoint` sent by the canonical trait yields
@@ -195,12 +230,12 @@ impl CanonicalOps for JdbBackend {
                     // `dbg hits Broken.java:35` matches via
                     // `stem_line_key` → `Broken:35`.
                     let class_part = symbol.rsplit_once('.').map(|x| x.0).unwrap_or(&symbol);
-                    let outer_class = class_part.rsplit_once('$').map(|x| x.0).unwrap_or(class_part);
-                    // Further strip package prefix so `com.foo.Broken` →
-                    // `Broken` for the key.
-                    let short = outer_class.rsplit_once('.').map(|x| x.1).unwrap_or(outer_class);
+                    let outer_class = class_part
+                        .rsplit_once('$')
+                        .map(|x| x.0)
+                        .unwrap_or(class_part);
                     return Some(HitEvent {
-                        location_key: format!("{short}:{line_no}"),
+                        location_key: format!("{outer_class}:{line_no}"),
                         thread: Some(thread),
                         frame_symbol: Some(symbol),
                         file: None,
@@ -220,14 +255,204 @@ impl CanonicalOps for JdbBackend {
             let line = line.trim();
             if let Some((name, val)) = line.split_once(" = ") {
                 let name = name.trim().to_string();
-                if name.is_empty() || name.contains(' ') { continue; }
+                if name.is_empty() || name.contains(' ') {
+                    continue;
+                }
                 let mut entry = Map::new();
                 entry.insert("value".into(), Value::String(val.trim().to_string()));
                 obj.insert(name, Value::Object(entry));
             }
         }
-        if obj.is_empty() { None } else { Some(Value::Object(obj)) }
+        if obj.is_empty() {
+            None
+        } else {
+            Some(Value::Object(obj))
+        }
     }
+}
+
+fn jdb_class_name(file: &str) -> String {
+    let stem = file
+        .strip_suffix(".java")
+        .or_else(|| file.strip_suffix(".kt"))
+        .unwrap_or(file)
+        .replace('\\', "/");
+    let relative = [
+        "src/main/java/",
+        "src/test/java/",
+        "src/",
+        "java/",
+        "kotlin/",
+    ]
+    .iter()
+    .find_map(|root| stem.find(root).map(|i| &stem[i + root.len()..]));
+    let class = relative.unwrap_or_else(|| {
+        if stem.starts_with('/') {
+            stem.rsplit('/').next().unwrap_or(&stem)
+        } else {
+            &stem
+        }
+    });
+    class.replace('/', ".")
+}
+
+fn jdb_location_class(file: &str, line: u32) -> String {
+    let outer = jdb_class_name(file);
+    let path = std::path::Path::new(file);
+    let source_path = if path.is_file() {
+        path.to_path_buf()
+    } else if let Ok(cwd) = std::env::current_dir() {
+        cwd.join(path)
+    } else {
+        return outer;
+    };
+    let Ok(source) = std::fs::read_to_string(source_path) else {
+        return outer;
+    };
+
+    let source = sanitize_java_source(&source);
+    static CLASS_RE: OnceLock<Regex> = OnceLock::new();
+    let class_re = CLASS_RE.get_or_init(|| {
+        Regex::new(r"\b(?:class|interface|enum|record)\s+([A-Za-z_$][A-Za-z0-9_$]*)").unwrap()
+    });
+
+    let mut depth = 0usize;
+    let mut classes: Vec<(String, usize)> = Vec::new();
+    let mut pending = Vec::new();
+    for (index, text) in source.lines().enumerate() {
+        let source_line = index as u32 + 1;
+        let declarations: Vec<(usize, String)> = class_re
+            .captures_iter(text)
+            .filter_map(|capture| Some((capture.get(0)?.start(), capture[1].to_string())))
+            .collect();
+        let mut declaration_index = 0;
+
+        if source_line == line {
+            let nested: Vec<&str> = classes
+                .iter()
+                .skip(1)
+                .map(|(name, _)| name.as_str())
+                .collect();
+            if !nested.is_empty() {
+                return format!("{}${}", outer, nested.join("$"));
+            }
+        }
+
+        for (position, character) in text.char_indices() {
+            match character {
+                '{' => {
+                    if declaration_index < declarations.len()
+                        && declarations[declaration_index].0 < position
+                    {
+                        pending.push(declarations[declaration_index].1.clone());
+                        declaration_index += 1;
+                    }
+                    if let Some(name) = pending.pop() {
+                        classes.push((name, depth));
+                    }
+                    depth += 1;
+                }
+                '}' => {
+                    depth = depth.saturating_sub(1);
+                    while classes
+                        .last()
+                        .is_some_and(|(_, open_depth)| *open_depth >= depth)
+                    {
+                        classes.pop();
+                    }
+                }
+                _ => {}
+            }
+        }
+        pending.extend(
+            declarations
+                .into_iter()
+                .skip(declaration_index)
+                .map(|(_, name)| name),
+        );
+    }
+    outer
+}
+
+/// Replace comments and string contents with spaces before scanning braces.
+/// This keeps source positions while preventing text from changing scope.
+fn sanitize_java_source(source: &str) -> String {
+    let mut clean = String::with_capacity(source.len());
+    let bytes = source.as_bytes();
+    let mut index = 0;
+    let mut block_comment = false;
+    let mut quote = None;
+    let mut text_block = false;
+    while index < bytes.len() {
+        if block_comment {
+            if bytes[index..].starts_with(b"*/") {
+                clean.push(' ');
+                clean.push(' ');
+                index += 2;
+                block_comment = false;
+            } else {
+                clean.push(if bytes[index] == b'\n' { '\n' } else { ' ' });
+                index += 1;
+            }
+            continue;
+        }
+        if text_block {
+            if bytes[index..].starts_with(b"\"\"\"") {
+                clean.push_str("   ");
+                index += 3;
+                text_block = false;
+            } else {
+                clean.push(if bytes[index] == b'\n' { '\n' } else { ' ' });
+                index += 1;
+            }
+            continue;
+        }
+        if let Some(end_quote) = quote {
+            if bytes[index] == b'\\' && index + 1 < bytes.len() {
+                clean.push(' ');
+                clean.push(if bytes[index + 1] == b'\n' { '\n' } else { ' ' });
+                index += 2;
+            } else if bytes[index] as char == end_quote {
+                clean.push(' ');
+                index += 1;
+                quote = None;
+            } else {
+                clean.push(if bytes[index] == b'\n' { '\n' } else { ' ' });
+                index += 1;
+            }
+            continue;
+        }
+        if bytes[index..].starts_with(b"//") {
+            clean.push_str("  ");
+            index += 2;
+            while index < bytes.len() && bytes[index] != b'\n' {
+                clean.push(' ');
+                index += 1;
+            }
+            continue;
+        }
+        if bytes[index..].starts_with(b"/*") {
+            clean.push_str("  ");
+            index += 2;
+            block_comment = true;
+            continue;
+        }
+        if bytes[index..].starts_with(b"\"\"\"") {
+            clean.push_str("   ");
+            index += 3;
+            text_block = true;
+            continue;
+        }
+        if bytes[index] == b'"' || bytes[index] == b'\'' {
+            clean.push(' ');
+            quote = Some(bytes[index] as char);
+            index += 1;
+            continue;
+        }
+        clean.push(bytes[index] as char);
+        index += 1;
+    }
+    clean
 }
 
 #[cfg(test)]
@@ -237,6 +462,12 @@ mod tests {
     #[test]
     fn format_breakpoint() {
         assert_eq!(JdbBackend.format_breakpoint("Main:10"), "stop at Main:10");
+    }
+
+    #[test]
+    fn canonical_frame_does_not_translate_absolute_index_to_relative_up() {
+        let error = JdbBackend.op_frame(2).unwrap_err();
+        assert!(error.to_string().contains("not supported"));
     }
 
     #[test]
@@ -260,8 +491,7 @@ It will be set after the class is loaded.\n\
 The application exited";
         let r = JdbBackend.clean("run", input);
         assert!(
-            r.to_lowercase().contains("javac -g")
-                || r.to_lowercase().contains("debug info"),
+            r.to_lowercase().contains("javac -g") || r.to_lowercase().contains("debug info"),
             "expected -g hint when bp didn't fire before exit, got: {}",
             r
         );
@@ -294,7 +524,10 @@ The application exited";
     fn parse_hit_breakpoint_banner() {
         let raw = "> \nBreakpoint hit: \"thread=main\", Algos.fibonacci(), line=17 bci=13\n17                long next = a + b;\n\nmain[1] ";
         let hit = JdbBackend.parse_hit(raw);
-        assert!(hit.is_some(), "parse_hit should match jdb breakpoint banner");
+        assert!(
+            hit.is_some(),
+            "parse_hit should match jdb breakpoint banner"
+        );
         let hit = hit.unwrap();
         assert_eq!(hit.thread.as_deref(), Some("main"));
         assert_eq!(hit.frame_symbol.as_deref(), Some("Algos.fibonacci"));
@@ -306,8 +539,11 @@ The application exited";
         // Line breakpoints in methods with parameters used to return
         // None — the regex required empty `()`. This is the exact
         // banner the jdb docs show for such a break.
-        let raw = "Breakpoint hit: \"thread=main\", Broken.merge(int[], int, int), line=35 bci=12\n";
-        let hit = JdbBackend.parse_hit(raw).expect("should match parameterized method");
+        let raw =
+            "Breakpoint hit: \"thread=main\", Broken.merge(int[], int, int), line=35 bci=12\n";
+        let hit = JdbBackend
+            .parse_hit(raw)
+            .expect("should match parameterized method");
         assert_eq!(hit.line, Some(35));
         assert_eq!(hit.location_key, "Broken:35");
         assert_eq!(hit.frame_symbol.as_deref(), Some("Broken.merge"));
@@ -319,14 +555,97 @@ The application exited";
         let hit = JdbBackend.parse_hit(raw).expect("nested class");
         assert_eq!(hit.line, Some(42));
         // Outer class, package stripped, $Inner stripped.
-        assert_eq!(hit.location_key, "Outer:42");
+        assert_eq!(hit.location_key, "com.x.Outer:42");
+    }
+
+    #[test]
+    fn file_breakpoint_keeps_java_package_qualifier() {
+        assert_eq!(
+            JdbBackend
+                .op_break(&BreakLoc::FileLine {
+                    file: "src/com/example/Main.java".into(),
+                    line: 12,
+                })
+                .unwrap(),
+            "stop at com.example.Main:12"
+        );
+    }
+
+    #[test]
+    fn file_breakpoint_targets_nested_class_at_source_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("Broken.java");
+        std::fs::write(
+            &source,
+            "public class Broken {\n    static class Sku {\n        boolean same() {\n            return true;\n        }\n    }\n}\n",
+        )
+        .unwrap();
+        assert_eq!(
+            JdbBackend
+                .op_break(&BreakLoc::FileLine {
+                    file: source.to_string_lossy().into_owned(),
+                    line: 4,
+                })
+                .unwrap(),
+            "stop at Broken$Sku:4"
+        );
+    }
+
+    #[test]
+    fn file_breakpoint_ignores_braces_in_comments_and_strings() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("Broken.java");
+        std::fs::write(
+            &source,
+            "class Broken {\n    static class Sku {\n        String text = \"}\"; // }\n        void run() {\n            return;\n        }\n    }\n}\n",
+        )
+        .unwrap();
+        assert_eq!(
+            JdbBackend
+                .op_break(&BreakLoc::FileLine {
+                    file: source.to_string_lossy().into_owned(),
+                    line: 5,
+                })
+                .unwrap(),
+            "stop at Broken$Sku:5"
+        );
+    }
+
+    #[test]
+    fn file_breakpoint_accepts_class_brace_on_next_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("Broken.java");
+        std::fs::write(
+            &source,
+            "class Broken\n{\n    static class Sku\n    {\n        void run() {}\n    }\n}\n",
+        )
+        .unwrap();
+        assert_eq!(
+            JdbBackend
+                .op_break(&BreakLoc::FileLine {
+                    file: source.to_string_lossy().into_owned(),
+                    line: 5,
+                })
+                .unwrap(),
+            "stop at Broken$Sku:5"
+        );
     }
 
     #[test]
     fn parse_locals_simple() {
         let output = "a = 0\nb = 1\nnext = 1\ni = 0";
         let v = JdbBackend.parse_locals(output).expect("should parse");
-        assert_eq!(v.as_object().unwrap().get("a").unwrap().get("value").unwrap().as_str().unwrap(), "0");
+        assert_eq!(
+            v.as_object()
+                .unwrap()
+                .get("a")
+                .unwrap()
+                .get("value")
+                .unwrap()
+                .as_str()
+                .unwrap(),
+            "0"
+        );
     }
 
     #[test]

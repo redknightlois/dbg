@@ -446,7 +446,7 @@ fn cmd_replay(args: &[String]) -> Result<()> {
             dbg_cli::session_db::SCHEMA_VERSION
         );
     }
-    let db = dbg_cli::session_db::SessionDb::open(&path)?;
+    let db = dbg_cli::session_db::SessionDb::open_read_only(&path)?;
 
     // Dump high-level info, then either execute a one-shot query from
     // any trailing args or drop into a minimal REPL.
@@ -469,7 +469,7 @@ fn cmd_replay(args: &[String]) -> Result<()> {
     // write-only — top/callers/callees would all bail because no live
     // backend is attached. With it, every profile REPL verb works
     // identically against a saved DB.
-    let mut profile = load_profile_from_db(&db);
+    let mut profile = load_profile_from_db(&db)?;
 
     let is_profile = matches!(db.kind(), dbg_cli::session_db::SessionKind::Profile);
     eprintln!("replay `{label}` (target={target}, class={target_class}) — read-only REPL");
@@ -528,15 +528,19 @@ fn cmd_replay(args: &[String]) -> Result<()> {
 }
 
 /// Rebuild a `ProfileData` from the source content stashed in the DB
-/// at session start. Returns `None` when the meta keys are missing
-/// (debug session, or profile session captured before persistence
-/// landed) or when parsing fails.
+/// at session start. Missing source is valid for old/debug sessions;
+/// malformed persisted source is corrupt evidence and is reported.
 pub(crate) fn load_profile_from_db(
     db: &dbg_cli::session_db::SessionDb,
-) -> Option<profile::ProfileData> {
-    let content = db.meta("profile_raw").ok().flatten()?;
-    let ext = db.meta("profile_raw_ext").ok().flatten();
-    profile::ProfileData::load_str(&content, ext.as_deref()).ok()
+) -> Result<Option<profile::ProfileData>> {
+    let Some(content) = db.meta("profile_raw")? else {
+        return Ok(None);
+    };
+    let ext = db.meta("profile_raw_ext")?;
+    Ok(Some(
+        profile::ProfileData::load_str(&content, ext.as_deref())
+            .context("parsing persisted profile source")?,
+    ))
 }
 
 fn replay_eval(
@@ -571,6 +575,15 @@ fn replay_eval(
             commands::crosstrack::run(&q, db, &ctx)
         }
         Some(commands::Dispatched::Lifecycle(l)) => {
+            if matches!(
+                l,
+                commands::lifecycle::Lifecycle::Save { .. }
+                    | commands::lifecycle::Lifecycle::Prune { .. }
+                    | commands::lifecycle::Lifecycle::Replay { .. }
+            ) {
+                return "replay is read-only: save, prune, and nested replay are unavailable"
+                    .into();
+            }
             let ctx = commands::lifecycle::LifeCtx {
                 cwd,
                 active: Some(db),
@@ -723,9 +736,7 @@ fn cmd_import(registry: &Registry, args: &[String]) -> Result<()> {
             })
             .collect();
         if sanitized.is_empty() || sanitized.chars().all(|c| c == '_') {
-            bail!(
-                "--label `{name}` sanitizes to empty/all-underscore (allowed: [A-Za-z0-9-_])"
-            );
+            bail!("--label `{name}` sanitizes to empty/all-underscore (allowed: [A-Za-z0-9-_])");
         }
         // SAFETY: cmd_import runs on the single client thread before
         // any daemon fork; matching the contract used by cmd_start.
@@ -829,7 +840,9 @@ fn autodetect_backend(target: &str) -> Option<&'static str> {
     } else if lower.ends_with(".php") {
         Some("phpdbg")
     } else if lower.ends_with(".csproj") {
-        Some("netcoredbg")
+        // The protocol backend is the headless path. The legacy PTY
+        // backend is not reliable for a non-interactive daemon.
+        Some("netcoredbg-proto")
     } else if lower.ends_with(".js") || lower.ends_with(".mjs") || lower.ends_with(".ts") {
         Some("node-proto")
     } else if lower.ends_with(".hs") {
@@ -849,6 +862,7 @@ struct ParsedStartFlags {
     run_args: Vec<String>,
     do_run: bool,
     attach_pid: Option<u32>,
+    attach_port: Option<String>,
 }
 
 /// Parse the trailing flag tail of `dbg start <type> <target> …`.
@@ -856,6 +870,7 @@ struct ParsedStartFlags {
 ///   - `--break SPEC` / `-b SPEC`: append to `breakpoints`.
 ///   - `--run` / `-r`: set `do_run`.
 ///   - `--attach-pid N` / `--attach-pid=N`: set `attach_pid`.
+///   - `--attach-port H:P` / `--attach-port=H:P`: connect to an existing DAP adapter.
 ///   - `--args …`: forward everything that follows to the debuggee.
 ///     Bails if a known dbg flag (`--break`, `--run`, `--attach-pid`,
 ///     `--attach-port`) appears after `--args` — that misroute used
@@ -866,14 +881,16 @@ fn parse_start_flags(args: &[String]) -> Result<ParsedStartFlags> {
     let mut run_args = Vec::new();
     let mut do_run = false;
     let mut attach_pid: Option<u32> = None;
+    let mut attach_port: Option<String> = None;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
             "--break" | "-b" => {
                 i += 1;
-                if i < args.len() {
-                    breakpoints.push(args[i].clone());
+                if i >= args.len() || args[i].trim().is_empty() {
+                    bail!("--break requires a breakpoint specification");
                 }
+                breakpoints.push(args[i].clone());
             }
             "--args" | "-a" => {
                 // Everything after `--args` belongs to the debuggee,
@@ -917,6 +934,13 @@ fn parse_start_flags(args: &[String]) -> Result<ParsedStartFlags> {
                     bail!("--attach-pid requires a PID");
                 }
             }
+            "--attach-port" => {
+                i += 1;
+                if i >= args.len() || args[i].trim().is_empty() {
+                    bail!("--attach-port requires HOST:PORT");
+                }
+                attach_port = Some(validate_attach_port(&args[i])?);
+            }
             other if other.starts_with("--attach-pid=") => {
                 let pid = other.trim_start_matches("--attach-pid=");
                 if pid.is_empty() {
@@ -926,6 +950,13 @@ fn parse_start_flags(args: &[String]) -> Result<ParsedStartFlags> {
                     pid.parse()
                         .with_context(|| format!("invalid --attach-pid `{pid}`"))?,
                 );
+            }
+            other if other.starts_with("--attach-port=") => {
+                let address = other.trim_start_matches("--attach-port=");
+                if address.trim().is_empty() {
+                    bail!("--attach-port requires HOST:PORT");
+                }
+                attach_port = Some(validate_attach_port(address)?);
             }
             other => {
                 // Bare positionals and unknown `--*` flags both go to
@@ -944,25 +975,41 @@ fn parse_start_flags(args: &[String]) -> Result<ParsedStartFlags> {
         run_args,
         do_run,
         attach_pid,
+        attach_port,
     })
+}
+
+fn validate_attach_port(address: &str) -> Result<String> {
+    let address = address.trim();
+    let (host, port) = address
+        .rsplit_once(':')
+        .ok_or_else(|| anyhow::anyhow!("invalid --attach-port `{address}`; expected HOST:PORT"))?;
+    if host.is_empty() || port.parse::<u16>().ok().filter(|p| *p != 0).is_none() {
+        bail!("invalid --attach-port `{address}`; expected HOST:PORT with a non-zero port");
+    }
+    Ok(address.to_string())
 }
 
 fn normalize_start_args(registry: &Registry, args: &[String]) -> Result<Vec<String>> {
     if args.is_empty() {
         bail!("usage: dbg start <type> <target> [--break spec] [--args ...] [--run]");
     }
-    if args
-        .first()
-        .is_some_and(|a| a == "--attach-pid" || a.starts_with("--attach-pid="))
-    {
+    if args.first().is_some_and(|a| {
+        a == "--attach-pid"
+            || a.starts_with("--attach-pid=")
+            || a == "--attach-port"
+            || a.starts_with("--attach-port=")
+    }) {
         bail!(
             "usage: dbg start <type> <target> --attach-pid <PID>\n       --attach-pid must come after <type> <target>; attach mode still needs an explicit DAP backend type and target hint"
         );
     }
-    if args
-        .get(1)
-        .is_some_and(|a| a == "--attach-pid" || a.starts_with("--attach-pid="))
-    {
+    if args.get(1).is_some_and(|a| {
+        a == "--attach-pid"
+            || a.starts_with("--attach-pid=")
+            || a == "--attach-port"
+            || a.starts_with("--attach-port=")
+    }) {
         bail!(
             "usage: dbg start <type> <target> --attach-pid <PID>\n       attach mode still needs a target hint before --attach-pid; use an absolute target/path hint when source paths matter"
         );
@@ -1022,9 +1069,6 @@ fn cmd_start(registry: &Registry, args: &[String]) -> Result<()> {
     unsafe {
         std::env::set_var("DBG_SESSION", &slug);
     }
-    // Publish this as the newest daemon in the cwd so env-less
-    // clients in other shells find it by default.
-    daemon::write_latest_pointer(&slug);
     let peers = daemon::live_slugs_in_cwd();
     if !peers.is_empty() {
         eprintln!(
@@ -1102,12 +1146,23 @@ fn cmd_start(registry: &Registry, args: &[String]) -> Result<()> {
     let run_args = parsed.run_args;
     let do_run = parsed.do_run;
     let attach_pid = parsed.attach_pid;
-    if attach_pid.is_some() && !backend.uses_dap() {
+    let attach_port = parsed.attach_port;
+    if (attach_pid.is_some() || attach_port.is_some()) && !backend.uses_dap() {
         bail!(
-            "--attach-pid requires a DAP backend such as netcoredbg-proto, debugpy-proto, delve-proto, or lldb-dap-proto; `{backend_type}` is not DAP-based"
+            "--attach-pid/--attach-port requires a DAP backend such as netcoredbg-proto, debugpy-proto, delve-proto, or lldb-dap-proto; `{backend_type}` is not DAP-based"
         );
     }
-    let attach = attach_pid.map(|pid| backend::AttachSpec { pid: Some(pid) });
+    if attach_pid.is_some() && attach_port.is_some() {
+        bail!("--attach-pid and --attach-port are mutually exclusive");
+    }
+    let attach = if attach_pid.is_some() || attach_port.is_some() {
+        Some(backend::AttachSpec {
+            pid: attach_pid,
+            port: attach_port,
+        })
+    } else {
+        None
+    };
 
     // Resolve target. Attach mode doesn't need a local target file —
     // the debuggee is already running — so skip resolution and pass
@@ -1135,6 +1190,7 @@ fn cmd_start(registry: &Registry, args: &[String]) -> Result<()> {
             daemon::detach_stdio(&log_path);
             if let Err(e) = daemon::run_daemon(backend, &resolved, &run_args, attach.as_ref()) {
                 eprintln!("daemon error: {e:#}");
+                daemon::cleanup_after_startup_error();
                 std::process::exit(1);
             }
             std::process::exit(0);
@@ -1192,6 +1248,12 @@ fn cmd_start(registry: &Registry, args: &[String]) -> Result<()> {
                 }
             }
 
+            // Publish only a session that has made it through validation,
+            // process creation, and the daemon readiness probe. A rejected
+            // start must not hide the previous live session from env-less
+            // clients.
+            daemon::write_latest_pointer(&slug);
+
             // Set breakpoints FIRST — some adapters (delve, DAP) need
             // every breakpoint registered before the program starts,
             // otherwise they never fire. If any `--break` fails we
@@ -1224,25 +1286,22 @@ fn cmd_start(registry: &Registry, args: &[String]) -> Result<()> {
                 }
             }
 
+            if !bp_ok {
+                bail!("one or more requested breakpoints failed to register");
+            }
+
             // Auto-run — but only when every breakpoint stuck. --run
             // means "start the debuggee (and let it stop at your
             // breakpoints)", not "run past all breakpoints". See
             // `dbg help start`.
             if do_run {
-                if !bp_ok && !breakpoints.is_empty() {
-                    eprintln!(
-                        "dbg: skipping --run because a breakpoint failed to register. \
-                         Fix the breakpoint or omit --break and drive with `dbg run` manually."
-                    );
+                let cmd = if backend.canonical_ops().is_some() {
+                    "run".to_string()
                 } else {
-                    let cmd = if backend.canonical_ops().is_some() {
-                        "run".to_string()
-                    } else {
-                        backend.run_command().to_string()
-                    };
-                    let resp = daemon::send_command(&cmd)?;
-                    println!("{resp}");
-                }
+                    backend.run_command().to_string()
+                };
+                let resp = daemon::send_command(&cmd)?;
+                println!("{resp}");
             }
 
             Ok(())
@@ -1268,10 +1327,11 @@ mod tests {
         assert_eq!(autodetect_backend("App.java"), Some("jdb"));
         assert_eq!(autodetect_backend("script.rb"), Some("rdbg"));
         assert_eq!(autodetect_backend("site.php"), Some("phpdbg"));
-        assert_eq!(autodetect_backend("proj.csproj"), Some("netcoredbg"));
+        assert_eq!(autodetect_backend("proj.csproj"), Some("netcoredbg-proto"));
         assert_eq!(autodetect_backend("app.js"), Some("node-proto"));
         assert_eq!(autodetect_backend("app.ts"), Some("node-proto"));
         assert_eq!(autodetect_backend("foo.hs"), Some("ghci"));
+        assert_eq!(autodetect_backend("main.ml"), Some("ocamldebug"));
         assert_eq!(autodetect_backend("bin/no-ext"), None);
     }
 
@@ -1404,7 +1464,9 @@ mod tests {
         .unwrap();
         db.set_meta("profile_raw", speedscope).unwrap();
 
-        let mut p = load_profile_from_db(&db).expect("rehydrate failed");
+        let mut p = load_profile_from_db(&db)
+            .expect("profile metadata read failed")
+            .expect("rehydrate failed");
         let top = p.handle_command("top 5");
         // Both frames should appear with non-zero inclusive %.
         assert!(top.contains("a"), "top output missing frame `a`:\n{top}");
@@ -1429,7 +1491,32 @@ mod tests {
             target_hash: None,
         })
         .unwrap();
-        assert!(load_profile_from_db(&db).is_none());
+        assert!(load_profile_from_db(&db).unwrap().is_none());
+    }
+
+    #[test]
+    fn replay_rejects_malformed_persisted_profile() {
+        use dbg_cli::session_db::{CreateOptions, SessionDb, SessionKind, TargetClass};
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db = SessionDb::create(CreateOptions {
+            kind: SessionKind::Profile,
+            target: "./app",
+            target_class: TargetClass::NativeCpu,
+            cwd: tmp.path(),
+            db_path: None,
+            label: Some("bad-profile".into()),
+            target_hash: None,
+        })
+        .unwrap();
+        db.set_meta("profile_raw", "not a profile").unwrap();
+        let error = match load_profile_from_db(&db) {
+            Ok(_) => panic!("malformed persisted profile unexpectedly parsed"),
+            Err(error) => error.to_string(),
+        };
+        assert!(
+            error.contains("parsing persisted profile source"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -1531,13 +1618,31 @@ mod tests {
     fn dap_attach_configs_remember_debuggee_pid() {
         use crate::backend::Backend;
 
-        let spec = backend::AttachSpec { pid: Some(4321) };
+        let spec = backend::AttachSpec {
+            pid: Some(4321),
+            port: None,
+        };
         let cfg = backend::netcoredbg_proto::NetCoreDbgProtoBackend
             .dap_attach(&spec)
             .unwrap();
         assert_eq!(cfg.launch_verb, "attach");
         assert_eq!(cfg.debuggee_pid, Some(4321));
         assert_eq!(cfg.launch_args["processId"], 4321);
+    }
+
+    #[test]
+    fn dap_attach_port_uses_existing_endpoint() {
+        use crate::backend::Backend;
+
+        let spec = backend::AttachSpec {
+            pid: None,
+            port: Some("127.0.0.1:4711".into()),
+        };
+        let cfg = backend::netcoredbg_proto::NetCoreDbgProtoBackend
+            .dap_attach(&spec)
+            .unwrap();
+        assert_eq!(cfg.connect_addr.as_deref(), Some("127.0.0.1:4711"));
+        assert!(cfg.debuggee_pid.is_none());
     }
 
     #[test]
@@ -1583,6 +1688,16 @@ mod tests {
     }
 
     #[test]
+    fn parse_start_flags_validates_attach_port() {
+        let p = parse_start_flags(&s(&["--attach-port", "127.0.0.1:4711"])).unwrap();
+        assert_eq!(p.attach_port.as_deref(), Some("127.0.0.1:4711"));
+        let p = parse_start_flags(&s(&["--attach-port=localhost:9000"])).unwrap();
+        assert_eq!(p.attach_port.as_deref(), Some("localhost:9000"));
+        assert!(parse_start_flags(&s(&["--attach-port", "127.0.0.1:0"])).is_err());
+        assert!(parse_start_flags(&s(&["--attach-port", "no-port"])).is_err());
+    }
+
+    #[test]
     fn parse_start_flags_args_forwards_everything() {
         // Hyphenated debuggee flags must reach run_args verbatim,
         // including ones that look like other tools' flags.
@@ -1622,9 +1737,8 @@ mod tests {
             vec!["--args", "foo", "--attach-pid=1"],
             vec!["--args", "foo", "--attach-port=:9999"],
         ] {
-            let err = parse_start_flags(&s(&misordered)).expect_err(&format!(
-                "expected error for misordered `{misordered:?}`"
-            ));
+            let err = parse_start_flags(&s(&misordered))
+                .expect_err(&format!("expected error for misordered `{misordered:?}`"));
             let msg = format!("{err:#}");
             assert!(
                 msg.contains("appeared after `--args`"),
@@ -1643,7 +1757,10 @@ mod tests {
         // assumed to be for the debuggee, so `dbg start cargo run --release`
         // works without manual --args.
         let p = parse_start_flags(&s(&["positional", "--release", "--features", "x"])).unwrap();
-        assert_eq!(p.run_args, vec!["positional", "--release", "--features", "x"]);
+        assert_eq!(
+            p.run_args,
+            vec!["positional", "--release", "--features", "x"]
+        );
         assert!(p.breakpoints.is_empty());
         assert!(!p.do_run);
         assert!(p.attach_pid.is_none());

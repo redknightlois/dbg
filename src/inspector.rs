@@ -22,7 +22,7 @@ use std::collections::HashMap;
 use std::io::{BufRead, BufReader};
 use std::net::TcpStream;
 use std::os::fd::AsRawFd;
-use std::process::{Child, ChildStderr, Command, Stdio};
+use std::process::{Child, ChildStderr, ChildStdout, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::sync::{Arc, Condvar, Mutex};
@@ -32,11 +32,24 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, anyhow, bail};
 use nix::unistd::Pid;
 use serde_json::{Value, json};
-use tungstenite::{Message, WebSocket};
 use tungstenite::stream::MaybeTlsStream;
+use tungstenite::{Message, WebSocket};
+
+const MAX_INSPECTOR_PENDING_REQUESTS: usize = 4096;
 
 use crate::backend::canonical::HitEvent;
 use crate::pty::{DebuggerIo, EventKind, LogHandle};
+
+struct SpawnedChildGuard(Option<Child>);
+
+impl Drop for SpawnedChildGuard {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.0.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
 
 /// Tracks conversation state on the inspector socket. Protected by a
 /// mutex + condvar so `send_and_wait` callers on the daemon side can
@@ -49,6 +62,7 @@ struct State {
     /// Populated when a new paused event arrives. Daemon drains via
     /// `pending_hit()` before the next command runs.
     pending_hit: Option<HitEvent>,
+    pending_action_generation: u64,
     /// scriptId → source URL. Tracks `Debugger.scriptParsed` so we can
     /// map breakpoint paths and format call frames in terms of files.
     script_urls: HashMap<String, String>,
@@ -66,6 +80,8 @@ struct State {
     /// own contexts during a healthy run, and we must not mark the
     /// whole session dead in that case.
     main_context_id: Option<i64>,
+    action_generation: u64,
+    stop_generation: u64,
 }
 
 impl State {
@@ -74,11 +90,14 @@ impl State {
             paused: false,
             call_frames: Vec::new(),
             pending_hit: None,
+            pending_action_generation: 0,
             script_urls: HashMap::new(),
             script_sources: HashMap::new(),
             breakpoints: HashMap::new(),
             alive: true,
             main_context_id: None,
+            action_generation: 0,
+            stop_generation: 0,
         }
     }
 }
@@ -93,6 +112,15 @@ impl crate::transport_common::StopState for State {
     }
     fn alive(&self) -> bool {
         self.alive
+    }
+    fn stop_generation(&self) -> u64 {
+        self.stop_generation
+    }
+    fn action_generation(&self) -> u64 {
+        self.action_generation
+    }
+    fn pending_action_generation(&self) -> u64 {
+        self.pending_action_generation
     }
 }
 
@@ -137,13 +165,14 @@ impl InspectorTransport {
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        let mut child = cmd.spawn().context("failed to spawn node")?;
+        let mut child_guard = SpawnedChildGuard(Some(cmd.spawn().context("failed to spawn node")?));
+        let child = child_guard.0.as_mut().expect("child guard is populated");
         let child_pid = Pid::from_raw(child.id() as i32);
 
         let stderr = child.stderr.take().context("missing node stderr")?;
         // Claim stdout from the Child so it closes cleanly on Drop.
         // Not piped into the event log — see comment below.
-        let _stdout = child.stdout.take().context("missing node stdout")?;
+        let stdout = child.stdout.take().context("missing node stdout")?;
 
         // Scrape the ws URL from stderr. Node emits
         //   "Debugger listening on ws://127.0.0.1:PORT/UUID"
@@ -159,6 +188,7 @@ impl InspectorTransport {
         set_nonblocking(&mut ws)?;
 
         let log = LogHandle::new();
+        spawn_stdout_drain(stdout, log.clone());
         let state = Arc::new((Mutex::new(State::new()), Condvar::new()));
         let shutdown = Arc::new(AtomicBool::new(false));
         let (driver_tx, driver_rx) = mpsc::channel::<DriverCmd>();
@@ -188,7 +218,9 @@ impl InspectorTransport {
 
         let transport = Self {
             child_pid,
-            child: Mutex::new(Some(child)),
+            child: Mutex::new(Some(
+                child_guard.0.take().expect("child guard is populated"),
+            )),
             driver_tx,
             log,
             state,
@@ -245,16 +277,28 @@ impl InspectorTransport {
 
         // Resume / step family.
         if matches!(trimmed, "cont" | "c" | "continue") {
-            return self.exec(|s| s.call_blocking("Debugger.resume", json!({}), timeout), timeout);
+            return self.exec(
+                |s| s.call_blocking("Debugger.resume", json!({}), timeout),
+                timeout,
+            );
         }
         if matches!(trimmed, "step" | "s" | "stepi") {
-            return self.exec(|s| s.call_blocking("Debugger.stepInto", json!({}), timeout), timeout);
+            return self.exec(
+                |s| s.call_blocking("Debugger.stepInto", json!({}), timeout),
+                timeout,
+            );
         }
         if matches!(trimmed, "next" | "n") {
-            return self.exec(|s| s.call_blocking("Debugger.stepOver", json!({}), timeout), timeout);
+            return self.exec(
+                |s| s.call_blocking("Debugger.stepOver", json!({}), timeout),
+                timeout,
+            );
         }
         if matches!(trimmed, "out" | "finish") {
-            return self.exec(|s| s.call_blocking("Debugger.stepOut", json!({}), timeout), timeout);
+            return self.exec(
+                |s| s.call_blocking("Debugger.stepOut", json!({}), timeout),
+                timeout,
+            );
         }
         if trimmed == "catch" || trimmed == "catch off" {
             self.call_blocking(
@@ -291,7 +335,10 @@ impl InspectorTransport {
             // Inspector's pause doesn't emit `Debugger.paused` on its own
             // reply — the async notification arrives shortly after. Use
             // the same exec() helper so we wait for the stopped event.
-            return self.exec(|s| s.call_blocking("Debugger.pause", json!({}), timeout), timeout);
+            return self.exec(
+                |s| s.call_blocking("Debugger.pause", json!({}), timeout),
+                timeout,
+            );
         }
 
         // backtrace — from cached call_frames, no round trip.
@@ -369,14 +416,28 @@ impl InspectorTransport {
     /// any, lands in `state.pending_hit` for the daemon to drain via
     /// `pending_hit()`.
     fn exec<F: FnOnce(&Self) -> Result<Value>>(&self, f: F, timeout: Duration) -> Result<String> {
-        crate::transport_common::wait_for_stop(
-            &self.state,
-            || f(self).map(|_| ()),
-            timeout,
-        )
+        {
+            let (lock, _) = &*self.state;
+            let mut s = lock.lock().unwrap();
+            s.action_generation = s.action_generation.wrapping_add(1);
+        }
+        crate::transport_common::wait_for_stop(&self.state, || f(self).map(|_| ()), timeout)
     }
 
-    fn set_breakpoint(&self, bp: ParsedSb, cond: Option<&str>, timeout: Duration) -> Result<String> {
+    fn set_breakpoint(
+        &self,
+        bp: ParsedSb,
+        cond: Option<&str>,
+        timeout: Duration,
+    ) -> Result<String> {
+        if let Some(condition) = cond {
+            if condition.trim().is_empty()
+                || condition.len() > 256 * 1024
+                || condition.chars().any(|c| c.is_control() && c != '\t')
+            {
+                bail!("invalid breakpoint condition");
+            }
+        }
         match bp {
             ParsedSb::FileLine { file, line } => {
                 // Inspector wants `url` or `urlRegex`. Node reports
@@ -403,7 +464,10 @@ impl InspectorTransport {
                 let key = format!("{file}:{line}");
                 {
                     let (lock, _) = &*self.state;
-                    lock.lock().unwrap().breakpoints.insert(key.clone(), bp_id.clone());
+                    lock.lock()
+                        .unwrap()
+                        .breakpoints
+                        .insert(key.clone(), bp_id.clone());
                 }
                 match cond {
                     Some(c) => Ok(format!("Breakpoint set at {key} if {c} (id={bp_id})")),
@@ -423,7 +487,10 @@ impl InspectorTransport {
                                 .and_then(|v| v.as_str())
                                 .unwrap_or("")
                                 .to_string(),
-                            f.get("url").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                            f.get("url")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                                .to_string(),
                         ),
                         None => (String::new(), String::new()),
                     }
@@ -439,11 +506,8 @@ impl InspectorTransport {
                 if let Some(c) = cond {
                     params.insert("condition".into(), Value::String(c.to_string()));
                 }
-                let resp = self.call_blocking(
-                    "Debugger.setBreakpoint",
-                    Value::Object(params),
-                    timeout,
-                )?;
+                let resp =
+                    self.call_blocking("Debugger.setBreakpoint", Value::Object(params), timeout)?;
                 let bp_id = resp
                     .get("breakpointId")
                     .and_then(|v| v.as_str())
@@ -452,12 +516,17 @@ impl InspectorTransport {
                 let key = format!("{url}:{line}");
                 {
                     let (lock, _) = &*self.state;
-                    lock.lock().unwrap().breakpoints.insert(key.clone(), bp_id.clone());
+                    lock.lock()
+                        .unwrap()
+                        .breakpoints
+                        .insert(key.clone(), bp_id.clone());
                 }
                 Ok(format!("Breakpoint set at {key} (id={bp_id})"))
             }
             ParsedSb::Name(_) => {
-                bail!("node-proto: function-name breakpoints unsupported — use `break file.js:line`");
+                bail!(
+                    "node-proto: function-name breakpoints unsupported — use `break file.js:line`"
+                );
             }
         }
     }
@@ -466,9 +535,11 @@ impl InspectorTransport {
         let call_frame_id = {
             let (lock, _) = &*self.state;
             let s = lock.lock().unwrap();
-            s.call_frames
-                .first()
-                .and_then(|f| f.get("callFrameId").and_then(|v| v.as_str()).map(String::from))
+            s.call_frames.first().and_then(|f| {
+                f.get("callFrameId")
+                    .and_then(|v| v.as_str())
+                    .map(String::from)
+            })
         };
         let (method, params) = match call_frame_id {
             Some(id) => (
@@ -483,7 +554,10 @@ impl InspectorTransport {
         let resp = self.call_blocking(method, params, timeout)?;
         let result = resp.get("result").unwrap_or(&Value::Null);
         if let Some(exc) = resp.get("exceptionDetails") {
-            return Ok(format!("[exception] {}", exc.get("text").and_then(|v| v.as_str()).unwrap_or("")));
+            return Ok(format!(
+                "[exception] {}",
+                exc.get("text").and_then(|v| v.as_str()).unwrap_or("")
+            ));
         }
         let rendered = match result.get("value") {
             Some(v) if !v.is_null() => match v {
@@ -596,10 +670,7 @@ impl InspectorTransport {
                     if out.contains_key(name) {
                         continue;
                     }
-                    out.insert(
-                        name.to_string(),
-                        json!({ "value": rendered }),
-                    );
+                    out.insert(name.to_string(), json!({ "value": rendered }));
                 }
             }
         }
@@ -618,7 +689,10 @@ impl InspectorTransport {
             None => {
                 let (lock, _) = &*self.state;
                 let s = lock.lock().unwrap();
-                let top = s.call_frames.first().ok_or_else(|| anyhow!("list: not paused"))?;
+                let top = s
+                    .call_frames
+                    .first()
+                    .ok_or_else(|| anyhow!("list: not paused"))?;
                 let location = top.get("location");
                 let sid = location
                     .and_then(|l| l.get("scriptId"))
@@ -675,7 +749,10 @@ impl InspectorTransport {
                 .unwrap_or("")
                 .to_string();
             let (lock, _) = &*self.state;
-            lock.lock().unwrap().script_sources.insert(script_id.clone(), src.clone());
+            lock.lock()
+                .unwrap()
+                .script_sources
+                .insert(script_id.clone(), src.clone());
             Ok(src)
         })?;
 
@@ -703,11 +780,25 @@ impl InspectorTransport {
         }
         let mut out = String::new();
         for (i, f) in s.call_frames.iter().enumerate() {
-            let func = f.get("functionName").and_then(|v| v.as_str()).filter(|x| !x.is_empty()).unwrap_or("(anonymous)");
+            let func = f
+                .get("functionName")
+                .and_then(|v| v.as_str())
+                .filter(|x| !x.is_empty())
+                .unwrap_or("(anonymous)");
             let loc = f.get("location");
-            let line = loc.and_then(|l| l.get("lineNumber")).and_then(|v| v.as_u64()).unwrap_or(0) + 1;
-            let script_id = loc.and_then(|l| l.get("scriptId")).and_then(|v| v.as_str()).unwrap_or("");
-            let url = s.script_urls.get(script_id).cloned()
+            let line = loc
+                .and_then(|l| l.get("lineNumber"))
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0)
+                + 1;
+            let script_id = loc
+                .and_then(|l| l.get("scriptId"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let url = s
+                .script_urls
+                .get(script_id)
+                .cloned()
                 .or_else(|| f.get("url").and_then(|v| v.as_str()).map(String::from))
                 .unwrap_or_default();
             out.push_str(&format!("#{i} {func} at {url}:{line}\n"));
@@ -728,7 +819,6 @@ impl InspectorTransport {
         out.trim_end().to_string()
     }
 }
-
 
 /// Render a `Runtime.RemoteObject` as a JSON-friendly value for the
 /// locals dump. Primitives come through with their real value;
@@ -785,8 +875,11 @@ impl DebuggerIo for InspectorTransport {
             {
                 let (lock, _) = &*self.state;
                 let s = lock.lock().unwrap();
-                if s.paused || !s.alive {
+                if s.paused {
                     return Ok(String::new());
+                }
+                if !s.alive {
+                    bail!("node terminated before the required entry stop");
                 }
             }
             if Instant::now() >= deadline {
@@ -882,7 +975,10 @@ impl Drop for InspectorTransport {
 /// any post-handshake stderr output).
 fn scrape_ws_url(stderr: ChildStderr, timeout: Duration) -> Result<String> {
     let fd = stderr.as_raw_fd();
-    nix::fcntl::fcntl(fd, nix::fcntl::FcntlArg::F_SETFL(nix::fcntl::OFlag::O_NONBLOCK))?;
+    nix::fcntl::fcntl(
+        fd,
+        nix::fcntl::FcntlArg::F_SETFL(nix::fcntl::OFlag::O_NONBLOCK),
+    )?;
     let mut reader = BufReader::new(stderr);
     let deadline = Instant::now() + timeout;
     let mut line = String::new();
@@ -910,7 +1006,25 @@ fn extract_ws_url(line: &str) -> Option<String> {
     let start = line.find("ws://")?;
     let tail = &line[start..];
     let end = tail.find(char::is_whitespace).unwrap_or(tail.len());
-    Some(tail[..end].to_string())
+    let url = &tail[..end];
+    let authority = url.strip_prefix("ws://")?.split('/').next()?;
+    let (host, port) = authority.rsplit_once(':')?;
+    if host.is_empty() || port.parse::<u16>().ok().filter(|p| *p != 0).is_none() {
+        return None;
+    }
+    Some(url.to_string())
+}
+
+fn spawn_stdout_drain(mut stdout: ChildStdout, log: LogHandle) {
+    std::thread::spawn(move || {
+        let mut buf = [0u8; 4096];
+        loop {
+            match std::io::Read::read(&mut stdout, &mut buf) {
+                Ok(0) | Err(_) => return,
+                Ok(n) => log.push(EventKind::Stdout, buf[..n].to_vec()),
+            }
+        }
+    });
 }
 
 fn set_nonblocking(ws: &mut WebSocket<MaybeTlsStream<TcpStream>>) -> Result<()> {
@@ -981,7 +1095,15 @@ fn driver_loop(
                     mark_dead(&state);
                     return;
                 }
-                Ok(DriverCmd::Call { method, params, resp }) => {
+                Ok(DriverCmd::Call {
+                    method,
+                    params,
+                    resp,
+                }) => {
+                    if pending.len() >= MAX_INSPECTOR_PENDING_REQUESTS {
+                        let _ = resp.send(Err("Inspector request queue is full".into()));
+                        continue;
+                    }
                     let id = next_id;
                     next_id += 1;
                     let frame = json!({ "id": id, "method": method, "params": params });
@@ -1054,8 +1176,16 @@ fn dispatch_incoming(
 
     match method {
         "Debugger.scriptParsed" => {
-            let script_id = params.get("scriptId").and_then(|v| v.as_str()).unwrap_or("").to_string();
-            let url = params.get("url").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let script_id = params
+                .get("scriptId")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let url = params
+                .get("url")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
             if !script_id.is_empty() {
                 let (lock, _) = &**state;
                 lock.lock().unwrap().script_urls.insert(script_id, url);
@@ -1077,8 +1207,10 @@ fn dispatch_incoming(
             let (lock, cvar) = &**state;
             let mut s = lock.lock().unwrap();
             s.paused = true;
+            s.stop_generation = s.stop_generation.wrapping_add(1);
             s.call_frames = call_frames;
             s.pending_hit = Some(hit);
+            s.pending_action_generation = s.action_generation;
             cvar.notify_all();
         }
         "Debugger.resumed" => {
@@ -1118,7 +1250,11 @@ fn dispatch_incoming(
         "Runtime.executionContextCreated" => {
             // First context is the main realm; subsequent ones are
             // worker_threads, vm modules, etc. — ignore those.
-            if let Some(id) = params.get("context").and_then(|c| c.get("id")).and_then(|v| v.as_i64()) {
+            if let Some(id) = params
+                .get("context")
+                .and_then(|c| c.get("id"))
+                .and_then(|v| v.as_i64())
+            {
                 let (lock, _) = &**state;
                 let mut s = lock.lock().unwrap();
                 if s.main_context_id.is_none() {
@@ -1129,9 +1265,7 @@ fn dispatch_incoming(
         "Runtime.executionContextDestroyed" => {
             // Only tear down when the *main* context dies. A
             // worker_thread finishing should not kill the session.
-            let destroyed_id = params
-                .get("executionContextId")
-                .and_then(|v| v.as_i64());
+            let destroyed_id = params.get("executionContextId").and_then(|v| v.as_i64());
             let is_main = {
                 let (lock, _) = &**state;
                 let s = lock.lock().unwrap();
@@ -1156,7 +1290,10 @@ fn build_hit_event(frames: &[Value], state: &Arc<(Mutex<State>, Condvar)>) -> Hi
         .and_then(|f| f.get("location"))
         .map(|l| {
             (
-                l.get("scriptId").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                l.get("scriptId")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
                 l.get("lineNumber").and_then(|v| v.as_u64()).unwrap_or(0) as u32 + 1,
             )
         })
@@ -1167,10 +1304,7 @@ fn build_hit_event(frames: &[Value], state: &Arc<(Mutex<State>, Condvar)>) -> Hi
         s.script_urls.get(&script_id).cloned().unwrap_or_default()
     };
     // Pull file path from the url — strip `file://` if present.
-    let file = url
-        .strip_prefix("file://")
-        .unwrap_or(&url)
-        .to_string();
+    let file = url.strip_prefix("file://").unwrap_or(&url).to_string();
     HitEvent {
         location_key: if file.is_empty() {
             format!("scriptId={script_id}:{line_no}")
@@ -1196,7 +1330,10 @@ fn parse_sb(cmd: &str) -> Option<(ParsedSb, Option<String>)> {
     // Optionally followed by ` if <expr>`.
     let rest = cmd.strip_prefix("sb(")?;
     let (inner, cond) = match rest.find(") if ") {
-        Some(i) => (&rest[..i], Some(rest[i + 5..].trim().to_string())),
+        Some(i) if !rest[i + 5..].trim().is_empty() => {
+            (&rest[..i], Some(rest[i + 5..].trim().to_string()))
+        }
+        Some(_) => return None,
         None => (rest.strip_suffix(')')?, None),
     };
     let inner = inner.trim();
@@ -1204,13 +1341,26 @@ fn parse_sb(cmd: &str) -> Option<(ParsedSb, Option<String>)> {
         return None;
     }
     let parsed = if let Some((a, b)) = inner.split_once(',') {
+        if b.contains(',') {
+            return None;
+        }
         let file = a.trim().trim_matches('\'').trim_matches('"').to_string();
         let line: u32 = b.trim().parse().ok()?;
+        if line == 0 || file.is_empty() {
+            return None;
+        }
         ParsedSb::FileLine { file, line }
     } else if let Ok(line) = inner.parse::<u32>() {
+        if line == 0 {
+            return None;
+        }
         ParsedSb::Line(line)
     } else {
-        let name = inner.trim_matches('\'').trim_matches('"').to_string();
+        let name = inner.trim_matches('\'').trim_matches('"').trim();
+        if name.is_empty() || name.chars().any(|c| c.is_control()) {
+            return None;
+        }
+        let name = name.to_string();
         ParsedSb::Name(name)
     };
     Some((parsed, cond))
@@ -1245,7 +1395,10 @@ mod tests {
 
     #[test]
     fn parse_sb_line_only() {
-        assert!(matches!(parse_sb("sb(42)"), Some((ParsedSb::Line(42), None))));
+        assert!(matches!(
+            parse_sb("sb(42)"),
+            Some((ParsedSb::Line(42), None))
+        ));
     }
 
     #[test]

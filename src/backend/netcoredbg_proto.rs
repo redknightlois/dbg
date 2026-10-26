@@ -85,7 +85,10 @@ impl Backend for NetCoreDbgProtoBackend {
     }
 
     fn adapters(&self) -> Vec<(&'static str, &'static str)> {
-        vec![("dotnet.md", include_str!("../../skills/adapters/dotnet.md"))]
+        vec![(
+            "dotnet.md",
+            include_str!("../../skills/references/adapters/dotnet.md"),
+        )]
     }
 
     fn canonical_ops(&self) -> Option<&dyn CanonicalOps> {
@@ -125,11 +128,24 @@ impl Backend for NetCoreDbgProtoBackend {
                 "justMyCode": false,
             }),
             preassigned_addr: Some(format!("127.0.0.1:{port}")),
+            connect_addr: None,
             debuggee_pid: None,
         })
     }
 
     fn dap_attach(&self, spec: &super::AttachSpec) -> anyhow::Result<crate::dap::DapLaunchConfig> {
+        if let Some(addr) = &spec.port {
+            return Ok(crate::dap::DapLaunchConfig {
+                bin: "external-dap".into(),
+                args: vec![],
+                listen_marker: String::new(),
+                launch_verb: "attach".into(),
+                launch_args: json!({"request": "attach"}),
+                preassigned_addr: None,
+                connect_addr: Some(addr.clone()),
+                debuggee_pid: spec.pid,
+            });
+        }
         let pid = spec
             .pid
             .ok_or_else(|| anyhow::anyhow!("netcoredbg-proto attach needs --attach-pid"))?;
@@ -145,6 +161,7 @@ impl Backend for NetCoreDbgProtoBackend {
                 "justMyCode": false,
             }),
             preassigned_addr: Some(format!("127.0.0.1:{port}")),
+            connect_addr: None,
             debuggee_pid: Some(pid),
         })
     }

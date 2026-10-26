@@ -1,6 +1,6 @@
 use std::process::Command;
 
-use dbg_cli::deps::{self, Dependency, DependencyCheck, DepStatus, find_bundled_tool};
+use dbg_cli::deps::{self, DepStatus, Dependency, DependencyCheck, find_bundled_tool};
 
 use super::collect::NSIGHT_SYSTEMS;
 

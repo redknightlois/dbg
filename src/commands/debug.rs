@@ -54,18 +54,12 @@ pub fn dispatch_to(input: &str, backend: &dyn Backend) -> Dispatched {
         // reach for when they don't know a given backend's preferred
         // verb — all of them mean "step into the call at this
         // line", which is exactly what canonical `step` does.
-        "step" | "step-into" | "step-in" | "stepi" => {
-            one_arg_native(ops.op_step(), "step")
-        }
+        "step" | "step-into" | "step-in" | "stepi" => one_arg_native(ops.op_step(), "step"),
         // `step-over` / `stepover` consistently mean "next" across
         // IDEs; route them accordingly so scenario instructions that
         // use the IDE spellings don't bounce off the dispatcher.
-        "next" | "step-over" | "stepover" => {
-            one_arg_native(ops.op_next(), "next")
-        }
-        "finish" | "step-out" | "stepout" => {
-            one_arg_native(ops.op_finish(), "finish")
-        }
+        "next" | "step-over" | "stepover" => one_arg_native(ops.op_next(), "next"),
+        "finish" | "step-out" | "stepout" => one_arg_native(ops.op_finish(), "finish"),
         "pause" => one_arg_native(ops.op_pause(), "pause"),
         "restart" => one_arg_native(ops.op_restart(), "restart"),
         "stack" => dispatch_stack(ops, rest),
@@ -113,10 +107,7 @@ fn render_tool_info(backend: &dyn Backend) -> String {
     }
 }
 
-fn one_arg_native(
-    cmd: anyhow::Result<String>,
-    canonical_op: &'static str,
-) -> Dispatched {
+fn one_arg_native(cmd: anyhow::Result<String>, canonical_op: &'static str) -> Dispatched {
     match cmd {
         Ok(native_cmd) => Dispatched::Native {
             canonical_op,
@@ -134,17 +125,27 @@ fn dispatch_break(ops: &dyn CanonicalOps, rest: &str) -> Dispatched {
             "usage: dbg break <file:line | symbol | module!method> [if <cond>] [log <msg>]".into(),
         );
     }
+    if rest.trim_start().starts_with("if ") || rest.trim_start().starts_with("log ") {
+        return invalid_breakpoint();
+    }
     // Peel ` log <template>` first (templates can contain ` if ` text),
     // then an optional ` if <expr>`. The remainder is the location.
-    let (head, log_msg) = match rest.find(" log ") {
-        Some(i) => (&rest[..i], &rest[i + 5..]),
+    let (head, log_msg) = match find_keyword_outside_quotes(rest, " log ") {
+        Some(i) if !rest[i + 5..].trim().is_empty() => (&rest[..i], &rest[i + 5..]),
+        Some(_) => return invalid_breakpoint(),
+        None if rest.trim_end().ends_with(" log") => return invalid_breakpoint(),
         None => (rest, ""),
     };
-    let (loc_str, cond) = match head.find(" if ") {
-        Some(i) => (&head[..i], &head[i + 4..]),
+    let (loc_str, cond) = match find_keyword_outside_quotes(head, " if ") {
+        Some(i) if !head[i + 4..].trim().is_empty() => (&head[..i], &head[i + 4..]),
+        Some(_) => return invalid_breakpoint(),
+        None if head.trim_end().ends_with(" if") => return invalid_breakpoint(),
         None => (head, ""),
     };
-    let loc = BreakLoc::parse(loc_str.trim());
+    let loc = match BreakLoc::parse_checked(loc_str) {
+        Ok(loc) => loc,
+        Err(e) => return Dispatched::Immediate(format!("[error: {e}]")),
+    };
     let cond_trim = cond.trim();
     let log_trim = log_msg.trim();
     let result = if !log_trim.is_empty() {
@@ -166,18 +167,60 @@ fn dispatch_break(ops: &dyn CanonicalOps, rest: &str) -> Dispatched {
             decorate: true,
             structured: Some(CanonicalReq::Break {
                 loc,
-                cond: if cond_trim.is_empty() { None } else { Some(cond_trim.to_string()) },
-                log: if log_trim.is_empty() { None } else { Some(log_trim.to_string()) },
+                cond: if cond_trim.is_empty() {
+                    None
+                } else {
+                    Some(cond_trim.to_string())
+                },
+                log: if log_trim.is_empty() {
+                    None
+                } else {
+                    Some(log_trim.to_string())
+                },
             }),
         },
         Err(e) => Dispatched::Immediate(format!("[error: {e}]")),
     }
 }
 
+fn invalid_breakpoint() -> Dispatched {
+    Dispatched::Immediate(
+        "invalid breakpoint expression: location, condition, and log message must be non-empty"
+            .into(),
+    )
+}
+
+fn find_keyword_outside_quotes(input: &str, keyword: &str) -> Option<usize> {
+    let bytes = input.as_bytes();
+    let needle = keyword.as_bytes();
+    let mut quote = None;
+    let mut escaped = false;
+    for i in 0..=bytes.len().saturating_sub(needle.len()) {
+        let ch = bytes[i] as char;
+        if escaped {
+            escaped = false;
+        } else if ch == '\\' && quote.is_some() {
+            escaped = true;
+        } else if ch == '\'' || ch == '"' {
+            quote = if quote == Some(ch) {
+                None
+            } else if quote.is_none() {
+                Some(ch)
+            } else {
+                quote
+            };
+        }
+        if quote.is_none() && bytes.get(i..i + needle.len()) == Some(needle) {
+            return Some(i);
+        }
+    }
+    None
+}
+
 fn dispatch_unbreak(ops: &dyn CanonicalOps, rest: &str) -> Dispatched {
     let id = match rest.parse::<u32>() {
-        Ok(n) => BreakId(n),
-        Err(_) => {
+        Ok(n) if n > 0 => BreakId(n),
+        Ok(_) | Err(_) => {
             return Dispatched::Immediate(
                 "usage: dbg unbreak <id>  (id comes from `dbg breaks`)".into(),
             );
@@ -304,11 +347,7 @@ fn dispatch_catch(ops: &dyn CanonicalOps, rest: &str) -> Dispatched {
 /// Given the canonical-op name the daemon stamped on the response,
 /// run the backend's per-op postprocess hook and prepend a
 /// `[via <tool> <version>]` header.
-pub fn decorate_output_for_op(
-    backend: &dyn Backend,
-    canonical_op: &str,
-    output: &str,
-) -> String {
+pub fn decorate_output_for_op(backend: &dyn Backend, canonical_op: &str, output: &str) -> String {
     let Some(ops) = backend.canonical_ops() else {
         return output.to_string();
     };
@@ -330,20 +369,30 @@ mod tests {
 
     // ---------- canonical routing over lldb ----------
 
-    fn lldb() -> LldbBackend { LldbBackend }
+    fn lldb() -> LldbBackend {
+        LldbBackend
+    }
 
     fn native_of(d: Dispatched) -> (&'static str, String, bool) {
         match d {
-            Dispatched::Native { canonical_op, native_cmd, decorate, .. } => {
-                (canonical_op, native_cmd, decorate)
-            }
+            Dispatched::Native {
+                canonical_op,
+                native_cmd,
+                decorate,
+                ..
+            } => (canonical_op, native_cmd, decorate),
             other => panic!("expected Native, got {:?}", describe(&other)),
         }
     }
 
     fn describe(d: &Dispatched) -> String {
         match d {
-            Dispatched::Native { canonical_op, native_cmd, decorate, .. } => {
+            Dispatched::Native {
+                canonical_op,
+                native_cmd,
+                decorate,
+                ..
+            } => {
                 format!("Native({canonical_op}, {native_cmd:?}, decorate={decorate})")
             }
             Dispatched::Immediate(s) => format!("Immediate({s:?})"),
@@ -367,7 +416,13 @@ mod tests {
         let d = dispatch_to("break app.go:10", &lldb());
         match structured_of(d) {
             Some(CanonicalReq::Break { loc, cond, log }) => {
-                assert_eq!(loc, BreakLoc::FileLine { file: "app.go".into(), line: 10 });
+                assert_eq!(
+                    loc,
+                    BreakLoc::FileLine {
+                        file: "app.go".into(),
+                        line: 10
+                    }
+                );
                 assert!(cond.is_none());
                 assert!(log.is_none());
             }
@@ -382,7 +437,13 @@ mod tests {
         let d = dispatch_to("break app.go:10 if x > 0", &DelveProtoBackend);
         match structured_of(d) {
             Some(CanonicalReq::Break { loc, cond, log }) => {
-                assert_eq!(loc, BreakLoc::FileLine { file: "app.go".into(), line: 10 });
+                assert_eq!(
+                    loc,
+                    BreakLoc::FileLine {
+                        file: "app.go".into(),
+                        line: 10
+                    }
+                );
                 assert_eq!(cond.as_deref(), Some("x > 0"));
                 assert!(log.is_none());
             }
@@ -392,7 +453,13 @@ mod tests {
         let d = dispatch_to("break app.go:10 log hit {x}", &DelveProtoBackend);
         match structured_of(d) {
             Some(CanonicalReq::Break { loc, cond, log }) => {
-                assert_eq!(loc, BreakLoc::FileLine { file: "app.go".into(), line: 10 });
+                assert_eq!(
+                    loc,
+                    BreakLoc::FileLine {
+                        file: "app.go".into(),
+                        line: 10
+                    }
+                );
                 assert!(cond.is_none());
                 assert_eq!(log.as_deref(), Some("hit {x}"));
             }
@@ -412,8 +479,34 @@ mod tests {
         let d = dispatch_to("break src/foo.rs:42", &b);
         let (op, cmd, dec) = native_of(d);
         assert_eq!(op, "break");
-        assert_eq!(cmd, "breakpoint set --file src/foo.rs --line 42");
+        assert_eq!(cmd, "breakpoint set --file \"src/foo.rs\" --line 42");
         assert!(dec);
+    }
+
+    #[test]
+    fn malformed_breakpoint_suffixes_are_rejected() {
+        for input in ["break app.go:10 if", "break app.go:10 log", "break  if x"] {
+            match dispatch_to(input, &lldb()) {
+                Dispatched::Immediate(message) => assert!(message.contains("invalid breakpoint")),
+                other => panic!("malformed breakpoint was accepted: {}", describe(&other)),
+            }
+        }
+    }
+
+    #[test]
+    fn quoted_condition_text_is_not_treated_as_a_log_suffix() {
+        use crate::backend::delve_proto::DelveProtoBackend;
+        let d = dispatch_to(
+            r#"break app.go:10 if message == " log " "#,
+            &DelveProtoBackend,
+        );
+        match structured_of(d) {
+            Some(CanonicalReq::Break { cond, log, .. }) => {
+                assert_eq!(cond.as_deref(), Some(r#"message == " log ""#.trim()));
+                assert!(log.is_none());
+            }
+            other => panic!("expected structured breakpoint, got {other:?}"),
+        }
     }
 
     #[test]

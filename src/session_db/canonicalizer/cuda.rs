@@ -143,7 +143,9 @@ fn normalize(s: &str) -> String {
 mod tests {
     use super::*;
 
-    fn c() -> CudaCanonicalizer { CudaCanonicalizer }
+    fn c() -> CudaCanonicalizer {
+        CudaCanonicalizer
+    }
 
     #[test]
     fn simple_kernel_preserved() {

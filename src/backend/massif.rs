@@ -22,7 +22,8 @@ impl Backend for MassifBackend {
 
         let mut valgrind_cmd = format!(
             "valgrind --tool=massif --massif-out-file={} {}",
-            out_str, shell_escape(target)
+            shell_escape(&out_str),
+            shell_escape(target)
         );
         for a in args {
             valgrind_cmd.push(' ');
@@ -32,14 +33,8 @@ impl Backend for MassifBackend {
         Ok(SpawnConfig {
             bin: "bash".into(),
             args: vec!["--norc".into(), "--noprofile".into()],
-            env: vec![
-                ("PS1".into(), "$ ".into()),
-                ("MASSIF_OUT".into(), out_str),
-            ],
-            init_commands: vec![
-                valgrind_cmd,
-                "echo '--- massif data ready ---'".into(),
-            ],
+            env: vec![("PS1".into(), "$ ".into()), ("MASSIF_OUT".into(), out_str)],
+            init_commands: vec![valgrind_cmd, "echo '--- massif data ready ---'".into()],
         })
     }
 
@@ -71,7 +66,11 @@ impl Backend for MassifBackend {
     }
 
     fn run_command(&self) -> &'static str {
-        "ms_print $MASSIF_OUT"
+        "ms_print \"$MASSIF_OUT\""
+    }
+
+    fn is_profile_backend(&self) -> bool {
+        true
     }
 
     fn quit_command(&self) -> &'static str {
@@ -79,14 +78,16 @@ impl Backend for MassifBackend {
     }
 
     fn parse_help(&self, _raw: &str) -> String {
-        "massif: ms_print [--threshold=N] $MASSIF_OUT".to_string()
+        "massif: ms_print [--threshold=N] \"$MASSIF_OUT\"".to_string()
     }
 
     fn clean(&self, _cmd: &str, output: &str) -> String {
         let mut lines = Vec::new();
         for line in output.lines() {
             let trimmed = line.trim();
-            if trimmed.starts_with("==") && (trimmed.contains("Massif") || trimmed.contains("Copyright")) {
+            if trimmed.starts_with("==")
+                && (trimmed.contains("Massif") || trimmed.contains("Copyright"))
+            {
                 continue;
             }
             lines.push(line);
@@ -95,7 +96,10 @@ impl Backend for MassifBackend {
     }
 
     fn adapters(&self) -> Vec<(&'static str, &'static str)> {
-        vec![("massif.md", include_str!("../../skills/adapters/massif.md"))]
+        vec![(
+            "massif.md",
+            include_str!("../../skills/references/adapters/massif.md"),
+        )]
     }
 }
 
@@ -139,10 +143,14 @@ mod tests {
 
     #[test]
     fn spawn_config_escapes_spaces() {
-        let cfg = MassifBackend
-            .spawn_config("./my app", &[])
-            .unwrap();
+        let cfg = MassifBackend.spawn_config("./my app", &[]).unwrap();
         let cmd = &cfg.init_commands[0];
         assert!(cmd.contains("'./my app'"), "target not escaped: {cmd}");
+    }
+
+    #[test]
+    fn session_output_path_is_quoted_in_commands() {
+        assert_eq!(MassifBackend.run_command(), "ms_print \"$MASSIF_OUT\"");
+        assert!(MassifBackend.parse_help("").contains("\"$MASSIF_OUT\""));
     }
 }

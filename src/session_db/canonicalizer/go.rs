@@ -55,7 +55,9 @@ fn is_synthetic(s: &str) -> bool {
 mod tests {
     use super::*;
 
-    fn g() -> GoCanonicalizer { GoCanonicalizer }
+    fn g() -> GoCanonicalizer {
+        GoCanonicalizer
+    }
 
     #[test]
     fn plain_function_preserved() {

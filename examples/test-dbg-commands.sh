@@ -283,7 +283,7 @@ run_target() {
     sleep 0.2
 
     echo "    $lang/$target_name: $TARGET_OK ok, $TARGET_FAIL fail" >> "$log"
-    return 0
+    [[ $TARGET_FAIL -eq 0 ]]
 }
 
 # --------------------------------------------------------------
@@ -380,13 +380,17 @@ run_one() {
     echo
 
     # Decide overall rc for this language:
-    #  * any target ran to completion → 0 (ok)
+    #  * any canonical command failed → 1
+    #  * otherwise, any target ran to completion → 0 (ok)
     #  * at least one target failed fatally → classify as toolchain-skip
     #    only if ALL attempted targets failed at start with a "no
     #    debugger executable found" signature; else propagate as fail.
     #  * else (every target skipped due to missing marker) → 2.
     local any_ran=$(( fib_ran + ack_ran ))
     local any_fatal=$(( fib_fatal + ack_fatal ))
+    if [[ $lang_fail -gt 0 ]]; then
+        return 1
+    fi
     if [[ $any_ran -gt 0 ]]; then
         return 0
     fi
@@ -434,3 +438,4 @@ done
 echo "================ summary ================"
 echo "  $overall_ok ok, $overall_skip skipped, $overall_fail failed"
 echo "  logs under $OUT/"
+[[ $overall_fail -eq 0 ]]
