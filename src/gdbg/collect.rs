@@ -427,7 +427,7 @@ fn collect_ncu(
 fn ncu_command(target: &str, args: &[String], kernel_name: &str, kind: TargetKind) -> Command {
     let regex = crate::commands::escape_regex(kernel_name);
     let mut cmd = Command::new("ncu");
-    cmd.args(["--set", "full", "--csv"]);
+    cmd.args(["--set", "full", "--csv", "--print-units", "base"]);
     // The importer keys off Nsight Compute's stable metric identifiers (for
     // example `sm__throughput.avg.pct_of_peak_sustained_elapsed`).  CSV output
     // uses localized/display labels such as `Compute (SM) Throughput` unless
@@ -687,6 +687,10 @@ mod tests {
             args.windows(2)
                 .any(|w| w == ["--kernel-name-base", "demangled"]),
             "ncu must match the demangled names imported from nsys: {args:?}"
+        );
+        assert!(
+            args.windows(2).any(|w| w == ["--print-units", "base"]),
+            "ncu must emit base units consumed by the parser: {args:?}"
         );
         assert!(
             args.windows(2)
