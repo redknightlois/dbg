@@ -195,33 +195,19 @@ fn ncu_csv_edge_cases() {
 }
 
 #[test]
-fn chrome_trace_ncu_oversized_input_fails_closed() {
+fn ncu_oversized_input_fails_closed() {
     const MAX: u64 = 256 * 1024 * 1024;
     let dir = tempfile::tempdir().unwrap();
-    let chrome = dir.path().join("oversized.json");
     let ncu = dir.path().join("oversized.csv");
-    std::fs::File::create(&chrome)
-        .unwrap()
-        .set_len(MAX + 1)
-        .unwrap();
     std::fs::File::create(&ncu)
         .unwrap()
         .set_len(MAX + 1)
         .unwrap();
     let db = GpuDb::create(&dir.path().join("session.gpu.db")).unwrap();
-    let chrome_layer = db
-        .add_layer("torch", "oversized.json", None, None, None)
-        .unwrap();
     let ncu_layer = db
         .add_layer("ncu", "oversized.csv", None, None, None)
         .unwrap();
 
-    assert!(
-        import_chrome_trace(&db.conn, &chrome, chrome_layer)
-            .unwrap_err()
-            .to_string()
-            .contains("too large")
-    );
     assert!(
         import_ncu_csv(&db.conn, &ncu, ncu_layer)
             .unwrap_err()

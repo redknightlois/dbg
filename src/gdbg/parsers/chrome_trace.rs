@@ -1,17 +1,65 @@
 use std::collections::{BTreeSet, HashMap};
+use std::fmt;
+use std::fs::File;
+use std::io::BufReader;
 use std::path::Path;
-use std::{fs::File, io::Read};
 
 use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, params};
-use serde::Deserialize;
+use serde::de::{Error as _, IgnoredAny, MapAccess, SeqAccess, Visitor};
+use serde::{Deserialize, Deserializer};
 
 use crate::kernel::normalize_kernel_name;
 
 #[derive(Deserialize)]
 struct ChromeTrace {
     #[serde(rename = "traceEvents")]
-    trace_events: Vec<TraceEvent>,
+    trace_events: TraceEvents,
+}
+
+struct TraceEvents(Vec<TraceEvent>);
+
+impl<'de> Deserialize<'de> for TraceEvents {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct EventsVisitor;
+
+        impl<'de> Visitor<'de> for EventsVisitor {
+            type Value = TraceEvents;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("a Chrome trace event array")
+            }
+
+            fn visit_seq<A>(self, mut sequence: A) -> std::result::Result<Self::Value, A::Error>
+            where
+                A: SeqAccess<'de>,
+            {
+                let mut events = Vec::new();
+                while let Some(event) = sequence.next_element::<TraceEvent>()? {
+                    if event.ph != "X"
+                        || !matches!(
+                            event.cat.as_str(),
+                            "kernel" | "cpu_op" | "user_annotation" | "Operator"
+                        )
+                    {
+                        continue;
+                    }
+                    if events.len() == MAX_TRACE_EVENTS {
+                        return Err(A::Error::custom(format!(
+                            "Chrome trace contains more than {MAX_TRACE_EVENTS} supported events"
+                        )));
+                    }
+                    events.push(event);
+                }
+                Ok(TraceEvents(events))
+            }
+        }
+
+        deserializer.deserialize_seq(EventsVisitor)
+    }
 }
 
 #[derive(Clone, Deserialize, Eq, Hash, PartialEq)]
@@ -35,39 +83,23 @@ struct TraceEvent {
     pid: Option<TraceId>,
     #[serde(default)]
     tid: Option<TraceId>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_args")]
     args: Option<serde_json::Value>,
 }
 
-const MAX_IMPORT_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_TRACE_EVENTS: usize = 1_000_000;
 
 /// Parse a Chrome Trace JSON (torch.profiler export) and INSERT into session DB.
 pub fn import_chrome_trace(dest: &Connection, json_path: &Path, layer_id: i64) -> Result<()> {
-    let size = std::fs::metadata(json_path)
-        .with_context(|| format!("stat {}", json_path.display()))?
-        .len();
-    if size > MAX_IMPORT_BYTES {
-        bail!(
-            "Chrome trace {} is too large ({size} bytes; maximum is {MAX_IMPORT_BYTES})",
-            json_path.display()
-        );
-    }
-    let content = read_bounded_text(json_path, "Chrome trace")?;
-
-    let trace: ChromeTrace = serde_json::from_str(&content)
+    let file =
+        File::open(json_path).with_context(|| format!("cannot read {}", json_path.display()))?;
+    let trace: ChromeTrace = serde_json::from_reader(BufReader::new(file))
         .with_context(|| format!("cannot parse {}", json_path.display()))?;
-    if trace.trace_events.len() > MAX_TRACE_EVENTS {
-        bail!(
-            "Chrome trace contains {} events; maximum is {MAX_TRACE_EVENTS}",
-            trace.trace_events.len()
-        );
-    }
 
-    validate_supported_events(&trace.trace_events)?;
+    validate_supported_events(&trace.trace_events.0)?;
 
-    import_kernel_events(dest, &trace.trace_events, layer_id)?;
-    import_ops(dest, &trace.trace_events, layer_id)?;
+    import_kernel_events(dest, &trace.trace_events.0, layer_id)?;
+    import_ops(dest, &trace.trace_events.0, layer_id)?;
 
     Ok(())
 }
@@ -121,41 +153,6 @@ fn event_timing(event: &TraceEvent) -> Result<(f64, f64)> {
         .dur
         .ok_or_else(|| anyhow::anyhow!("Chrome trace event is missing dur"))?;
     Ok((ts, dur))
-}
-
-/// Read an import without allowing a file that grows after the metadata
-/// check to make the process accumulate unbounded input. Reads are capped to
-/// the remaining capacity, and a one-byte probe detects growth at the exact
-/// limit without appending that byte to the buffer.
-fn read_bounded_text(path: &Path, kind: &str) -> Result<String> {
-    read_bounded_text_with_limit(path, kind, MAX_IMPORT_BYTES)
-}
-
-fn read_bounded_text_with_limit(path: &Path, kind: &str, limit: u64) -> Result<String> {
-    let mut file = File::open(path).with_context(|| format!("cannot read {}", path.display()))?;
-    let mut bytes = Vec::new();
-    let mut chunk = [0_u8; 8192];
-    loop {
-        let remaining = limit.saturating_sub(bytes.len() as u64);
-        if remaining == 0 {
-            let mut probe = [0_u8; 1];
-            if file.read(&mut probe)? != 0 {
-                bail!(
-                    "{kind} {} grew beyond the maximum input size of {limit} bytes",
-                    path.display()
-                );
-            }
-            break;
-        }
-        let chunk_len = (remaining as usize).min(chunk.len());
-        let read = file.read(&mut chunk[..chunk_len])?;
-        if read == 0 {
-            break;
-        }
-        bytes.extend_from_slice(&chunk[..read]);
-    }
-    String::from_utf8(bytes)
-        .with_context(|| format!("{kind} {} is not valid UTF-8", path.display()))
 }
 
 // ---------------------------------------------------------------------------
@@ -396,6 +393,91 @@ fn import_ops(dest: &Connection, events: &[TraceEvent], layer_id: i64) -> Result
 // JSON field extractors
 // ---------------------------------------------------------------------------
 
+fn deserialize_args<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<serde_json::Value>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    struct ArgsVisitor;
+
+    impl<'de> Visitor<'de> for ArgsVisitor {
+        type Value = Option<serde_json::Value>;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("Chrome trace event arguments")
+        }
+
+        fn visit_map<A>(self, mut map: A) -> std::result::Result<Self::Value, A::Error>
+        where
+            A: MapAccess<'de>,
+        {
+            let mut fields = serde_json::Map::new();
+            while let Some(key) = map.next_key::<String>()? {
+                if matches!(
+                    key.as_str(),
+                    "grid"
+                        | "block"
+                        | "grid_x"
+                        | "grid_y"
+                        | "grid_z"
+                        | "block_x"
+                        | "block_y"
+                        | "block_z"
+                        | "stream"
+                        | "stream_id"
+                        | "correlation"
+                        | "External id"
+                        | "external id"
+                        | "Python module id"
+                        | "module"
+                        | "Input Dims"
+                        | "input_shapes"
+                ) {
+                    fields.insert(key, map.next_value()?);
+                } else {
+                    map.next_value::<IgnoredAny>()?;
+                }
+            }
+            Ok(Some(serde_json::Value::Object(fields)))
+        }
+
+        fn visit_unit<E>(self) -> std::result::Result<Self::Value, E> {
+            Ok(None)
+        }
+
+        fn visit_seq<A>(self, mut sequence: A) -> std::result::Result<Self::Value, A::Error>
+        where
+            A: SeqAccess<'de>,
+        {
+            while sequence.next_element::<IgnoredAny>()?.is_some() {}
+            Ok(Some(serde_json::Value::Null))
+        }
+
+        fn visit_bool<E>(self, _: bool) -> std::result::Result<Self::Value, E> {
+            Ok(Some(serde_json::Value::Null))
+        }
+
+        fn visit_i64<E>(self, _: i64) -> std::result::Result<Self::Value, E> {
+            Ok(Some(serde_json::Value::Null))
+        }
+
+        fn visit_u64<E>(self, _: u64) -> std::result::Result<Self::Value, E> {
+            Ok(Some(serde_json::Value::Null))
+        }
+
+        fn visit_f64<E>(self, _: f64) -> std::result::Result<Self::Value, E> {
+            Ok(Some(serde_json::Value::Null))
+        }
+
+        fn visit_str<E>(self, _: &str) -> std::result::Result<Self::Value, E> {
+            Ok(Some(serde_json::Value::Null))
+        }
+    }
+
+    deserializer.deserialize_any(ArgsVisitor)
+}
+
 fn extract_tuple(
     args: &Option<serde_json::Value>,
     array_key: &str,
@@ -463,7 +545,7 @@ fn extract_string(args: &Option<serde_json::Value>, key: &str) -> Option<String>
 mod tests {
     use super::*;
     use crate::db::GpuDb;
-    use std::io::Write;
+    use std::io::{BufWriter, Write};
 
     #[test]
     fn import_chrome_trace_basic() {
@@ -510,18 +592,39 @@ mod tests {
     }
 
     #[test]
-    fn bounded_read_accepts_exact_limit_and_rejects_one_more_byte() {
-        let mut exact = tempfile::NamedTempFile::new().unwrap();
-        exact.write_all(b"12345678").unwrap();
-        assert_eq!(
-            read_bounded_text_with_limit(exact.path(), "Chrome trace", 8).unwrap(),
-            "12345678"
-        );
+    fn streams_large_ignored_args_and_more_than_a_million_metadata_events() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("large.json");
+        let mut output = BufWriter::new(File::create(&path).unwrap());
+        output.write_all(br#"{"traceEvents":[{"name":"aten::linear","cat":"cpu_op","ph":"X","ts":1,"dur":9,"args":{"External id":7,"Python module id":42,"module":"linear","Input Dims":[[1,4]],"Call stack":""#).unwrap();
+        let chunk = [b'x'; 64 * 1024];
+        for _ in 0..4097 {
+            output.write_all(&chunk).unwrap();
+        }
+        output.write_all(br#""}}"#).unwrap();
+        let metadata = r#",{"ph":"M","args":[true]}"#.repeat(1024);
+        for _ in 0..=(MAX_TRACE_EVENTS / 1024) {
+            output.write_all(metadata.as_bytes()).unwrap();
+        }
+        output.write_all(br#",{"name":"kernel","cat":"kernel","ph":"X","ts":11,"dur":2,"args":{"external id":7,"grid":[1,1,1],"block":[32,1,1]}}]}"#).unwrap();
+        output.flush().unwrap();
+        assert!(std::fs::metadata(&path).unwrap().len() > 256 * 1024 * 1024);
 
-        let mut oversized = tempfile::NamedTempFile::new().unwrap();
-        oversized.write_all(b"123456789").unwrap();
-        let error = read_bounded_text_with_limit(oversized.path(), "Chrome trace", 8).unwrap_err();
-        assert!(error.to_string().contains("maximum input size of 8 bytes"));
+        let db = GpuDb::create(&directory.path().join("session.db")).unwrap();
+        let layer = db
+            .add_layer("torch", "large.json", None, None, None)
+            .unwrap();
+        import_chrome_trace(&db.conn, &path, layer).unwrap();
+        assert_eq!(db.total_launch_count(), 1);
+        let result: (String, String, f64) = db
+            .conn
+            .query_row(
+                "SELECT module_path, input_shapes, gpu_time_us FROM ops",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(result, ("linear".into(), "[[1,4]]".into(), 2.0));
     }
 
     #[test]
