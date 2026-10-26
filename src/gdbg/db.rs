@@ -72,6 +72,27 @@ pub fn like_param(pattern: &str) -> String {
     format!("%{}%", escape_sql_like(pattern))
 }
 
+/// Meta keys whose value belongs to one capture layer.
+const LAYER_META_KEYS: [&str; 2] = ["wall_time_us", "device"];
+
+fn layer_meta_key(layer_id: i64, key: &str) -> String {
+    format!("{key}@{layer_id}")
+}
+
+/// Record `key` for `layer_id`, and as the most recent write of `key`.
+pub(crate) fn set_layer_meta(
+    conn: &Connection,
+    layer_id: i64,
+    key: &str,
+    value: &str,
+) -> Result<()> {
+    conn.execute(
+        "INSERT OR REPLACE INTO meta (key, value) VALUES (?1, ?3), (?2, ?3)",
+        params![layer_meta_key(layer_id, key), key, value],
+    )?;
+    Ok(())
+}
+
 impl GpuDb {
     /// Create a new session database at the given path.
     pub fn create(path: &Path) -> Result<Self> {
@@ -392,7 +413,17 @@ impl GpuDb {
     // Meta
     // -----------------------------------------------------------------------
 
+    /// A layer-scoped key describes the newest layer, the one an import
+    /// is filling.
     pub fn set_meta(&self, key: &str, value: &str) -> Result<()> {
+        if LAYER_META_KEYS.contains(&key) {
+            let newest: Option<i64> =
+                self.conn
+                    .query_row("SELECT MAX(id) FROM layers", [], |row| row.get(0))?;
+            if let Some(layer_id) = newest {
+                return set_layer_meta(&self.conn, layer_id, key, value);
+            }
+        }
         self.conn.execute(
             "INSERT OR REPLACE INTO meta (key, value) VALUES (?1, ?2)",
             params![key, value],
@@ -400,13 +431,25 @@ impl GpuDb {
         Ok(())
     }
 
+    /// A layer-scoped key reads the value of the timeline layer, so it
+    /// describes the same capture as the timeline rows. Without one, it
+    /// reads the most recent write.
     pub fn meta(&self, key: &str) -> String {
-        self.conn
-            .query_row(
-                "SELECT value FROM meta WHERE key = ?1",
-                params![key],
-                |row| row.get(0),
-            )
+        let get = |key: &str| {
+            self.conn
+                .query_row(
+                    "SELECT value FROM meta WHERE key = ?1",
+                    params![key],
+                    |row| row.get::<_, String>(0),
+                )
+                .ok()
+        };
+        LAYER_META_KEYS
+            .contains(&key)
+            .then(|| self.timeline_layer_id())
+            .flatten()
+            .and_then(|layer_id| get(&layer_meta_key(layer_id, key)))
+            .or_else(|| get(key))
             .unwrap_or_default()
     }
 
@@ -728,14 +771,15 @@ impl GpuDb {
 
         // Mappings with a source launch ID represent individual occurrences.
         // IDs are not comparable across profiler layers, so rank same-name
-        // occurrences by time and pair them one-to-one. Legacy/name-only
+        // occurrences by time within each source layer and pair each
+        // layer's ranks one-to-one with the timeline layer's. Legacy/name-only
         // mappings represent an aggregate relationship and intentionally sum
         // the selected layer's same-name launches once per operator.
         if let Err(e) = self.conn.execute(
             "WITH exact_mappings AS (
                 SELECT mappings.op_id, mappings.kernel_name,
                        ROW_NUMBER() OVER (
-                           PARTITION BY mappings.kernel_name
+                           PARTITION BY source.layer_id, mappings.kernel_name
                            ORDER BY source.start_us, mappings.launch_id, mappings.op_id
                        ) AS occurrence
                 FROM op_kernel_map AS mappings
@@ -1747,6 +1791,58 @@ mod tests {
             row.get(0)
         });
         assert_eq!(times, vec![2.0, 3.0]);
+    }
+
+    fn two_source_layers_one_timeline_launch(timeline_us: f64, starts: [f64; 2]) -> Vec<f64> {
+        let db = temp_db();
+        let timeline = db.add_layer("nsys", "trace.rep", None, None, None).unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO launches (kernel_name, duration_us, start_us, layer_id)
+                 VALUES ('k', ?1, 0, ?2)",
+                params![timeline_us, timeline],
+            )
+            .unwrap();
+        for (op_id, (file, start)) in [(1, ("a.json", starts[0])), (2, ("b.json", starts[1]))] {
+            let source = db.add_layer("torch", file, None, None, None).unwrap();
+            db.conn
+                .execute(
+                    "INSERT INTO ops (id, name, gpu_time_us, layer_id) VALUES (?1, 'op', 0, ?2)",
+                    params![op_id, source],
+                )
+                .unwrap();
+            db.conn
+                .execute(
+                    "INSERT INTO launches (kernel_name, duration_us, start_us, layer_id)
+                     VALUES ('k', 1.0, ?1, ?2)",
+                    params![start, source],
+                )
+                .unwrap();
+            db.conn
+                .execute(
+                    "INSERT INTO op_kernel_map (op_id, kernel_name, launch_id) VALUES (?1, 'k', ?2)",
+                    params![op_id, db.conn.last_insert_rowid()],
+                )
+                .unwrap();
+        }
+        db.recompute_op_gpu_times();
+        db.query_vec("SELECT gpu_time_us FROM ops ORDER BY id", [], |row| {
+            row.get(0)
+        })
+    }
+
+    #[test]
+    fn recompute_ranks_occurrences_within_each_source_layer() {
+        assert_eq!(
+            two_source_layers_one_timeline_launch(2.0, [10.0, 5.0]),
+            vec![2.0, 2.0]
+        );
+    }
+
+    #[test]
+    fn recompute_does_not_zero_an_exact_mapping_from_a_second_source_layer() {
+        let times = two_source_layers_one_timeline_launch(4.0, [10.0, 20.0]);
+        assert!(times.iter().all(|&t| t != 0.0), "{times:?}");
     }
 
     #[test]

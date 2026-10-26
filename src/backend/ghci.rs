@@ -171,7 +171,20 @@ impl Backend for GhciBackend {
 }
 
 fn ghci_command_arg(value: &str) -> String {
-    format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
+    let mut out = String::from("\"");
+    for ch in value.chars() {
+        match ch {
+            '\\' | '"' => {
+                out.push('\\');
+                out.push(ch);
+            }
+            // The pty and haskeline act on raw control bytes; `\&` ends the number.
+            _ if ch.is_control() => out.push_str(&format!("\\{}\\&", ch as u32)),
+            _ => out.push(ch),
+        }
+    }
+    out.push('"');
+    out
 }
 
 impl CanonicalOps for GhciBackend {
@@ -293,6 +306,50 @@ impl CanonicalOps for GhciBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn spawn_config_does_not_split_an_argument_into_two_ghci_commands() {
+        let cfg = GhciBackend
+            .spawn_config("Main.hs", &["a\n:! touch /tmp/pwned\r".into()])
+            .unwrap();
+        assert!(
+            cfg.init_commands
+                .iter()
+                .all(|c| !c.contains('\n') && !c.contains('\r')),
+            "{:?}",
+            cfg.init_commands
+        );
+    }
+
+    #[test]
+    fn ghci_command_arg_has_no_control_byte_and_round_trips() {
+        let value = "a\u{15}b\u{17}\u{3}\u{4}\t\u{7f}\r\n1\\\"z";
+        let arg = ghci_command_arg(value);
+        assert!(!arg.bytes().any(|b| b < 0x20 || b == 0x7f), "{arg:?}");
+        // Decodes the Haskell string-literal escapes that the encoder emits.
+        let inner = &arg[1..arg.len() - 1];
+        let mut decoded = String::new();
+        let mut chars = inner.chars().peekable();
+        while let Some(ch) = chars.next() {
+            if ch != '\\' {
+                decoded.push(ch);
+                continue;
+            }
+            match chars.next().unwrap() {
+                '&' => {}
+                d if d.is_ascii_digit() => {
+                    let mut code = d.to_digit(10).unwrap();
+                    while let Some(d) = chars.peek().and_then(|c| c.to_digit(10)) {
+                        code = code * 10 + d;
+                        chars.next();
+                    }
+                    decoded.push(char::from_u32(code).unwrap());
+                }
+                other => decoded.push(other),
+            }
+        }
+        assert_eq!(decoded, value);
+    }
 
     #[test]
     fn format_breakpoint_function() {

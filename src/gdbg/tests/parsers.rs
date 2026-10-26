@@ -817,7 +817,7 @@ fn chrome_trace_innermost_op_wins() {
 }
 
 #[test]
-fn chrome_trace_correlation_respects_process_and_thread_identity() {
+fn chrome_trace_uncorrelated_kernel_prefers_an_op_on_its_own_thread() {
     use crate::db::GpuDb;
     use crate::parsers::chrome_trace::import_chrome_trace;
 
@@ -953,11 +953,13 @@ fn chrome_trace_string_tracks_and_async_external_ids_preserve_identity() {
         {"ph":"X", "cat":"cpu_op", "name":"launch", "pid":123, "tid":11, "ts":0, "dur":1, "args":{"External id":42}},
         {"ph":"X", "cat":"kernel", "name":"async", "pid":0, "tid":7, "ts":10, "dur":3, "args":{"External id":42}},
         {"ph":"X", "cat":"cpu_op", "name":"text_track", "pid":"123", "tid":"11", "ts":50, "dur":10},
+        {"ph":"X", "cat":"cuda_driver", "name":"cuLaunchKernel", "pid":"123", "tid":"11", "ts":53, "dur":1, "args":{"correlation":77}},
+        {"ph":"X", "cat":"kernel", "name":"async_text_launcher", "pid":0, "tid":7, "ts":80, "dur":2, "args":{"correlation":77}},
         {"ph":"X", "cat":"kernel", "name":"same_text_track", "pid":"123", "tid":"11", "ts":52, "dur":2},
         {"ph":"X", "cat":"kernel", "name":"different_numeric_track", "pid":123, "tid":11, "ts":52, "dur":2},
         {"ph":"X", "cat":"cpu_op", "name":"duplicate_one", "ts":100, "dur":10, "args":{"External id":99}},
         {"ph":"X", "cat":"cpu_op", "name":"duplicate_two", "ts":100, "dur":10, "args":{"External id":99}},
-        {"ph":"X", "cat":"kernel", "name":"ambiguous", "ts":101, "dur":1, "args":{"External id":99}}
+        {"ph":"X", "cat":"kernel", "name":"ambiguous", "ts":101, "dur":1, "args":{"External id":99,"correlation":77}}
     ]});
     let path = dir.path().join("trace.json");
     std::fs::write(&path, trace.to_string()).unwrap();
@@ -975,7 +977,113 @@ fn chrome_trace_string_tracks_and_async_external_ids_preserve_identity() {
         links,
         vec![
             ("async".into(), "launch".into()),
+            ("async_text_launcher".into(), "text_track".into()),
             ("same_text_track".into(), "text_track".into())
         ]
     );
+}
+
+#[test]
+fn chrome_trace_uncorrelated_kernel_without_an_own_thread_op_stays_unmapped() {
+    use crate::db::GpuDb;
+    use crate::parsers::chrome_trace::import_chrome_trace;
+
+    let db = GpuDb::create(&tempfile::tempdir().unwrap().keep().join("contexts.db")).unwrap();
+    let layer = db
+        .add_layer("torch", "trace.json", None, None, None)
+        .unwrap();
+    let trace = serde_json::json!({
+        "traceEvents": [
+            {"ph":"X", "cat":"cpu_op", "name":"other-thread", "pid":2, "tid":1,
+             "ts":0.0, "dur":200.0, "args":{}},
+            {"ph":"X", "cat":"cpu_op", "name":"other-process", "pid":3, "tid":7,
+             "ts":0.0, "dur":200.0, "args":{}},
+            {"ph":"X", "cat":"kernel", "name":"kernel", "pid":2, "tid":7,
+             "ts":110.0, "dur":5.0, "args":{}}
+        ]
+    });
+    let file = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(file.path(), serde_json::to_vec(&trace).unwrap()).unwrap();
+
+    import_chrome_trace(&db.conn, file.path(), layer).unwrap();
+
+    let mapped: i64 = db
+        .conn
+        .query_row("SELECT COUNT(*) FROM op_kernel_map", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(mapped, 0);
+}
+
+#[test]
+fn chrome_trace_launcher_correlation_selects_the_launcher_thread() {
+    use crate::db::GpuDb;
+    use crate::parsers::chrome_trace::import_chrome_trace;
+
+    let db = GpuDb::create(&tempfile::tempdir().unwrap().keep().join("contexts.db")).unwrap();
+    let layer = db
+        .add_layer("torch", "trace.json", None, None, None)
+        .unwrap();
+    let trace = serde_json::json!({
+        "traceEvents": [
+            {"ph":"X", "cat":"cpu_op", "name":"wrong-shorter", "pid":1, "tid":1,
+             "ts":100.0, "dur":20.0, "args":{}},
+            {"ph":"X", "cat":"cpu_op", "name":"right-context", "pid":2, "tid":7,
+             "ts":0.0, "dur":200.0, "args":{}},
+            {"ph":"X", "cat":"cuda_runtime", "name":"cudaLaunchKernel", "pid":2, "tid":7,
+             "ts":50.0, "dur":4.0, "args":{"correlation":5}},
+            {"ph":"X", "cat":"kernel", "name":"kernel", "pid":0, "tid":7,
+             "ts":110.0, "dur":5.0, "args":{"correlation":5, "stream":7}}
+        ]
+    });
+    let file = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(file.path(), serde_json::to_vec(&trace).unwrap()).unwrap();
+
+    import_chrome_trace(&db.conn, file.path(), layer).unwrap();
+
+    let mapped: String = db
+        .conn
+        .query_row(
+            "SELECT ops.name FROM op_kernel_map
+             JOIN ops ON ops.id = op_kernel_map.op_id",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(mapped, "right-context");
+}
+
+#[test]
+fn chrome_trace_kernel_maps_through_external_id() {
+    use crate::db::GpuDb;
+    use crate::parsers::chrome_trace::import_chrome_trace;
+
+    let db = GpuDb::create(&tempfile::tempdir().unwrap().keep().join("ext.db")).unwrap();
+    let layer = db
+        .add_layer("torch", "trace.json", None, None, None)
+        .unwrap();
+    let trace = serde_json::json!({
+        "traceEvents": [
+            {"ph":"X", "cat":"cpu_op", "name":"launcher", "pid":1, "tid":3,
+             "ts":0.0, "dur":10.0, "args":{"External id":9}},
+            {"ph":"X", "cat":"cpu_op", "name":"bystander", "pid":1, "tid":4,
+             "ts":100.0, "dur":50.0, "args":{"External id":10}},
+            {"ph":"X", "cat":"kernel", "name":"kernel", "pid":0, "tid":7,
+             "ts":120.0, "dur":5.0, "args":{"External id":9}}
+        ]
+    });
+    let file = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(file.path(), serde_json::to_vec(&trace).unwrap()).unwrap();
+
+    import_chrome_trace(&db.conn, file.path(), layer).unwrap();
+
+    let mapped: String = db
+        .conn
+        .query_row(
+            "SELECT ops.name FROM op_kernel_map
+             JOIN ops ON ops.id = op_kernel_map.op_id",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(mapped, "launcher");
 }

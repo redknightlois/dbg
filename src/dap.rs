@@ -294,6 +294,9 @@ struct State {
     armed_action_generation: u64,
     stop_generation: u64,
     enriched_stop_generation: u64,
+    /// True while the stackTrace helper of the current stop has not ended.
+    /// A paused stop with no frame and no pending helper failed enrichment.
+    stack_pending: bool,
 }
 
 impl State {
@@ -324,6 +327,7 @@ impl State {
             armed_action_generation: 0,
             stop_generation: 0,
             enriched_stop_generation: 0,
+            stack_pending: false,
         }
     }
 }
@@ -1289,13 +1293,7 @@ impl DapTransport {
         if lhs.is_empty() || rhs.is_empty() {
             bail!("usage: dbg set <lhs> = <expr>");
         }
-        let frame_id = {
-            let (lock, _) = &*self.state;
-            let s = lock.lock().unwrap();
-            s.top_frame
-                .as_ref()
-                .and_then(|f| f.get("id").and_then(|v| v.as_i64()))
-        };
+        let frame_id = self.stop_frame_id(timeout)?;
         let mut args = json!({
             "expression": lhs,
             "value": rhs,
@@ -1387,14 +1385,43 @@ impl DapTransport {
         bail!("variable `{lhs}` not found in any frame scope")
     }
 
+    /// Frame id of the current stop, or `None` when the session is not
+    /// paused. While the stop's stackTrace helper is in flight, the call
+    /// waits up to `timeout` for it. A paused session whose stop has no
+    /// known frame after enrichment is an error that names the recovery
+    /// command, so no request falls back to the adapter's global scope.
+    fn stop_frame_id(&self, timeout: Duration) -> Result<Option<i64>> {
+        let (lock, cvar) = &*self.state;
+        let s = lock.lock().unwrap();
+        let generation = s.stop_generation;
+        let (s, _) = cvar
+            .wait_timeout_while(s, timeout, |s| {
+                s.paused
+                    && s.top_frame.is_none()
+                    && s.stack_pending
+                    && s.stop_generation == generation
+            })
+            .unwrap();
+        if s.paused && s.top_frame.is_none() && s.stack_pending {
+            bail!("paused, but the stack trace for the current stop has not arrived yet");
+        }
+        let id = s
+            .top_frame
+            .as_ref()
+            .and_then(|f| f.get("id").and_then(|v| v.as_i64()));
+        if id.is_none() && s.paused {
+            let thread = s
+                .current_thread
+                .map_or_else(|| "<id>".to_string(), |tid| tid.to_string());
+            bail!(
+                "paused, but no frame is known for the current stop; run `dbg thread {thread}` to load its frames"
+            );
+        }
+        Ok(id)
+    }
+
     fn evaluate(&self, expr: &str, timeout: Duration) -> Result<String> {
-        let frame_id = {
-            let (lock, _) = &*self.state;
-            let s = lock.lock().unwrap();
-            s.top_frame
-                .as_ref()
-                .and_then(|f| f.get("id").and_then(|v| v.as_i64()))
-        };
+        let frame_id = self.stop_frame_id(timeout)?;
         let mut args = json!({
             "expression": expr,
             "context": "repl",
@@ -1411,14 +1438,9 @@ impl DapTransport {
     }
 
     fn collect_locals(&self, timeout: Duration) -> Result<String> {
-        let frame_id = {
-            let (lock, _) = &*self.state;
-            let s = lock.lock().unwrap();
-            s.top_frame
-                .as_ref()
-                .and_then(|f| f.get("id").and_then(|v| v.as_i64()))
-                .ok_or_else(|| anyhow!("locals: not paused"))?
-        };
+        let frame_id = self
+            .stop_frame_id(timeout)?
+            .ok_or_else(|| anyhow!("locals: not paused"))?;
         let scopes_resp = self.call_blocking("scopes", json!({ "frameId": frame_id }), timeout)?;
         let scopes = scopes_resp
             .get("scopes")
@@ -2494,6 +2516,10 @@ fn dispatch_incoming(
                         // but its delayed helper must not create a hit for
                         // a later continue.
                         s.pending_hit = None;
+                        // Only this stop's stackTrace response or `dbg thread` sets frames.
+                        s.top_frame = None;
+                        s.call_frames.clear();
+                        s.stack_pending = thread_id.is_some();
                         s.stop_generation
                     };
                     if let Some(tid) = thread_id {
@@ -2507,7 +2533,17 @@ fn dispatch_incoming(
                         // handler can build a structured HitEvent. We
                         // bypass the call_blocking path (driver can't
                         // block on itself) and write directly.
+                        // At the helper cap, publish a location-less hit so a
+                        // waiter still observes this stop.
                         if !can_schedule_stack_helper(pending) {
+                            let (lock, cvar) = &**state;
+                            let mut s = lock.lock().unwrap();
+                            s.pending_hit = Some(HitEvent {
+                                thread: Some(tid.to_string()),
+                                ..HitEvent::default()
+                            });
+                            s.stack_pending = false;
+                            cvar.notify_all();
                             return;
                         }
                         let seq = *next_seq;
@@ -2532,9 +2568,15 @@ fn dispatch_incoming(
                         // Defer the response-waiting onto a short-lived
                         // helper thread so we don't block the driver.
                         let state2 = state.clone();
-                        std::thread::spawn(move || match rx.recv_timeout(Duration::from_secs(5)) {
-                            Ok(Ok(body)) => handle_stack_response(body, &state2, stop_generation),
-                            _ => cancelled.store(true, Ordering::Release),
+                        std::thread::spawn(move || {
+                            let body = match rx.recv_timeout(Duration::from_secs(5)) {
+                                Ok(Ok(body)) => Some(body),
+                                _ => {
+                                    cancelled.store(true, Ordering::Release);
+                                    None
+                                }
+                            };
+                            handle_stack_response(body, &state2, stop_generation, tid);
                         });
                     } else {
                         let (lock, cvar) = &**state;
@@ -2602,9 +2644,17 @@ fn dispatch_incoming(
     }
 }
 
-fn handle_stack_response(body: Value, state: &Arc<(Mutex<State>, Condvar)>, stop_generation: u64) {
+/// A `None` body means the stackTrace request failed or was not answered;
+/// the stop is then published without a location, on the stopped thread.
+fn handle_stack_response(
+    body: Option<Value>,
+    state: &Arc<(Mutex<State>, Condvar)>,
+    stop_generation: u64,
+    thread_id: i64,
+) {
     let frames = body
-        .get("stackFrames")
+        .as_ref()
+        .and_then(|b| b.get("stackFrames"))
         .and_then(|v| v.as_array())
         .cloned()
         .unwrap_or_default();
@@ -2636,17 +2686,25 @@ fn handle_stack_response(body: Value, state: &Arc<(Mutex<State>, Condvar)>, stop
     });
     let (lock, cvar) = &**state;
     let mut s = lock.lock().unwrap();
-    // A stack helper owns exactly the stop event which created it. If the
-    // daemon already consumed that stop, or another stop arrived, this
+    // A stack helper owns exactly the stop event which created it.
+    if s.stop_generation != stop_generation {
+        return;
+    }
+    s.stack_pending = false;
+    cvar.notify_all();
+    // Frames are written only while the stop is paused and has none, so
+    // frames that `dbg thread` loaded are kept.
+    if s.paused && s.top_frame.is_none() {
+        s.call_frames = frames;
+        s.top_frame = top;
+    }
+    // If the daemon already consumed this stop, or a later action began, this
     // delayed response must not create a hit for a later continue.
-    if s.stop_generation != stop_generation
-        || s.pending_action_generation != s.action_generation
+    if s.pending_action_generation != s.action_generation
         || s.enriched_stop_generation == stop_generation
     {
         return;
     }
-    s.call_frames = frames;
-    s.top_frame = top;
     if let Some(hit) = hit {
         s.pending_hit = Some(hit);
     } else {
@@ -2654,7 +2712,10 @@ fn handle_stack_response(body: Value, state: &Arc<(Mutex<State>, Condvar)>, stop
         // frames. Publish a structured placeholder only after that answer;
         // this keeps the wait ordering deterministic without inventing a
         // hit before enrichment completes.
-        s.pending_hit = Some(HitEvent::default());
+        s.pending_hit = Some(HitEvent {
+            thread: body.is_none().then(|| thread_id.to_string()),
+            ..HitEvent::default()
+        });
     }
     s.pending_action_generation = s.action_generation;
     s.enriched_stop_generation = stop_generation;
@@ -3040,6 +3101,80 @@ mod tests {
             );
         }
         assert!(!can_schedule_stack_helper(&pending));
+    }
+
+    #[test]
+    fn stopped_event_at_the_helper_cap_is_still_observable() {
+        let state = Arc::new((Mutex::new(State::new()), Condvar::new()));
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let peer = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut pending = HashMap::new();
+        let mut receivers = Vec::new();
+        for seq in 0..MAX_DAP_STACK_HELPERS {
+            let (tx, rx) = mpsc::channel();
+            receivers.push(rx);
+            pending.insert(
+                seq as i64,
+                PendingRequest {
+                    command: "stackTrace".into(),
+                    resp: tx,
+                    cancelled: Arc::new(AtomicBool::new(false)),
+                },
+            );
+        }
+        {
+            let mut s = state.0.lock().unwrap();
+            s.top_frame = Some(json!({"id": 1000}));
+            s.call_frames.push(json!({"id": 1000}));
+        }
+        let log = LogHandle::new();
+        let mut next_seq = 100;
+        dispatch_incoming(
+            json!({"type":"event", "event":"stopped", "body":{"threadId":7}}),
+            &mut pending,
+            &state,
+            &log,
+            &mut stream,
+            &mut next_seq,
+        );
+        drop(peer);
+        let (lock, _) = &*state;
+        let guard = lock.lock().unwrap();
+        assert!(guard.paused);
+        assert_eq!(pending.len(), MAX_DAP_STACK_HELPERS);
+        assert_eq!(
+            guard
+                .pending_hit
+                .as_ref()
+                .and_then(|hit| hit.thread.as_deref()),
+            Some("7")
+        );
+        assert!(!guard.pending_is_unscoped);
+        assert!(guard.top_frame.is_none());
+        assert!(guard.call_frames.is_empty());
+    }
+
+    #[test]
+    fn paused_without_a_frame_refuses_frameless_requests() {
+        let (transport, calls) = test_transport(vec![Ok(json!({"result": "1"}))]);
+        transport.state.0.lock().unwrap().paused = true;
+        let timeout = Duration::from_secs(1);
+        let error = transport.evaluate("x", timeout).unwrap_err().to_string();
+        assert!(error.contains("no frame"), "{error}");
+        let error = transport
+            .set_expression("x = 1", timeout)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("no frame"), "{error}");
+        let error = transport.collect_locals(timeout).unwrap_err().to_string();
+        assert!(!error.contains("not paused"), "{error}");
+        assert_eq!(calls.load(Ordering::Relaxed), 0);
+
+        transport.state.0.lock().unwrap().paused = false;
+        assert_eq!(transport.evaluate("x", timeout).unwrap(), "1");
+        let error = transport.collect_locals(timeout).unwrap_err().to_string();
+        assert!(error.contains("not paused"), "{error}");
     }
 
     fn assert_no_breakpoint_state(transport: &DapTransport, next_id: u32) {
@@ -3576,6 +3711,11 @@ mod tests {
         let mut pending = HashMap::new();
         let log = LogHandle::new();
         let mut next_seq = 1;
+        {
+            let mut s = state.0.lock().unwrap();
+            s.top_frame = Some(json!({"id": 1000}));
+            s.call_frames.push(json!({"id": 1000}));
+        }
         dispatch_incoming(
             json!({"type":"event", "event":"stopped", "body":{"threadId":null}}),
             &mut pending,
@@ -3589,6 +3729,179 @@ mod tests {
         let guard = lock.lock().unwrap();
         assert!(guard.pending_is_unscoped);
         assert!(guard.pending_hit.is_some());
+        assert!(guard.top_frame.is_none());
+        assert!(guard.call_frames.is_empty());
+    }
+
+    /// Answers the single pending stackTrace request of a stop.
+    fn answer_stack_trace(
+        pending: &mut HashMap<i64, PendingRequest>,
+        transport: &DapTransport,
+        stream: &mut std::net::TcpStream,
+        next_seq: &mut i64,
+        response: Value,
+    ) {
+        let seq = *pending.keys().next().expect("a pending stackTrace request");
+        let mut response = response;
+        response["type"] = json!("response");
+        response["request_seq"] = json!(seq);
+        dispatch_incoming(
+            response,
+            pending,
+            &transport.state,
+            &transport.log,
+            stream,
+            next_seq,
+        );
+    }
+
+    #[test]
+    fn frameless_stop_names_the_recovery_command() {
+        let (transport, calls) = test_transport(vec![]);
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let peer = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut pending = HashMap::new();
+        let mut next_seq = 1;
+        transport.state.0.lock().unwrap().top_frame = Some(json!({"id": 1000}));
+        // Bounds the wait for the helper thread to record the failed stackTrace.
+        let timeout = Duration::from_secs(30);
+        for (body, command) in [
+            (json!({}), "dbg thread <id>"),
+            (json!({"threadId": 7}), "dbg thread 7"),
+        ] {
+            dispatch_incoming(
+                json!({"type":"event", "event":"stopped", "body": body}),
+                &mut pending,
+                &transport.state,
+                &transport.log,
+                &mut stream,
+                &mut next_seq,
+            );
+            if !pending.is_empty() {
+                answer_stack_trace(
+                    &mut pending,
+                    &transport,
+                    &mut stream,
+                    &mut next_seq,
+                    json!({"success": false, "message": "no stack"}),
+                );
+            }
+            let error = transport.evaluate("x", timeout).unwrap_err().to_string();
+            assert!(error.contains(command), "{error}");
+            let error = transport
+                .set_expression("x = 1", timeout)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains(command), "{error}");
+        }
+        drop(peer);
+        assert_eq!(calls.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn stack_enrichment_writes_only_a_frame_the_current_stop_supplied() {
+        let (transport, calls) = test_transport(vec![Ok(json!({"result": "1"}))]);
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let peer = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut pending = HashMap::new();
+        let mut next_seq = 1;
+        let stopped = json!({"type":"event","event":"stopped","body":{"threadId":7}});
+        let frames =
+            json!({"stackFrames":[{"id":1000,"name":"main","line":3,"source":{"path":"/t/a.py"}}]});
+        let timeout = Duration::from_secs(30);
+
+        let settled = |transport: &DapTransport| {
+            let (lock, cvar) = &*transport.state;
+            let s = lock.lock().unwrap();
+            cvar.wait_timeout_while(s, timeout, |s| s.stack_pending)
+                .unwrap()
+                .0
+                .top_frame
+                .clone()
+        };
+
+        // An action advanced its generation before arming. While the
+        // stop's stackTrace is in flight, `print` reports it as pending,
+        // and the response still writes the stop's frame.
+        {
+            let mut s = transport.state.0.lock().unwrap();
+            s.action_generation = 1;
+            s.armed_action_generation = 0;
+        }
+        dispatch_incoming(
+            stopped.clone(),
+            &mut pending,
+            &transport.state,
+            &transport.log,
+            &mut stream,
+            &mut next_seq,
+        );
+        let error = transport
+            .evaluate("x", Duration::ZERO)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("has not arrived yet") && !error.contains("dbg thread"),
+            "{error}"
+        );
+        answer_stack_trace(
+            &mut pending,
+            &transport,
+            &mut stream,
+            &mut next_seq,
+            json!({"success": true, "body": frames}),
+        );
+        assert_eq!(transport.evaluate("x", timeout).unwrap(), "1");
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        assert!(transport.state.0.lock().unwrap().pending_hit.is_none());
+
+        // A stop that resumed before its response arrived gets no frame.
+        dispatch_incoming(
+            stopped.clone(),
+            &mut pending,
+            &transport.state,
+            &transport.log,
+            &mut stream,
+            &mut next_seq,
+        );
+        dispatch_incoming(
+            json!({"type":"event","event":"continued","body":{"threadId":7}}),
+            &mut pending,
+            &transport.state,
+            &transport.log,
+            &mut stream,
+            &mut next_seq,
+        );
+        answer_stack_trace(
+            &mut pending,
+            &transport,
+            &mut stream,
+            &mut next_seq,
+            json!({"success": true, "body": frames}),
+        );
+        assert_eq!(settled(&transport), None);
+
+        // A failed stackTrace keeps the frames that `dbg thread` loaded for its stop.
+        dispatch_incoming(
+            stopped,
+            &mut pending,
+            &transport.state,
+            &transport.log,
+            &mut stream,
+            &mut next_seq,
+        );
+        transport.state.0.lock().unwrap().top_frame = Some(json!({"id": 2000}));
+        answer_stack_trace(
+            &mut pending,
+            &transport,
+            &mut stream,
+            &mut next_seq,
+            json!({"success": false, "message": "no stack"}),
+        );
+        assert_eq!(settled(&transport), Some(json!({"id": 2000})));
+        drop(peer);
     }
 
     #[test]
@@ -3747,6 +4060,61 @@ mod tests {
     }
 
     #[test]
+    fn a_failed_stack_trace_still_publishes_a_location_less_stop() {
+        let state = Arc::new((Mutex::new(State::new()), Condvar::new()));
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let _peer = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut pending = HashMap::new();
+        let log = LogHandle::new();
+        let mut next_seq = 100;
+        dispatch_incoming(
+            json!({"type":"event", "event":"stopped", "body":{"threadId":7}}),
+            &mut pending,
+            &state,
+            &log,
+            &mut stream,
+            &mut next_seq,
+        );
+        dispatch_incoming(
+            json!({"type":"response", "request_seq":100, "success":false, "message":"no stack"}),
+            &mut pending,
+            &state,
+            &log,
+            &mut stream,
+            &mut next_seq,
+        );
+        let (lock, cvar) = &*state;
+        // The cap only ends a failing run; a published hit wakes the wait at once.
+        let (guard, _) = cvar
+            .wait_timeout_while(lock.lock().unwrap(), Duration::from_secs(30), |s| {
+                s.pending_hit.is_none()
+            })
+            .unwrap();
+        let hit = guard
+            .pending_hit
+            .as_ref()
+            .expect("failed stackTrace published no stop");
+        assert_eq!(hit.thread.as_deref(), Some("7"));
+        assert!(hit.file.is_none() && hit.line.is_none());
+    }
+
+    #[test]
+    fn a_failed_stack_trace_for_a_superseded_stop_publishes_nothing() {
+        let state = Arc::new((Mutex::new(State::new()), Condvar::new()));
+        let (lock, _) = &*state;
+        let stale = {
+            let mut s = lock.lock().unwrap();
+            let stale = s.stop_generation.wrapping_add(1);
+            s.stop_generation = stale.wrapping_add(1);
+            assert_ne!(s.enriched_stop_generation, stale);
+            stale
+        };
+        handle_stack_response(None, &state, stale, 7);
+        assert!(lock.lock().unwrap().pending_hit.is_none());
+    }
+
+    #[test]
     fn a_consumed_stop_cannot_be_recreated_by_a_late_stack_helper() {
         let state = Arc::new((Mutex::new(State::new()), Condvar::new()));
         {
@@ -3762,7 +4130,7 @@ mod tests {
                 "source": { "path": "old.rs" }
             }]
         });
-        handle_stack_response(body.clone(), &state, 7);
+        handle_stack_response(Some(body.clone()), &state, 7, 1);
         {
             let (lock, _) = &*state;
             assert_eq!(
@@ -3779,7 +4147,7 @@ mod tests {
 
         // The daemon consumed the stop and began a later action. A delayed
         // helper from the earlier stop must not repopulate pending state.
-        handle_stack_response(body, &state, 7);
+        handle_stack_response(Some(body), &state, 7, 1);
         let (lock, _) = &*state;
         assert!(lock.lock().unwrap().pending_hit.is_none());
     }

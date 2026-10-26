@@ -283,7 +283,7 @@ run_target() {
     sleep 0.2
 
     echo "    $lang/$target_name: $TARGET_OK ok, $TARGET_FAIL fail" >> "$log"
-    [[ $TARGET_FAIL -eq 0 ]]
+    return 0
 }
 
 # --------------------------------------------------------------
@@ -380,24 +380,17 @@ run_one() {
     echo
 
     # Decide overall rc for this language:
-    #  * any canonical command failed → 1
-    #  * otherwise, any target ran to completion → 0 (ok)
-    #  * at least one target failed fatally → classify as toolchain-skip
-    #    only if ALL attempted targets failed at start with a "no
-    #    debugger executable found" signature; else propagate as fail.
+    #  * any target started → 1 if any command or target failed, else 0
+    #  * every attempted target failed to start → 2 (toolchain skip) only
+    #    when the logs carry a missing-debugger signature, else 1
     #  * else (every target skipped due to missing marker) → 2.
     local any_ran=$(( fib_ran + ack_ran ))
     local any_fatal=$(( fib_fatal + ack_fatal ))
-    if [[ $lang_fail -gt 0 ]]; then
-        return 1
-    fi
     if [[ $any_ran -gt 0 ]]; then
-        return 0
+        [[ $lang_fail -eq 0 ]]
+        return
     fi
     if [[ $any_fatal -gt 0 ]]; then
-        # Did every fatal failure come from a missing debugger binary?
-        # Look for the signature dbg emits in that case. If yes → skip
-        # (toolchain absent). Otherwise → fail.
         local log_dir="$OUT/$lang"
         if grep -qiE 'no debugger executable|not found in PATH|no such file|could not find|command not found|missing dependencies|install missing dependencies' \
                  "$log_dir"/*.log 2>/dev/null; then

@@ -40,10 +40,9 @@ impl<'de> Deserialize<'de> for TraceEvents {
                 let mut events = Vec::new();
                 while let Some(event) = sequence.next_element::<TraceEvent>()? {
                     if event.ph != "X"
-                        || !matches!(
-                            event.cat.as_str(),
-                            "kernel" | "cpu_op" | "user_annotation" | "Operator"
-                        )
+                        || !(event.cat == "kernel"
+                            || is_op_category(&event.cat)
+                            || is_launch_category(&event.cat))
                     {
                         continue;
                     }
@@ -236,9 +235,8 @@ fn import_ops(dest: &Connection, events: &[TraceEvent], layer_id: i64) -> Result
         if event.ph != "X" {
             continue;
         }
-        match event.cat.as_str() {
-            "cpu_op" | "user_annotation" | "Operator" => {}
-            _ => continue,
+        if !is_op_category(&event.cat) {
+            continue;
         }
         let (ts, dur) = event_timing(event)?;
         invocations.push(OpInvocation {
@@ -277,8 +275,7 @@ fn import_ops(dest: &Connection, events: &[TraceEvent], layer_id: i64) -> Result
         op_ids.push(dest.last_insert_rowid());
     }
 
-    // Unique external IDs retain asynchronous attribution across process and thread tracks.
-    // The temporal fallback uses a sweep line within each execution context.
+    // Duplicate external IDs cannot identify a unique operator invocation.
     let mut external_ops = HashMap::new();
     for (index, inv) in invocations.iter().enumerate() {
         if let Some(id) = inv.external_id {
@@ -299,28 +296,53 @@ fn import_ops(dest: &Connection, events: &[TraceEvent], layer_id: i64) -> Result
         })?
         .filter_map(|r| r.ok())
         .collect();
-    let kernel_contexts = events
+    // Runtime correlation identifies the launch thread even after its op ends.
+    let launcher_by_correlation = events
+        .iter()
+        .filter(|event| event.ph == "X" && is_launch_category(&event.cat))
+        .filter_map(|event| {
+            Some((
+                event_id(event, "correlation")?,
+                ((event.pid.clone(), event.tid.clone()), event.ts?),
+            ))
+        })
+        .collect::<HashMap<_, _>>();
+    let kernel_probes = events
         .iter()
         .filter(|event| event.ph == "X" && event.cat == "kernel")
         .map(|event| {
-            Ok((
-                event.pid.clone(),
-                event.tid.clone(),
-                external_id(&event.args)?,
-            ))
+            if let Some(id) = external_id(&event.args)? {
+                match external_ops.get(&id) {
+                    Some(Some(index)) => return Ok(Probe::Op(*index)),
+                    Some(None) => return Ok(Probe::Unmapped),
+                    None => {}
+                }
+            }
+            if let Some((context, ts)) =
+                event_id(event, "correlation").and_then(|id| launcher_by_correlation.get(&id))
+            {
+                Ok(Probe::At(*ts, context.clone()))
+            } else {
+                Ok(Probe::At(
+                    event_timing(event)?.0,
+                    (event.pid.clone(), event.tid.clone()),
+                ))
+            }
         })
         .collect::<Result<Vec<_>>>()?;
-    if kernel_rows.len() != kernel_contexts.len() {
+    if kernel_rows.len() != kernel_probes.len() {
         bail!("Chrome trace kernel identity count changed during import");
     }
     let mut kernels = kernel_rows
         .into_iter()
-        .zip(kernel_contexts)
-        .map(|((id, name, start), (pid, tid, external_id))| {
-            (id, name, start, (pid, tid), external_id)
-        })
+        .zip(kernel_probes)
+        .map(|((id, name, _), probe)| (id, name, probe))
         .collect::<Vec<_>>();
-    kernels.sort_by(|a, b| a.2.partial_cmp(&b.2).unwrap_or(std::cmp::Ordering::Equal));
+    kernels.sort_by(|a, b| {
+        a.2.time()
+            .partial_cmp(&b.2.time())
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
 
     let mut starts = (0..invocations.len()).collect::<Vec<_>>();
     starts.sort_by(|&a, &b| {
@@ -344,34 +366,36 @@ fn import_ops(dest: &Connection, events: &[TraceEvent], layer_id: i64) -> Result
     let mut map_stmt = dest.prepare(
         "INSERT OR IGNORE INTO op_kernel_map (op_id, kernel_name, launch_id) VALUES (?1, ?2, ?3)",
     )?;
-    for (launch_id, kernel_name, k_start, context, external_id) in &kernels {
-        if let Some(id) = external_id {
-            if let Some(Some(index)) = external_ops.get(id) {
-                map_stmt.execute(params![op_ids[*index], kernel_name, launch_id])?;
+    for (launch_id, kernel_name, probe) in &kernels {
+        let index = match probe {
+            Probe::Op(index) => Some(*index),
+            Probe::Unmapped => None,
+            Probe::At(at, context) => {
+                while next_start < starts.len() && invocations[starts[next_start]].start_us <= *at {
+                    let index = starts[next_start];
+                    let inv = &invocations[index];
+                    active
+                        .entry((inv.pid.clone(), inv.tid.clone()))
+                        .or_default()
+                        .insert(((inv.end_us - inv.start_us).to_bits(), index));
+                    next_start += 1;
+                }
+                while next_end < ends.len() && invocations[ends[next_end]].end_us < *at {
+                    let index = ends[next_end];
+                    let inv = &invocations[index];
+                    if let Some(set) = active.get_mut(&(inv.pid.clone(), inv.tid.clone())) {
+                        set.remove(&((inv.end_us - inv.start_us).to_bits(), index));
+                    }
+                    next_end += 1;
+                }
+                active
+                    .get(context)
+                    .and_then(|set| set.first())
+                    .map(|&(_, index)| index)
             }
-            continue;
-        }
-        while next_start < starts.len() && invocations[starts[next_start]].start_us <= *k_start {
-            let index = starts[next_start];
-            let inv = &invocations[index];
-            active
-                .entry((inv.pid.clone(), inv.tid.clone()))
-                .or_default()
-                .insert(((inv.end_us - inv.start_us).to_bits(), index));
-            next_start += 1;
-        }
-        while next_end < ends.len() && invocations[ends[next_end]].end_us < *k_start {
-            let index = ends[next_end];
-            let inv = &invocations[index];
-            if let Some(set) = active.get_mut(&(inv.pid.clone(), inv.tid.clone())) {
-                set.remove(&((inv.end_us - inv.start_us).to_bits(), index));
-            }
-            next_end += 1;
-        }
-        if let Some((_, index)) = active.get(context).and_then(|set| set.first()) {
-            if let Some(&op_id) = op_ids.get(*index) {
-                map_stmt.execute(params![op_id, kernel_name, launch_id])?;
-            }
+        };
+        if let Some(&op_id) = index.and_then(|index| op_ids.get(index)) {
+            map_stmt.execute(params![op_id, kernel_name, launch_id])?;
         }
     }
 
@@ -387,6 +411,41 @@ fn import_ops(dest: &Connection, events: &[TraceEvent], layer_id: i64) -> Result
     dest.execute(update_sql, params![layer_id])?;
 
     Ok(())
+}
+
+/// A kernel's unique op, context-specific timing probe, or unresolved identity.
+enum Probe {
+    Op(usize),
+    At(f64, (Option<TraceId>, Option<TraceId>)),
+    Unmapped,
+}
+
+impl Probe {
+    fn time(&self) -> f64 {
+        match self {
+            Probe::Op(_) | Probe::Unmapped => f64::NEG_INFINITY,
+            Probe::At(at, ..) => *at,
+        }
+    }
+}
+
+fn is_op_category(cat: &str) -> bool {
+    matches!(cat, "cpu_op" | "user_annotation" | "Operator")
+}
+
+/// Host-side CUDA API calls (`cuda_runtime`, `cuda_driver`, legacy `Runtime`).
+fn is_launch_category(cat: &str) -> bool {
+    cat.as_bytes()
+        .windows(7)
+        .any(|part| part.eq_ignore_ascii_case(b"runtime"))
+        || cat
+            .as_bytes()
+            .windows(6)
+            .any(|part| part.eq_ignore_ascii_case(b"driver"))
+}
+
+fn event_id(event: &TraceEvent, key: &str) -> Option<i64> {
+    value_for(&event.args, key)?.as_i64()
 }
 
 // ---------------------------------------------------------------------------
@@ -571,7 +630,7 @@ mod tests {
                     "ph": "X",
                     "ts": 900.0,
                     "dur": 120.0,
-                    "pid": 1, "tid": 0
+                    "pid": 1, "tid": 1
                 }
             ]
         }"#;
@@ -589,6 +648,12 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM ops", [], |row| row.get(0))
             .unwrap();
         assert_eq!(op_count, 1);
+
+        let mapped: i64 = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM op_kernel_map", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(mapped, 1);
     }
 
     #[test]
