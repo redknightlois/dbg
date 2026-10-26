@@ -147,12 +147,50 @@ pub(crate) fn session_dir() -> PathBuf {
 // Full collection pipeline
 // ---------------------------------------------------------------------------
 
+#[derive(clap::Args, Default)]
+pub struct CollectionOptions {
+    #[arg(
+        long,
+        conflicts_with = "kernel_name",
+        help = "Collect counters for every timeline kernel instead of the top five"
+    )]
+    pub all_kernels: bool,
+    #[arg(
+        long,
+        conflicts_with = "launch_count",
+        help = "Collect every matching launch instead of the first per kernel"
+    )]
+    pub all_launches: bool,
+    #[arg(long, value_parser = clap::builder::NonEmptyStringValueParser::new(), help = "Native kernel name to profile (repeatable, regex-escaped literal)")]
+    pub kernel_name: Vec<String>,
+    #[arg(long, conflicts_with = "section", value_parser = clap::builder::NonEmptyStringValueParser::new(), help = "Nsight Compute metric set; defaults to full unless sections are selected")]
+    pub ncu_set: Option<String>,
+    #[arg(long, value_parser = clap::builder::NonEmptyStringValueParser::new(), help = "Nsight Compute section ID (repeatable; replaces the default full set)")]
+    pub section: Vec<String>,
+    #[arg(
+        long,
+        default_value_t = 0,
+        help = "Skip this many matching launches per selected kernel invocation"
+    )]
+    pub launch_skip: u32,
+    #[arg(long, value_parser = clap::value_parser!(u32).range(1..), help = "Collect this many matching launches per selected kernel; defaults to 1")]
+    pub launch_count: Option<u32>,
+    #[arg(
+        long,
+        requires = "kernel_name",
+        conflicts_with = "timeline_only",
+        help = "Collect selected counters only, without another timeline or operator capture"
+    )]
+    pub counters_only: bool,
+    #[arg(long, conflicts_with_all = ["kernel_name", "section", "ncu_set", "launch_skip", "launch_count", "all_kernels", "all_launches"], help = "Collect only the Nsight Systems timeline")]
+    pub timeline_only: bool,
+}
+
 pub fn collect_all(
     db: &GpuDb,
     target: &str,
     args: &[String],
-    all_kernels: bool,
-    all_launches: bool,
+    options: &CollectionOptions,
 ) -> Result<()> {
     let kind = detect_target(target);
     let session = session_dir();
@@ -200,49 +238,98 @@ pub fn collect_all(
         }
     };
 
-    // Phase 1: nsys timeline
-    eprintln!("--- phase 1: timeline capture (nsys) ---");
-    run_phase("nsys", &|| {
-        collect_nsys(db, target, args, kind, &session, target_hash.as_deref())
-    });
+    db.set_meta(
+        "collection_mode",
+        if options.timeline_only {
+            "timeline only"
+        } else if options.counters_only {
+            "counters only"
+        } else {
+            "full pipeline"
+        },
+    )?;
+    if !options.counters_only {
+        eprintln!("--- phase 1: timeline capture (nsys) ---");
+        run_phase("nsys", &|| {
+            collect_nsys(db, target, args, kind, &session, target_hash.as_deref())
+        });
+    }
+    if options.timeline_only {
+        return Ok(());
+    }
 
-    let top_names = top_kernel_names(db, if all_kernels { 0 } else { 5 });
+    let names = if options.kernel_name.is_empty() {
+        top_kernel_names(db, if options.all_kernels { 0 } else { 5 })
+    } else {
+        options.kernel_name.clone()
+    };
     db.set_meta(
         "ncu_kernel_scope",
-        if all_kernels { "all" } else { "top five" },
+        if !options.kernel_name.is_empty() {
+            "selected"
+        } else if options.all_kernels {
+            "all"
+        } else {
+            "top five"
+        },
+    )?;
+    db.set_meta("ncu_selected_kernel_names", &serde_json::to_string(&names)?)?;
+    db.set_meta("ncu_sections", &serde_json::to_string(&options.section)?)?;
+    db.set_meta(
+        "ncu_set",
+        options
+            .ncu_set
+            .as_deref()
+            .unwrap_or(if options.section.is_empty() {
+                "full"
+            } else {
+                "sections only"
+            }),
+    )?;
+    db.set_meta("ncu_launch_skip", &options.launch_skip.to_string())?;
+    db.set_meta(
+        "ncu_launch_count",
+        &if options.all_launches {
+            "all".into()
+        } else {
+            options.launch_count.unwrap_or(1).to_string()
+        },
     )?;
     db.set_meta(
         "ncu_launch_scope",
-        if all_launches {
+        if options.all_launches && options.launch_skip == 0 {
             "all matching"
-        } else {
+        } else if options.launch_skip == 0 && options.launch_count.unwrap_or(1) == 1 {
             "first per kernel"
+        } else {
+            "selected matching instances"
         },
     )?;
 
-    // Phase 2: ncu deep metrics
-    if !top_names.is_empty() {
+    if !names.is_empty() {
         eprintln!("--- phase 2: deep kernel metrics (ncu) ---");
         eprintln!(
-            "  profiling {} kernels: {}",
-            top_names.len(),
-            top_names.join(", ")
+            "  profiling {} kernel selections: {}",
+            names.len(),
+            names.join(", ")
         );
         run_phase("ncu", &|| {
             collect_ncu(
                 db,
                 target,
                 args,
-                &top_names,
+                &names,
                 kind,
                 &session,
                 target_hash.as_deref(),
-                all_kernels,
-                all_launches,
+                options,
             )
         });
     } else {
         eprintln!("--- phase 2: skipped (no kernels found in phase 1) ---");
+    }
+    if options.counters_only {
+        return Ok(());
     }
 
     // Phase 3: op mapping (PyTorch/Triton only)
@@ -391,32 +478,27 @@ fn collect_ncu(
     kind: TargetKind,
     session: &Path,
     target_hash: Option<&str>,
-    all_kernels: bool,
-    all_launches: bool,
+    options: &CollectionOptions,
 ) -> Result<()> {
     let start = Instant::now();
-    let unfiltered = all_kernels && all_launches;
+    let unfiltered = options.all_kernels && options.all_launches;
     let labels = if unfiltered {
         vec!["all kernels".to_string()]
     } else {
         kernel_names.to_vec()
     };
     let description = format!(
-        "ncu --set full --kernel-name-base demangled {} {} {target}",
-        if all_kernels {
-            "all kernels"
-        } else {
-            "top five kernels"
-        },
-        if all_launches {
-            "all matching launches"
-        } else {
-            "--launch-count 1 per kernel"
-        }
+        "ncu set={:?} sections={:?} kernels={:?} skip={} count={:?} all_launches={} target={target} args={args:?}",
+        options.ncu_set,
+        options.section,
+        labels,
+        options.launch_skip,
+        options.launch_count,
+        options.all_launches
     );
     collect_ncu_samples(db, session, &labels, &description, target_hash, |label| {
         let filter = if unfiltered { None } else { Some(label) };
-        let mut cmd = ncu_command(target, args, filter, kind, all_launches);
+        let mut cmd = ncu_command(target, args, filter, kind, options);
         cmd.output()
             .with_context(|| format!("cannot start ncu for `{label}`"))
     })?;
@@ -551,10 +633,18 @@ fn ncu_command(
     args: &[String],
     kernel_name: Option<&str>,
     kind: TargetKind,
-    all_launches: bool,
+    options: &CollectionOptions,
 ) -> Command {
     let mut cmd = Command::new("ncu");
-    cmd.args(["--set", "full", "--csv", "--print-units", "base"]);
+    if let Some(set) = &options.ncu_set {
+        cmd.args(["--set", set]);
+    } else if options.section.is_empty() {
+        cmd.args(["--set", "full"]);
+    }
+    for section in &options.section {
+        cmd.args(["--section", section]);
+    }
+    cmd.args(["--csv", "--print-units", "base"]);
     // The importer keys off Nsight Compute's stable metric identifiers (for
     // example `sm__throughput.avg.pct_of_peak_sustained_elapsed`).  CSV output
     // uses localized/display labels such as `Compute (SM) Throughput` unless
@@ -566,8 +656,14 @@ fn ncu_command(
         let regex = regex::escape(kernel_name);
         cmd.args(["--kernel-name", &format!("regex:{regex}")]);
     }
-    if !all_launches {
-        cmd.args(["--launch-count", "1"]);
+    if options.launch_skip > 0 {
+        cmd.args(["--launch-skip", &options.launch_skip.to_string()]);
+    }
+    if !options.all_launches {
+        cmd.args([
+            "--launch-count",
+            &options.launch_count.unwrap_or(1).to_string(),
+        ]);
     }
     if matches!(
         kind,
@@ -951,7 +1047,13 @@ mod tests {
     #[test]
     fn ncu_filter_preserves_typed_template_arguments() {
         let raw = "void at::native::add<(int)4, std::array<char *, (unsigned long)3>>(int, T2)";
-        let command = ncu_command("train.py", &[], Some(raw), TargetKind::PythonTorch, false);
+        let command = ncu_command(
+            "train.py",
+            &[],
+            Some(raw),
+            TargetKind::PythonTorch,
+            &CollectionOptions::default(),
+        );
         let args: Vec<_> = command
             .get_args()
             .map(|s| s.to_string_lossy().into_owned())
@@ -1003,7 +1105,7 @@ mod tests {
             &["--size".into(), "42".into()],
             Some("add_one(float *, int)"),
             TargetKind::Binary,
-            false,
+            &CollectionOptions::default(),
         );
         let args: Vec<String> = cmd
             .get_args()
@@ -1036,13 +1138,73 @@ mod tests {
     }
 
     #[test]
+    fn selected_sections_and_second_matching_instance_preserve_raw_units() {
+        let mut options = CollectionOptions {
+            section: vec!["WarpStateStats".into(), "SpeedOfLight".into()],
+            launch_skip: 1,
+            launch_count: Some(1),
+            ..Default::default()
+        };
+        let command = ncu_command(
+            "worker.py",
+            &[],
+            Some("Marlin<(int)4>"),
+            TargetKind::PythonTorch,
+            &options,
+        );
+        let args: Vec<_> = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert!(!args.iter().any(|arg| arg == "--set"));
+        for pair in [
+            ["--section", "WarpStateStats"],
+            ["--section", "SpeedOfLight"],
+            ["--launch-skip", "1"],
+            ["--launch-count", "1"],
+            ["--print-units", "base"],
+            ["--print-metric-name", "name"],
+        ] {
+            assert!(
+                args.windows(2).any(|window| window == pair),
+                "missing {pair:?}: {args:?}"
+            );
+        }
+        assert!(args.contains(&format!("regex:{}", regex::escape("Marlin<(int)4>"))));
+        options.section.clear();
+        options.ncu_set = Some("basic".into());
+        let command = ncu_command("./app", &[], None, TargetKind::Binary, &options);
+        let args: Vec<_> = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert!(args.windows(2).any(|window| window == ["--set", "basic"]));
+        let command = ncu_command(
+            "./app",
+            &[],
+            None,
+            TargetKind::Binary,
+            &CollectionOptions::default(),
+        );
+        let args: Vec<_> = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert!(args.windows(2).any(|window| window == ["--set", "full"]));
+        assert!(
+            args.windows(2)
+                .any(|window| window == ["--launch-count", "1"])
+        );
+    }
+
+    #[test]
     fn ncu_command_wraps_python_targets_after_profiler_flags() {
         let cmd = ncu_command(
             "train.py",
             &["--steps".into(), "2".into()],
             Some("kernel()"),
             TargetKind::PythonTorch,
-            false,
+            &CollectionOptions::default(),
         );
         let args: Vec<String> = cmd
             .get_args()
@@ -1063,7 +1225,10 @@ mod tests {
             &["--replays".into(), "1".into()],
             None,
             TargetKind::PythonTorch,
-            true,
+            &CollectionOptions {
+                all_launches: true,
+                ..Default::default()
+            },
         );
         let args: Vec<_> = cmd
             .get_args()
@@ -1080,7 +1245,16 @@ mod tests {
             "--replays".into(),
             "1".into()
         ]));
-        let matched = ncu_command("./app", &[], Some("kernel()"), TargetKind::Binary, true);
+        let matched = ncu_command(
+            "./app",
+            &[],
+            Some("kernel()"),
+            TargetKind::Binary,
+            &CollectionOptions {
+                all_launches: true,
+                ..Default::default()
+            },
+        );
         let args: Vec<_> = matched
             .get_args()
             .map(|arg| arg.to_string_lossy().into_owned())

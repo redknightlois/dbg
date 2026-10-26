@@ -33,6 +33,46 @@ On WSL2: `nsys` works but cannot trace GPU kernel internals (no CUPTI kernel act
 
 Everything goes into a single SQLite session. The REPL queries the database directly.
 
+## Staged counter collection
+
+Start with a timeline, then collect only the names and instances needed to test a
+specific hypothesis. Put gdbg flags before the target; subsequent flags belong
+to the target.
+
+```bash
+gdbg --timeline-only ./worker.py --case-index 0
+# Copy the native symbol from the timeline into KERNEL.
+gdbg --counters-only --kernel-name "$KERNEL" --launch-skip 1 --launch-count 1 \
+  --section SpeedOfLight --section WarpStateStats ./worker.py --case-index 0
+```
+
+`--kernel-name` repeats for several literal native names; gdbg escapes regex
+metacharacters. Each selection runs a separate NCU invocation. Skip/count refer
+to matching launches within that invocation, not global timeline IDs. For W13
+and W2 sharing one symbol in a single replay, skip 0 selects the first matching
+instance and skip 1 selects the second. Verify raw IDs, order, geometry, source,
+case and replay identity before assigning either meaning. A count of 2 collects
+both; normalized kernel summaries still merge identical symbols.
+
+`--section ID` repeats and replaces the default full metric set. Use
+`ncu --list-sections` to discover section IDs for the installed version.
+`--ncu-set NAME` selects an NCU set instead; it cannot be combined with sections.
+Use only sections that discriminate the current hypothesis, then collect missing
+sections or instances. Reduced sections do not establish full counter coverage.
+
+`--timeline-only` skips counters and operator tracing. `--counters-only` requires
+explicit names and skips another Nsys/operator capture. It creates a separate
+session, preserving the original timeline. Callers match source, hardware,
+runtime, workload and cache policy across sessions; it does not claim equal
+physical state or comparable NCU/Nsys durations. The shared GPU lock still
+belongs to the workload's GPU phases; no outer lock around gdbg or analysis.
+
+Defaults remain top five timeline names, full sections and first matching
+launch. `--all-kernels --all-launches` keeps complete instance collection.
+Each completed NCU invocation is transactionally imported before the next;
+partial/unfinished collection state and raw base-unit values remain available.
+No active capture should have its tool binary or runtime replaced.
+
 ## Target detection
 
 `gdbg` reads the target file and auto-detects:
