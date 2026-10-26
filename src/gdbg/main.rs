@@ -20,6 +20,16 @@ use db::GpuDb;
     about = "GPU profiler — collect, correlate, and query CUDA/PyTorch/Triton performance data"
 )]
 struct Cli {
+    #[arg(
+        long,
+        help = "Collect counters for every timeline kernel instead of the top five"
+    )]
+    all_kernels: bool,
+    #[arg(
+        long,
+        help = "Collect every matching launch instead of the first per kernel"
+    )]
+    all_launches: bool,
     #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
     args: Vec<String>,
 }
@@ -47,13 +57,14 @@ fn main() -> Result<()> {
             print_usage();
             Ok(())
         }
-        _ => cmd_profile(&cli.args),
+        _ => cmd_profile(&cli.args, cli.all_kernels, cli.all_launches),
     }
 }
 
 fn print_usage() {
     println!("gdbg — GPU profiler for CUDA, PyTorch, and Triton\n");
     println!("  gdbg <target> [args...]         Profile a binary or script");
+    println!("  gdbg --all-kernels --all-launches <target>  Collect every kernel instance");
     println!("  gdbg --from <name>              Reload a saved session");
     println!("  gdbg list                       List saved sessions");
     println!("  gdbg diff <a> <b>               Diff two saved sessions");
@@ -94,7 +105,7 @@ fn cmd_from(args: &[String]) -> Result<()> {
     repl::run(&mut db)
 }
 
-fn cmd_profile(args: &[String]) -> Result<()> {
+fn cmd_profile(args: &[String], all_kernels: bool, all_launches: bool) -> Result<()> {
     let target = &args[0];
     let extra_args = &args[1..];
 
@@ -141,7 +152,7 @@ fn cmd_profile(args: &[String]) -> Result<()> {
     eprintln!("session: {}", db_path.display());
     eprintln!("collecting profile data (this may take several minutes)...\n");
 
-    collect::collect_all(&db, target, extra_args)?;
+    collect::collect_all(&db, target, extra_args, all_kernels, all_launches)?;
 
     // Consistency checks
     if let Some(warning) = db.check_target_consistency() {
@@ -169,4 +180,25 @@ fn epoch_days_to_ymd(days: u64) -> (u64, u64, u64) {
     let m = if mp < 10 { mp + 3 } else { mp - 9 };
     let y = if m <= 2 { y + 1 } else { y };
     (y, m, d)
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use super::*;
+
+    #[test]
+    fn counter_flags_apply_only_before_the_target() {
+        let default = Cli::try_parse_from(["gdbg", "./app"]).unwrap();
+        assert!(!default.all_kernels && !default.all_launches);
+        let all = Cli::try_parse_from([
+            "gdbg",
+            "--all-kernels",
+            "--all-launches",
+            "./app",
+            "--all-kernels",
+        ])
+        .unwrap();
+        assert!(all.all_kernels && all.all_launches);
+        assert_eq!(all.args, ["./app", "--all-kernels"]);
+    }
 }

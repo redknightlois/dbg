@@ -147,7 +147,13 @@ pub(crate) fn session_dir() -> PathBuf {
 // Full collection pipeline
 // ---------------------------------------------------------------------------
 
-pub fn collect_all(db: &GpuDb, target: &str, args: &[String]) -> Result<()> {
+pub fn collect_all(
+    db: &GpuDb,
+    target: &str,
+    args: &[String],
+    all_kernels: bool,
+    all_launches: bool,
+) -> Result<()> {
     let kind = detect_target(target);
     let session = session_dir();
 
@@ -200,10 +206,21 @@ pub fn collect_all(db: &GpuDb, target: &str, args: &[String]) -> Result<()> {
         collect_nsys(db, target, args, kind, &session, target_hash.as_deref())
     });
 
-    // Identify top kernels for ncu
-    let top_names = top_kernel_names(db, 5);
+    let top_names = top_kernel_names(db, if all_kernels { 0 } else { 5 });
+    db.set_meta(
+        "ncu_kernel_scope",
+        if all_kernels { "all" } else { "top five" },
+    )?;
+    db.set_meta(
+        "ncu_launch_scope",
+        if all_launches {
+            "all matching"
+        } else {
+            "first per kernel"
+        },
+    )?;
 
-    // Phase 2: ncu deep metrics (on top kernels only)
+    // Phase 2: ncu deep metrics
     if !top_names.is_empty() {
         eprintln!("--- phase 2: deep kernel metrics (ncu) ---");
         eprintln!(
@@ -220,6 +237,8 @@ pub fn collect_all(db: &GpuDb, target: &str, args: &[String]) -> Result<()> {
                 kind,
                 &session,
                 target_hash.as_deref(),
+                all_kernels,
+                all_launches,
             )
         });
     } else {
@@ -371,31 +390,33 @@ fn collect_ncu(
     kind: TargetKind,
     session: &Path,
     target_hash: Option<&str>,
+    all_kernels: bool,
+    all_launches: bool,
 ) -> Result<()> {
     let csv_path = session.join("ncu_metrics.csv");
     let start = Instant::now();
 
-    // nsys stores demangled signatures (for example
-    // `add_one(float *, int)`), while ncu matches `--kernel-name` against
-    // its shorter `function` basis by default (`add_one`). Explicitly select
-    // the demangled basis so the phase-1 names match phase 2. Run each top
-    // kernel separately and capture one representative launch: a combined
-    // regex plus a global launch limit can consume every slot on the first
-    // hot kernel, while omitting the limit can attempt to replay 100k+ tiny
-    // launches under `--set full`.
+    // A global launch limit can select only the first kernel in a combined filter.
+    // Unlimited collection uses one invocation; bounded collection runs per name.
+    let filters = if all_kernels && all_launches {
+        vec![None]
+    } else {
+        kernel_names
+            .iter()
+            .map(|name| Some(name.as_str()))
+            .collect()
+    };
     let mut combined_csv = Vec::new();
-    for kernel_name in kernel_names {
-        let mut cmd = ncu_command(target, args, kernel_name, kind);
-        let output = run_cmd(&mut cmd, &format!("ncu failed for kernel `{kernel_name}`"))?;
+    for kernel_name in filters {
+        let label = kernel_name.unwrap_or("all kernels");
+        let mut cmd = ncu_command(target, args, kernel_name, kind, all_launches);
+        let output = run_cmd(&mut cmd, &format!("ncu failed for `{label}`"))?;
         let stdout = String::from_utf8_lossy(&output.stdout);
         if !stdout.contains("\"Kernel Name\"")
             || !stdout.contains("\"Metric Name\"")
             || !stdout.contains("\"Metric Value\"")
         {
-            bail!(
-                "ncu produced no metrics for kernel `{kernel_name}`:\n{}",
-                stdout.trim()
-            );
+            bail!("ncu produced no metrics for `{label}`:\n{}", stdout.trim());
         }
         combined_csv.extend_from_slice(&output.stdout);
         if !combined_csv.ends_with(b"\n") {
@@ -409,8 +430,17 @@ fn collect_ncu(
         "ncu",
         &csv_path.display().to_string(),
         Some(&format!(
-            "ncu --set full --kernel-name-base demangled --launch-count 1 \
-             (one run per top kernel) {target}"
+            "ncu --set full --kernel-name-base demangled {} {} {target}",
+            if all_kernels {
+                "all kernels"
+            } else {
+                "top five kernels"
+            },
+            if all_launches {
+                "all matching launches"
+            } else {
+                "--launch-count 1 per kernel"
+            }
         )),
         Some(elapsed),
         target_hash,
@@ -424,8 +454,13 @@ fn collect_ncu(
     Ok(())
 }
 
-fn ncu_command(target: &str, args: &[String], kernel_name: &str, kind: TargetKind) -> Command {
-    let regex = crate::commands::escape_regex(kernel_name);
+fn ncu_command(
+    target: &str,
+    args: &[String],
+    kernel_name: Option<&str>,
+    kind: TargetKind,
+    all_launches: bool,
+) -> Command {
     let mut cmd = Command::new("ncu");
     cmd.args(["--set", "full", "--csv", "--print-units", "base"]);
     // The importer keys off Nsight Compute's stable metric identifiers (for
@@ -435,8 +470,13 @@ fn ncu_command(target: &str, args: &[String], kernel_name: &str, kind: TargetKin
     // only NULL values and makes the REPL report `[no ncu]`.
     cmd.args(["--print-metric-name", "name"]);
     cmd.args(["--kernel-name-base", "demangled"]);
-    cmd.args(["--kernel-name", &format!("regex:{regex}")]);
-    cmd.args(["--launch-count", "1"]);
+    if let Some(kernel_name) = kernel_name {
+        let regex = crate::commands::escape_regex(kernel_name);
+        cmd.args(["--kernel-name", &format!("regex:{regex}")]);
+    }
+    if !all_launches {
+        cmd.args(["--launch-count", "1"]);
+    }
     if matches!(
         kind,
         TargetKind::Python | TargetKind::PythonTorch | TargetKind::PythonTriton
@@ -561,11 +601,13 @@ fn top_kernel_names(db: &GpuDb, n: usize) -> Vec<String> {
         "SELECT kernel_name, SUM(duration_us) as total FROM launches WHERE {} GROUP BY kernel_name ORDER BY total DESC LIMIT ?1",
         db.timeline_filter(),
     )).unwrap();
-    stmt.query_map([n as i64], |row| row.get::<_, String>(0))
-        .unwrap()
-        .filter_map(|r| r.ok())
-        .map(|name| db.native_kernel_name(&name))
-        .collect()
+    stmt.query_map([if n == 0 { -1 } else { n as i64 }], |row| {
+        row.get::<_, String>(0)
+    })
+    .unwrap()
+    .filter_map(|r| r.ok())
+    .map(|name| db.native_kernel_name(&name))
+    .collect()
 }
 
 /// Escape a string for safe use as a Python string literal.
@@ -676,8 +718,9 @@ mod tests {
         let cmd = ncu_command(
             "./app",
             &["--size".into(), "42".into()],
-            "add_one(float *, int)",
+            Some("add_one(float *, int)"),
             TargetKind::Binary,
+            false,
         );
         let args: Vec<String> = cmd
             .get_args()
@@ -714,8 +757,9 @@ mod tests {
         let cmd = ncu_command(
             "train.py",
             &["--steps".into(), "2".into()],
-            "kernel()",
+            Some("kernel()"),
             TargetKind::PythonTorch,
+            false,
         );
         let args: Vec<String> = cmd
             .get_args()
@@ -727,6 +771,39 @@ mod tests {
             "--steps".into(),
             "2".into(),
         ]));
+    }
+
+    #[test]
+    fn unlimited_counters_keep_all_kernel_instances_in_one_invocation() {
+        let cmd = ncu_command(
+            "driver.py",
+            &["--replays".into(), "1".into()],
+            None,
+            TargetKind::PythonTorch,
+            true,
+        );
+        let args: Vec<_> = cmd
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            !args
+                .iter()
+                .any(|arg| arg == "--launch-count" || arg == "--kernel-name")
+        );
+        assert!(args.ends_with(&[
+            "python3".into(),
+            "driver.py".into(),
+            "--replays".into(),
+            "1".into()
+        ]));
+        let matched = ncu_command("./app", &[], Some("kernel()"), TargetKind::Binary, true);
+        let args: Vec<_> = matched
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert!(args.iter().any(|arg| arg == "--kernel-name"));
+        assert!(!args.iter().any(|arg| arg == "--launch-count"));
     }
     #[test]
     fn counter_collection_uses_native_names_while_queries_keep_canonical_keys() {
@@ -750,5 +827,15 @@ mod tests {
         .unwrap();
         assert_eq!(top_kernel_names(&db, 1), vec![raw]);
         assert_eq!(db.unique_kernel_count(), 1);
+        for index in 0..6 {
+            db.conn
+                .execute(
+                    "INSERT INTO launches (kernel_name, duration_us, layer_id) VALUES (?1, 1, ?2)",
+                    rusqlite::params![format!("other{index}"), layer],
+                )
+                .unwrap();
+        }
+        assert_eq!(top_kernel_names(&db, 5).len(), 5);
+        assert_eq!(top_kernel_names(&db, 0).len(), 7);
     }
 }
