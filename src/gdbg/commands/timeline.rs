@@ -24,11 +24,11 @@ fn print_unified_memory_faults(db: &GpuDb) {
         .as_ref()
         .and_then(|s| Some((s["events"].as_u64()?, s["page_faults"].as_u64()?)))
     {
-        Some((events, faults)) => println!(
+        Some((events, faults)) if events > 0 => println!(
             "  Unified Memory GPU faults (whole capture): {events} events, {faults} page faults.\n  Fault counts are separate from explicit-copy bytes and times.\n"
         ),
-        None => println!(
-            "  Unified Memory GPU fault coverage unavailable; re-capture with --cuda-um-gpu-page-faults=true.\n"
+        _ => println!(
+            "  Unified Memory GPU fault coverage unverified: no fault-event records imported.\n  Absence does not establish zero faults or a missing capture flag. Inspect retained Nsight metadata; this message alone does not require recapture.\n"
         ),
     }
 }

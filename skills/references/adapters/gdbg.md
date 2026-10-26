@@ -81,6 +81,11 @@ Each completed NCU invocation is transactionally imported before the next;
 partial/unfinished collection state and raw base-unit values remain available. Failed-command stdout and stderr are retained separately; errors show up to 4 KiB from each stream and link to the full logs.
 No active capture should have its tool binary or runtime replaced.
 
+Missing or empty Unified Memory GPU fault records leave coverage unverified,
+even when the saved command and capture metadata enable fault collection.
+They do not establish zero faults or a missing flag. Do not recollect solely
+because those records are absent; inspect the retained Nsight metadata first.
+
 ## Target detection
 
 `gdbg` reads the target file and auto-detects:

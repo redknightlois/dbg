@@ -548,3 +548,63 @@ fn missing_metrics_are_not_zero_or_occupancy_limits() {
         "{text}"
     );
 }
+
+#[test]
+fn absent_or_empty_um_fault_records_do_not_request_recapture() {
+    const CHILD_DB: &str = "GDBG_UM_FAULT_COVERAGE_TEST_DB";
+    if let Some(path) = std::env::var_os(CHILD_DB) {
+        let db = GpuDb::open(std::path::Path::new(&path)).unwrap();
+        crate::commands::cmd_transfers(&db, &[]);
+        return;
+    }
+    let directory = tempfile::tempdir().unwrap();
+    let source = directory.path().join("trace.sqlite");
+    let src = rusqlite::Connection::open(&source).unwrap();
+    src.execute_batch(
+        "CREATE TABLE NVTX_EVENTS(text TEXT,start INTEGER,end INTEGER);
+        INSERT INTO NVTX_EVENTS VALUES('candidate',1000,2000);
+        CREATE TABLE META_DATA_CAPTURE(name TEXT NOT NULL,value TEXT);
+        INSERT INTO META_DATA_CAPTURE VALUES('PROCESS_0:COLLECT_UVM_GPU_PAGE_FAULTS','true');",
+    )
+    .unwrap();
+    let path = directory.path().join("session.gpu.db");
+    let db = GpuDb::create(&path).unwrap();
+    for state in ["absent", "empty", "records"] {
+        if state == "empty" {
+            src.execute_batch(
+                "CREATE TABLE CUDA_UM_GPU_PAGE_FAULT_EVENTS(numberOfPageFaults INTEGER);",
+            )
+            .unwrap();
+        } else if state == "records" {
+            src.execute("INSERT INTO CUDA_UM_GPU_PAGE_FAULT_EVENTS VALUES(5)", [])
+                .unwrap();
+        }
+        db.import_layer(
+            "nsys",
+            source.to_str().unwrap(),
+            None,
+            None,
+            None,
+            |conn, layer| crate::parsers::nsys::import_nsys_rep(conn, &source, layer),
+        )
+        .unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tests::regressions::absent_or_empty_um_fault_records_do_not_request_recapture",
+                "--nocapture",
+            ])
+            .env(CHILD_DB, &path)
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let text = String::from_utf8(output.stdout).unwrap();
+        assert!(!text.contains("re-capture with"), "{text}");
+        if state == "records" {
+            assert!(text.contains("1 events, 5 page faults"), "{text}");
+        } else {
+            assert!(text.contains("coverage unverified"), "{text}");
+            assert!(!text.contains("0 page faults"), "{text}");
+        }
+    }
+}
