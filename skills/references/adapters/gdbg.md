@@ -78,7 +78,7 @@ targets require their own GPU-phase lock and reject `--gpu-lock`.
 Defaults remain top five timeline names, full sections and first matching
 launch. `--all-kernels --all-launches` keeps complete instance collection.
 Each completed NCU invocation is transactionally imported before the next;
-partial/unfinished collection state and raw base-unit values remain available.
+partial/unfinished collection state and raw base-unit values remain available. Failed-command stdout and stderr are retained separately; errors show up to 4 KiB from each stream and link to the full logs.
 No active capture should have its tool binary or runtime replaced.
 
 ## Target detection

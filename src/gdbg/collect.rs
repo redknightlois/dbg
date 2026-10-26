@@ -70,11 +70,37 @@ fn capture_output(cmd: &mut Command, gpu_lock: Option<&Path>) -> Result<Output> 
     Ok(cmd.output()?)
 }
 
+fn output_diagnostics(output: &Output) -> String {
+    let tail = |bytes: &[u8]| {
+        String::from_utf8_lossy(&bytes[bytes.len().saturating_sub(4096)..]).into_owned()
+    };
+    format!(
+        "status: {}\nstdout:\n{}\nstderr:\n{}",
+        output.status,
+        tail(&output.stdout),
+        tail(&output.stderr)
+    )
+}
+
 fn run_cmd(cmd: &mut Command, context: &str, gpu_lock: Option<&Path>) -> Result<Output> {
     let output = capture_output(cmd, gpu_lock).with_context(|| context.to_string())?;
     if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        bail!("{context}:\n{stderr}");
+        static FAILED_COMMAND: std::sync::atomic::AtomicUsize =
+            std::sync::atomic::AtomicUsize::new(0);
+        let index = FAILED_COMMAND.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let prefix = session_dir().join(format!("failed-command-{index}"));
+        let stdout = prefix.with_extension("stdout.log");
+        let stderr = prefix.with_extension("stderr.log");
+        let detail = format!("{context}: {cmd:?}\n{}", output_diagnostics(&output));
+        std::fs::write(&stdout, &output.stdout)
+            .with_context(|| format!("{detail}; saving {}", stdout.display()))?;
+        std::fs::write(&stderr, &output.stderr)
+            .with_context(|| format!("{detail}; saving {}", stderr.display()))?;
+        bail!(
+            "{detail}\nraw output: {} and {}",
+            stdout.display(),
+            stderr.display()
+        );
     }
     Ok(output)
 }
@@ -253,8 +279,8 @@ pub fn collect_all(
                     "`python3 -c \"import {module}\"` failed — gdbg would have \
                      hung in nsys waiting on a crashing child. Install the \
                      dependency (e.g. `pip install {module}`) and retry.\n\
-                     stderr: {}",
-                    String::from_utf8_lossy(&o.stderr).trim(),
+                     output: {}",
+                    output_diagnostics(&o),
                 );
             }
             Err(e) => {
@@ -440,14 +466,14 @@ fn collect_nsys(
         if qdstrm.exists() {
             let importer =
                 find_bundled_tool(&NSIGHT_SYSTEMS, "QdstrmImporter").ok_or_else(|| {
-                    let stderr = String::from_utf8_lossy(&profile_output.stderr);
+                    let details = output_diagnostics(&profile_output);
                     anyhow::anyhow!(
                         "nsys produced {} but no trace.nsys-rep (silent QdstrmImporter failure).\n\
                      Could not locate QdstrmImporter binary on this system.\n\
                      Install nsight-systems with its runtime deps, or upgrade nsys to 2024+.\n\
-                     nsys stderr:\n{}",
+                     nsys output:\n{}",
                         qdstrm.display(),
-                        stderr
+                        details
                     )
                 })?;
             run_cmd(
@@ -585,15 +611,17 @@ fn collect_ncu_samples(
                 std::fs::write(&stderr_path, &output.stderr)?;
                 let stdout = String::from_utf8_lossy(&output.stdout);
                 let process_failure = (!output.status.success())
-                    .then(|| format!("ncu exited with {}", output.status));
+                    .then(|| format!("ncu {}", output_diagnostics(&output)));
                 if !stdout.contains("\"Kernel Name\"")
                     || !stdout.contains("\"Metric Name\"")
                     || !stdout.contains("\"Metric Value\"")
                 {
-                    Some(
-                        process_failure
-                            .unwrap_or_else(|| "ncu returned no metric table".to_string()),
-                    )
+                    Some(process_failure.unwrap_or_else(|| {
+                        format!(
+                            "ncu returned no metric table; {}",
+                            output_diagnostics(&output)
+                        )
+                    }))
                 } else {
                     let imported_sample = (|| -> Result<i64> {
                         let transaction = db.conn.unchecked_transaction()?;
@@ -910,6 +938,37 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn failed_command_keeps_both_streams_and_surfaces_stdout_only_errors() {
+        let stdout = "==ERROR== option --print-units cannot be specified more than once";
+        let mut command = Command::new("sh");
+        command.args(["-c", "printf '%s' '==ERROR== option --print-units cannot be specified more than once'; printf '%s' 'stderr detail' >&2; exit 7"]);
+        let error = run_cmd(&mut command, "profiler failed", None)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains(stdout), "{error}");
+        assert!(error.contains("stderr detail"), "{error}");
+        assert!(error.contains("exit status: 7"), "{error}");
+        let raw_stdout = std::fs::read_dir(session_dir())
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .find(|path| {
+                path.to_string_lossy().ends_with("stdout.log")
+                    && std::fs::read(path).is_ok_and(|bytes| bytes == stdout.as_bytes())
+            })
+            .unwrap();
+        let stderr = raw_stdout.with_file_name(
+            raw_stdout
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .replace("stdout.log", "stderr.log"),
+        );
+        assert_eq!(std::fs::read(stderr).unwrap(), b"stderr detail");
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn native_capture_locks_gpu_and_releases_before_analysis_or_after_spawn_error() {
         let directory = tempfile::tempdir().unwrap();
         let lock = directory.path().join("gpu.lock");
@@ -1089,7 +1148,6 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn ncu_records_process_errors_and_rejects_empty_collection() {
-        use std::os::unix::process::ExitStatusExt;
         let directory = tempfile::tempdir().unwrap();
         let db = GpuDb::create(&directory.path().join("session.db")).unwrap();
         let names = vec!["failed".to_string(), "unavailable".to_string()];
@@ -1103,20 +1161,19 @@ mod tests {
                 if name == "unavailable" {
                     bail!("cannot start collector");
                 }
-                Ok(Output {
-                    status: std::process::ExitStatus::from_raw(1 << 8),
-                    stdout: Vec::new(),
-                    stderr: b"counter unavailable".to_vec(),
-                })
+                Ok(Command::new("sh").args(["-c", "printf '%s' '==ERROR== option --print-units cannot be specified more than once'; exit 1"]).output()?)
             },
         )
         .unwrap_err();
         assert!(error.to_string().contains("no metrics"));
         assert_eq!(db.failures().len(), 2);
         assert_eq!(
-            std::fs::read_to_string(directory.path().join("ncu-0.stderr.log")).unwrap(),
-            "counter unavailable"
+            std::fs::read_to_string(directory.path().join("ncu-0.stdout.csv")).unwrap(),
+            "==ERROR== option --print-units cannot be specified more than once"
         );
+        assert!(db.failures().iter().any(|(_, error)| {
+            error.contains("option --print-units cannot be specified more than once")
+        }));
     }
 
     #[test]
