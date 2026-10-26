@@ -50,9 +50,28 @@ pub(super) const NSIGHT_SYSTEMS: BundledToolkit = BundledToolkit {
     }),
 };
 
-/// Run a Command, check for success, bail with stderr on failure.
-fn run_cmd(cmd: &mut Command, context: &str) -> Result<Output> {
-    let output = cmd.output().with_context(|| context.to_string())?;
+fn capture_output(cmd: &mut Command, gpu_lock: Option<&Path>) -> Result<Output> {
+    let _guard = if let Some(path) = gpu_lock {
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(path)
+            .with_context(|| format!("cannot open GPU lock {}", path.display()))?;
+        Some(
+            nix::fcntl::Flock::lock(file, nix::fcntl::FlockArg::LockExclusive).map_err(
+                |(_, error)| anyhow::anyhow!("cannot acquire GPU lock {}: {error}", path.display()),
+            )?,
+        )
+    } else {
+        None
+    };
+    Ok(cmd.output()?)
+}
+
+fn run_cmd(cmd: &mut Command, context: &str, gpu_lock: Option<&Path>) -> Result<Output> {
+    let output = capture_output(cmd, gpu_lock).with_context(|| context.to_string())?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         bail!("{context}:\n{stderr}");
@@ -151,6 +170,11 @@ pub(crate) fn session_dir() -> PathBuf {
 pub struct CollectionOptions {
     #[arg(
         long,
+        help = "Shared mutex for native GPU capture commands; exports/imports/analysis remain unlocked"
+    )]
+    pub gpu_lock: Option<PathBuf>,
+    #[arg(
+        long,
         conflicts_with = "kernel_name",
         help = "Collect counters for every timeline kernel instead of the top five"
     )]
@@ -193,6 +217,16 @@ pub fn collect_all(
     options: &CollectionOptions,
 ) -> Result<()> {
     let kind = detect_target(target);
+    if options.gpu_lock.is_some()
+        && matches!(
+            kind,
+            TargetKind::Python | TargetKind::PythonTorch | TargetKind::PythonTriton
+        )
+    {
+        bail!(
+            "--gpu-lock supports native targets; Python harnesses must lock their GPU phases internally and omit this flag"
+        );
+    }
     let session = session_dir();
 
     // Compile .cu sources first
@@ -238,6 +272,9 @@ pub fn collect_all(
         }
     };
 
+    if let Some(path) = &options.gpu_lock {
+        db.set_meta("gpu_capture_lock", &path.display().to_string())?;
+    }
     db.set_meta(
         "collection_mode",
         if options.timeline_only {
@@ -251,7 +288,15 @@ pub fn collect_all(
     if !options.counters_only {
         eprintln!("--- phase 1: timeline capture (nsys) ---");
         run_phase("nsys", &|| {
-            collect_nsys(db, target, args, kind, &session, target_hash.as_deref())
+            collect_nsys(
+                db,
+                target,
+                args,
+                kind,
+                &session,
+                target_hash.as_deref(),
+                options.gpu_lock.as_deref(),
+            )
         });
     }
     if options.timeline_only {
@@ -373,6 +418,7 @@ fn collect_nsys(
     kind: TargetKind,
     session: &Path,
     target_hash: Option<&str>,
+    gpu_lock: Option<&Path>,
 ) -> Result<()> {
     let trace_base = session.join("trace");
     let trace_rep = session.join("trace.nsys-rep");
@@ -381,7 +427,7 @@ fn collect_nsys(
     let mut cmd = nsys_command(target, args, kind, &trace_base);
 
     let command = format!("{cmd:?}");
-    let profile_output = run_cmd(&mut cmd, "nsys profile failed")?;
+    let profile_output = run_cmd(&mut cmd, "nsys profile failed", gpu_lock)?;
     let elapsed = start.elapsed().as_secs_f64();
 
     // nsys 2023.x on Debian/Ubuntu has a silent-importer bug: it writes
@@ -407,6 +453,7 @@ fn collect_nsys(
             run_cmd(
                 Command::new(&importer).arg("-i").arg(&qdstrm),
                 "QdstrmImporter fallback failed",
+                None,
             )?;
         }
         if !trace_rep.exists() {
@@ -424,6 +471,7 @@ fn collect_nsys(
             .arg("--force-overwrite=true")
             .arg(&trace_rep),
         "nsys export to sqlite failed",
+        None,
     )?;
 
     if !sqlite_path.exists() {
@@ -499,7 +547,7 @@ fn collect_ncu(
     collect_ncu_samples(db, session, &labels, &description, target_hash, |label| {
         let filter = if unfiltered { None } else { Some(label) };
         let mut cmd = ncu_command(target, args, filter, kind, options);
-        cmd.output()
+        capture_output(&mut cmd, options.gpu_lock.as_deref())
             .with_context(|| format!("cannot start ncu for `{label}`"))
     })?;
     let elapsed = start.elapsed().as_secs_f64();
@@ -696,7 +744,7 @@ fn collect_proton(
         .arg("python3")
         .arg(target)
         .args(args);
-    run_cmd(&mut cmd, "proton failed")?;
+    run_cmd(&mut cmd, "proton failed", None)?;
     if !trace_json.exists() {
         bail!("proton did not produce {}", trace_json.display());
     }
@@ -760,6 +808,7 @@ fn collect_torch(
     run_cmd(
         Command::new("python3").arg(&wrapper_path),
         "torch.profiler wrapper failed",
+        None,
     )?;
     let elapsed = start.elapsed().as_secs_f64();
 
@@ -859,11 +908,37 @@ pub(crate) fn python_preflight_module(kind: TargetKind) -> Option<&'static str> 
 mod tests {
     use super::*;
 
-    /// Regression: nvcc+ptxas printed "Conflicting options specified:
-    /// --device-debug --generate-line-info" on every build because
-    /// both `-G` and `-lineinfo` were passed. `-G` already implies
-    /// line info, so drop `-lineinfo` to silence the warning without
-    /// losing debug information.
+    #[cfg(unix)]
+    #[test]
+    fn native_capture_locks_gpu_and_releases_before_analysis_or_after_spawn_error() {
+        let directory = tempfile::tempdir().unwrap();
+        let lock = directory.path().join("gpu.lock");
+        let mut probe = Command::new("flock");
+        probe.arg("-n").arg(&lock).arg("true");
+        let output = capture_output(&mut probe, Some(&lock)).unwrap();
+        use std::os::unix::fs::MetadataExt;
+        let inode = std::fs::metadata(&lock).unwrap().ino();
+        assert!(
+            !output.status.success(),
+            "capture did not exclude a competing GPU process"
+        );
+        let mut analysis = Command::new("flock");
+        analysis.arg("-n").arg(&lock).arg("true");
+        assert!(
+            run_cmd(&mut analysis, "analysis", None)
+                .unwrap()
+                .status
+                .success()
+        );
+        let mut missing = Command::new(directory.path().join("missing-target"));
+        assert!(capture_output(&mut missing, Some(&lock)).is_err());
+        assert!(
+            analysis.status().unwrap().success(),
+            "spawn error retained the GPU lock"
+        );
+        assert_eq!(std::fs::metadata(&lock).unwrap().ino(), inode);
+    }
+
     #[test]
     fn nsys_collects_cuda_graph_kernel_nodes() {
         let command = nsys_command(

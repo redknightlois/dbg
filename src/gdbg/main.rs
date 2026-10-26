@@ -209,6 +209,18 @@ mod cli_tests {
         );
         assert_eq!(selected.collection.launch_skip, 1);
         assert_eq!(selected.args, ["worker.py", "--section", "target-arg"]);
+        let native = Cli::try_parse_from([
+            "gdbg",
+            "--gpu-lock",
+            "/shared/gpu.lock",
+            "--timeline-only",
+            "./app",
+        ])
+        .unwrap();
+        assert_eq!(
+            native.collection.gpu_lock,
+            Some(std::path::PathBuf::from("/shared/gpu.lock"))
+        );
         for flags in [
             vec!["--counters-only"],
             vec!["--launch-count", "0"],

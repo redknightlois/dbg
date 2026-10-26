@@ -67,6 +67,14 @@ runtime, workload and cache policy across sessions; it does not claim equal
 physical state or comparable NCU/Nsys durations. The shared GPU lock still
 belongs to the workload's GPU phases; no outer lock around gdbg or analysis.
 
+For native ELF/CUDA targets, `--gpu-lock PATH` serializes each Nsys/NCU capture
+command. It waits before starting the profiler and releases the same lock inode
+before exports, SQLite imports, the next capture, or REPL analysis. Compilation
+also stays outside the lock. Do not wrap gdbg itself in flock. An application's
+CPU work inside the capture process remains within that command's lock scope;
+harnesses needing finer boundaries lock internally and omit this flag. Python
+targets require their own GPU-phase lock and reject `--gpu-lock`.
+
 Defaults remain top five timeline names, full sections and first matching
 launch. `--all-kernels --all-launches` keeps complete instance collection.
 Each completed NCU invocation is transactionally imported before the next;
