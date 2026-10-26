@@ -124,10 +124,11 @@ pub fn cmd_inspect(db: &GpuDb, args: &[&str]) {
         if let Some(v) = m.3 {
             println!("    Registers/thread:  {v}");
         }
-        let shmem = m.4.unwrap_or(0) + m.5.unwrap_or(0);
-        if shmem > 0 {
-            println!("    Shared memory:     {}", fmt_bytes(shmem));
-        }
+        let shmem =
+            m.4.zip(m.5)
+                .map(|(a, b)| fmt_bytes(a + b))
+                .unwrap_or_else(|| "N/A".into());
+        println!("    Shared memory:     {shmem}");
         if let Some(v) = m.6 {
             println!("    L2 hit rate:       {v:.1}%");
         }

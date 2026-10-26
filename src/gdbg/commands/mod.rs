@@ -45,6 +45,12 @@ pub(crate) fn fmt_us(us: f64) -> String {
     }
 }
 
+fn fmt_opt_pct(value: Option<f64>) -> String {
+    value
+        .map(|v| format!("{v:.1}%"))
+        .unwrap_or_else(|| "N/A".into())
+}
+
 pub(crate) fn fmt_bytes(b: i64) -> String {
     if b >= 1_073_741_824 {
         format!("{:.1} GB", b as f64 / 1_073_741_824.0)

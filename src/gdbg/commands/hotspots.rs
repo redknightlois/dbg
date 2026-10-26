@@ -144,7 +144,7 @@ pub fn cmd_kernels(db: &GpuDb, args: &[&str]) {
                     - AVG(launches.duration_us) * AVG(launches.duration_us) as var,
                 m.boundedness,
                 m.compute_throughput_pct,
-                m.memory_throughput_pct
+                m.memory_throughput_pct, m.kernel_name
          FROM launches
          LEFT JOIN metrics m ON m.kernel_name = launches.kernel_name AND {metrics_filter}
          WHERE {} AND {tl} {pattern_clause}
@@ -174,11 +174,12 @@ pub fn cmd_kernels(db: &GpuDb, args: &[&str]) {
             row.get::<_, Option<String>>(5)?,
             row.get::<_, Option<f64>>(6)?,
             row.get::<_, Option<f64>>(7)?,
+            row.get::<_, Option<String>>(8)?,
         ))
     });
 
     println!("# | Kernel | Time | % | Launches | Avg | Stddev | Tail% | Bound");
-    for (i, (name, cnt, total, avg, var, bound, cmp, mem)) in rows.iter().enumerate() {
+    for (i, (name, cnt, total, avg, var, bound, cmp, mem, metric_name)) in rows.iter().enumerate() {
         let pct = if gpu_total > 0.0 {
             total / gpu_total * 100.0
         } else {
@@ -186,10 +187,15 @@ pub fn cmd_kernels(db: &GpuDb, args: &[&str]) {
         };
         let stddev = var.max(0.0).sqrt();
         let tail_pct = tail_over_2x_median(db, name, &tl);
-        let bound_str = match bound.as_deref() {
-            Some("compute") => format!("cmp {:.0}%", cmp.unwrap_or(0.0)),
-            Some("memory") => format!("mem {:.0}%", mem.unwrap_or(0.0)),
+        let bound_str = match bound.as_deref().filter(|_| cmp.is_some() && mem.is_some()) {
+            Some("compute") => cmp
+                .map(|v| format!("cmp {v:.0}%"))
+                .unwrap_or_else(|| "cmp N/A".into()),
+            Some("memory") => mem
+                .map(|v| format!("mem {v:.0}%"))
+                .unwrap_or_else(|| "mem N/A".into()),
             Some("latency") => "latency".into(),
+            _ if metric_name.is_some() => "[unclassified]".into(),
             _ => "[no ncu]".into(),
         };
         let tail_str = match tail_pct {

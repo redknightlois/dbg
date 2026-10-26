@@ -474,3 +474,77 @@ fn hotspot_empty_and_degenerate() {
     let (b, _, _, _) = find_hottest_window(&intervals, 0.0);
     assert_eq!(b, 0.0);
 }
+
+#[test]
+fn missing_metrics_are_not_zero_or_occupancy_limits() {
+    const CHILD_DB: &str = "GDBG_NULL_METRICS_TEST_DB";
+    if let Some(path) = std::env::var_os(CHILD_DB) {
+        let db = GpuDb::open(std::path::Path::new(&path)).unwrap();
+        crate::commands::cmd_roofline(&db, &[]);
+        crate::commands::cmd_bound(&db, &["missing_compute"]);
+        crate::commands::cmd_bound(&db, &["stale_classification"]);
+        crate::commands::cmd_occupancy(&db, &[]);
+        crate::commands::cmd_inspect(&db, &["partial_shmem"]);
+        crate::commands::cmd_kernels(&db, &[]);
+        return;
+    }
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("partial.gpu.db");
+    let db = GpuDb::create(&path).unwrap();
+    let timeline = db
+        .add_layer("nsys", "retained-timeline", None, None, None)
+        .unwrap();
+    let counters = db
+        .add_layer("ncu", "retained-counters", None, None, None)
+        .unwrap();
+    for name in [
+        "missing_compute",
+        "measured_zero",
+        "partial_shmem",
+        "stale_classification",
+        "no_metrics",
+    ] {
+        db.conn.execute("INSERT INTO launches(kernel_name,duration_us,start_us,layer_id) VALUES(?1,10,0,?2)", params![name,timeline]).unwrap();
+    }
+    db.conn.execute("INSERT INTO metrics(kernel_name,occupancy_pct,memory_throughput_pct,layer_id) VALUES('missing_compute',45.91,75.77,?1)", [counters]).unwrap();
+    db.conn.execute("INSERT INTO metrics(kernel_name,occupancy_pct,compute_throughput_pct,memory_throughput_pct,registers_per_thread,shared_mem_static_bytes,shared_mem_dynamic_bytes,boundedness,layer_id) VALUES('measured_zero',0,0,0,0,0,0,'latency',?1)", [counters]).unwrap();
+    db.conn.execute("INSERT INTO metrics(kernel_name,occupancy_pct,registers_per_thread,shared_mem_static_bytes,layer_id) VALUES('partial_shmem',50,128,1024,?1)", [counters]).unwrap();
+    db.conn.execute("INSERT INTO metrics(kernel_name,occupancy_pct,memory_throughput_pct,boundedness,layer_id) VALUES('stale_classification',45,75,'compute',?1)", [counters]).unwrap();
+    drop(db);
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "tests::regressions::missing_metrics_are_not_zero_or_occupancy_limits",
+            "--nocapture",
+        ])
+        .env(CHILD_DB, &path)
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let text = String::from_utf8(output.stdout).unwrap();
+    assert!(text.contains("Compute: N/A, Memory: 75.8%"), "{text}");
+    assert!(
+        text.contains("measured_zero | latency | 0.0% | 0.0% | 0.0%"),
+        "{text}"
+    );
+    assert!(
+        !text.contains("| Limiting") && !text.contains("block size"),
+        "{text}"
+    );
+    assert!(!text.contains("Compute-bound"), "{text}");
+    assert!(
+        text.lines()
+            .any(|l| l.contains("Shared memory:") && l.ends_with("N/A")),
+        "{text}"
+    );
+    assert!(
+        text.lines()
+            .any(|l| l.contains(" | missing_compute | ") && l.ends_with("[unclassified]")),
+        "{text}"
+    );
+    assert!(
+        text.lines()
+            .any(|l| l.contains(" | no_metrics | ") && l.ends_with("[no ncu]")),
+        "{text}"
+    );
+}

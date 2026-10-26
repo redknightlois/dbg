@@ -1,8 +1,8 @@
 use std::path::Path;
 
 use super::{
-    GpuDb, compute_gpu_gaps, detect_warmup_count, find_hottest_window, fmt_bytes, fmt_us,
-    like_param, merge_intervals, parse_count, parse_pattern, require_op_layer,
+    GpuDb, compute_gpu_gaps, detect_warmup_count, find_hottest_window, fmt_bytes, fmt_opt_pct,
+    fmt_us, like_param, merge_intervals, parse_count, parse_pattern, require_op_layer,
 };
 use rusqlite::params_from_iter;
 
@@ -48,17 +48,17 @@ pub fn cmd_bound(db: &GpuDb, args: &[&str]) {
 
     for (name, bound, cmp, mem, l2, bw, peak, occ) in &rows {
         println!("{name}:");
-        match bound.as_deref() {
+        match bound.as_deref().filter(|_| cmp.is_some() && mem.is_some()) {
             Some("compute") => println!(
-                "  Compute-bound ({:.1}% compute, {:.1}% memory)",
-                cmp.unwrap_or(0.0),
-                mem.unwrap_or(0.0)
+                "  Compute-bound ({} compute, {} memory)",
+                fmt_opt_pct(*cmp),
+                fmt_opt_pct(*mem)
             ),
             Some("memory") => {
                 println!(
-                    "  Memory-bound ({:.1}% memory, {:.1}% compute)",
-                    mem.unwrap_or(0.0),
-                    cmp.unwrap_or(0.0)
+                    "  Memory-bound ({} memory, {} compute)",
+                    fmt_opt_pct(*mem),
+                    fmt_opt_pct(*cmp)
                 );
                 if let Some(l) = l2 {
                     println!("  L2 hit rate: {l:.1}%");
@@ -77,9 +77,9 @@ pub fn cmd_bound(db: &GpuDb, args: &[&str]) {
                 }
             }
             _ => println!(
-                "  Compute: {:.1}%, Memory: {:.1}%",
-                cmp.unwrap_or(0.0),
-                mem.unwrap_or(0.0)
+                "  Compute: {}, Memory: {}",
+                fmt_opt_pct(*cmp),
+                fmt_opt_pct(*mem)
             ),
         }
     }
@@ -123,13 +123,15 @@ pub fn cmd_roofline(db: &GpuDb, args: &[&str]) {
     println!("Kernel | Bound | Compute% | Memory% | Occupancy");
     for (name, bound, cmp, mem, occ) in &rows {
         println!(
-            "{} | {} | {:.1}% | {:.1}% | {}",
+            "{} | {} | {} | {} | {}",
             name,
-            bound.as_deref().unwrap_or("?"),
-            cmp.unwrap_or(0.0),
-            mem.unwrap_or(0.0),
-            occ.map(|v| format!("{v:.1}%"))
-                .unwrap_or_else(|| "?".into())
+            bound
+                .as_deref()
+                .filter(|_| cmp.is_some() && mem.is_some())
+                .unwrap_or("?"),
+            fmt_opt_pct(*cmp),
+            fmt_opt_pct(*mem),
+            fmt_opt_pct(*occ)
         );
     }
 }
@@ -157,24 +159,16 @@ pub fn cmd_occupancy(db: &GpuDb, args: &[&str]) {
             Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
         });
 
-    println!("Kernel | Occupancy | Regs | ShmemK | Limiting");
+    println!("Kernel | Occupancy | Regs | ShmemK");
     for (name, occ, regs, shmem) in &rows {
-        let limit = if regs.unwrap_or(0) > 64 {
-            "registers"
-        } else if shmem.unwrap_or(0) > 48 * 1024 {
-            "shared mem"
-        } else {
-            "block size"
-        };
         println!(
-            "{} | {:.1}% | {} | {} | {}",
+            "{} | {:.1}% | {} | {}",
             name,
             occ,
-            regs.map(|v| v.to_string()).unwrap_or_else(|| "?".into()),
+            regs.map(|v| v.to_string()).unwrap_or_else(|| "N/A".into()),
             shmem
                 .map(|v| format!("{:.1}", v as f64 / 1024.0))
-                .unwrap_or_else(|| "?".into()),
-            limit
+                .unwrap_or_else(|| "N/A".into())
         );
     }
 }
@@ -1955,8 +1949,6 @@ pub fn cmd_compare(db: &GpuDb, args: &[&str]) {
 
     if ma.is_some() || mb.is_some() {
         println!("\n  Hardware metrics (ncu):");
-        let fmt_opt_pct =
-            |v: Option<f64>| v.map(|x| format!("{x:.1}%")).unwrap_or_else(|| "?".into());
         let fmt_opt_bw = |v: Option<f64>| {
             v.map(|x| format!("{x:.1} GB/s"))
                 .unwrap_or_else(|| "?".into())
