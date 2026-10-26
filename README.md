@@ -204,6 +204,11 @@ Why this matters:
 
 ## Contributing
 
+Keep `develop` at `main` or ahead of it: `main` must be an ancestor of `develop`.
+Fetch both branches before publishing and merge new `main` commits into
+`develop` while preserving its existing commits. Push coordinated branch
+updates atomically when both tips change.
+
 Adding a new backend is writing a prompt. Each backend implements a trait that describes how to spawn the debugger, detect its prompt, format breakpoints, and clean output. See `src/backend/mod.rs` for the trait and any existing backend (e.g., `lldb.rs`, `delve.rs`) as a template.
 
 ## License
