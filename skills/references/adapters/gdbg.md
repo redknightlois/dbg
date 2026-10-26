@@ -47,7 +47,7 @@ gdbg --counters-only --kernel-name "$KERNEL" --launch-skip 1 --launch-count 1 \
 ```
 
 `--kernel-name` repeats for several literal native names; gdbg escapes regex
-metacharacters. Each selection runs a separate NCU invocation. Skip/count refer
+metacharacters. NCU output uses native demangled names with simplification disabled, preserving namespaces for exact timeline joins. Each selection runs a separate NCU invocation. Skip/count refer
 to matching launches within that invocation, not global timeline IDs. For W13
 and W2 sharing one symbol in a single replay, skip 0 selects the first matching
 instance and skip 1 selects the second. Verify raw IDs, order, geometry, source,

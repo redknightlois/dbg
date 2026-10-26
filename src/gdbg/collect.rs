@@ -728,6 +728,7 @@ fn ncu_command(
     // only NULL values and makes the REPL report `[no ncu]`.
     cmd.args(["--print-metric-name", "name"]);
     cmd.args(["--kernel-name-base", "demangled"]);
+    cmd.args(["--print-kernel-base", "demangled", "--rename-kernels", "0"]);
     if let Some(kernel_name) = kernel_name {
         let regex = regex::escape(kernel_name);
         cmd.args(["--kernel-name", &format!("regex:{regex}")]);
@@ -1248,6 +1249,11 @@ mod tests {
                 .any(|w| w == ["--kernel-name-base", "demangled"]),
             "ncu must match the demangled names imported from nsys: {args:?}"
         );
+        assert!(args.windows(2).any(|w| w == ["--rename-kernels", "0"]));
+        assert!(
+            args.windows(2)
+                .any(|w| w == ["--print-kernel-base", "demangled"])
+        );
         assert!(
             args.windows(2).any(|w| w == ["--print-units", "base"]),
             "ncu must emit base units consumed by the parser: {args:?}"
@@ -1394,6 +1400,57 @@ mod tests {
         assert!(args.iter().any(|arg| arg == "--kernel-name"));
         assert!(!args.iter().any(|arg| arg == "--launch-count"));
     }
+    #[test]
+    fn native_ncu_metrics_join_timeline_without_merging_namespaces() {
+        let directory = tempfile::tempdir().unwrap();
+        let db = GpuDb::create(&directory.path().join("session.db")).unwrap();
+        let timeline = db.add_layer("nsys", "trace", None, None, None).unwrap();
+        let canonical = crate::kernel::normalize_kernel_name(
+            "void cdf::detail::map_kernel<256,1,unsigned int,cdf::Native<float>,cdf::Native<float>,Twice>()",
+        );
+        let other = crate::kernel::normalize_kernel_name(
+            "void other::detail::map_kernel<256,1,unsigned int,other::Native<float>,other::Native<float>,Twice>()",
+        );
+        for _ in 0..20 {
+            db.conn
+                .execute(
+                    "INSERT INTO launches(kernel_name,duration_us,layer_id) VALUES(?1,5,?2)",
+                    rusqlite::params![canonical, timeline],
+                )
+                .unwrap();
+        }
+        db.conn
+            .execute(
+                "INSERT INTO launches(kernel_name,duration_us,layer_id) VALUES(?1,5,?2)",
+                rusqlite::params![other, timeline],
+            )
+            .unwrap();
+        let native = "void cdf::detail::map_kernel<(int)256, (bool)1, unsigned int, cdf::Native<float>, cdf::Native<float>, Twice>(cdf::Tensor<T4>, cdf::Tensor<T5>, T6)";
+        let csv = directory.path().join("ncu.csv");
+        std::fs::write(&csv, format!("\"Kernel Name\",\"Metric Name\",\"Metric Value\"\n\"{native}\",\"sm__throughput.avg.pct_of_peak_sustained_elapsed\",\"21.6\"\n")).unwrap();
+        db.import_layer(
+            "ncu",
+            &csv.display().to_string(),
+            None,
+            None,
+            None,
+            |conn, layer| parsers::ncu::import_ncu_csv(conn, &csv, layer),
+        )
+        .unwrap();
+        let joined: i64 = db.conn.query_row("SELECT COUNT(*) FROM launches l JOIN metrics m ON m.kernel_name=l.kernel_name WHERE l.layer_id=?1 AND m.compute_throughput_pct=21.6", [timeline], |r| r.get(0)).unwrap();
+        assert_eq!(joined, 20);
+        let unrelated: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM metrics WHERE kernel_name=?1",
+                [&other],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(unrelated, 0);
+        assert_ne!(canonical, other);
+    }
+
     #[test]
     fn counter_collection_uses_native_names_while_queries_keep_canonical_keys() {
         let dir = tempfile::tempdir().unwrap();
