@@ -612,10 +612,7 @@ fn collect_ncu_samples(
                 let stdout = String::from_utf8_lossy(&output.stdout);
                 let process_failure = (!output.status.success())
                     .then(|| format!("ncu {}", output_diagnostics(&output)));
-                if !stdout.contains("\"Kernel Name\"")
-                    || !stdout.contains("\"Metric Name\"")
-                    || !stdout.contains("\"Metric Value\"")
-                {
+                if !stdout.lines().any(parsers::ncu::is_ncu_csv_header) {
                     Some(process_failure.unwrap_or_else(|| {
                         format!(
                             "ncu returned no metric table; {}",
@@ -651,18 +648,7 @@ fn collect_ncu_samples(
                         Ok(layer) => {
                             layer_id = Some(layer);
                             imported += 1;
-                            let keep_header = combined_csv.is_empty();
-                            for line in stdout.lines() {
-                                if !keep_header
-                                    && line.contains("\"Kernel Name\"")
-                                    && line.contains("\"Metric Name\"")
-                                    && line.contains("\"Metric Value\"")
-                                {
-                                    continue;
-                                }
-                                combined_csv.extend_from_slice(line.as_bytes());
-                                combined_csv.push(b'\n');
-                            }
+                            combined_csv.extend_from_slice(&output.stdout);
                             if !combined_csv.ends_with(b"\n") {
                                 combined_csv.push(b'\n');
                             }
@@ -720,7 +706,7 @@ fn ncu_command(
     for section in &options.section {
         cmd.args(["--section", section]);
     }
-    cmd.args(["--csv", "--print-units", "base"]);
+    cmd.args(["--csv", "--page", "raw", "--print-units", "base"]);
     // The importer keys off Nsight Compute's stable metric identifiers (for
     // example `sm__throughput.avg.pct_of_peak_sustained_elapsed`).  CSV output
     // uses localized/display labels such as `Compute (SM) Throughput` unless
@@ -1036,12 +1022,16 @@ mod tests {
             visited.push(name.to_string());
             let stdout = if name == "missing" {
                 "==WARNING== No kernels were profiled.\n".to_string()
+            } else if name == "last" {
+                "\"ID\",\"Kernel Name\",\"Grid Size\",\"Block Size\",\"Stream\",\"gpu__time_duration.sum\"\n\"\",\"\",\"\",\"\",\"\",\"nsecond\"\n\"0\",\"last\",\"(528,1,1)\",\"(256,1,1)\",\"13\",\"427936\"\n".to_string()
             } else {
                 format!("==PROF== Connected to process 123\n\"Kernel Name\",\"Metric Name\",\"Metric Value\"\n\"{name}\",\"launch__registers_per_thread\",\"32\"\n")
             };
             Ok(Output { status: std::process::ExitStatus::from_raw(if name == "last" { 1 << 8 } else { 0 }), stdout: stdout.into_bytes(), stderr: Vec::new() })
         }).unwrap();
         assert_eq!(visited, names);
+        assert_eq!(db.total_launch_count(), 1);
+        assert!((db.total_gpu_time_us() - 427.936).abs() < 0.001);
         assert!(directory.path().join("ncu-1.stdout.csv").exists());
         assert_eq!(db.failures().len(), 2);
         assert!(csv.exists());
@@ -1301,6 +1291,7 @@ mod tests {
             ["--launch-skip", "1"],
             ["--launch-count", "1"],
             ["--print-units", "base"],
+            ["--page", "raw"],
             ["--print-metric-name", "name"],
         ] {
             assert!(

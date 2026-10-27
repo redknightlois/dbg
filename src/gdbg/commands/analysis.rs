@@ -1733,7 +1733,19 @@ pub fn cmd_launches(db: &GpuDb, args: &[&str]) {
         }) {
         Ok(x) => x,
         Err(_) => {
-            println!("no kernel matching '{pattern}'");
+            let metric_sql = format!(
+                r"SELECT COUNT(*) FROM metrics m WHERE kernel_name LIKE ?1 ESCAPE '\' AND {}",
+                db.metric_filter_for("m")
+            );
+            let known: i64 = db
+                .conn
+                .query_row(&metric_sql, [like_param(pattern)], |row| row.get(0))
+                .unwrap_or(0);
+            if known > 0 {
+                println!("Selected NCU instances: N/A (duration and timeline unavailable)");
+            } else {
+                println!("no kernel matching '{pattern}'");
+            }
             return;
         }
     };
@@ -1742,12 +1754,12 @@ pub fn cmd_launches(db: &GpuDb, args: &[&str]) {
         "SELECT start_us, duration_us, grid_x, grid_y, grid_z,
                 block_x, block_y, block_z, stream_id
          FROM launches
-         WHERE kernel_name = ?1 AND start_us IS NOT NULL AND {tl}
-         ORDER BY start_us LIMIT ?2"
+         WHERE kernel_name = ?1 AND {tl}
+         ORDER BY start_us, id LIMIT ?2"
     );
     let rows: Vec<_> = db.query_vec(&sql, rusqlite::params![name, limit as i64], |row| {
         Ok((
-            row.get::<_, f64>(0)?,
+            row.get::<_, Option<f64>>(0)?,
             row.get::<_, f64>(1)?,
             row.get::<_, Option<u32>>(2)?,
             row.get::<_, Option<u32>>(3)?,
@@ -1759,16 +1771,26 @@ pub fn cmd_launches(db: &GpuDb, args: &[&str]) {
         ))
     });
 
+    let scope = if db.timeline_layer_id().is_none() && db.has_layer("ncu") {
+        "Selected NCU instances"
+    } else {
+        "Launches"
+    };
     println!(
-        "  Launches of {} ({} total, showing {})\n",
+        "  {scope} of {} ({} total, showing {})\n",
         &name,
         cnt,
         rows.len()
     );
-    println!("# | Start | Duration | Gap | Stream | Grid | Block");
+    if db.timeline_layer_id().is_none() && db.has_layer("ncu") {
+        println!("Timeline duration: N/A (timeline unavailable)");
+        println!("# | Start | Instrumented NCU replay duration | Gap | Stream | Grid | Block");
+    } else {
+        println!("# | Start | Duration | Gap | Stream | Grid | Block");
+    }
     let mut prev_end: Option<f64> = None;
     for (i, (start, dur, gx, gy, gz, bx, by, bz, sid)) in rows.iter().enumerate() {
-        let gap = prev_end.map(|e| start - e);
+        let gap = start.zip(prev_end).map(|(start, end)| start - end);
         let gap_s = gap
             .map(|g| {
                 if g >= 0.0 {
@@ -1779,31 +1801,31 @@ pub fn cmd_launches(db: &GpuDb, args: &[&str]) {
             })
             .unwrap_or_else(|| "—".into());
         let grid = match (gx, gy, gz) {
-            (Some(x), Some(y), Some(z)) => format!("({x},{y},{z})"),
+            (Some(x), Some(y), Some(z)) if *x > 0 && *y > 0 && *z > 0 => format!("({x},{y},{z})"),
             _ => "—".into(),
         };
         let block = match (bx, by, bz) {
-            (Some(x), Some(y), Some(z)) => format!("({x},{y},{z})"),
+            (Some(x), Some(y), Some(z)) if *x > 0 && *y > 0 && *z > 0 => format!("({x},{y},{z})"),
             _ => "—".into(),
         };
         let sid_s = sid.map(|s| s.to_string()).unwrap_or_else(|| "?".into());
         println!(
             "{} | {} | {} | {} | {} | {} | {}",
             i + 1,
-            fmt_us(*start),
+            start.map(fmt_us).unwrap_or_else(|| "N/A".into()),
             fmt_us(*dur),
             gap_s,
             sid_s,
             &grid,
             &block
         );
-        prev_end = Some(start + dur);
+        prev_end = start.map(|start| start + dur);
     }
 
     if rows.len() >= 2 {
         let gaps: Vec<f64> = rows
             .windows(2)
-            .map(|w| w[1].0 - (w[0].0 + w[0].1))
+            .filter_map(|w| Some(w[1].0? - (w[0].0? + w[0].1)))
             .filter(|g| *g >= 0.0)
             .collect();
         if !gaps.is_empty() {

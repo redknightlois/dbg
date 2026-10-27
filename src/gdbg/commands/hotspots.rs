@@ -10,6 +10,9 @@ pub fn cmd_stats(db: &GpuDb) {
     let device = db.meta("device");
     let wall_us: f64 = db.meta("wall_time_us").parse().unwrap_or(0.0);
     let gpu_us = db.total_gpu_time_us();
+    let counter_only = db.timeline_layer_id().is_none() && db.has_layer("ncu");
+    let launch_count = db.total_launch_count();
+    let measured_kernels = db.kernels_with_metrics();
     let transfer_filter = db.timeline_filter_for("transfers");
     let xfer_us: f64 = db.scalar_f64(&format!(
         "SELECT COALESCE(SUM(duration_us),0) FROM transfers WHERE {transfer_filter}"
@@ -20,15 +23,10 @@ pub fn cmd_stats(db: &GpuDb) {
     if !device.is_empty() {
         println!("  Device:       {device}");
     }
-    // When wall_time_us is missing / zero, the underlying collection
-    // failed (e.g. nsys import errored out). Printing "0.0us" and
-    // "0.0% of wall" for every row made broken sessions look merely
-    // quiet. Surface the absence explicitly so agents don't draw
-    // wrong conclusions from phantom percentages.
     if wall_us > 0.0 {
         println!("  Wall time:    {}", fmt_us(wall_us));
     } else {
-        println!("Wall time: | N/A (nsys did not record — re-run `gdbg collect`)");
+        println!("  Wall time:    N/A (timeline unavailable)");
     }
     let fmt_pct = |v: f64| {
         if wall_us > 0.0 {
@@ -37,7 +35,16 @@ pub fn cmd_stats(db: &GpuDb) {
             "wall=N/A".to_string()
         }
     };
-    println!("  Kernel time:  {} ({})", fmt_us(gpu_us), fmt_pct(gpu_us));
+    if counter_only {
+        println!("  Timeline time: N/A (timeline unavailable)");
+        if launch_count == 0 {
+            println!("  NCU replay time: N/A (duration unavailable)");
+        } else {
+            println!("  NCU replay time: {gpu_us:.3}us (instrumented, selected instances)");
+        }
+    } else {
+        println!("  Kernel time:  {} ({})", fmt_us(gpu_us), fmt_pct(gpu_us));
+    }
     if xfer_us > 0.0 {
         println!(
             "  Transfer time: {} ({})",
@@ -59,13 +66,32 @@ pub fn cmd_stats(db: &GpuDb) {
             fmt_us(wall_us)
         );
     }
-    println!(
-        "  Kernels:      {} launches, {} unique",
-        db.total_launch_count(),
-        db.unique_kernel_count()
-    );
-    println!("  Transfers:    {}", db.transfer_count());
-    println!("  Streams:      {}", db.stream_count());
+    if counter_only {
+        if launch_count == 0 {
+            println!(
+                "  Kernels:      {measured_kernels} counter-only kernels; selected instances N/A"
+            );
+        } else {
+            println!(
+                "  Kernels:      {launch_count} selected NCU instances, {} unique",
+                db.unique_kernel_count()
+            );
+        }
+        println!("  Transfers:    N/A (timeline unavailable)");
+        let streams = db.stream_count();
+        if streams > 0 {
+            println!("  Streams:      {streams} selected NCU streams");
+        } else {
+            println!("  Streams:      N/A (NCU stream metadata unavailable)");
+        }
+    } else {
+        println!(
+            "  Kernels:      {launch_count} launches, {} unique",
+            db.unique_kernel_count()
+        );
+        println!("  Transfers:    {}", db.transfer_count());
+        println!("  Streams:      {}", db.stream_count());
+    }
 
     let layers = db.layer_names();
     let has_nsys = db.has_layer("nsys");
@@ -93,7 +119,11 @@ pub fn cmd_stats(db: &GpuDb) {
 
     let uk = db.unique_kernel_count();
     let wm = db.kernels_with_metrics();
-    println!("  Deep metrics: {wm}/{uk} kernels");
+    if counter_only {
+        println!("  Deep metrics: {wm} counter-only kernels");
+    } else {
+        println!("  Deep metrics: {wm}/{uk} kernels");
+    }
 
     let wo = db.kernels_with_ops();
     if wo > 0 {
@@ -178,7 +208,33 @@ pub fn cmd_kernels(db: &GpuDb, args: &[&str]) {
         ))
     });
 
-    println!("# | Kernel | Time | % | Launches | Avg | Stddev | Tail% | Bound");
+    if db.timeline_layer_id().is_none() && db.has_layer("ncu") {
+        println!("Timeline duration: N/A (timeline unavailable)");
+        if rows.is_empty() {
+            let sql = format!(
+                r"SELECT kernel_name FROM metrics m WHERE {} AND kernel_name LIKE ?1 ESCAPE '\' ORDER BY kernel_name LIMIT ?2",
+                db.metric_filter_for("m")
+            );
+            let names: Vec<String> = db.query_vec(
+                &sql,
+                rusqlite::params![like_param(pattern.unwrap_or("")), n as i64],
+                |row| row.get(0),
+            );
+            println!(
+                "{} counter-only kernels; selected instances and NCU replay duration N/A",
+                names.len()
+            );
+            for name in names {
+                println!("  {name}");
+            }
+            return;
+        }
+        println!(
+            "# | Kernel | Instrumented NCU replay time | % selected replay | Selected instances | Replay avg | Replay stddev | Replay tail% | Bound"
+        );
+    } else {
+        println!("# | Kernel | Time | % | Launches | Avg | Stddev | Tail% | Bound");
+    }
     for (i, (name, cnt, total, avg, var, bound, cmp, mem, metric_name)) in rows.iter().enumerate() {
         let pct = if gpu_total > 0.0 {
             total / gpu_total * 100.0

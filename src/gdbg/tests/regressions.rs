@@ -608,3 +608,204 @@ fn absent_or_empty_um_fault_records_do_not_request_recapture() {
         }
     }
 }
+
+#[test]
+fn ncu_raw_and_details_preserve_selected_launches_without_timeline() {
+    const CHILD_DB: &str = "GDBG_NCU_SELECTED_LAUNCH_TEST_DB";
+    if let Some(path) = std::env::var_os(CHILD_DB) {
+        let db = GpuDb::open(std::path::Path::new(&path)).unwrap();
+        crate::commands::cmd_stats(&db);
+        crate::commands::cmd_kernels(&db, &[]);
+        crate::commands::cmd_inspect(&db, &["humming"]);
+        crate::commands::cmd_launches(&db, &["humming"]);
+        return;
+    }
+    let directory = tempfile::tempdir().unwrap();
+    for (case, csv, expected_duration, expected_launches) in [
+        (
+            "details",
+            "\"ID\",\"Process ID\",\"Kernel Name\",\"Context\",\"Stream\",\"Block Size\",\"Grid Size\",\"Metric Name\",\"Metric Unit\",\"Metric Value\"\n\"0\",\"210497\",\"humming\",\"1\",\"13\",\"(128, 1, 1)\",\"(528, 1, 1)\",\"gpu__time_duration.sum\",\"nsecond\",\"304864\"\n",
+            Some(304.864),
+            1,
+        ),
+        (
+            "raw",
+            "\"ID\",\"Process ID\",\"Kernel Name\",\"Context\",\"Stream\",\"Block Size\",\"Grid Size\",\"gpu__time_duration.sum\",\"launch__registers_per_thread\"\n\"\",\"\",\"\",\"\",\"\",\"\",\"\",\"nsecond\",\"register/thread\"\n\"0\",\"233158\",\"humming\",\"1\",\"13\",\"(256, 1, 1)\",\"(528, 1, 1)\",\"427936\",\"128\"\n\"1\",\"233158\",\"humming\",\"1\",\"14\",\"(128, 1, 1)\",\"(529, 1, 1)\",\"304864\",\"64\"\n",
+            Some(732.8),
+            2,
+        ),
+        (
+            "metrics_only",
+            "\"Kernel Name\",\"Metric Name\",\"Metric Unit\",\"Metric Value\"\n\"humming\",\"launch__registers_per_thread\",\"register/thread\",\"128\"\n",
+            None,
+            0,
+        ),
+    ] {
+        let path = directory.path().join(format!("{case}.gpu.db"));
+        let db = GpuDb::create(&path).unwrap();
+        let csv_path = directory.path().join(format!("{case}.csv"));
+        std::fs::write(&csv_path, csv).unwrap();
+        let layer = db
+            .add_layer("ncu", csv_path.to_str().unwrap(), None, None, None)
+            .unwrap();
+        crate::parsers::ncu::import_ncu_csv(&db.conn, &csv_path, layer).unwrap();
+        assert_eq!(db.total_launch_count(), expected_launches);
+        assert_eq!(db.kernels_with_metrics(), 1);
+        assert_eq!(
+            db.count("SELECT COUNT(*) FROM launches WHERE start_us IS NOT NULL"),
+            0
+        );
+        assert_eq!(
+            db.count("SELECT COUNT(*) FROM launches WHERE grid_x=0 OR block_x=0"),
+            0
+        );
+        if let Some(duration) = expected_duration {
+            assert!((db.total_gpu_time_us() - duration).abs() < 0.001);
+            let (grid, block, stream): (i64, i64, i64) = db
+                .conn
+                .query_row(
+                    "SELECT grid_x,block_x,stream_id FROM launches ORDER BY grid_x LIMIT 1",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .unwrap();
+            assert_eq!(
+                (grid, block, stream),
+                (528, if case == "raw" { 256 } else { 128 }, 13)
+            );
+        }
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "tests::regressions::ncu_raw_and_details_preserve_selected_launches_without_timeline", "--nocapture"])
+            .env(CHILD_DB, &path).output().unwrap();
+        assert!(output.status.success());
+        let text = String::from_utf8(output.stdout).unwrap();
+        assert!(
+            !text.contains("threads/block=0") && !text.contains("Deep metrics: 1/0"),
+            "{text}"
+        );
+        assert!(
+            text.contains("counter-only kernels") && text.contains("timeline unavailable"),
+            "{text}"
+        );
+        if expected_duration.is_some() {
+            assert!(
+                text.contains("selected NCU instances") && text.contains("1 | N/A |"),
+                "{text}"
+            );
+            assert!(
+                text.contains(&format!("showing {expected_launches}")),
+                "{text}"
+            );
+        } else {
+            assert!(
+                text.contains("NCU replay time: N/A")
+                    && text.contains("Total:    N/A")
+                    && text.contains("Kernel: humming"),
+                "{text}"
+            );
+        }
+        let timeline = db.add_layer("nsys", "trace", None, None, None).unwrap();
+        db.conn.execute("INSERT INTO launches(kernel_name,duration_us,start_us,layer_id) VALUES('humming',10,123,?1)", [timeline]).unwrap();
+        assert_eq!(db.total_launch_count(), 1);
+        assert_eq!(db.total_gpu_time_us(), 10.0);
+    }
+}
+
+#[test]
+fn ncu_m128_duration_is_an_instrumented_replay_measurement() {
+    const CHILD_DB: &str = "GDBG_M128_NCU_REPLAY_TEST_DB";
+    const KERNEL: &str = "nvjet_sm90_tst_64x64_64x13_2x1_v_bz_TNT";
+    if let Some(path) = std::env::var_os(CHILD_DB) {
+        let db = GpuDb::open(std::path::Path::new(&path)).unwrap();
+        crate::commands::cmd_stats(&db);
+        crate::commands::cmd_kernels(&db, &[]);
+        crate::commands::cmd_inspect(&db, &[KERNEL]);
+        crate::commands::cmd_launches(&db, &[KERNEL]);
+        crate::commands::cmd_layers(&db);
+        crate::commands::cmd_suggest(&db);
+        return;
+    }
+    let directory = tempfile::tempdir().unwrap();
+    for timed in [false, true] {
+        let path = directory.path().join(format!("m128-{timed}.gpu.db"));
+        let db = GpuDb::create(&path).unwrap();
+        let csv_path = directory.path().join(format!("m128-{timed}.csv"));
+        let csv = if timed {
+            format!(
+                "\"ID\",\"Process ID\",\"Kernel Name\",\"Context\",\"Stream\",\"Block Size\",\"Grid Size\",\"gpu__time_duration.sum\"\n\"\",\"\",\"\",\"\",\"\",\"\",\"\",\"nsecond\"\n\"0\",\"370761\",\"{KERNEL}\",\"1\",\"7\",\"(384,1,1)\",\"(2,64,1)\",\"26976\"\n"
+            )
+        } else {
+            format!(
+                "\"Kernel Name\",\"Metric Name\",\"Metric Value\"\n\"{KERNEL}\",\"sm__throughput.avg.pct_of_peak_sustained_elapsed\",\"45.8\"\n"
+            )
+        };
+        std::fs::write(&csv_path, csv).unwrap();
+        let layer = db
+            .add_layer("ncu", csv_path.to_str().unwrap(), None, None, None)
+            .unwrap();
+        crate::parsers::ncu::import_ncu_csv(&db.conn, &csv_path, layer).unwrap();
+        assert_eq!(
+            db.count("SELECT COUNT(*) FROM launches WHERE start_us IS NOT NULL"),
+            0
+        );
+        if timed {
+            assert!((db.total_gpu_time_us() - 26.976).abs() < 0.000001);
+            assert_eq!(db.total_launch_count(), 1);
+        } else {
+            assert_eq!(db.total_launch_count(), 0);
+        }
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tests::regressions::ncu_m128_duration_is_an_instrumented_replay_measurement",
+                "--nocapture",
+            ])
+            .env(CHILD_DB, &path)
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let text = String::from_utf8(output.stdout).unwrap();
+        assert!(
+            text.contains(KERNEL) && text.contains("Timeline duration: N/A"),
+            "{text}"
+        );
+        assert!(
+            !text.contains("no kernel matching")
+                && !text.contains("Kernel time:  0.0us")
+                && !text.contains("Deep metrics: 1/0"),
+            "{text}"
+        );
+        assert!(
+            text.contains("NCU counter-only selections: 1 kernels")
+                && text.contains("Timeline correlation: N/A"),
+            "{text}"
+        );
+        assert!(
+            text.contains("Counter-only profile: 1 selected NCU kernels."),
+            "{text}"
+        );
+        for misleading in [
+            "no profile data",
+            "No kernel data collected",
+            "Correlation: 0 unique kernels",
+            "With metrics:  1/0",
+        ] {
+            assert!(!text.contains(misleading), "{text}");
+        }
+        if timed {
+            assert!(
+                text.contains("NCU replay time: 26.976us (instrumented, selected instances)"),
+                "{text}"
+            );
+            assert!(text.contains("Instrumented NCU replay duration"), "{text}");
+        } else {
+            assert!(
+                text.contains(
+                    "1 counter-only kernels; selected instances and NCU replay duration N/A"
+                ),
+                "{text}"
+            );
+            assert!(text.contains("NCU replay time: N/A"), "{text}");
+        }
+    }
+}

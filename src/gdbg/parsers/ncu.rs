@@ -10,7 +10,7 @@ const MAX_IMPORT_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_NCU_ROWS: usize = 1_000_000;
 const MAX_KERNELS: usize = 100_000;
 
-/// Parse ncu CSV output and INSERT metrics into the session DB.
+/// Import NCU details/raw CSV metrics and selected replay instances.
 pub fn import_ncu_csv(dest: &Connection, csv_path: &Path, layer_id: i64) -> Result<()> {
     let size = std::fs::metadata(csv_path)
         .with_context(|| format!("stat {}", csv_path.display()))?
@@ -23,70 +23,89 @@ pub fn import_ncu_csv(dest: &Connection, csv_path: &Path, layer_id: i64) -> Resu
     }
     let content = read_bounded_text(csv_path)?;
 
-    // Find headers
-    let mut lines = content.lines();
-    let header = loop {
-        match lines.next() {
-            Some(line) if line.contains("Kernel Name") && line.contains("Metric") => break line,
-            Some(_) => continue,
-            None => bail!("NCU CSV contains no candidate header"),
-        }
-    };
-
-    let headers = parse_csv_line(header);
-    let kernel_idx = find_col(&headers, "Kernel Name");
-    let metric_name_idx = find_col(&headers, "Metric Name");
-    let metric_value_idx = find_col(&headers, "Metric Value");
-
-    let (kernel_idx, metric_name_idx, metric_value_idx) = match (
-        kernel_idx,
-        metric_name_idx,
-        metric_value_idx,
-    ) {
-        (Some(k), Some(n), Some(v)) => (k, n, v),
-        _ => bail!(
-            "NCU CSV header is missing one or more required columns: Kernel Name, Metric Name, Metric Value"
-        ),
-    };
-
-    // Collect all metrics per kernel
+    let mut headers = Vec::new();
+    let mut duration_unit = "nsecond".to_string();
     let mut kernel_metrics: HashMap<String, HashMap<String, f64>> = HashMap::new();
-
+    let mut launches: HashMap<(String, String, String, String), NcuLaunch> = HashMap::new();
     let mut row_count = 0usize;
-    for line in lines {
+    for line in content.lines() {
+        if is_ncu_csv_header(line) {
+            headers = parse_csv_line(line);
+            duration_unit = "nsecond".into();
+            continue;
+        }
+        if line.contains("Kernel Name") && find_col(&parse_csv_line(line), "Kernel Name").is_some()
+        {
+            bail!("NCU CSV header is missing one or more required columns");
+        }
+        if headers.is_empty() || line.trim().is_empty() || line.starts_with("==") {
+            continue;
+        }
         row_count += 1;
         if row_count > MAX_NCU_ROWS {
             bail!("NCU CSV exceeds the maximum of {MAX_NCU_ROWS} data rows");
         }
-        let line = line.trim();
-        if line.is_empty() || line.starts_with("==") {
+        let fields = parse_csv_line(line);
+        let field = |name: &str| {
+            find_col(&headers, name)
+                .and_then(|index| fields.get(index))
+                .map(String::as_str)
+                .unwrap_or("")
+        };
+        let kernel = field("Kernel Name");
+        if kernel.is_empty() {
+            let unit = field("gpu__time_duration.sum");
+            if !unit.is_empty() {
+                duration_unit = unit.into();
+            }
             continue;
         }
-        let fields = parse_csv_line(line);
-
-        let kernel = match fields.get(kernel_idx) {
-            Some(k) if !k.is_empty() => normalize_kernel_name(k),
-            _ => continue,
-        };
-        let metric_name = match fields.get(metric_name_idx) {
-            Some(n) if !n.is_empty() => n.to_string(),
-            _ => continue,
-        };
-        let metric_value = fields
-            .get(metric_value_idx)
-            .and_then(|v| v.replace(',', "").parse::<f64>().ok())
-            .filter(|v| v.is_finite());
-        let Some(metric_value) = metric_value else {
-            continue;
-        };
-
-        kernel_metrics
-            .entry(kernel)
-            .or_default()
-            .insert(metric_name, metric_value);
+        let kernel = normalize_kernel_name(kernel);
+        let metrics = kernel_metrics.entry(kernel.clone()).or_default();
+        let sample = launches
+            .entry((
+                kernel.clone(),
+                field("Process ID").into(),
+                field("Context").into(),
+                field("ID").into(),
+            ))
+            .or_insert_with(|| NcuLaunch {
+                kernel,
+                ..Default::default()
+            });
+        for (target, name) in [
+            (&mut sample.grid, "Grid Size"),
+            (&mut sample.block, "Block Size"),
+        ] {
+            if !field(name).is_empty() {
+                *target = parse_size(field(name), name)?;
+            }
+        }
+        if !field("Stream").is_empty() && !field("Stream").eq_ignore_ascii_case("n/a") {
+            sample.stream = Some(field("Stream").parse().context("invalid NCU stream ID")?);
+        }
+        if let Some(index) = find_col(&headers, "Metric Name") {
+            let name = fields.get(index).map(String::as_str).unwrap_or("");
+            if let Some(value) = number(field("Metric Value")) {
+                metrics.insert(name.into(), value);
+                sample.metric(name, value, field("Metric Unit"))?;
+            }
+        } else {
+            for (name, value) in headers.iter().zip(&fields) {
+                if name.contains("__") {
+                    if let Some(value) = number(value) {
+                        metrics.insert(name.clone(), value);
+                        sample.metric(name, value, &duration_unit)?;
+                    }
+                }
+            }
+        }
         if kernel_metrics.len() > MAX_KERNELS {
             bail!("NCU CSV exceeds the maximum of {MAX_KERNELS} kernels");
         }
+    }
+    if headers.is_empty() {
+        bail!("NCU CSV contains no candidate header");
     }
 
     // Insert into metrics table
@@ -97,14 +116,6 @@ pub fn import_ncu_csv(dest: &Connection, csv_path: &Path, layer_id: i64) -> Resu
              l2_hit_rate_pct, achieved_bandwidth_gb_s, peak_bandwidth_gb_s,
              boundedness, layer_id)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
-    )?;
-
-    // Also insert per-launch data if available
-    let mut launch_stmt = dest.prepare(
-        "INSERT INTO launches
-            (kernel_name, duration_us, grid_x, grid_y, grid_z,
-             block_x, block_y, block_z, stream_id, layer_id)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
     )?;
 
     for (raw_name, m) in &kernel_metrics {
@@ -151,56 +162,119 @@ pub fn import_ncu_csv(dest: &Connection, csv_path: &Path, layer_id: i64) -> Resu
             boundedness,
             layer_id,
         ])?;
+    }
 
-        // Insert a launch record if we have duration and config
-        let duration_ns = m
-            .get("gpu__time_duration.sum")
-            .or_else(|| m.get("Duration"))
-            .copied()
-            .unwrap_or(0.0);
-        if duration_ns.is_finite() && duration_ns > 0.0 {
-            let gx = valid_dim(
-                m.get("launch__grid_size_x").copied().unwrap_or(0.0),
-                "grid_x",
-            )?;
-            let gy = valid_dim(
-                m.get("launch__grid_size_y").copied().unwrap_or(0.0),
-                "grid_y",
-            )?;
-            let gz = valid_dim(
-                m.get("launch__grid_size_z").copied().unwrap_or(0.0),
-                "grid_z",
-            )?;
-            let bx = valid_dim(
-                m.get("launch__block_size_x").copied().unwrap_or(0.0),
-                "block_x",
-            )?;
-            let by = valid_dim(
-                m.get("launch__block_size_y").copied().unwrap_or(0.0),
-                "block_y",
-            )?;
-            let bz = valid_dim(
-                m.get("launch__block_size_z").copied().unwrap_or(0.0),
-                "block_z",
-            )?;
-            let sid = m.get("launch__stream_id").map(|v| *v as i64);
-
+    let mut launch_stmt = dest.prepare(
+        "INSERT INTO launches
+            (kernel_name, duration_us, grid_x, grid_y, grid_z,
+             block_x, block_y, block_z, stream_id, layer_id)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+    )?;
+    for sample in launches.values() {
+        if let Some(duration) = sample.duration_us.filter(|value| *value > 0.0) {
             launch_stmt.execute(params![
-                &name,
-                duration_ns / 1000.0,
-                gx,
-                gy,
-                gz,
-                bx,
-                by,
-                bz,
-                sid,
-                layer_id,
+                sample.kernel,
+                duration,
+                sample.grid[0],
+                sample.grid[1],
+                sample.grid[2],
+                sample.block[0],
+                sample.block[1],
+                sample.block[2],
+                sample.stream,
+                layer_id
             ])?;
         }
     }
 
     Ok(())
+}
+
+#[derive(Default)]
+struct NcuLaunch {
+    kernel: String,
+    duration_us: Option<f64>,
+    grid: [Option<u32>; 3],
+    block: [Option<u32>; 3],
+    stream: Option<i64>,
+}
+
+impl NcuLaunch {
+    fn metric(&mut self, name: &str, value: f64, unit: &str) -> Result<()> {
+        match name {
+            "gpu__time_duration.sum" | "Duration" => {
+                self.duration_us = Some(duration_us(value, unit)?)
+            }
+            "launch__stream_id" => self.stream = self.stream.or_else(|| nonnegative_i64(value)),
+            name if name.starts_with("launch__") => {
+                for (dims, axis) in [(&mut self.grid, "grid"), (&mut self.block, "block")] {
+                    for (i, key) in ["x", "y", "z"].iter().enumerate() {
+                        if name == format!("launch__{axis}_size_{key}") {
+                            dims[i].get_or_insert(valid_dim(value, key)?);
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+}
+
+pub fn is_ncu_csv_header(line: &str) -> bool {
+    if !line.contains("Kernel Name") {
+        return false;
+    }
+    let headers = parse_csv_line(line);
+    find_col(&headers, "Kernel Name").is_some()
+        && ((find_col(&headers, "Metric Name").is_some()
+            && find_col(&headers, "Metric Value").is_some())
+            || (find_col(&headers, "ID").is_some() && find_col(&headers, "Grid Size").is_some()))
+}
+
+fn number(value: &str) -> Option<f64> {
+    value
+        .replace(',', "")
+        .parse::<f64>()
+        .ok()
+        .filter(|value| value.is_finite())
+}
+
+fn duration_us(value: f64, unit: &str) -> Result<f64> {
+    let scale = match unit {
+        "" | "nsecond" | "ns" => 0.001,
+        "usecond" | "us" => 1.0,
+        "msecond" | "ms" => 1000.0,
+        "second" | "s" => 1_000_000.0,
+        _ => bail!("unsupported NCU duration unit: {unit}"),
+    };
+    if value < 0.0 {
+        bail!("negative NCU duration: {value}");
+    }
+    let duration = value * scale;
+    if !duration.is_finite() {
+        bail!("NCU duration is out of range: {value}");
+    }
+    Ok(duration)
+}
+
+fn parse_size(value: &str, name: &str) -> Result<[Option<u32>; 3]> {
+    if value.eq_ignore_ascii_case("n/a") {
+        return Ok([None; 3]);
+    }
+    let parts: Vec<_> = value.trim_matches(['(', ')']).split(',').collect();
+    if parts.len() != 3 {
+        bail!("NCU {name} must contain three dimensions: {value}");
+    }
+    let mut result = [None; 3];
+    for (target, part) in result.iter_mut().zip(parts) {
+        let value = part
+            .trim()
+            .parse::<f64>()
+            .with_context(|| format!("invalid NCU {name}: {value}"))?;
+        *target = Some(valid_dim(value, name)?);
+    }
+    Ok(result)
 }
 
 fn read_bounded_text(path: &Path) -> Result<String> {
@@ -298,8 +372,8 @@ fn nonnegative_i64(value: f64) -> Option<i64> {
 }
 
 fn valid_dim(value: f64, name: &str) -> Result<u32> {
-    if !value.is_finite() || value < 0.0 || value > u32::MAX as f64 || value.fract() != 0.0 {
-        bail!("NCU {name} is not a valid non-negative integer: {value}");
+    if !value.is_finite() || value <= 0.0 || value > u32::MAX as f64 || value.fract() != 0.0 {
+        bail!("NCU {name} is not a valid positive integer: {value}");
     }
     Ok(value as u32)
 }

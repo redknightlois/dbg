@@ -38,6 +38,14 @@ pub fn cmd_layers(db: &GpuDb) {
     let uk = db.unique_kernel_count();
     let wm = db.kernels_with_metrics();
     let wo = db.kernels_with_ops();
+    if db.timeline_layer_id().is_none() && wm > 0 {
+        println!("\n  NCU counter-only selections: {wm} kernels");
+        println!("  Timeline correlation: N/A (timeline unavailable)");
+        if wo > 0 {
+            println!("  Kernels with op mapping: {wo}");
+        }
+        return;
+    }
     println!("\n  Correlation: {uk} unique kernels");
     println!("    With metrics:  {wm}/{uk}");
     println!("    With op map:   {wo}/{uk}");
@@ -49,13 +57,14 @@ pub fn cmd_layers(db: &GpuDb) {
 
 pub fn cmd_suggest(db: &GpuDb) {
     let uk = db.unique_kernel_count();
+    let wm = db.kernels_with_metrics();
     let failures = db.failures();
     let has_nsys = db.has_layer("nsys");
     let has_ncu = db.has_layer("ncu");
     let has_torch = db.has_layer("torch");
     let target = db.meta("target");
 
-    if uk == 0 && failures.is_empty() {
+    if uk == 0 && wm == 0 && failures.is_empty() {
         println!("no profile data");
         return;
     }
@@ -71,6 +80,16 @@ pub fn cmd_suggest(db: &GpuDb) {
         println!();
     }
 
+    if db.timeline_layer_id().is_none() && wm > 0 {
+        println!("  Counter-only profile: {wm} selected NCU kernels.");
+        println!(
+            "  Timeline unavailable; wall time, launch gaps and timeline correlation are N/A."
+        );
+        println!(
+            "  Use kernels, inspect <kernel> and bound <kernel> to inspect retained counters."
+        );
+        return;
+    }
     if uk == 0 {
         println!("  No kernel data collected.");
         return;

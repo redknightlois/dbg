@@ -21,17 +21,35 @@ pub fn cmd_inspect(db: &GpuDb, args: &[&str]) {
                FROM launches WHERE kernel_name LIKE ?1 ESCAPE '\' AND {tl}
                GROUP BY kernel_name"
     );
-    let rows: Vec<(String, i64, f64, f64, f64, f64)> =
-        db.query_vec(&sql, [like_param(pattern)], |row| {
-            Ok((
-                row.get(0)?,
-                row.get(1)?,
-                row.get(2)?,
-                row.get(3)?,
-                row.get(4)?,
-                row.get(5)?,
-            ))
-        });
+    let mut rows: Vec<(
+        String,
+        i64,
+        Option<f64>,
+        Option<f64>,
+        Option<f64>,
+        Option<f64>,
+    )> = db.query_vec(&sql, [like_param(pattern)], |row| {
+        Ok((
+            row.get(0)?,
+            row.get(1)?,
+            row.get(2)?,
+            row.get(3)?,
+            row.get(4)?,
+            row.get(5)?,
+        ))
+    });
+    if rows.is_empty() {
+        let sql = format!(
+            r"SELECT kernel_name FROM metrics m WHERE kernel_name LIKE ?1 ESCAPE '\' AND {}",
+            db.metric_filter_for("m")
+        );
+        let names: Vec<String> = db.query_vec(&sql, [like_param(pattern)], |row| row.get(0));
+        rows.extend(
+            names
+                .into_iter()
+                .map(|name| (name, 0, None, None, None, None)),
+        );
+    }
     if rows.is_empty() {
         println!("no kernel matching '{pattern}'");
         return;
@@ -47,12 +65,35 @@ pub fn cmd_inspect(db: &GpuDb, args: &[&str]) {
     let (name, cnt, total, avg, min, max) = rows.into_iter().next().unwrap();
 
     println!("Kernel: {name}");
-    println!("  Launches: {cnt}");
-    println!("  Total:    {}", fmt_us(total));
-    println!("  Average:  {}", fmt_us(avg));
+    let counter_only = db.timeline_layer_id().is_none() && db.has_layer("ncu");
+    if counter_only {
+        let count = if cnt == 0 {
+            "N/A".into()
+        } else {
+            cnt.to_string()
+        };
+        println!("  Selected NCU instances: {count}");
+        println!("  Timeline duration: N/A (timeline unavailable)");
+        println!("  Instrumented NCU replay durations:");
+    } else {
+        println!("  Launches: {cnt}");
+    }
+    let duration = |value: Option<f64>| {
+        value
+            .map(|value| {
+                if counter_only {
+                    format!("{value:.3}us")
+                } else {
+                    fmt_us(value)
+                }
+            })
+            .unwrap_or_else(|| "N/A".into())
+    };
+    println!("  Total:    {}", duration(total));
+    println!("  Average:  {}", duration(avg));
     if cnt > 1 {
-        println!("  Min:      {}", fmt_us(min));
-        println!("  Max:      {}", fmt_us(max));
+        println!("  Min:      {}", duration(min));
+        println!("  Max:      {}", duration(max));
     }
 
     // Launch config — most common
@@ -60,7 +101,8 @@ pub fn cmd_inspect(db: &GpuDb, args: &[&str]) {
         "SELECT grid_x, grid_y, grid_z, block_x, block_y, block_z,
                              COUNT(*) as cnt
                       FROM launches WHERE kernel_name = ?1
-                      AND grid_x IS NOT NULL AND {tl}
+                      AND grid_x > 0 AND grid_y > 0 AND grid_z > 0
+                      AND block_x > 0 AND block_y > 0 AND block_z > 0 AND {tl}
                       GROUP BY grid_x, grid_y, grid_z, block_x, block_y, block_z
                       ORDER BY cnt DESC LIMIT 5"
     );
