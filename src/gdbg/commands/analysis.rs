@@ -640,7 +640,7 @@ pub fn cmd_concurrency(db: &GpuDb) {
     if merged_active > 0.0 && gpu_total > 0.0 {
         let pindex = gpu_total / merged_active;
         let verdict = if pindex < 1.05 {
-            "serial — no overlap"
+            "low overlap"
         } else if pindex < 1.5 {
             "light overlap"
         } else if pindex < 2.5 {

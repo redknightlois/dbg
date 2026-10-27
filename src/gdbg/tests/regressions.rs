@@ -264,6 +264,35 @@ fn overlap_positive_when_concurrent() {
 }
 
 #[test]
+fn low_parallelism_index_reports_low_overlap() {
+    const CHILD_DB: &str = "GDBG_LOW_OVERLAP_TEST_DB";
+    if let Some(path) = std::env::var_os(CHILD_DB) {
+        let db = GpuDb::open(std::path::Path::new(&path)).unwrap();
+        crate::commands::cmd_concurrency(&db);
+        return;
+    }
+
+    let (db, directory) = make_db(&[("main", 0.0, 5.0, 7), ("side", 4.7, 5.0, 146)], &[]);
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "tests::regressions::low_parallelism_index_reports_low_overlap",
+            "--nocapture",
+        ])
+        .env(CHILD_DB, directory.path().join("t.gpu.db"))
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let text = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        text.contains("Parallelism index: 1.03x  (low overlap)"),
+        "{text}"
+    );
+    assert!(!text.contains("no overlap"), "{text}");
+    drop(db);
+}
+
+#[test]
 fn overlap_across_multiple_kernels() {
     // Two kernels covering 0..500, 1000..1500; transfer 400..1100 overlaps both.
     //   0..500 ∩ 400..1100 = 100us
