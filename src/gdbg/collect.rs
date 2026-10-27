@@ -707,12 +707,6 @@ fn ncu_command(
         cmd.args(["--section", section]);
     }
     cmd.args(["--csv", "--page", "raw", "--print-units", "base"]);
-    // The importer keys off Nsight Compute's stable metric identifiers (for
-    // example `sm__throughput.avg.pct_of_peak_sustained_elapsed`).  CSV output
-    // uses localized/display labels such as `Compute (SM) Throughput` unless
-    // this is requested explicitly, which creates a metrics row containing
-    // only NULL values and makes the REPL report `[no ncu]`.
-    cmd.args(["--print-metric-name", "name"]);
     cmd.args(["--kernel-name-base", "demangled"]);
     cmd.args(["--print-kernel-base", "demangled", "--rename-kernels", "0"]);
     if let Some(kernel_name) = kernel_name {
@@ -1248,11 +1242,7 @@ mod tests {
             args.windows(2).any(|w| w == ["--print-units", "base"]),
             "ncu must emit base units consumed by the parser: {args:?}"
         );
-        assert!(
-            args.windows(2)
-                .any(|w| w == ["--print-metric-name", "name"]),
-            "ncu must emit stable metric identifiers consumed by the parser: {args:?}"
-        );
+        assert!(!args.iter().any(|arg| arg == "--print-metric-name"));
         assert!(
             args.windows(2).any(|w| w == ["--launch-count", "1"]),
             "each ncu subprocess must capture one representative launch: {args:?}"
@@ -1292,13 +1282,13 @@ mod tests {
             ["--launch-count", "1"],
             ["--print-units", "base"],
             ["--page", "raw"],
-            ["--print-metric-name", "name"],
         ] {
             assert!(
                 args.windows(2).any(|window| window == pair),
                 "missing {pair:?}: {args:?}"
             );
         }
+        assert!(!args.iter().any(|arg| arg == "--print-metric-name"));
         assert!(args.contains(&format!("regex:{}", regex::escape("Marlin<(int)4>"))));
         options.section.clear();
         options.ncu_set = Some("basic".into());
