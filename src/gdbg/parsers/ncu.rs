@@ -525,21 +525,18 @@ mod tests {
         let layer = db
             .add_layer("ncu", "counter-only.csv", None, None, None)
             .unwrap();
-        let mut csv = tempfile::NamedTempFile::new().unwrap();
         use std::io::Write;
-        writeln!(csv, "\"ID\",\"Process ID\",\"Kernel Name\",\"Context\",\"Stream\",\"Block Size\",\"Grid Size\",\"smsp__pcsamp_sample_count\"").unwrap();
-        writeln!(
-            csv,
-            "\"0\",\"429257\",\"humming_w13\",\"1\",\"9\",\"(256,1,1)\",\"(528,1,1)\",\"5\""
-        )
-        .unwrap();
-        writeln!(
-            csv,
-            "\"1\",\"429257\",\"humming_w2\",\"1\",\"9\",\"(256,1,1)\",\"(528,1,1)\",\"7\""
-        )
-        .unwrap();
-
-        import_ncu_csv(&db.conn, csv.path(), layer).unwrap();
+        let header = "\"ID\",\"Process ID\",\"Kernel Name\",\"Context\",\"Stream\",\"Block Size\",\"Grid Size\",\"smsp__pcsamp_sample_count\"";
+        for (pid, shape, samples) in [("454808", "8192", "5"), ("455034", "4096", "7")] {
+            let mut csv = tempfile::NamedTempFile::new().unwrap();
+            writeln!(csv, "{header}").unwrap();
+            writeln!(
+                csv,
+                "\"0\",\"{pid}\",\"void humming<MmaOpClass, Shape<(unsigned int)0, (unsigned int){shape}, (unsigned int)4096>>\",\"1\",\"13\",\"(256,1,1)\",\"(528,1,1)\",\"{samples}\""
+            )
+            .unwrap();
+            import_ncu_csv(&db.conn, csv.path(), layer).unwrap();
+        }
 
         assert_eq!(db.total_launch_count(), 0);
         assert_eq!(db.unique_kernel_count(), 0);
