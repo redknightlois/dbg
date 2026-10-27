@@ -1,4 +1,7 @@
-use super::{GpuDb, fmt_us, gpu_busy_us, like_param, parse_count, parse_pattern, require_op_layer};
+use super::{
+    GpuDb, fmt_us, gpu_busy_us, like_param, ncu_instance_count_for_names, ncu_instance_count_label,
+    parse_count, parse_pattern, require_op_layer,
+};
 use rusqlite::params_from_iter;
 
 // ---------------------------------------------------------------------------
@@ -37,6 +40,7 @@ pub fn cmd_stats(db: &GpuDb) {
     };
     if counter_only {
         println!("  Timeline time: N/A (timeline unavailable)");
+        println!("  Timeline launches: N/A (Nsight Systems not collected)");
         if launch_count == 0 {
             println!("  NCU replay time: N/A (duration unavailable)");
         } else {
@@ -67,16 +71,9 @@ pub fn cmd_stats(db: &GpuDb) {
         );
     }
     if counter_only {
-        if launch_count == 0 {
-            println!(
-                "  Kernels:      {measured_kernels} counter-only kernels; selected instances N/A"
-            );
-        } else {
-            println!(
-                "  Kernels:      {launch_count} selected NCU instances, {} unique",
-                db.unique_kernel_count()
-            );
-        }
+        let count = db.ncu_instance_counts().map(|counts| counts.values().sum());
+        println!("  Kernels:      {measured_kernels} counter-only kernel names");
+        println!("  NCU instances: {}", ncu_instance_count_label(db, count));
         println!("  Transfers:    N/A (timeline unavailable)");
         let streams = db.stream_count();
         if streams > 0 {
@@ -220,10 +217,10 @@ pub fn cmd_kernels(db: &GpuDb, args: &[&str]) {
                 rusqlite::params![like_param(pattern.unwrap_or("")), n as i64],
                 |row| row.get(0),
             );
-            println!(
-                "{} counter-only kernels; selected instances and NCU replay duration N/A",
-                names.len()
-            );
+            let count = ncu_instance_count_for_names(db, &names);
+            println!("{} counter-only kernel names", names.len());
+            println!("  NCU instances: {}", ncu_instance_count_label(db, count));
+            println!("  NCU replay duration: N/A (not exported)");
             for name in names {
                 println!("  {name}");
             }

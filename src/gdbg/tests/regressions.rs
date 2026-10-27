@@ -689,7 +689,7 @@ fn ncu_raw_and_details_preserve_selected_launches_without_timeline() {
         );
         if expected_duration.is_some() {
             assert!(
-                text.contains("selected NCU instances") && text.contains("1 | N/A |"),
+                text.contains("Selected NCU instances") && text.contains("1 | N/A |"),
                 "{text}"
             );
             assert!(
@@ -736,7 +736,7 @@ fn ncu_m128_duration_is_an_instrumented_replay_measurement() {
             )
         } else {
             format!(
-                "\"Kernel Name\",\"Metric Name\",\"Metric Value\"\n\"{KERNEL}\",\"sm__throughput.avg.pct_of_peak_sustained_elapsed\",\"45.8\"\n"
+                "\"ID\",\"Process ID\",\"Kernel Name\",\"Context\",\"Stream\",\"Block Size\",\"Grid Size\",\"sm__throughput.avg.pct_of_peak_sustained_elapsed\"\n\"1\",\"370761\",\"{KERNEL}\",\"1\",\"7\",\"(384,1,1)\",\"(2,64,1)\",\"45.8\"\n"
             )
         };
         std::fs::write(&csv_path, csv).unwrap();
@@ -776,12 +776,13 @@ fn ncu_m128_duration_is_an_instrumented_replay_measurement() {
             "{text}"
         );
         assert!(
-            text.contains("NCU counter-only selections: 1 kernels")
+            text.contains("NCU counter-only kernel names: 1")
                 && text.contains("Timeline correlation: N/A"),
             "{text}"
         );
         assert!(
-            text.contains("Counter-only profile: 1 selected NCU kernels."),
+            text.contains("Counter-only profile: 1 NCU kernel names.")
+                && text.contains("Selected NCU instances: 1 identified."),
             "{text}"
         );
         for misleading in [
@@ -799,10 +800,11 @@ fn ncu_m128_duration_is_an_instrumented_replay_measurement() {
             );
             assert!(text.contains("Instrumented NCU replay duration"), "{text}");
         } else {
+            assert!(text.contains("1 counter-only kernel names"), "{text}");
             assert!(
-                text.contains(
-                    "1 counter-only kernels; selected instances and NCU replay duration N/A"
-                ),
+                text.contains("NCU instances: 1 identified")
+                    && text.contains("Timeline launches: N/A")
+                    && text.contains("NCU replay duration: N/A"),
                 "{text}"
             );
             assert!(text.contains("NCU replay time: N/A"), "{text}");

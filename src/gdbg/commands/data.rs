@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use super::{GpuDb, escape_regex, fmt_us};
+use super::{GpuDb, escape_regex, fmt_us, ncu_instance_count_for_names, ncu_instance_count_label};
 
 // ---------------------------------------------------------------------------
 // layers
@@ -39,7 +39,17 @@ pub fn cmd_layers(db: &GpuDb) {
     let wm = db.kernels_with_metrics();
     let wo = db.kernels_with_ops();
     if db.timeline_layer_id().is_none() && wm > 0 {
-        println!("\n  NCU counter-only selections: {wm} kernels");
+        let names: Vec<String> = db.query_vec(
+            &format!(
+                "SELECT kernel_name FROM metrics m WHERE {}",
+                db.metric_filter_for("m")
+            ),
+            [],
+            |row| row.get(0),
+        );
+        let count = ncu_instance_count_for_names(db, &names);
+        println!("\n  NCU counter-only kernel names: {wm}");
+        println!("  NCU instances: {}", ncu_instance_count_label(db, count));
         println!("  Timeline correlation: N/A (timeline unavailable)");
         if wo > 0 {
             println!("  Kernels with op mapping: {wo}");
@@ -81,7 +91,13 @@ pub fn cmd_suggest(db: &GpuDb) {
     }
 
     if db.timeline_layer_id().is_none() && wm > 0 {
-        println!("  Counter-only profile: {wm} selected NCU kernels.");
+        let counts = db.ncu_instance_counts();
+        let count = counts.as_ref().map(|counts| counts.values().sum());
+        println!("  Counter-only profile: {wm} NCU kernel names.");
+        println!(
+            "  Selected NCU instances: {}.",
+            ncu_instance_count_label(db, count)
+        );
         println!(
             "  Timeline unavailable; wall time, launch gaps and timeline correlation are N/A."
         );

@@ -1,9 +1,10 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::{fs::File, io::Read, path::Path};
 
 use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, params};
 
+use crate::db::set_layer_meta;
 use crate::kernel::normalize_kernel_name;
 
 const MAX_IMPORT_BYTES: u64 = 256 * 1024 * 1024;
@@ -27,10 +28,14 @@ pub fn import_ncu_csv(dest: &Connection, csv_path: &Path, layer_id: i64) -> Resu
     let mut duration_unit = "nsecond".to_string();
     let mut kernel_metrics: HashMap<String, HashMap<String, f64>> = HashMap::new();
     let mut launches: HashMap<(String, String, String, String), NcuLaunch> = HashMap::new();
+    let mut instance_ids_available = true;
+    let mut saw_header = false;
     let mut row_count = 0usize;
     for line in content.lines() {
         if is_ncu_csv_header(line) {
             headers = parse_csv_line(line);
+            instance_ids_available &= find_col(&headers, "ID").is_some();
+            saw_header = true;
             duration_unit = "nsecond".into();
             continue;
         }
@@ -59,6 +64,9 @@ pub fn import_ncu_csv(dest: &Connection, csv_path: &Path, layer_id: i64) -> Resu
                 duration_unit = unit.into();
             }
             continue;
+        }
+        if field("ID").is_empty() {
+            instance_ids_available = false;
         }
         let kernel = normalize_kernel_name(kernel);
         let metrics = kernel_metrics.entry(kernel.clone()).or_default();
@@ -107,6 +115,50 @@ pub fn import_ncu_csv(dest: &Connection, csv_path: &Path, layer_id: i64) -> Resu
     if headers.is_empty() {
         bail!("NCU CSV contains no candidate header");
     }
+
+    let mut instance_ids: HashMap<String, HashSet<(String, String, String)>> = HashMap::new();
+    for (kernel, process_id, context, instance_id) in launches.keys() {
+        if !instance_id.is_empty() {
+            instance_ids.entry(kernel.clone()).or_default().insert((
+                process_id.clone(),
+                context.clone(),
+                instance_id.clone(),
+            ));
+        }
+    }
+    let counts_key = format!("ncu_instance_counts@{layer_id}");
+    let mut instance_counts: HashMap<String, usize> = dest
+        .query_row("SELECT value FROM meta WHERE key=?1", [counts_key], |row| {
+            row.get::<_, String>(0)
+        })
+        .ok()
+        .and_then(|value| serde_json::from_str(&value).ok())
+        .unwrap_or_default();
+    for (kernel, ids) in instance_ids {
+        *instance_counts.entry(kernel).or_default() += ids.len();
+    }
+    let available_key = format!("ncu_instance_ids_available@{layer_id}");
+    let previously_available = dest
+        .query_row(
+            "SELECT value FROM meta WHERE key=?1",
+            [available_key],
+            |row| row.get::<_, String>(0),
+        )
+        .ok()
+        .map(|value| value == "true")
+        .unwrap_or(true);
+    set_layer_meta(
+        dest,
+        layer_id,
+        "ncu_instance_counts",
+        &serde_json::to_string(&instance_counts)?,
+    )?;
+    set_layer_meta(
+        dest,
+        layer_id,
+        "ncu_instance_ids_available",
+        &(saw_header && instance_ids_available && previously_available).to_string(),
+    )?;
 
     // Insert into metrics table
     let mut stmt = dest.prepare(
@@ -462,6 +514,37 @@ mod tests {
             )
             .unwrap();
         assert_eq!(bound, "memory");
+    }
+
+    #[test]
+    fn counter_only_raw_page_counts_instances_without_timeline_launches() {
+        use crate::db::GpuDb;
+
+        let db =
+            GpuDb::create(&tempfile::tempdir().unwrap().keep().join("counter-only.db")).unwrap();
+        let layer = db
+            .add_layer("ncu", "counter-only.csv", None, None, None)
+            .unwrap();
+        let mut csv = tempfile::NamedTempFile::new().unwrap();
+        use std::io::Write;
+        writeln!(csv, "\"ID\",\"Process ID\",\"Kernel Name\",\"Context\",\"Stream\",\"Block Size\",\"Grid Size\",\"smsp__pcsamp_sample_count\"").unwrap();
+        writeln!(
+            csv,
+            "\"0\",\"429257\",\"humming_w13\",\"1\",\"9\",\"(256,1,1)\",\"(528,1,1)\",\"5\""
+        )
+        .unwrap();
+        writeln!(
+            csv,
+            "\"1\",\"429257\",\"humming_w2\",\"1\",\"9\",\"(256,1,1)\",\"(528,1,1)\",\"7\""
+        )
+        .unwrap();
+
+        import_ncu_csv(&db.conn, csv.path(), layer).unwrap();
+
+        assert_eq!(db.total_launch_count(), 0);
+        assert_eq!(db.unique_kernel_count(), 0);
+        assert!(db.ncu_instance_ids_available());
+        assert_eq!(db.ncu_instance_counts().unwrap().values().sum::<usize>(), 2);
     }
 
     #[test]

@@ -45,6 +45,26 @@ pub(crate) fn fmt_us(us: f64) -> String {
     }
 }
 
+pub(crate) fn ncu_instance_count_label(db: &GpuDb, count: Option<usize>) -> String {
+    match (count, db.ncu_instance_ids_available()) {
+        (Some(count), true) => format!("{count} identified"),
+        (Some(count), false) if count > 0 => {
+            format!("at least {count} identified; some IDs unavailable")
+        }
+        _ => "N/A (NCU instance IDs unavailable)".into(),
+    }
+}
+
+pub(crate) fn ncu_instance_count_for_names(db: &GpuDb, names: &[String]) -> Option<usize> {
+    let counts = db.ncu_instance_counts()?;
+    Some(
+        names
+            .iter()
+            .map(|name| counts.get(name).copied().unwrap_or(0))
+            .sum(),
+    )
+}
+
 fn fmt_opt_pct(value: Option<f64>) -> String {
     value
         .map(|v| format!("{v:.1}%"))

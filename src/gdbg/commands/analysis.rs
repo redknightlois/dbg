@@ -2,7 +2,8 @@ use std::path::Path;
 
 use super::{
     GpuDb, compute_gpu_gaps, detect_warmup_count, find_hottest_window, fmt_bytes, fmt_opt_pct,
-    fmt_us, like_param, merge_intervals, parse_count, parse_pattern, require_op_layer,
+    fmt_us, like_param, merge_intervals, ncu_instance_count_label, parse_count, parse_pattern,
+    require_op_layer,
 };
 use rusqlite::params_from_iter;
 
@@ -1742,7 +1743,21 @@ pub fn cmd_launches(db: &GpuDb, args: &[&str]) {
                 .query_row(&metric_sql, [like_param(pattern)], |row| row.get(0))
                 .unwrap_or(0);
             if known > 0 {
-                println!("Selected NCU instances: N/A (duration and timeline unavailable)");
+                let counts = db.ncu_instance_counts();
+                let count = counts.as_ref().map(|counts| {
+                    let pattern = pattern.to_ascii_lowercase();
+                    counts
+                        .iter()
+                        .filter(|(name, _)| name.to_ascii_lowercase().contains(&pattern))
+                        .map(|(_, count)| *count)
+                        .sum()
+                });
+                println!(
+                    "Selected NCU instances: {}",
+                    ncu_instance_count_label(db, count)
+                );
+                println!("Timeline launches: N/A (timeline unavailable)");
+                println!("NCU replay duration: N/A (not exported)");
             } else {
                 println!("no kernel matching '{pattern}'");
             }

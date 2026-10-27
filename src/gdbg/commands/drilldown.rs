@@ -1,4 +1,4 @@
-use super::{GpuDb, fmt_bytes, fmt_us, like_param, require_op_layer};
+use super::{GpuDb, fmt_bytes, fmt_us, like_param, ncu_instance_count_label, require_op_layer};
 
 // ---------------------------------------------------------------------------
 // inspect
@@ -67,12 +67,13 @@ pub fn cmd_inspect(db: &GpuDb, args: &[&str]) {
     println!("Kernel: {name}");
     let counter_only = db.timeline_layer_id().is_none() && db.has_layer("ncu");
     if counter_only {
-        let count = if cnt == 0 {
-            "N/A".into()
-        } else {
-            cnt.to_string()
-        };
-        println!("  Selected NCU instances: {count}");
+        let count = db
+            .ncu_instance_counts()
+            .and_then(|counts| counts.get(&name).copied());
+        println!(
+            "  Selected NCU instances: {}",
+            ncu_instance_count_label(db, count)
+        );
         println!("  Timeline duration: N/A (timeline unavailable)");
         println!("  Instrumented NCU replay durations:");
     } else {

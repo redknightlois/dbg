@@ -92,15 +92,14 @@ fn cmd_from(args: &[String]) -> Result<()> {
     eprintln!("loading session '{}'...", args[0]);
     let mut db = GpuDb::load(&args[0])?;
     if db.timeline_layer_id().is_none() && db.has_layer("ncu") {
-        let instances = db.total_launch_count();
-        let instances = if instances == 0 {
-            "N/A".into()
-        } else {
-            instances.to_string()
-        };
+        let count = db
+            .ncu_instance_counts()
+            .as_ref()
+            .map(|counts| counts.values().sum::<usize>());
         eprintln!(
-            "restored: {} counter-only kernels, {instances} selected NCU instances",
-            db.kernels_with_metrics()
+            "restored: {} counter-only kernel names; NCU instances: {}",
+            db.kernels_with_metrics(),
+            commands::ncu_instance_count_label(&db, count)
         );
     } else {
         eprintln!(

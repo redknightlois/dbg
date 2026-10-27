@@ -705,6 +705,17 @@ impl GpuDb {
             .ok()
     }
 
+    pub fn ncu_instance_counts(&self) -> Option<HashMap<String, usize>> {
+        let layer_id = self.metrics_layer_id()?;
+        serde_json::from_str(&self.meta(&format!("ncu_instance_counts@{layer_id}"))).ok()
+    }
+
+    pub fn ncu_instance_ids_available(&self) -> bool {
+        self.metrics_layer_id()
+            .map(|layer_id| self.meta(&format!("ncu_instance_ids_available@{layer_id}")) == "true")
+            .unwrap_or(false)
+    }
+
     pub fn metrics_filter(&self) -> String {
         self.metrics_filter_for("metrics")
     }
